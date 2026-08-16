@@ -1,0 +1,13 @@
+{
+  "name": "update-config-reload",
+  "plugins": {
+    "p": {
+      "name": "p",
+      "apply": [{ "op": "log-config" }]
+    }
+  },
+  "steps": [
+    { "op": "plugin-with-config", "id": "p", "config": { "k": 1 } },
+    { "op": "update", "id": "p", "config": { "k": 2 } }
+  ]
+}

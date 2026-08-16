@@ -1,0 +1,12 @@
+# 依赖/构建产物
+/target
+**/target
+node_modules
+
+# 无关目录（不属本工程）
+deepseek-harness/
+cordis/
+$t
+
+# 用户私有笔记（deepseek-harness 主题，不属于 dsh-rs）
+DSH-插件开发经验.md

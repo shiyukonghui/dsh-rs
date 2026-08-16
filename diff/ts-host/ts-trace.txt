@@ -1,0 +1,12 @@
+﻿plugin:p
+status:p:Pending:Loading
+apply:p
+effect-reg:d1
+effect-reg:d2
+effect-reg:d3
+status:p:Loading:Active
+status:p:Active:Unloading
+dispose:d3
+dispose:d2
+dispose:d1
+status:p:Unloading:Disposed

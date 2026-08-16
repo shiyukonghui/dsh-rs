@@ -1,0 +1,10 @@
+{
+  "name": "dsh-ts-host",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "TS-side scenario host for Cordis-equivalence diff (M5).",
+  "dependencies": {
+    "cordis": "4.0.0-rc.8"
+  }
+}

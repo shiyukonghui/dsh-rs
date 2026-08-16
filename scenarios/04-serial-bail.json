@@ -1,0 +1,18 @@
+{
+  "name": "serial-bail",
+  "plugins": {
+    "p": {
+      "name": "p",
+      "apply": [
+        { "op": "on-return", "event": "e1", "log": "one", "value": null },
+        { "op": "on-return", "event": "e1", "log": "two", "value": false },
+        { "op": "on-return", "event": "e1", "log": "three", "value": "ok" },
+        { "op": "on-return", "event": "e1", "log": "four", "value": "never" }
+      ]
+    }
+  },
+  "steps": [
+    { "op": "plugin", "id": "p" },
+    { "op": "serial", "event": "e1", "args": [] }
+  ]
+}

@@ -1,0 +1,9 @@
+plugin:p
+status:p:Pending:Loading
+apply:p
+effect-reg:d1
+dispose:d1
+log:after-early-dispose
+status:p:Loading:Active
+status:p:Active:Unloading
+status:p:Unloading:Disposed

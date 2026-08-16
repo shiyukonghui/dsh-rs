@@ -1,0 +1,17 @@
+{
+  "name": "effect-idempotent",
+  "plugins": {
+    "p": {
+      "name": "p",
+      "apply": [
+        { "op": "effect", "dispose": "d1" },
+        { "op": "dispose-effect", "index": 0 },
+        { "op": "log", "text": "after-early-dispose" }
+      ]
+    }
+  },
+  "steps": [
+    { "op": "plugin", "id": "p" },
+    { "op": "unload", "id": "p" }
+  ]
+}

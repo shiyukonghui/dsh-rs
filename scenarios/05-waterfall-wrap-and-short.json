@@ -1,0 +1,18 @@
+{
+  "name": "waterfall-wrap-and-short",
+  "plugins": {
+    "p": {
+      "name": "p",
+      "apply": [
+        { "op": "on-waterfall", "event": "wf", "log": "outer-before", "after": "outer-after" },
+        { "op": "on-waterfall", "event": "wf", "log": "inner-before", "after": "inner-after" },
+        { "op": "on-short", "event": "wf2", "log": "stop" }
+      ]
+    }
+  },
+  "steps": [
+    { "op": "plugin", "id": "p" },
+    { "op": "waterfall", "event": "wf", "args": [] },
+    { "op": "waterfall", "event": "wf2", "args": [] }
+  ]
+}

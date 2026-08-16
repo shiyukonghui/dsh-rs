@@ -1,0 +1,17 @@
+{
+  "name": "effect-reverse-order",
+  "plugins": {
+    "p": {
+      "name": "p",
+      "apply": [
+        { "op": "effect", "dispose": "d1" },
+        { "op": "effect", "dispose": "d2" },
+        { "op": "effect", "dispose": "d3" }
+      ]
+    }
+  },
+  "steps": [
+    { "op": "plugin", "id": "p" },
+    { "op": "unload", "id": "p" }
+  ]
+}

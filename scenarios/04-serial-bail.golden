@@ -1,0 +1,13 @@
+plugin:p
+status:p:Pending:Loading
+apply:p
+on-return:e1:one
+on-return:e1:two
+on-return:e1:three
+on-return:e1:four
+status:p:Loading:Active
+serial:e1
+log:one
+log:two
+log:three
+serial-result:"ok"

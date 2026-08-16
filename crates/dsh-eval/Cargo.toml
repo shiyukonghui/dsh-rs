@@ -1,0 +1,10 @@
+[package]
+name = "dsh-eval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Restricted JS-expression evaluator for Cordis `!!js` loader expressions."
+
+[dependencies]
+serde_json = "1"

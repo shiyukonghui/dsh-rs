@@ -1,0 +1,22 @@
+{
+  "name": "intercept-merge",
+  "plugins": {
+    "parent": {
+      "name": "parent",
+      "apply": [
+        { "op": "intercept", "service": "srv", "config": { "a": 1 } },
+        { "op": "plugin", "id": "child" }
+      ]
+    },
+    "child": {
+      "name": "child",
+      "apply": [
+        { "op": "intercept", "service": "srv", "config": { "a": 9, "b": 2 } },
+        { "op": "resolve-config", "service": "srv" }
+      ]
+    }
+  },
+  "steps": [
+    { "op": "plugin", "id": "parent" }
+  ]
+}

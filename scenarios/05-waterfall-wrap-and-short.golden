@@ -1,0 +1,15 @@
+plugin:p
+status:p:Pending:Loading
+apply:p
+on-waterfall:wf:outer-before
+on-waterfall:wf:inner-before
+on-short:wf2:stop
+status:p:Loading:Active
+waterfall:wf
+log:outer-before
+log:inner-before
+log:inner-after
+log:outer-after
+waterfall-result:null
+waterfall:wf2
+log:stop

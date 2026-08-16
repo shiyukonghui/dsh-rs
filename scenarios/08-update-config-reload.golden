@@ -1,0 +1,10 @@
+plugin:p
+status:p:Pending:Loading
+apply:p
+log-config:{"k":1}
+status:p:Loading:Active
+status:p:Active:Unloading
+status:p:Unloading:Loading
+apply:p
+log-config:{"k":2}
+status:p:Loading:Active

@@ -1,0 +1,24 @@
+{
+  "name": "dependency-gate",
+  "plugins": {
+    "consumer": {
+      "name": "consumer",
+      "inject": ["svc"],
+      "apply": [{ "op": "log", "text": "consumer-applied" }]
+    },
+    "provider": {
+      "name": "provider",
+      "apply": [{ "op": "provide", "service": "svc", "value": "v1" }]
+    },
+    "provider2": {
+      "name": "provider2",
+      "apply": [{ "op": "provide", "service": "svc", "value": "v2" }]
+    }
+  },
+  "steps": [
+    { "op": "plugin", "id": "consumer" },
+    { "op": "plugin", "id": "provider" },
+    { "op": "unload", "id": "provider" },
+    { "op": "plugin", "id": "provider2" }
+  ]
+}

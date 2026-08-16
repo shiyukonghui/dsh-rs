@@ -1,0 +1,11 @@
+plugin:parent
+status:parent:Pending:Loading
+apply:parent
+intercept:srv:{"a":1}
+plugin:child
+status:child:Pending:Loading
+apply:child
+intercept:srv:{"a":9,"b":2}
+resolve-config:srv:{"a":9,"b":2}
+status:parent:Loading:Active
+status:child:Loading:Active

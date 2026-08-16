@@ -1,0 +1,12 @@
+[package]
+name = "dsh-wasmrt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "wasmtime backend for dsh: load WASM plugins as dsh-core Plugin (M6)."
+
+[dependencies]
+dsh-core = { path = "../dsh-core" }
+serde_json = "1"
+wasmtime = "34"

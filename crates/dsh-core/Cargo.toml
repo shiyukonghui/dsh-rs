@@ -1,0 +1,11 @@
+[package]
+name = "dsh-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Rust port of the Cordis plugin framework core: context, registry, fiber, events, reflect."
+
+[dependencies]
+dsh-schema = { path = "../dsh-schema" }
+serde_json = "1"

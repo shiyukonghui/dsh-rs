@@ -1,0 +1,17 @@
+{
+  "name": "emit-order-and-prepend",
+  "plugins": {
+    "p": {
+      "name": "p",
+      "apply": [
+        { "op": "on", "event": "e1", "log": "a" },
+        { "op": "on", "event": "e1", "log": "b" },
+        { "op": "on-prepend", "event": "e1", "log": "p" }
+      ]
+    }
+  },
+  "steps": [
+    { "op": "plugin", "id": "p" },
+    { "op": "emit", "event": "e1", "args": [1] }
+  ]
+}

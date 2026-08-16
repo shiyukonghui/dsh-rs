@@ -1,0 +1,11 @@
+[package]
+name = "dsh-schema"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Rust port of the Schemastery config schema (validation, defaults, autofix, transforms)."
+
+[dependencies]
+regex = "1"
+serde_json = "1"

@@ -1,0 +1,11 @@
+plugin:p
+status:p:Pending:Loading
+apply:p
+on:e1:a
+on:e1:b
+on-prepend:e1:p
+status:p:Loading:Active
+emit:e1
+log:p
+log:a
+log:b
