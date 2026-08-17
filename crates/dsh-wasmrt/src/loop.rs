@@ -47,9 +47,27 @@ pub struct LoopHost {
     pub tool_calls: Vec<(String, Vec<u8>)>,
     /// llm::generate 收到的 messages 字节。
     pub llm_calls: Vec<Vec<u8>>,
+    /// WASM 插件经 `tools::register` 声明的工具 `(name, schema)`（按声明序）。
+    /// 仅记录声明（name+schema）——`handler` 是 WASM 资源句柄，跨缝调用为
+    /// 后续增强（HANDOFF §7.13）——故此处存声明、执行时给出明确桥接错误。
+    pub wasm_tools: Vec<(String, Value)>,
     /// WASI preview2 上下文与资源表（组件为 wasip1 构建）。
     wasi: Option<wasmtime_wasi::p2::WasiCtx>,
     table: Option<wasmtime::component::ResourceTable>,
+}
+
+impl LoopHost {
+    /// 记录一条 WASM 插件声明的工具（按名去重覆盖；schema 原样保存）。
+    /// 返回一个稳定的声明序号作为 `tools::register` 的返回（宿主侧 id；当前
+    /// 无 consumer，仅用于可观测性与测试）。
+    fn register_wasm_tool(&mut self, name: &str, schema: Value) -> u32 {
+        if let Some(slot) = self.wasm_tools.iter_mut().find(|(n, _)| n == name) {
+            slot.1 = schema;
+        } else {
+            self.wasm_tools.push((name.to_string(), schema));
+        }
+        self.wasm_tools.len() as u32
+    }
 }
 
 impl LoopHost {
@@ -59,6 +77,7 @@ impl LoopHost {
             appends: Vec::new(),
             tool_calls: Vec::new(),
             llm_calls: Vec::new(),
+            wasm_tools: Vec::new(),
             wasi: Some(caps.build_wasi_ctx()),
             table: Some(wasmtime::component::ResourceTable::new()),
         }
@@ -80,13 +99,24 @@ impl LoopHost {
         (self.appends.len() - 1) as u64
     }
 
-    /// 经 Cordis `tools` 服务执行（若提供）；否则回退内存 add 工具。
+    /// 经 Cordis `tools` 服务执行（若提供且命中）；否则回退内存 add 工具；
+    /// 再否则：WASM 声明但 handler 未桥接 → 明确错误；真未注册 → "not registered"。
+    ///
+    /// 路由（第一性原理）：宿主注册表是**权威执行者**——WASM loop 声明的工具
+    /// （`wasm_tools`）在 handler 桥接落地（HANDOFF §7.13）之前**不可执行**，
+    /// 但也不该误导为「not registered」。故命中顺序为：宿主注册表实调 → 内存
+    /// add 回退 → WASM 声明（桥接未实现）→ 未注册。
     fn execute_tool(&mut self, name: &str, arguments: Value) -> Value {
         self.tool_calls
             .push((name.to_string(), serde_json::to_vec(&arguments).unwrap_or_default()));
         if let Some(ctx) = self.ctx() {
             if let Some(handle) = ctx.get_typed::<ToolRegistryHandle>("tools") {
-                return handle.lock().unwrap().execute(name, arguments);
+                let reg = handle.lock().unwrap();
+                // 宿主注册表命中 → 权威执行（schema 非 None 即已注册）。
+                if reg.schema(name).is_some() {
+                    return reg.execute(name, arguments);
+                }
+                // 未命中 → 落到下面统一处理（内存 add / WASM 声明 / not registered）。
             }
         }
         // 内存回退：add 工具
@@ -94,6 +124,13 @@ impl LoopHost {
             let a = arguments.get("a").and_then(|v| v.as_i64()).unwrap_or(0);
             let b = arguments.get("b").and_then(|v| v.as_i64()).unwrap_or(0);
             return serde_json::json!({"sum": a + b});
+        }
+        // WASM 插件声明过但 handler 未桥接：给出明确错误（而非误导「not
+        // registered」）。跨 WIT 资源回调为后续增强（HANDOFF §7.13）。
+        if self.wasm_tools.iter().any(|(n, _)| n == name) {
+            return serde_json::json!({"error": format!(
+                "tool \"{name}\" declared by WASM plugin: WASM handler bridge not wired (HANDOFF §7.13)"
+            )});
         }
         serde_json::json!({"error": format!("tool \"{name}\" not registered")})
     }
@@ -190,8 +227,13 @@ impl dsh::dsh::tools::Host for LoopHost {
         let result = self.execute_tool(&name, args);
         serde_json::to_vec(&result).unwrap_or_default()
     }
-    fn register(&mut self, _name: String, _schema: Vec<u8>, _handler: u32) -> u32 {
-        0
+    fn register(&mut self, name: String, schema: Vec<u8>, _handler: u32) -> u32 {
+        // 记录 WASM 插件声明的工具（name+schema）。`handler: u32` 是 WASM 资源
+        // 句柄，跨缝回调为后续增强（HANDOFF §7.13）——此处仅登记声明；执行经
+        // `execute_tool` 对声明内工具给出明确的「桥接未实现」错误，而非误报
+        // 「not registered」。
+        let schema: Value = serde_json::from_slice(&schema).unwrap_or(Value::Null);
+        self.register_wasm_tool(&name, schema)
     }
     /// 枚举已注册工具（WIT `tools::list-tools` → `list_tools`）。
     fn list_tools(&mut self) -> Vec<u8> {
@@ -358,6 +400,48 @@ impl WasmLoopPlugin {
             .as_mut()
             .map(|r| r.store.data_mut().list_tools())
             .unwrap_or_default();
+        CURRENT_CTX.with(|c| *c.borrow_mut() = None);
+        out
+    }
+
+    /// 驱动 host 侧 `tools::register`（记录 WASM 插件声明的工具），返回声明序号。
+    /// 注入 ctx 后调 `LoopHost::register`，供测试/宿主复现「WASM 插件注册工具」。
+    pub fn register_tool(&self, ctx: &Cordis, name: &str, schema: Value) -> u32 {
+        let _ = self.runtime(); // 确保实例化
+        let schema_bytes = serde_json::to_vec(&schema).unwrap_or_default();
+        CURRENT_CTX.with(|c| *c.borrow_mut() = Some(ctx.clone()));
+        let id = self
+            .rt
+            .borrow_mut()
+            .as_mut()
+            .map(|r| r.store.data_mut().register(name.to_string(), schema_bytes, 0))
+            .unwrap_or(0);
+        CURRENT_CTX.with(|c| *c.borrow_mut() = None);
+        id
+    }
+
+    /// WASM 插件经 `tools::register` 声明的工具 `(name, schema)` 对（声明序）。
+    /// 只读 `LoopHost::wasm_tools`；供测试/诊断核对声明记录。
+    pub fn wasm_tools(&self) -> Vec<(String, Value)> {
+        if let Some(rt) = self.rt.borrow().as_ref() {
+            rt.store.data().wasm_tools.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 驱动 host 侧 `tools::execute` 路由（注入 ctx 后调 `LoopHost::execute_tool`）。
+    /// 供测试核对执行分流：宿主注册工具 → 实调；WASM 声明但未桥接 → 明确错误；
+    /// 其它 → "not registered"。
+    pub fn execute_tool(&self, ctx: &Cordis, name: &str, args: Value) -> Value {
+        let _ = self.runtime(); // 确保实例化
+        CURRENT_CTX.with(|c| *c.borrow_mut() = Some(ctx.clone()));
+        let out = self
+            .rt
+            .borrow_mut()
+            .as_mut()
+            .map(|r| r.store.data_mut().execute_tool(name, args))
+            .unwrap_or(serde_json::json!({"error": "loop not instantiated"}));
         CURRENT_CTX.with(|c| *c.borrow_mut() = None);
         out
     }

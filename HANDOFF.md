@@ -55,7 +55,7 @@ cordis-plugin-loader 的完整功能面：
   loader 事务/部分失败回滚/group 嵌套/disabled/isolate-intercept、
   include 纯函数 patch（insert 进 group/顶层追加/嵌套命中/各 warn 诊断/
   通用 overrides 字段覆盖）。
-- **验证**：`cargo test --workspace` 245 项全绿、`cargo clippy --workspace
+- **验证**：`cargo test --workspace` 266 项全绿、`cargo clippy --workspace
   --all-targets` 零警告。
 - **二进制级冒烟（M62 轮）**：真实 `dsh.exe` 以 echo-loop 组件跑通完整
   生命周期——`--once "hello headless"` → 答案 `echo: hello headless`、reason=
@@ -238,6 +238,26 @@ PermissionDenied）。改为：https 客户端对**非 TLS 的裸 TCP 服务端*
 无自编 pfx、不新增 crate）、确定性、跨平台。全量回归 `cargo test --workspace`
 EXIT=0（245 项）、clippy `-D warnings` 零警告。
 
+**M68 WASM `tools::register` 桥接第一步——声明登记 + 明确路由**（§7.13 起点，
+决策日志 D-001）：
+- **`LoopHost::wasm_tools`**：记录 WASM 插件经 `tools::register` 声明的工具
+  `(name, schema)`（按声明序、同名去重覆盖）；`register_wasm_tool` 返回稳定
+  声明序号作 `register` 返回。
+- **`execute_tool` 路由重构**（不再误导）：命中顺序 = 宿主注册表**权威实调**
+  （`reg.schema(name).is_some()` 判命中）→ 内存 add 回退 → **WASM 声明但
+  handler 未桥接 → 明确错误**（`declared by WASM plugin: WASM handler bridge
+  not wired`）→ `not registered`。此前 WASM 声明过的工具被误报为 not
+  registered——现在显式暴露「桥接未实现」这一真实缺口。
+- **公开方法**：`WasmLoopPlugin::register_tool(ctx,name,schema)`（驱动 host 侧
+  register，注入 ctx）、`wasm_tools()`（读回声明）、`execute_tool(ctx,name,args)`
+  （驱动 host 侧 execute 路由，供测试核对分流）。
+- **`m8_dsh_loop.rs` +2 测试**：`wasm_tools_register_records_declaration`（声明
+  记录 + 同名覆盖）、`wasm_tools_execute_routes_bridge_error`（WASM 声明未桥接 →
+  明确错误 / 宿主注册表命中 → 实调 / 未注册 → not registered）。
+- 全量回归 `cargo test --workspace` 266 项全绿、clippy `-D warnings` 零警告。
+- **边界**：完整桥接（`handler` 资源化 + Store 重入 + WASM 导出回调）为 §7.13
+  后续增强——`wasm_tools` 即将来 handler 桥接的登记表（见 §7.13）。
+
 ## 2. 目录结构
 
 ```
@@ -310,7 +330,7 @@ dsh-rs/
 ## 4. 验证命令
 
 ```sh
-cargo test                # 182 项单元/集成测试（core/loader/eval/schema/diff/wasmrt/cli）
+cargo test                # 266 项单元/集成测试（core/loader/eval/schema/diff/wasmrt/cli）
 cargo clippy --all-targets # 必须零警告
 cargo run -p dsh-diff -- <scenario.json> [--golden f] [--async]   # 单场景差分
 cd diff/ts-host && node verify-diff.mjs                 # 全场景：TS 生成 golden + Rust 校验（16 场景含 loader/include）
@@ -613,11 +633,13 @@ cd diff/ts-host && node verify-diff.mjs                 # 全场景：TS 生成 
    wasmtime 34（preview1 socket stub）+ Rust std wasip1（std::net 未映射
    preview2 sockets）平台限制，待工具链支持。
 
-13. **WIT `tools::register` 的 WASM handler 桥接（M66 记为边界/后续增强）**：
+13. **WIT `tools::register` 的 WASM handler 桥接（M66 记为边界，M68 已落地
+    第一步——声明登记 + 明确路由）**：
     `dsh-loop.wit` 的 `register: func(name, schema: list<u8>, handler: u32)`，
-    `handler` 是 WASM 侧资源句柄（裸 `u32` 索引）。现状宿主 `LoopHost::register`
-    原样 no-op（返回 0）。要让「WASM 插件在缝内注册的、处理函数活在 WASM 里」
-    的工具真正可执行，需一路打通（尚未实现，供后续阶段设计起点）：
+    `handler` 是 WASM 侧资源句柄（裸 `u32` 索引）。**M68 已落地**：宿主记录
+    WASM 声明（`wasm_tools`，name+schema 按声明序、同名覆盖）；`execute_tool`
+    路由不再误导（宿主注册表权威实调 → 内存 add → WASM 声明给明确「桥接未
+    实现」错误 → not registered）。完整桥接仍待一路打通（供后续阶段设计起点）：
     - **WIT 重塑**：`handler: u32` 裸索引无法可靠定位实例/资源类型——应改为
       WIT 的真实 `resource`（`record`/`func` 资源）让 wit-bindgen 托管句柄表；
     - **Caller 感知**：`execute` 需能拿到当前调用方实例（`Caller`），才能在其
@@ -626,10 +648,10 @@ cd diff/ts-host && node verify-diff.mjs                 # 全场景：TS 生成 
       LoopRuntime>>>` 需换成可重入的访问模型）；
     - **宿主侧分流**：`execute_tool` 现统一代理到 Cordis `ToolRegistry`；需区分
       宿主注册工具与 WASM 注册工具两条路径。
-    需要一个导出 handler 资源的 WASM 测试组件来打通验证。**当前判定**：属
-    DSH 层 WIT 缝的跨资源桥接增强（非 Cordis 内核语义、无测试组件覆盖、涉及
-    WIT 契约 + Store 重入两处设计变更），不属「迁移未完成」——核心迁移已完成
-    且 245 项测试全绿。
+    需要一个导出 handler 资源的 WASM 测试组件来打通验证。**M68 已落地第一步**
+    （声明登记 + 明确路由，见 §1.5），完整桥接仍属 DSH 层 WIT 缝的跨资源桥接
+    增强（非 Cordis 内核语义、涉及 WIT 契约 + Store 重入两处设计变更），不属
+    「迁移未完成」——核心迁移已完成且 266 项测试全绿。
 
 ## 8. 工具链要求
 
