@@ -8,4 +8,11 @@ description = "Rust port of the Cordis plugin framework core: context, registry,
 
 [dependencies]
 dsh-schema = { path = "../dsh-schema" }
+native-tls = "0.2"
 serde_json = "1"
+# 默认特性含 async-await（需 futures-macro）；本 crate 只用 join_all/LocalBoxFuture/yield_now
+futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
+
+[dev-dependencies]
+native-tls = "0.2"
+tokio = { version = "1", features = ["rt", "macros"] }

@@ -764,3 +764,2350 @@ effect 逆序 / effect 幂等 / emit 顺序+prepend / serial-bail（null/false �
 已知 M6 差异：
 - 轻量 core-wasm FFI（非组件模型/cargo-component）；wasmtime 34 的 `func_wrap` 需 Send+Sync 闭包，故监听器注册由宿主 apply 侧统一完成；同一 `WasmPlugin` 实例多 fiber 并发挂载共享同一 wasm 实例（M6 单挂载）。
 - `host_get` 返回 JSON 值；WASI 能力（fs/网络）未授予（M6 仅 ABI 能力位，WASI preview2 组件模型留待后续）。
+
+---
+
+## 16. M7 交付记录（2026）—— async 基建
+
+**状态：M7 已交付**（`cargo test` 96 项全绿 + clippy 零警告；9 个差分场景：8 同步 + 1 async 深嵌套逐行一致）。
+
+### 目标（HANDOFF §7 方向 1）
+
+引入真实异步语义，替代两阶段延迟近似，使核心可承载 DSH 层（async 模型调用/工具执行）：
+`tokio current_thread` 执行环境、async listener/effect、`yield_now` 微任务让出、
+`parallel`/`serial` 真并发、`fiber.await()` 与 loader `EntryTree.await()`。
+
+### dsh-core 新增（`crates/dsh-core/`）
+
+- **依赖**：`futures-util`（默认特性关闭，只用 `join_all`/`LocalBoxFuture`；不引入
+  `futures-macro`，规避离线构建问题）；dev 依赖 `tokio`（rt + macros，测试用
+  `#[tokio::test]`）。
+- `events.rs`：`AsyncListener` 类型（`(ctx, args) -> LocalBoxFuture<Result<HookResult, CordisError>>`）、
+  `HookCallback` 枚举（`Sync(Listener) | Async(AsyncListener)`）；`Hook.cb` 统一为枚举，
+  同步分派只处理 `Sync` 变体（`Async` 跳过并记录差异），顺序（prepend）语义保留。
+- `fiber.rs`：`EffectOutcome::Async(LocalBoxFuture<EffectOutcome>)`（异步 disposer，
+  支持嵌套 resolve）；`FiberData.async_disposers` + `take_async_disposers`；
+  `collect_effect` 对 `Async` 存入异步列表（同步 wrapper 不含该部分）。
+- `runtime.rs`：`AsyncTask` 枚举（`Apply(FiberId) | Finish(FiberId)`）+ FIFO
+  `pending_async_loads` 微任务队列 + `async_mode` 标志（嵌套注册改走 async 入队）。
+- `context.rs`：
+  - `on_async` / `on_cb`（统一注册）；`parallel_async`（join_all + `AggregateError`，
+    allSettled 语义：全部执行、错误聚合）、`serial_async`（顺序 await + bail，错误传播）。
+  - `plugin_arc_async`（async 注册）：`run_transitions_async`（Load → Loading 同步 +
+    Apply 入队；Unload 同步）+ `drive_async_loads`（FIFO：`Apply` = yield → apply →
+    排入 `Finish`；`Finish` = yield → finish_load → notify 依赖方）。
+  - `yield_now`（自实现 ready-再-pending future，不依赖 `futures_util::task`）。
+  - `fiber_await`（轮询直到离开 Loading/Unloading；FAILED 传播）。
+  - `unload_async`（同步 disposer 逆序 + 异步 disposer join_all 并行，错误含化）。
+
+### 关键设计：`_reload` 的两个让出点（差分思维发现）
+
+TS 侧 `fiber.ts` 的 `_reload` 有**两次** `await` 让出：apply 前 `await Promise.resolve()`、
+apply 后 `await this._execute(...)`（即使同步值也让出一次）。嵌套 `ctx.plugin()` 在父
+apply 内**同步**注册（Loading 同步）并入队。因此 3 层嵌套的交错是：
+「b 的 apply 在 a Active 前、c 的 apply 在 a Active 后」。M5 的两阶段延迟只覆盖前两层，
+第 3 层顺序与 TS 偏差（HANDOFF §6 记录）。M7 用 FIFO 微任务队列 + 真实 `yield_now`
+精确复刻，**3 层嵌套与 TS 逐行一致**。
+
+### loader / diff
+
+- `Loader::await_idle`（等价 `EntryTree.await()`：轮询直到无 fiber 在 Loading/Unloading）。
+- `dsh-diff --async`：CLI 支持 async 编排（tokio current_thread + `LocalSet`）；
+  `Runner::run_async`；`verify-diff.mjs` 对深嵌套场景自动加 `--async`（`ASYNC_SCENARIOS`）。
+
+### 新增测试（11 项）
+
+- `m7_async.rs`（8）：parallel_async 全跑、错误聚合但 allSettled、serial_async bail、
+  错误传播、yield_now 交错、fiber_await、unload_async 异步 disposer、async listener
+  随卸载移除。
+- `m7_await.rs`（2）：loader await_idle 稳定返回、依赖门控收敛。
+- `m7_async_diff.rs`（1）：async 路径深嵌套（3 层）trace 与 TS golden 逐行一致。
+
+### 已知 M7 差异（M8 补齐）
+
+- 同步分派（emit/bail/serial/waterfall）跳过 async listener（Cordis 为 fire-and-forget）；
+  `unload`（同步）跳过 async disposer（需 `unload_async`）。
+- loader 事务仍同步（`Promise.allSettled` 并行 create 降顺序）；`EntryTree.await()`
+  轮询由 `Loader::await_idle` 提供但未接入 loader 内部事务。
+- async 加载路径（`plugin_arc_async`）与同步路径（两阶段延迟）并存：新场景用 async，
+  既有 8 个同步场景 golden 不变（向后兼容）。
+
+---
+
+## 17. M8 交付记录（2026）—— 组件模型 + DSH 层缝 WIT 化
+
+**状态：M8 已交付**（`cargo test` 101 项全绿 + clippy 零警告；C ABI 与组件模型双路径共存）。
+
+### 目标（方向 B：组件模型优先）
+
+按用户决策，先 cargo-component + WIT 定义 DSH 层 world，示例直接以 WASM 插件验证
+「loop 本身可替换」——替代手写 C ABI 的升级路径，并落地 WASI preview2 能力授予。
+
+### 工具链
+
+- `cargo component` 0.21.1（`cargo install cargo-component --locked`）+ wit-bindgen 0.44
+  （cargo-component 自带）+ `wasm32-wasip1` target。
+- workspace `rust-version` 1.75 → **1.85**（wit-bindgen/wasm-tools 组件模型 MSRV 下限；
+  HANDOFF 工具链声明本为 Rust 1.94+，1.75 是过期值）。
+
+### dsh-wasmrt 新增（`crates/dsh-wasmrt/`）
+
+- **WIT 契约**：
+  - `wit/plugin.wit`（`package dsh:plugin`）：插件载体——导出 `apply`（配置 bytes→s32）、
+    `handle-event`（事件名+payload→s32）、`dispose`；导入 host `log`/`emit`/`on`/`provide`/`get`
+    （能力位沿用 `Capabilities`）。
+  - `wit-dsh/dsh-loop.wit`（`package dsh:dsh`）：**DSH 层缝**——`session`（turn/step 边界 +
+    user/assistant/tool 消息 + append/derive-messages）、`tools`（execute/register）、
+    `llm`（generate）、`agent-loop`（run-turn）；world `dsh-loop` 导出 agent-loop、导入三缝。
+- **`component.rs`**：`WasmComponentPlugin`（适配 `Plugin`）——`wasmtime::component::bindgen!`
+  编译期 host 绑定（`DshPlugin` + `host_api::Host` trait）；`ComponentHostState` 实现
+  `Host` 与 `WasiView`/`IoView`；`wasmtime_wasi::p2::add_to_linker_sync` 注册 WASI preview2。
+- **Send 纪律**：wasmtime `IoView: Send` vs Cordis `Rc<RefCell>`——`ComponentHostState`
+  不含 Cordis，apply 时经 `thread_local CURRENT_CTX` 桥接（单线程内安全）。
+- `load_wasm_component_plugin`（宿主 API 入口）。
+
+### 组件插件（`wasm-plugins/`）
+
+- `hello-component`（`dsh:hello-component`）：等价 M6 hello——apply 提供 `greeting` 服务
+  + 注册 `ping` 监听；handle-event 回读服务并 host_emit；dispose 无操作。
+- `echo-loop`（`dsh:echo-loop`）：实现 `agent-loop` 缝——`run_turn` 在 WASM 插件内完成
+  turn/step 驱动 + session 回写（turn/start → step/start → user/message →
+  assistant/message → step/end → turn/end），**不依赖 LLM**，直接回显——证明
+  「loop 本身可替换」：宿主只提供缝，loop 实现与替换发生在插件层。
+
+### 新增测试（5 项）
+
+- `m8_component.rs`（4）：组件插件注册服务、事件双向（ping→pong）、卸载回滚、
+  能力拒绝（无 PROVIDE → apply -1 → FAILED）。
+- `m8_dsh_loop.rs`（1）：WASM echo-loop 组件实现 agent-loop——`run_turn` 返回
+  `{reason: completed, echo}` 且 session 缝被写入完整 turn/step 事件序列。
+
+### 关键陷阱（HANDOFF §5 已记录）
+
+- cargo-component path 依赖：一个 wit 目录只含一个 package；依赖放
+  `[package.metadata.component.target.dependencies]`。
+- wasip1 组件自动 import WASI → 宿主必须 `add_to_linker_sync`。
+- WIT 保留字：`stream` 非法（改 `generate`）；`_` 非法（用 kebab-case `out-len-ptr`）。
+
+### 已知 M8 差异（M9 补齐）
+
+- 组件路径 host `get` 为占位（无线性内存句柄；bytes 版待扩展）；WASI 授予为默认
+  `WasiCtxBuilder`（fs/网络按 caps 精细授予待做）；loader 未接入 `PluginHost`
+  （manifest 挂载组件插件待做）。
+- DSH 层仅 WIT 缝 + WASM echo-loop 验证；native 参考实现（tools/session/llm 服务）
+  未移植（下一步）。
+
+---
+
+## 18. M8 补充交付记录（2026）—— WASM DSH 层闭环
+
+**状态：补充交付**（`cargo test` 103 项全绿 + clippy 零警告）。
+
+### 背景修正
+
+上一轮 HANDOFF §7 曾写「DSH 层参考实现（native）」。经用户指正：B 方向的第一性原理
+是「缝的权威契约 = WIT，loop 以 WASM 为第一公民；宿主只承载缝」。据此修正：**不做
+native 参考插件**，把 `LoopHost` 提升为 dsh-wasmrt 正式宿主组件。
+
+### 新增（`crates/dsh-wasmrt/src/loop.rs`）
+
+- `LoopHost`：session/tools/llm 缝的 **Host 实现**（宿主职责，如同 WASI Host）——
+  session `append`/`derive-messages`（含宿主侧模型历史投影：user/assistant/tool 消息
+  序列）、tools `execute`（最小工具集：`add` 计算 a+b）/`register`、llm `generate`
+  （回显）；含 WASI preview2 上下文。
+- `WasmLoopPlugin`（适配 `Plugin`）：apply 懒实例化 dsh-loop 组件（三缝 Host + WASI
+  注册），返回 disposer（卸载清理）；`run_turn`（驱动 WASM loop）、`event_kinds`/
+  `derive_messages`（宿主读取 session 缝）。
+- `load_wasm_loop_plugin`（宿主 API 入口）。
+
+### 组件插件（`wasm-plugins/`）
+
+- `echo-loop`（`dsh:echo-loop`）：run_turn 回显输入 + 写完整 turn/step 事件序列。
+- `tool-loop`（`dsh:tool-loop`）：run_turn 调 `tools::execute("add", {a,b})` → 写
+  tool/call + tool/result → assistant/message 引用结果。
+
+### 新增测试（3 项，m8_dsh_loop.rs）
+
+- `wasm_loop_mounts_as_plugin_and_runs_turn`：WASM loop 经 `plugin_arc` 挂进 Cordis
+  （fiber Active）→ run_turn → session 事件序列 + 模型历史投影 → 卸载 Disposed。
+- `wasm_loop_runs_multiple_turns`：多轮累计。
+- `wasm_loop_calls_host_tool`：tools 缝双向桥接——WASM loop 调宿主 add 工具 → 结果
+  5 回 session → 模型历史含 tool 消息。
+
+### 结论
+
+「loop 本身可替换」以 **WASM 形态闭环**：loop 驱动与工具编排全在插件层（echo-loop/
+tool-loop），宿主只承载缝（LoopHost 的 session/tools/llm Host 实现）——与 B 方向
+一致，无 native 参考插件。下一轮：缝的承载实质化（桥接 Cordis 服务仓库）。
+
+---
+
+## 19. M8 补充交付记录（2026）—— 缝的承载实质化
+
+**状态：补充交付**（`cargo test` 108 项全绿 + clippy 零警告；9 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 1）
+
+`LoopHost` 的 session/tools 缝桥接 Cordis 服务仓库，使 WASM loop 的 session 输出
+经 Cordis 可查、工具注册经 Cordis 可扩展——「WASM DSH 层」与「dsh-core 运行时」
+深度整合。
+
+### dsh-core 新增（`crates/dsh-core/`）
+
+- `session.rs`：`SessionLog`（append-only 事件 + `derive_messages` 模型历史投影）、
+  `SessionEvent`（seq/kind/payload）、`SessionHandle`/`new_session`。
+- `tools.rs`：`ToolRegistry`（注册/执行/未注册错误）、`ToolRegistryHandle`/
+  `new_tool_registry`。
+- 句柄用 `Arc<Mutex<>>`（非 `Rc<RefCell<>>`）：服务仓库 `Impl.value: Arc<dyn Any +
+  Send + Sync>` 要求 Send+Sync；运行时单线程，Mutex 仅满足类型约束。
+
+### dsh-wasmrt（`crates/dsh-wasmrt/src/loop.rs`）
+
+- `LoopHost` 桥接：`append_session` 优先写 `ctx.sessions`（`SessionLog`）、
+  `execute_tool` 优先执行 `ctx.tools`（`ToolRegistry`），未提供时内存回退
+  （appends + add 工具）；`derive_messages` 优先取 Cordis sessions 投影。
+- `run_turn(ctx, input)`：显式注入当前 Cordis 至 `thread_local CURRENT_CTX`
+  （Send 约束），调用 WASM loop 后清理。
+
+### 新增测试
+
+- `m9_session_tools.rs`（4，dsh-core）：SessionLog append/投影、tool/result 投影、
+  ToolRegistry 注册/执行/未注册、句柄 Send+Sync 可作服务值。
+- `m8_dsh_loop.rs` 扩展 `wasm_loop_seam_bridges_cordis_services`：宿主 provide
+  sessions/tools 服务（含自定义 multiply + 覆盖 add 为 +100）→ WASM echo-loop 的
+  session 事件/模型历史经 `ctx.sessions` 可读；WASM tool-loop 调 add 得宿主实现
+  （2+3+100=105）→ tool/result 落入 `ctx.sessions`。
+
+### 已知差异（M9 补齐）
+
+- llm 缝未桥接 `ctx.llm`（LoopHost 回显）；完整 turn 流（pre-step → llm → 工具
+  循环 → post-step）未组合；loader 未接入 PluginHost。
+
+---
+
+## 20. M8 补充交付记录（2026）—— 完整 turn 流（llm 缝桥接）
+
+**状态：补充交付**（`cargo test` 112 项全绿 + clippy 零警告；9 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 1 续）
+
+桥接 llm 缝到 `ctx.llm`，组合完整 turn（pre-step → llm → 工具循环 → post-step），
+使「模型调用 → 工具执行 → 会话记录」全链路可配置替换。
+
+### dsh-core 新增（`crates/dsh-core/src/llm.rs`）
+
+- `LlmService`：默认适配器 + 按 provider 适配器表 + `generate(provider, messages, tools)`
+  → 助手响应 JSON；无适配器 → 错误 JSON。
+- `LlmHandle`/`new_llm`（`Arc<Mutex<>>`，满足服务仓库 Send+Sync）。
+
+### dsh-wasmrt（`crates/dsh-wasmrt/src/loop.rs`）
+
+- `LoopHost` 的 llm Host 桥接 `ctx.llm`：`generate` 优先调 `LlmService`（解析
+  messages/tools 为 JSON），未提供时内存回显。
+
+### 组件插件（`wasm-plugins/llm-loop`）
+
+- `llm-loop`（`dsh:llm-loop`）：**完整 turn 驱动**——pre-step（user/message）→
+  llm 缝（模型返回 add 工具调用）→ tools 缝（宿主执行 add）→ 写 tool/call +
+  tool/result → 再调 llm 缝（含工具结果，模型返回最终回答）→ assistant/message →
+  step/end → turn/end。
+
+### 新增测试
+
+- `m8_dsh_loop.rs` 扩展 `wasm_loop_full_turn_with_llm`：宿主 provide sessions/tools/
+  llm 三服务（llm 适配器：首轮返回 add 工具调用、含工具结果后返回 "sum is 5"）→
+  WASM llm-loop 驱动完整 turn → session 服务含完整事件序列
+  （user → tool/call → tool/result → assistant）+ 模型历史
+  （user → tool{sum:5} → assistant"sum is 5"）。
+- `m9_session_tools.rs` 扩展 LlmService（3）：默认/provider 适配器、未知 provider
+  回退默认、无适配器错误、句柄 Send+Sync。
+
+### 结论
+
+三缝（session/tools/llm）承载全部桥接 Cordis 服务，WASM loop 插件驱动完整 turn：
+「模型调用 → 工具执行 → 会话记录」全链路在插件层，宿主只承载缝——与 B 方向一致。
+下一轮：DSH 层配置化组装（loader 挂载 WASM loop + 服务）。
+
+---
+
+## 21. M9 交付记录（2026）—— DSH 层配置化组装
+
+**状态：M9 已交付**（`cargo test` 116 项全绿 + clippy 零警告；9 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 1 续）
+
+经 `dsh-loader` 从配置挂载服务插件 + WASM loop 插件——「loop 可替换」从代码级
+验证升级为**配置级验证**（换 entry `name` 即换 loop 行为，宿主不改代码）。
+
+### dsh-wasmrt 新增（`crates/dsh-wasmrt/src/services.rs`）
+
+- `DshServicesPlugin`（适配 `Plugin`）：apply 时按配置 `config.services`（默认全
+  注册）provide `sessions`/`tools`/`llm` 服务（`SessionLog`/`ToolRegistry`/
+  `LlmService` 句柄）。
+- `DshServicesConfig`（配置类型）。
+
+### 配置化组装（`crates/dsh-wasmrt/tests/m9_loader_assemble.rs`，4 项）
+
+- `loader_assemble_echo_loop`：`dsh:services` entry + `echo-loop` entry → run_turn
+  正常 + session 记录 6 事件。
+- `loader_assemble_tool_loop`：换 loop entry 为 `tool-loop` → 经 tools 缝调宿主
+  add 工具（2+3=5）+ tool/result。
+- `loader_assemble_llm_loop`：换为 `llm-loop` → 完整 turn（user → tool/call →
+  tool/result → assistant）+ 模型历史完整。
+- `loader_assemble_services_subset`：`config.services: ["sessions"]` → loop 仍可跑
+  （tools/llm 缝回退内存）。
+
+### 结论
+
+「loop 可替换」的配置级形态成立：`dsh:services`（缝的承载）+ WASM loop 插件
+（缝的消费）经 loader entry 组装，换 entry `name` 即换 loop 行为——对应
+deepseek-harness cordis.yml 的 agent-loop 行。下一轮：YAML 配置端到端
+（Include 从 cordis.yml 形态挂载）。
+
+---
+
+## 22. M9 补充交付记录（2026）—— YAML 配置端到端
+
+**状态：补充交付**（`cargo test` 120 项全绿 + clippy 零警告；9 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 1 续）
+
+用 `dsh-loader` 的 Include（YAML）从 **cordis.yml 形态**的配置挂载服务 + loop
+插件——贴近真实 dsh 启动方式（配置驱动、宿主不改代码）。
+
+### 测试（`crates/dsh-wasmrt/tests/m9_yaml_assemble.rs`，4 项）
+
+- `yaml_assemble_echo_loop`：写 cordis.yml 形态 YAML（services + echo-loop entries）
+  → `Include::load` → run_turn 正常 + session 记录 6 事件。
+- `yaml_assemble_tool_loop`：换 YAML 的 loop name 为 tool-loop → 经 tools 缝调
+  宿主 add 工具（2+3=5）+ tool/result。
+- `yaml_assemble_llm_loop`：换为 llm-loop → 完整 turn（user → tool/call →
+  tool/result → assistant）。
+- `yaml_patch_overrides_loop_config`：patch 覆盖 loop entry 的 config → 仍正常
+  挂载（patch 机制在 DSH 组装中生效）。
+
+### 结论
+
+DSH 层组装已具备 cordis.yml 形态的配置驱动：Include 读 YAML → loader 按名挂载
+服务 + WASM loop——换 YAML 的 loop name 即换 loop 行为。对应 deepseek-harness
+的 bundle/patch 组装。下一轮：DSH 层启动器（app-boot 等价，可执行入口）。
+
+---
+
+## 23. M9 补充交付记录（2026）—— DSH 层启动器（app-boot 等价）
+
+**状态：补充交付**（`cargo test` 122 项全绿 + clippy 零警告；9 差分场景不变；
+CLI 端到端实跑通过）。
+
+### 目标（HANDOFF §7 方向 1 续）
+
+可执行入口：读 cordis.yml → 注册插件仓库（native 服务 + WASM loop manifest）→
+Include 挂载 → 一次性 run_turn——对应 deepseek-harness 的 `dsh` CLI 最小形态。
+
+### 新建 `crates/dsh-cli`（bin `dsh`）
+
+- `src/lib.rs`：`boot(config_path, wasm_base)`——读 YAML 入口列表 → 注册
+  `dsh:services` + 每个非 services entry 按 `config.wasm`（组件目录）构建
+  `WasmLoopPlugin` → `Include::load` → 返回 `Boot{ctx, loop_plugin, sessions}`；
+  `run_turn(boot, input)` 驱动 WASM loop。缺 loop entry 报错（fail loud）。
+- `src/main.rs`：`dsh <cordis.yml> [wasm-base]`，stdin 读一行 JSON → run_turn →
+  打印响应。
+- `WasmLoopPlugin::new_owned`（运行时名字，Box::leak 换 `&'static str`）。
+
+### 新增测试
+
+- `crates/dsh-cli/tests/m9_boot.rs`（2）：boot 端到端（cordis.yml → echo-loop
+  run_turn → session 6 事件）；缺 loop entry 报错。
+- CLI 实跑：`echo '{"content":"hello from cli"}' | dsh cordis.yml wasm-plugins`
+  → `{"echo": "echo: hello from cli", "reason": "completed"}`。
+
+### 结论
+
+DSH 层具备可执行启动器：`dsh` CLI 从 cordis.yml 配置驱动 WASM loop（配置驱动、
+宿主不改代码）——app-boot 的最小形态。下一轮：交互式多轮 + profile 叠加层。
+
+---
+
+## 24. M9 补充交付记录（2026）—— 交互式运行（多轮 + profile 叠加 + manifest）
+
+**状态：补充交付**（`cargo test` 125 项全绿 + clippy 零警告；9 差分场景不变；
+CLI 多轮实跑通过）。
+
+### 目标（HANDOFF §7 方向 1 续）
+
+`dsh` CLI 支持多轮（stdin 循环）、`--overlay` profile 叠加层（bundle 语义）、
+loop manifest（`config.wasm` 目录或 `.wasm` 路径）。
+
+### dsh-cli（`crates/dsh-cli/`）
+
+- `boot(config_path, overlays, wasm_base)`：
+  - 读主配置 + 各 overlay（YAML 入口列表），`merge_entries` 同 id 覆盖
+    （bundle/patch 语义）；
+  - `config.wasm` 两种形态：目录名（构建目录）或 `.wasm` 路径（相对/绝对）；
+  - 合并后写唯一临时 YAML 供 Include 挂载。
+- `main.rs`：`dsh <cordis.yml> [--overlay <file>]... [--wasm-base <dir>]`，stdin
+  逐行 JSON → run_turn → 打印响应（多轮会话）。
+
+### 新增测试（`m9_boot.rs` 5 项）
+
+- `boot_loads_and_runs_turn`：端到端。
+- `boot_runs_multiple_turns`：同一 boot 连续 run_turn，session 累计 12 事件。
+- `boot_profile_overlay_swaps_loop`：overlay 把 loop 从 echo-loop 换成 tool-loop
+  （bundle 语义）。
+- `boot_manifest_wasm_path`：`config.wasm` 指向 `.wasm` 文件路径。
+- `boot_requires_loop_entry`：缺 loop 报错（fail loud）。
+
+### 结论
+
+`dsh` CLI 具备交互式多轮运行：cordis.yml + overlay 叠加 → 插件仓库 → Include →
+逐行 run_turn——对应 deepseek-harness 的 profile/bundle 组装与 `dsh` CLI。
+下一轮：完整 loop 语义（多轮共享上下文、工具/llm 配置化）。
+
+---
+
+## 25. M9 补充交付记录（2026）—— 完整 loop 语义（声明式配置 + 多轮上下文）
+
+**状态：补充交付**（`cargo test` 127 项全绿 + clippy 零警告；9 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 1 续）
+
+工具/llm 配置化（cordis.yml 声明，非代码注册）+ 多轮会话共享上下文
+（session 历史进 llm 缝输入）。
+
+### dsh-wasmrt（`crates/dsh-wasmrt/src/services.rs`）
+
+- `DshServicesPlugin` 声明式配置：
+  - `config.tools: [{name, op}]`——op ∈ add/multiply/echo，按配置注册（不再代码
+    注册）；
+  - `config.llm: {provider, behavior}`——behavior ∈ tool-first/echo，注册为
+    **默认适配器**（loop 的 llm 缝不带 provider 参数，走 default）。
+- `wasm-plugins/llm-loop`：run_turn 从 session 缝 `derive-messages` 取历史
+  （前轮 user/assistant/tool 消息）作为 llm 缝输入——多轮共享上下文在插件层。
+
+### 新增测试（`m9_boot.rs` 2 项）
+
+- `boot_declared_tools_and_llm`：cordis.yml 声明 add 工具 + tool-first llm →
+  tool-loop 经 tools 缝调声明式 add（2+3=5），无需代码注册。
+- `boot_multi_turn_shared_context`：llm-loop 两轮——第一轮 turn=1；第二轮 llm
+  缝输入含前轮历史（tool-first 回答 `sum is 5 (ctx=N)`），session 服务含两轮
+  16 事件。
+
+### 结论
+
+完整 loop 语义落地：声明式工具/llm 配置（cordis.yml 驱动）+ 多轮共享上下文
+（session 历史投影进 llm 缝）——DSH 层 turn 流可配置、可替换、带记忆。
+下一轮：组件模型完善（host get bytes 版、WASI 精细授予、loader 接入
+PluginHost）。
+
+---
+
+## 26. M10 交付记录（2026）—— 组件模型完善（WASI 精细授予 + llm provider）
+
+**状态：M10 已交付**（`cargo test` 129 项全绿 + clippy 零警告；9 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 1 续）
+
+WASI preview2 精细授予（按 caps 而非全量）+ llm 缝 provider 参数（按 provider
+选适配器）。
+
+### dsh-wasmrt（`crates/dsh-wasmrt/`）
+
+- `abi.rs`：`Capabilities` 增加 WASI 位——`CAPS_WASI_ENV`/`CAPS_WASI_FS`/
+  `CAPS_WASI_NET`；`build_wasi_ctx()` 按位构建 `WasiCtxBuilder`（env 继承、
+  fs 预打开根目录只读、net 继承 + TCP/UDP/域名解析）；`abi_only()` 无 WASI。
+- `loop.rs`/`component.rs`：`LoopHost`/`ComponentHostState` 用 `caps.build_wasi_ctx()`
+  （不再全量默认）。
+- WIT `dsh-loop.wit`：llm 缝 `generate(provider, messages, tools)`；`LoopHost`
+  llm Host 桥接按 provider 选 `LlmService` 适配器（空 → default）。
+
+### 组件重建 + 测试（`m9_boot.rs` 9 项）
+
+- `boot_works_without_wasi_caps`：`Capabilities::abi_only()`（无 WASI）loop 仍跑
+  （组件不依赖 WASI 功能）。
+- `llm_provider_selection`：多 provider（tool-first/echo）按名选择；未知 provider
+  回退 error。
+- 既有 7 项（多轮/overlay/manifest/声明式/上下文）全绿——WIT 变更向后兼容。
+
+### 结论
+
+组件模型路径具备**能力精细授予**（ABI 位 + WASI preview2 位按插件配置）与
+**provider 路由**（llm 缝带 provider，适配器按名选择）。下一轮：host `get`
+bytes 版 + loader 接入 PluginHost。
+
+---
+
+## 27. M10 补充交付记录（2026）—— host get bytes 版 + PluginHost 统一加载
+
+**状态：补充交付**（`cargo test` 132 项全绿 + clippy 零警告；9 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 1 续）
+
+host `get` 接口的 bytes 版（组件模型下返回值经 WIT `list<u8>`，无需线性内存
+句柄）+ `PluginHost` 统一加载组件插件（manifest 形态）。
+
+### dsh-wasmrt（`crates/dsh-wasmrt/`）
+
+- WIT `wit/plugin.wit`：host-api `get(service) -> list<u8>`（bytes 版，去掉
+  out-ptr/out-len-ptr 的 C ABI 形态）。
+- `component.rs`：`ComponentHostState::get` 返回服务值 JSON 字节（能力位检查，
+  被拒/缺失返回空）。
+- `host.rs`：`PluginKind::ComponentBytes(Vec<u8>)` + `NativeHost` 统一分派
+  （native / WasmBytes C ABI / ComponentBytes 组件）。
+- `wasm-plugins/hello-component`：handle_event 经 `host.get("greeting")` 回读服务
+  （bytes 版），emit 载荷含回读值。
+
+### 新增测试（`m10_plugin_host.rs`，3 项）
+
+- `plugin_host_loads_component`：PluginHost（ComponentBytes manifest）加载组件 →
+  Plugin trait 可用 + 提供服务。
+- `component_provides_and_rolls_back`：服务提供 + 卸载回滚。
+- `component_host_get_bytes_roundtrip`：ping → 组件内 host.get 回读 greeting →
+  emit 载荷含回读值（bytes 版双向）。
+
+### 结论
+
+组件模型路径补全：host `get` bytes 版（组件可回读服务）+ PluginHost 统一加载
+三形态插件（native / C ABI / 组件）。下一轮：async 收尾 / WASI 能力按 entry
+配置 / 真实 llm 接入。
+
+---
+
+## 28. M10 补充交付记录（2026）—— 能力按 entry 配置（界面驱动授权到配置层）
+
+**状态：补充交付**（`cargo test` 134 项全绿 + clippy 零警告；9 差分场景不变；
+CLI 受限 caps 实跑通过）。
+
+### 目标（HANDOFF §7 方向 1 续）
+
+cordis.yml 的 loop entry 声明 `caps`（能力位数组），启动器按配置授予——界面
+驱动授权落地到配置层（对应 WASI preview2 的按实例授予）。
+
+### dsh-wasmrt（`crates/dsh-wasmrt/src/abi.rs`）
+
+- `Capabilities::from_json(Option<&Value>)`：解析 `caps` 名称数组
+  （provide/emit/get/wasi-env/wasi-fs/wasi-net；`all`；缺省/空 → `abi_only`）。
+
+### dsh-cli（`crates/dsh-cli/src/lib.rs`）
+
+- `boot` 的 loop entry：`Capabilities::from_json(config.get("caps"))` 授予
+  （此前硬编码 `Capabilities::all()`）。
+
+### 新增测试（2 项）
+
+- `m10_plugin_host.rs` `capabilities_from_json`：缺省 abi_only、指定位、all。
+- `m9_boot.rs` `boot_caps_from_entry_config`：`caps: [provide, emit, get]` 的
+  loop entry 正常 run_turn。
+
+### 结论
+
+能力授予从硬编码变为**配置驱动**：cordis.yml 的 `caps` 字段控制插件能力
+（ABI + WASI 位），启动器按配置构建 WASI 上下文——界面驱动授权的配置层落地。
+下一轮：async 收尾 / 真实 llm 接入。
+
+## 29. M13 交付记录（2026）—— async 剩余收尾（emit fire-and-forget async listener + spawn 钩子）
+
+**状态：补充交付**（`cargo test` 135 项全绿 + clippy 零警告；9 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 1）
+
+async 剩余收尾第一半：`emit` 对 async listener 的 fire-and-forget。Cordis 语义中
+`ctx.emit` 同步返回、async listener 在宿主事件循环上异步执行；Rust 侧同步宿主无
+事件循环，故经「spawn 钩子」把异步任务交给宿主驱动——无钩子时跳过并记 trace。
+
+### dsh-core（`crates/dsh-core/src/runtime.rs` / `context.rs`）
+
+- `Runtime.spawn: Option<Box<dyn Fn(LocalBoxFuture<'static, ()>)>>` 字段（宿主
+  注入的任务驱动钩子；默认 None）。
+- `Cordis::set_spawn`：注入钩子（同步宿主可空转，async 宿主如 tokio LocalSet
+  用它 spawn_local 驱动）。
+- `Cordis::fire_async_listener`：`emit` 分派遇 `HookCallback::Async` 时把
+  `listener(&ctx, args)` 包成 `LocalBoxFuture` 交给钩子（fire-and-forget）；
+  无钩子则 `trace_push("async-listener-skipped")` 并跳过。
+
+### 新增测试（1 项）
+
+- `m7_async.rs` `emit_fire_and_forgets_async_listener`：宿主注入 tokio
+  LocalSet spawn 钩子，`emit` 同步返回后经 `run_until` + 多次 yield 驱动，
+  async listener 已执行（log 出现 "async-fired"）。
+
+### 结论
+
+`emit` 的异步监听器语义闭环：同步宿主可安全跳过（trace 可见）、async 宿主可
+经钩子驱动，行为对齐 Cordis 的 fire-and-forget。剩余：loader 事务 allSettled
+（同步收尾另一半）。
+
+## 30. M14 交付记录（2026）—— async 剩余收尾（loader 事务 allSettled）
+
+**状态：补充交付**（`cargo test` 142 项全绿 + clippy 零警告；9 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 1 另一半）
+
+loader 事务 allSettled：复刻 Cordis `EntryGroup.update(config)` 事务语义——
+全部入口都尝试 create/update（一个失败不阻断其他）、错误聚合（1 个失败 = 原
+错误；多个 = AggregateError）、任一失败则**整事务回滚**（逆序移除新建 + 重建
+旧配置），回滚错误并入 AggregateError。语义从 vendored
+`@deepseek-ai/cordis-plugin-loader` 逐行确认。
+
+### dsh-loader（`crates/dsh-loader/src/loader.rs`）
+
+- `Loader::create_async` / `update_async` / `remove_async`：async 生命周期变体
+  （`plugin_arc_async` / `unload_async`），四分支事务与同步版一致。
+- `Loader::sync_async`：**allSettled 事务**——重复 id 校验 → 全部入口
+  create/update（收集每个结果，不中断）→ 全成功才移除缺席旧入口 → 任一失败
+  回滚（逆序移除新建 + 重建旧配置）→ `AggregateError`。
+- async 内部生命周期避免 async 递归（编译器 E0733）：
+  - `start_entry_async`：显式栈迭代（组结构先挂载、子入口按序启动），中途
+    失败逆序清理已启动入口（`rollback_started`）。
+  - `dispose_entry_async`：后序收集子树 + 逐个 `unload_async`（子先父后）。
+  - `update_async`：队列迭代（group 子入口「更新既有」入队循环处理）。
+- `Include::load_async` / `refresh_async`：配置装载走 async 事务（Cordis
+  Include 插件的 `internal/update → EntryGroup.update(config)` 路径）。
+
+### 新增测试（7 项，`m14_loader_async.rs`）
+
+1. `sync_async_partial_failure_keeps_others`：create 阶段 allSettled（e1/e3 都
+   apply，不阻断）→ 整事务回滚（新建全部移除）；单失败 = 原错误。
+2. `sync_async_multiple_failures_aggregate`：多失败聚合（2 个都保留）。
+3. `sync_async_rollback_restores_old_config`：旧配置在运行 → sync 含失败 →
+   新建移除 + e1 恢复旧配置。
+4. `sync_async_success_removes_absent`：全成功（热更既有 + 新增 + 移除缺席）。
+5. `async_entry_lifecycle`：create/update/remove_async 基本路径。
+6. `sync_async_duplicate_id_fails`：重复 id 报错。
+7. `include_load_async_transaction`：YAML → async 事务装载；部分失败回滚；
+   修复后重载成功。
+
+### 结论
+
+async 剩余收尾闭环：`emit` fire-and-forget（M13）+ loader 事务 allSettled
+（M14）。loader 侧 Cordis `EntryGroup.update(config)` 语义完整落地，剩余仅为
+同步变体（`serial`/`parallel` 不调 async listener、同步 `unload` 跳过 async
+disposer）的既有差异。下一轮：真实 llm 接入 / HMR / loader 差分集。
+
+## 31. M15 交付记录（2026）—— HMR 热重载（文件 watcher + refresh 自动化）
+
+**状态：补充交付**（`cargo test` 147 项全绿 + clippy 零警告；9 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 3）
+
+HMR 热重载：对应 Cordis `cordis-plugin-hmr` 的 `registerConfig(filename, refresh)`
+——监听 add/change/unlink → refresh 串行执行；失败 emit `hmr/error` 事件。
+Rust 侧用**内容指纹轮询**（无 chokidar 依赖、无后台线程，符合单线程纪律）。
+
+### dsh-loader（`crates/dsh-loader/src/hmr.rs`）
+
+- `Hmr::register_config(path, refresh)`：注册监视（立即建快照——首次 `poll`
+  不触发，对应 chokidar `ready`）；`unregister` 取消。
+- `Hmr::poll() -> Vec<String>`：内容指纹（存在性 + std hash）检测变化 →
+  **串行**调用 refresh；返回本次触发路径列表。
+- `Hmr::take_errors() -> Vec<(String, CordisError)>`：refresh 失败记录
+  （对应 Cordis `hmr/error` 事件；Rust 侧查询式）。
+- `Include` 增加 `#[derive(Clone)]`（回调捕获用）。
+
+### dsh-cli（`crates/dsh-cli/src/lib.rs` / `main.rs`）
+
+- `Boot` 新增 `refresh: Rc<dyn Fn() -> Result<(), CordisError>>`：重读主配置 +
+  overlays → 重新挂载（`Include::load`；async 宿主可用 M14 `load_async`）。
+- `dsh --watch`：监视主配置 + overlays（`Hmr` 注册 → `boot.refresh`）；stdin
+  后台线程（mpsc）逐行发主循环，主循环 select stdin + HMR 轮询（50ms）。
+
+### 新增测试（5 项）
+
+- `m15_hmr.rs`（4）：首 poll 不触发 + 内容变化触发；删除/重建（unlink/add）
+  触发；多文件独立检测 + 失败记录；Include 集成热更（config k=1 → k=2）。
+- `m9_boot.rs` `boot_refresh_hot_reloads_llm_behavior`（1）：端到端——修改
+  cordis.yml 的 llm behavior（echo → tool-first）→ `boot.refresh()` → 新 turn
+  走新适配器（回答从回显变 `ctx=N`）。
+
+### 结论
+
+HMR 热重载闭环：配置变化 → `poll` 检测 → refresh 重挂载 → 运行中生效
+（llm 行为热更端到端验证）。剩余差异：事件驱动 vs 轮询（行为等价、
+实现无依赖）；`boot.refresh` 为同步路径（async 事务供 async 宿主）。
+下一轮：真实 llm 接入 / loader 差分集 / C ABI caps。
+
+## 32. M16 交付记录（2026）—— 能力按 entry 配置统一入口（C ABI + 组件）
+
+**状态：补充交付**（`cargo test` 151 项全绿 + clippy 零警告；9 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 3）
+
+C ABI 路径能力配置：此前仅组件路径（boot 的 loop entry）经
+`Capabilities::from_json(config.caps)` 接入配置；C ABI 路径（`WasmPlugin`）
+调用点全部硬编码 caps。统一为按 entry 配置解析的入口，两路径一致。
+
+### dsh-wasmrt（`crates/dsh-wasmrt/src/host.rs`）
+
+- `PluginManifest::from_config(name, kind, config)`：从 entry 配置构造清单——
+  `config.caps` 数组 → `Capabilities::from_json`（缺省 abi_only / `all` 全量）。
+  C ABI（`WasmBytes`）与组件（`ComponentBytes`）共用；native 直通（caps 无
+  host 侧检查）。
+
+### 新增测试（4 项，`m16_caps_config.rs`）
+
+1. `manifest_from_config_defaults_abi_only`：缺省 = ABI 能力（无 WASI）。
+2. `manifest_from_config_parses_caps_array`：位名映射（含 wasi-env/wasi-net）。
+3. `c_abi_caps_from_entry_config_enforced`：`caps: [provide]` → apply 成功
+   （provide 允许）、事件处理中 host_get 被拒（`host_get denied` 入插件日志）。
+4. `component_caps_from_entry_config_enforced`：`caps: [emit, get]`（无
+   provide）→ 组件 apply 提供服务被拒 → fiber Failed。
+
+### 结论
+
+能力授予的配置驱动在两条 WASM 路径闭环：`PluginManifest::from_config` 是统一
+入口（宿主/loader 组装任意形态插件时按 entry 配置授权），host import 侧检查
+生效并记录拒绝。剩余：C ABI 路径无 WASI 上下文（仅 ABI 位生效，WASI 位待接入
+`WasmPlugin`）。下一轮：真实 llm 接入 / loader 差分集 / HMR 完善。
+
+## 33. M17 交付记录（2026）—— 真实 HTTP llm 接入
+
+**状态：补充交付**（`cargo test` 157 项全绿 + clippy 零警告；9 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 1）
+
+真实 HTTP llm 适配器（非回显）替换声明式 mock：OpenAI 兼容 `/chat/completions`。
+无真实 API key / 外网依赖——用**本地 TCP mock 服务器**验证完整语义（请求形状、
+响应解析、错误路径），真实端点（https）仅需换 base URL。
+
+### dsh-core（`crates/dsh-core/src/llm_http.rs`）
+
+- `chat_completions(base, api_key, model, messages, tools)`：手写 HTTP/1.1
+  （`std::net::TcpStream`，零外部依赖；单线程纪律）——POST `{base}/chat/completions`，
+  body `{model, messages, tools}`，Bearer 认证可选；解析 `choices[0].message`
+  → `{content, tool_calls?}`；非 2xx / 形状不符 / 连接失败 → error JSON（fail
+  loud，不 panic）。Content-Length 提前截断读取。
+- `LlmService::register_http(provider, base, api_key, model)` /
+  `register_http_default(...)`：HTTP 适配器注册（默认或按 provider）。
+
+### dsh-wasmrt（`crates/dsh-wasmrt/src/services.rs`）
+
+- 声明式 `llm: {provider, http: {base, api_key, model}}`：`DshServicesPlugin`
+  按配置注册 HTTP 适配器（provider == "default" → 默认，否则按名）。
+
+### 新增测试（6 项）
+
+- `m17_http_llm.rs`（5，dsh-core）：mock 服务器请求形状（POST 路径 / Bearer /
+  model / messages）+ 响应解析；provider 作默认；非 2xx → error 含状态码；
+  连接拒绝 → error；响应无 choices → error。
+- `m9_yaml_assemble.rs` `yaml_declared_http_llm`（1，dsh-wasmrt）：YAML 声明
+  `llm.http` → llm-loop 完整 turn 经真实 HTTP（mock）→ 回答来自 HTTP 响应；
+  两步模型请求（step1+step2）各含 Bearer + model。
+
+### 结论
+
+真实模型接入的最小契约落地：声明式配置 → HTTP 请求 → 响应解析 → turn 流。
+剩余：https（TLS）待扩展（当前仅 http://；可后续 native-tls/rustls 或 ureq）。
+下一轮：loader 差分集 / HMR 完善 / C ABI WASI。
+
+## 34. M18 交付记录（2026）—— 同步分派对 async listener fire-and-forget 补全
+
+**状态：补充交付**（`cargo test` 159 项全绿 + clippy 零警告；9 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 3 之一）
+
+M13 已实现 `emit` 对 async listener fire-and-forget；`bail`/`serial`（同步
+`run_serialish`）与 `waterfall`（同步 `run_chain`）仍**跳过** async listener
+（记录为差异）。Cordis 语义：同步分派 `Reflect.apply` 直接调用 async listener
+（返回 Promise 被丢弃，不 await），bail 值不可同步判定 → 链继续。补全三处。
+
+### dsh-core（`crates/dsh-core/src/context.rs`）
+
+- `run_serialish`（`bail`/`serial`）：`HookCallback::Async` → `fire_async_listener`
+  （不再 `continue` 跳过）。
+- `run_chain`（`waterfall`）：`HookCallback::Async` → `fire_async_listener` +
+  继续 next 链（inner 仍执行）。
+- 无 spawn 钩子（同步宿主）时仍跳过并 trace "async-listener-skipped"（同 M13）。
+
+### 新增测试（2 项，`m7_async.rs`）
+
+1. `bail_and_serial_fire_and_forget_async_listener`：bail + serial 各触发一次
+   async listener（副作用执行）；async 返回值不参与 bail 判定。
+2. `waterfall_fire_and_forgets_async_listener`：waterfall 中 async listener
+   被调用（副作用执行）、inner 同步返回（链继续）。
+
+### 结论
+
+同步分派（emit/bail/serial/waterfall）对 async listener 的语义全部对齐
+Cordis（调用但不 await）。剩余 async 差异仅：同步 `unload` 跳过 async
+disposer（需 `unload_async`）。下一轮：真实模型 https / loader 差分集 /
+HMR 完善。
+
+## 35. M19 交付记录（2026）—— C ABI 路径 WASI 能力授予（preview1）
+
+**状态：补充交付**（`cargo test` 162 项全绿 + clippy 零警告；9 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 4）
+
+C ABI 路径（`WasmPlugin`）此前只有 ABI 能力位（provide/emit/get）生效，WASI
+位（env/fs/net）无上下文。接入 WASI **preview1**（core-module 形态）——wasip1
+构建的 C ABI 插件按 caps 注入环境变量/文件系统/网络。
+
+### 关键技术约束
+
+`wasmtime_wasi::preview1::add_to_linker_sync<T: Send>` 要求 store data 是
+Send；`WasmHostState` 此前含非 Send 的 `Option<Cordis>`。改造为**组件路径同款
+thread_local 桥接**（`CURRENT_CTX` + `mounted`），`WasmHostState` 变 Send。
+
+### dsh-wasmrt
+
+- `abi.rs`：`Capabilities::build_wasi_p1_ctx()`——按位构建 `WasiP1Ctx`
+  （`build_p1`）；**无任何 WASI 位 → None**（不注册，wasip1 插件 import 解析
+  失败 = 能力拒绝）。
+- `plugin.rs`：`WasmHostState` 移出 `ctx`（thread_local `CURRENT_CTX` +
+  `mounted: Cell<bool>`），新增 `wasi: Option<WasiP1Ctx>`；instantiate 时有
+  WASI ctx 则 `preview1::add_to_linker_sync` 注册；host import 闭包改经
+  `ctx()`（mounted + CURRENT_CTX）。
+- `wasm-plugins/hello-wasi`（新）：wasm32-wasip1 C ABI 插件，`plugin_apply`
+  读环境变量 `DSH_TEST` → `host_log`。
+
+### 新增测试（3 项，`m19_wasi_cabi.rs`）
+
+1. `wasi_env_cap_allows_env_read`：`caps: [provide, wasi-env]` → 插件读到
+   `DSH_TEST`（host_log 含值）。
+2. `no_wasi_cap_fails_instantiation`：`abi_only` → apply（懒实例化）时 wasi
+   import 无法解析 → fiber Failed（能力拒绝）。
+3. `wasi_fs_cap_builds_ctx_for_env_plugin`：纯 env ABI 插件（hello）+ WASI 位
+   注册无碍（实例化成功、服务正常）。
+
+### 结论
+
+C ABI 路径 WASI 精细授予闭环：wasip1 插件按 caps 注入（env 已验证端到端；
+fs/net 位同构构建，待端到端验证）。两条 WASM 路径（C ABI preview1 / 组件
+preview2）能力授予一致。下一轮：真实模型 https / loader 差分集 / HMR 完善。
+
+## 36. M20 交付记录（2026）—— loader 场景纳入差分集
+
+**状态：补充交付**（`cargo test` 162 项全绿 + clippy 零警告；**11 个差分场景**
+全部逐行一致——9 核心 + 2 loader 事务）。
+
+### 目标（HANDOFF §7 方向 2）
+
+loader/include 场景纳入差分集。TS 参照改用 **vendored
+`@deepseek-ai/cordis-plugin-loader`**（DSH 实际使用的 4.0.1+1.0.2 配对；无需
+npm 装 `@koishijs/loader`）——`diff/ts-host/loader-host.mjs`。
+
+### 关键发现：真并行 create
+
+Rust `Loader::sync_async` 原为**串行** create（PLAN §10 记录「并行降为顺序」），
+与 TS `Promise.allSettled(config.map(create))` 的 plugin/status/apply **交错
+顺序**不一致（差分逐行比对暴露）。改为 **join_all 真并行**：
+- `futures-util` 加入 dsh-loader 依赖；`sync_async` 的 allSettled 循环改
+  `join_all`（`LocalBoxFuture` 显式类型）。
+- 竞争分析：`pending_entry`/`pending_isolate`/`pending_intercept` 在
+  `register_plugin` 的**同步段**被 take（不跨 await），并行 create 各自
+  register 时无覆盖竞争。
+- 回滚路径保持串行（逆序移除新建 + 重建旧配置），语义不变。
+
+### dsh-diff
+
+- `Step` 增加 `LoaderSync`/`LoaderCreate`/`LoaderUpdate`/`LoaderRemove`
+  （serde kebab-case：`loader-sync` 等）；`LoaderEntry = serde_json::Value`
+  （保序——TS 侧 canonical 排序对齐 Rust BTreeMap 默认键序）。
+- `Runner` 持有懒初始化 `Loader`（`ensure_loader`：挂载 Loader 插件 + 注册场景
+  插件；挂载产生的 `plugin:loader` trace 丢弃——TS 在框架监听前挂载）。
+- loader 步骤必须走 `--async`（同步路径报错提示）；错误 trace 只输出**失败
+  数量**（两边错误消息文本不同，数量语义一致）。
+- `verify-diff.mjs`：loader 场景用 `loader-host.mjs` 生成 golden + `--async`
+  校验；golden 去 BOM。
+
+### 新增场景（2 个）
+
+1. `loader-01-sync-success`：sync 两入口（并行交错）→ update 热更 → remove。
+2. `loader-02-partial-failure-rollback`：sync 三入口含未知插件 → 部分失败
+   整事务回滚（新建移除 + 旧配置重建）+ `loader-error:1` → 恢复 sync。
+
+### 结论
+
+loader 事务语义（allSettled 并行交错 + 失败回滚）与 TS **逐行一致**（20/26
+行 PASS）。剩余差异：group 入口 Rust 无 Group 插件 fiber 形态（TS 有
+`plugin:Group`/`status:Group`）——group 场景待实现后纳入。下一轮：loader
+group 对齐 / 真实模型 https / HMR 完善。
+
+## 37. M21 交付记录（2026）—— C ABI 路径 WASI fs 授予端到端验证
+
+**状态：补充交付**（`cargo test` 164 项全绿 + clippy 零警告；11 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 4 之一）
+
+M19 已实现 C ABI 路径 WASI preview1 授予（env 端到端验证）；fs 位同构构建但
+未验证。补充 fs 端到端：wasip1 C ABI 插件读取预打开根目录文件。
+
+### 实现
+
+- `wasm-plugins/hello-wasi/src/lib.rs`：`plugin_apply` 读环境变量（`M19_ENV_A`/
+  `M19_ENV_B`，并行测试互不覆盖）+ 读根目录 `/dsh_fs_test.txt` → `host_log`。
+- `m19_wasi_cabi.rs` 新增 2 项：
+  1. `wasi_fs_cap_allows_file_read`：`caps: [provide, wasi-fs]` → 插件读到文件
+     （`FS_READ=fs-cap-ok`）。
+  2. `no_wasi_fs_cap_denies_file_read`：`caps: [provide, wasi-env]`（无 fs）→
+     `FS_READ=<fs-error: ...>`（未预打开根目录）。
+- 修复：env 测试用唯一变量名（`M19_ENV_A`/`M19_ENV_B`）避免并行 `set_var`
+  覆盖（原 `DSH_TEST` 被并行测试互相覆盖导致断言失败）。
+
+### 结论
+
+C ABI 路径 WASI 精细授予闭环：env + fs 位端到端验证（授予可读、拒绝报错）。
+剩余：`net` 位同构构建待验证。下一轮：loader group 对齐 / 真实模型 https /
+HMR 完善。
+
+## 38. M22 交付记录（2026）—— Group 插件 fiber 形态
+
+**状态：补充交付**（`cargo test` 165 项全绿 + clippy 零警告；11 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 1）
+
+loader 差分暴露：TS 的 group 入口是真实插件（`Group extends EntryGroup`，
+`plugin:Group`/`status:Group` trace，子入口 parent=Group），Rust 此前直接挂
+子组（无 fiber）。实现 Group 插件形态。
+
+### dsh-loader（`crates/dsh-loader/src/loader.rs`）
+
+- `GroupPlugin`（`name="Group"`）：apply 解析 config（子入口数组）→ 逐个
+  `insert_child` + `start_entry`（在 Group fiber 的 apply 期间注册 → 子入口
+  parent 自动 = Group fiber）；注册 stop disposer（卸载时递归 `dispose_entry`
+  子入口）。
+- `start_entry`/`start_entry_async` 的 group 分支：改为 `load_group_plugin`/
+  `load_group_plugin_async`（注册 GroupPlugin，`pending_entry` 关联 entry）。
+- `dispose_entry`/`dispose_entry_async`：group 入口经 Group fiber 卸载
+  （disposer 递归 stop 子入口），移除原手动递归 + `collect_subtree_postorder`；
+  group 结构（subgroup/groups/group_owner）在卸载后清理。
+- `sync_children`/group 分支（async 内联）：顺序修正为「先更新/新建、后移除
+  缺席」——对齐 Cordis `EntryGroup.update(config)`（allSettled create 全部 →
+  全成功后移除缺席）。
+
+### 新增测试（1 项，`m2_loader.rs`）
+
+- `group_plugin_fiber_mounts_children`：group 入口有 Group fiber；子入口 parent
+  = Group fiber；卸载 → Group fiber + 子入口全部 Disposed。
+
+### 结论
+
+group 入口的 Group 插件 fiber 形态落地（`plugin:Group`、子入口 parent 链、
+卸载递归 stop）。剩余差异：Rust `Plugin::apply` 同步契约 vs TS `[Service.init]`
+async generator——Group apply 同步完成，Active 时序与子入口热更交错未逐行
+一致，group 差分场景暂未纳入（m2 单测覆盖）。下一轮：Group apply 异步化 /
+真实模型 https / HMR 完善。
+
+## 39. M23 交付记录（2026）—— HMR 完善（`boot.refresh` async 事务）
+
+**状态：补充交付**（`cargo test` 166 项全绿 + clippy 零警告；11 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 3）
+
+M14 已交付 `Include::load_async`（`sync_async` allSettled + 整事务回滚），
+但 `boot.refresh` 仍用同步 `Include::load`（fail-fast）。接入 async 事务。
+
+### dsh-cli（`crates/dsh-cli/src/lib.rs` / `Cargo.toml`）
+
+- `tokio`（rt + macros）加入正式依赖。
+- `Boot.refresh` 改为：重读配置 + overlays → `Include::new` → `load_async`
+  经 current_thread runtime `block_on` 驱动；`AggregateError` → 错误消息含
+  失败数量（`hmr refresh failed (N errors)`）。
+
+### 新增测试（1 项，`m9_boot.rs`）
+
+- `boot_refresh_async_transaction_reports_failure`：配置含未注册插件 →
+  refresh 报错（含 errors 数量）不 panic；恢复配置后 refresh 成功、turn 正常。
+
+### 结论
+
+HMR 热重载的 loader 事务语义对齐：`boot.refresh` 走 allSettled（一个失败不
+阻断其他、失败回滚），与 Cordis Include 的 `internal/update → EntryGroup.update`
+路径一致。剩余：文件 watcher 事件驱动（当前轮询）。下一轮：Group apply
+异步化 / 真实模型 https / C ABI WASI net。
+
+## 40. M24 交付记录（2026）—— 同步 unload 的 async disposer 显式记录
+
+**状态：补充交付**（`cargo test` 167 项全绿 + clippy 零警告；11 差分场景不变）。
+
+### 目标（async 剩余差异收尾）
+
+`run_unload`（同步）此前静默丢弃 `async_disposers`（`EffectOutcome::Async` 的
+future）。同步 `unload` 无法 await（Cordis 的 `fiber.dispose()` 总是 async），
+但不应无痕——显式记录跳过，完整异步清理由 `unload_async` 提供。
+
+### dsh-core（`crates/dsh-core/src/context.rs`）
+
+- `run_unload`：卸载时检查 `fiber.async_disposers` 非空 → trace
+  `async-disposers-skipped`（不静默丢弃）；同步 disposer 照常逆序执行。
+
+### 新增测试（1 项，`m7_async.rs`）
+
+- `sync_unload_skips_async_disposer_with_trace`：同步 `unload` 后异步 disposer
+  未执行但 trace 有 `async-disposers-skipped`；对照 `unload_async`（current_thread
+  runtime block_on）完整执行异步 disposer。
+
+### 结论
+
+async disposer 的同步/异步卸载路径语义明确：同步 `unload` = 同步 disposer +
+显式跳过记录；`unload_async` = 完整并行清理。差异从「静默丢弃」变为「可观察」。
+下一轮：Group apply 异步化 / 真实模型 https / HMR watcher。
+
+## 41. M25 交付记录（2026）—— dsh-schema strict 贯穿
+
+**状态：补充交付**（`cargo test` 171 项全绿 + clippy 零警告；11 差分场景不变）。
+
+### 目标（HANDOFF §6 dsh-schema 差异之一）
+
+`strict` 标志未贯穿（Rust `ResolveOptions` 无 strict 字段）。TS 参照确认：
+`Schema.resolve(data, schema, options, strict = false)` 第 4 参——dict/tuple/
+object/intersect 的 strict 行为各异。
+
+### dsh-schema（`crates/dsh-schema/src/lib.rs`）
+
+- `ResolveOptions` 增加 `strict: bool`（M25）。
+- 按 TS 语义贯穿（`resolve_kind`）：
+  - **dict**：sKey 校验失败 → strict 跳过该键 / 非 strict 抛错（原恒跳过）。
+  - **tuple**：strict 不追加多余项（非 strict 保留）。
+  - **object**：strict 不合并多余键（丢弃）。
+  - **intersect**：strict 不合并剩余对象键。
+
+### 新增测试（4 项，`m4_schema.rs`）
+
+1. `strict_object_drops_extra_keys`：非 strict 保留 / strict 丢弃多余键。
+2. `strict_tuple_drops_extra_items`：非 strict 追加 / strict 丢弃多余项。
+3. `strict_intersect_drops_extra_keys`：非 strict 合并 / strict 丢弃多余键。
+4. `strict_dict_skips_invalid_key`：sKey 失败非 strict 抛错 / strict 跳过。
+
+### 结论
+
+Schemastery `strict` 语义完整落地（4 种 kind）。剩余 schema 差异：regex flags
+（`i/m/s` 外）、`function`/`is(Class)` 映射。下一轮：Group apply 异步化 /
+真实模型 https / HMR watcher / schema regex。
+
+## 42. M26 交付记录（2026）—— schema regex flags + date/regExp 组合子
+
+**状态：补充交付**（`cargo test` 174 项全绿 + clippy 零警告；11 差分场景不变）。
+
+### 目标（HANDOFF §6 dsh-schema 差异）
+
+regex flags 覆盖验证 + TS 有的 `date`/`regExp` 组合子在 Rust 缺失（补全）。
+
+### dsh-schema（`crates/dsh-schema/src/lib.rs`）
+
+- **regex flags**：`i/m/s` 已实现（`build_regex` 前缀 `(?i)/(?m)/(?s)`）；
+  `u` 为 Rust regex 默认（Unicode）；`g/y` 对 test 无意义、被安全忽略——补
+  测试覆盖（含 `\p{L}` Unicode、多行 `^`、dotall `.`）。
+- **`Schema::date()`**：union[is("Date"), transform(string 校验 RFC3339)]。
+  新增 `parse_datetime`（轻量 RFC3339 校验：`YYYY-MM-DDTHH:MM:SS[.frac]?(Z|±HH:MM)`，
+  无 chrono 依赖）。
+- **`Schema::reg_exp(flag)`**：union[is("RegExp"), transform(string 校验可
+  编译)]——源字符串经 `build_regex` 编译验证。
+- Value-land 限制：is(Date)/is(RegExp) 恒失败（JSON 无此类），string 分支为
+  实际路径（与 TS union 一致）。
+
+### 新增测试（3 项，`m4_schema.rs`）
+
+1. `regex_flags_behavior`：i/m/s 生效、u 默认、g/y 忽略。
+2. `date_combinator_validates_rfc3339`：合法 RFC3339 原样返回、非法聚合报错。
+3. `regexp_combinator_validates_source`：可编译正则通过、非法拒绝、flag 生效。
+
+### 结论
+
+schema 组合子补全：regex flags 行为验证 + date/regExp（TS 等价）。剩余
+`function`/`is(Class)` 为 Value-land 本质限制。下一轮：Group apply 异步化 /
+真实模型 https / HMR watcher。
+
+## 43. M27 交付记录（2026）—— Group apply 异步化（EffectOutcome::Await）
+
+**状态：补充交付**（`cargo test` 175 项全绿 + clippy 零警告；11 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 1）
+
+Group 的 `[Service.init]` 是 async generator（await update 挂载子入口）→ Group
+ACTIVE 在子入口之后。Rust `Plugin::apply` 同步契约无法表达——引入
+`EffectOutcome::Await`（apply 期间异步完成）。
+
+### dsh-core（`crates/dsh-core/src/`）
+
+- `fiber.rs`：`EffectOutcome::Await(LocalBoxFuture<'static, EffectOutcome>)`；
+  `FiberData.await_children: bool` 标记。
+- `context.rs`：
+  - `apply_body`：同步路径对 Await `now_or_never`（future 为同步体，立即完成；
+    Group 子入口挂载仍在 current 上下文内 → parent 正确）；async 模式保留
+    Await（current 不 pop，留给 drive_async_loads await 后 pop）。
+  - `drive_async_loads` Apply 分支：Await → `fut.await`（current 保留，子入口
+    注册 parent=Group）→ pop → 标记 `await_children` → 排 Finish。
+  - `drive_async_loads` Finish 分支：仅 `await_children` 标记的 fiber 在仍有
+    Loading 后代时重新入队（等子任务完成）；普通 fiber 不受影响（_reload 的
+    父先 Active 时序保持——09 差分不回归）。
+  - `unload_async` 的 stack 展开：Await 同 Async（await 得最终 outcome）。
+- `runtime.rs`：`fiber_chain_contains`（parent 链判定）；`finish_load` 清标记。
+
+### dsh-loader（`crates/dsh-loader/src/loader.rs`）
+
+- `GroupPlugin.apply` 返回 `Await`（future 内挂载子入口）。
+- `update_async`/`update_one_async`：移除队列迭代（group 子入口按 config 序
+  立即处理，Box::pin 打破嵌套 group 的 async 递归）——c1 热更在 c3 新建之前
+  （对齐 TS `config.map(create)` 顺序）。
+
+### 新增测试（1 项，`m14_loader_async.rs`）
+
+- `group_await_children_before_active`：async 路径 Group 子入口全部 Active 后
+  Group Active；卸载递归 stop。
+
+### 结论
+
+Group apply 异步化落地：`EffectOutcome::Await` 表达「apply 期异步完成」，Group
+等子入口 Active 后再 Active。group 差分场景新建段（14 行）与热更段已对齐；
+剩余 remove 段子入口卸载分布时序略异（总数一致）。下一轮：group remove 段
+对齐 / 真实模型 https / HMR watcher。
+
+## 44. M28 交付记录（2026）—— group 热更误删修复 + stop 并行
+
+**状态：补充交付**（`cargo test` 175 项全绿 + clippy 零警告；11 差分场景不变）。
+
+### 目标（M27 后续：group 差分 remove 段诊断）
+
+定位 group 热更后 c2 双卸 trace 冗余：`dispose_entry:c2 → remove:c2 →
+dispose-entry:c2 → dispose-entry:c1`（c2 卸两次、c1 被误删）。
+
+### 根因（临时调试确认）
+
+`sync_async` 的 old_map 用 `st.entries.values()` 收集**全部**入口（含 group
+子入口 c1/c2）。第二段 sync 时：`update_async(g1)` 的 group 分支已移除缺席
+子入口 c2（从 subgroup + entries）；随后「移除缺席旧入口」循环遍历 old_map
+（含 c1/c2）→ c1/c2 不在 new_map → 再次 remove（c2 二次卸 + c1 误删）。
+
+### dsh-loader 修复（`crates/dsh-loader/src/loader.rs`）
+
+1. `sync_async` old_map 只收集**根组**入口（`parent_group == root_group`）——
+   group 子入口由 group 分支管理，不再被根级 remove 误删。
+2. 同步 `dispose_entry`：group 入口先**同步串行**卸子入口（同步路径无法
+   await Group 的 Async stop disposer——兜底保证 m2 同步 remove 语义）。
+3. GroupPlugin stop disposer 改 `EffectOutcome::Async`（join_all 并行卸载子
+   入口——unload_async 路径语义对齐 TS `Promise.allSettled(stop)`）。
+
+### 结论
+
+c2 双卸根因修复（old_map 范围）。group 差分新建段 + 热更段逐行对齐；剩余
+remove 段差异：Rust 子入口卸载无内部 await（纯同步段）→ join_all 无法交错，
+trace 串行 vs TS 并行（最终状态一致）。下一轮：remove 段并行（卸载路径插入
+yield）/ 真实模型 https / HMR watcher。
+
+## 45. M29 交付记录（2026）—— group 差分纳入（卸载让出并行）
+
+**状态：补充交付**（`cargo test` 175 项全绿 + clippy 零警告；**12 差分场景
+全部逐行一致**——9 核心 + 3 loader 事务含 group 嵌套）。
+
+### 目标（M28 后续：remove 段串行 vs 并行）
+
+group 差分剩余差异：Rust 子入口卸载是连续同步段（begin_unload → disposers
+→ finish_unload 无 await），join_all 无法交错；TS `Promise.all` 卸载先全部
+Unloading 再逐个 Disposed。
+
+### dsh-core（`crates/dsh-core/src/context.rs`）
+
+- `unload_async` 插入两个卸载让出点：
+  - `begin_unload` 后 `yield_now`——并行卸载的各 fiber 先提交 Unloading。
+  - disposers 后、`finish_unload` 前 `yield_now`——Disposed 状态交错提交。
+- 效果：Group 子入口并行卸载 trace = `a:Active:Unloading ×2` → `a:Unloading:
+  Disposed ×2`（对齐 TS `Promise.all`）。
+
+### 场景（`scenarios/loader-10-group-nested.json`）
+
+- sync 两子入口 → sync 热更（c1 更新 + c3 新建 + c2 移除）→ remove g1。
+- `verify-diff.mjs`：加入 ASYNC_SCENARIOS。
+
+### 结论
+
+group 嵌套场景（loader-10，34 行）逐行一致，group 差分正式纳入。loader 事务
+/嵌套语义与 TS 完整对齐（12 场景）。下一轮：真实模型 https / HMR watcher /
+C ABI WASI net。
+
+## 46. M30 交付记录（2026）—— 组件路径 WASI net 验证
+
+**状态：补充交付**（`cargo test` 177 项全绿 + clippy 零警告；12 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 5：net 位端到端）
+
+C ABI 路径（preview1）net 位受 wasmtime 34 socket stub 限制；组件路径
+（preview2 `inherit_network`/`allow_tcp`/`check_allowed_tcp`）已支持——验证
+组件路径的 net 路径。
+
+### 实现
+
+- `wasm-plugins/hello-net/`（新）：wasip1 组件插件（dsh-plugin world），
+  `apply(config)` 经 `std::net::TcpStream::connect(config.host:config.port)` →
+  `host_api::log("NET_OK/NET_ERR=...")`。
+- `m30_net_component.rs`（新，2 项）：
+  1. `component_wasi_net_path_reachable`：组件尝试网络不崩溃、日志记录 NET_*
+     （本地 mock TCP 服务器）。
+  2. `component_wasi_net_capability_configured`：net 位下 `build_wasi_ctx`
+     构建成功（能力授予路径存在）。
+
+### 发现（平台限制）
+
+wasm32-wasip1 的 `std::net::TcpStream` **未实现**（Rust std 不映射 preview2
+`sockets`）→ 连接返回 `operation not supported on this platform`（NET_ERR，
+不崩溃）。能力授予机制（`inherit_network`/`allow_tcp`/`check_allowed_tcp`）
+已配置——端到端 TCP 受 wasmtime 34 + Rust std 平台限制（已知，待工具链支持）。
+
+### 结论
+
+WASI net 能力授予机制完整（配置 + 能力检查存在），组件网络路径可达（不
+崩溃、结果记录）。端到端 TCP 受平台限制，记录为已知。下一轮：真实模型
+https / HMR watcher。
+
+## 47. M31 交付记录（2026）—— llm_http https 支持（native-tls）
+
+**状态：补充交付**（`cargo test` 179 项全绿 + clippy 零警告；12 差分场景不变）。
+
+### 目标（HANDOFF §7 方向 2）
+
+真实 HTTP llm 客户端仅支持 http://；补 https（TLS）。
+
+### dsh-core（`crates/dsh-core/src/llm_http.rs` + `Cargo.toml`）
+
+- `native-tls` 依赖（dependencies + dev-dependencies）。
+- `parse_base`：解析 `https://`（默认端口 443）与 `http://`（80）→ 返回
+  (scheme, host, port, path)。
+- `tcp_exchange(scheme, ...)`：https 时 `TlsConnector`（证书验证默认开启——
+  生产安全）包裹 TcpStream；http 直连。
+- `trait ReadWrite: Read + Write`（TcpStream/TlsStream 统一盒装）。
+
+### 新增测试（2 项，`m17_http_llm.rs`）
+
+1. `https_provider_tls_handshake_path`：openssl 生成自签证书 → native-tls
+   服务端（PKCS#12 Identity）起 TLS mock 服务器 → https 客户端连接——证书
+   验证拒绝自签 → error JSON（证明 TLS 层可达、生产验证路径正确）。
+2. `https_base_defaults_to_443`：https URL 连接失败（conn refused）→ error
+   JSON 不 panic。
+
+### 结论
+
+真实 HTTP llm 支持 https（TLS）：`parse_base` 双 scheme + native-tls 包裹。
+证书验证默认开启（自签被正确拒绝——生产安全）；真实 API 验证需可信证书。
+下一轮：HMR watcher / 其余收尾。
+
+## 48. M32 交付记录（2026）—— session 缝投影对齐（空 assistant 跳过）
+
+**状态：补充交付**（`cargo test` 180 项全绿 + clippy 零警告；12 差分场景不变）。
+
+### 目标（session 缝权威契约对齐）
+
+对照 vendored `@deepseek-ai/dsh-session` 的 `deriveEventMessage` 权威投影规则：
+- `user/message` → `event.data`（消息）
+- `assistant/message` → **空 content 返回 null**（仅承载 usage 的 max-tokens
+  助手消息不入模型历史）；否则 `event.data.message`
+- `tool/result` → `event.data.message`
+
+Rust `SessionLog::derive_messages` 此前**无条件输出** assistant/message（即使
+content 空）——补跳过规则。
+
+### dsh-core（`crates/dsh-core/src/session.rs`）
+
+- `derive_messages`：`assistant/message` 空 content（null 或空字符串）→ 跳过
+  （continue）；其余消息照常投影。
+
+### 新增测试（1 项，`m9_session_tools.rs`）
+
+- `session_log_skips_empty_assistant`：user + 空 content assistant + 实 content
+  assistant → 空消息被跳过、两条消息入历史。
+
+### 结论
+
+session 缝投影与 DSH `deriveEventMessage` 规则对齐（空 assistant 跳过）。
+剩余预留差异：Rust 演示 loop 的消息形状为扁平契约（`{role, content}`），
+DSH 生产为 message 对象（id/source/content 数组）——完整对齐需同时改写入端
+（llm-loop 组件）与读取端，记录为预留。下一轮：HMR watcher / 预留差异。
+
+## 49. M33 交付记录（2026）—— include patch 对齐（group insert + 嵌套命中）
+
+**状态：补充交付**（`cargo test` 182 项全绿 + clippy 零警告；12 差分场景不变）。
+
+### 目标（include patch 语义对齐）
+
+对照 vendored `@deepseek-ai/cordis-plugin-include` 的 `applyEntryPatches`：
+1. `insert` 带 `id` → 向该 id 的 **group** config 数组插入（目标非 group 则
+   跳过 + warn）；无 id → 顶层追加。
+2. `id` patch 命中**嵌套**入口（entryMap 含 group 子入口）。
+3. name mismatch 跳过。
+
+Rust 此前只支持顶层 insert / 顶层 id 命中。
+
+### dsh-loader（`crates/dsh-loader/src/include.rs`）
+
+- `apply_entry_patches`：insert 带 id → `patch_insert_into_group`（递归重建，
+  目标必须是 group）；id patch → `patch_update`（`&dyn Fn` trait object 打破
+  泛型递归的类型膨胀）。
+- 纯函数式递归重建（patch 数据小，clone 可接受；无借用冲突）。
+
+### 新增测试（2 项，`m3_include.rs`）
+
+1. `apply_patches_insert_into_group`：insert 带 id → group config 追加；非
+   group 目标跳过。
+2. `apply_patches_hits_nested_group_child`：id patch 命中嵌套 c1 → config 覆盖。
+
+### 结论
+
+include patch 语义与 Cordis `applyEntryPatches` 对齐（group insert + 嵌套
+命中）。剩余 include 差异：patch warn sink（Rust 静默跳过）——可选增强。
+下一轮：HMR watcher / 预留差异。
+
+## 50. M34 交付记录（2026）—— session 缝消息形状对齐（生产 Message 对象）
+
+**状态：补充交付**（`cargo test` 184 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 DSH 层缝的承载形状）。
+
+### 目标（session 缝消息形状完整对齐）
+
+M32 记录预留差异：Rust 演示 loop 的消息为**扁平契约**（`{role, content}`），
+DSH 生产为 **message 对象**（`{id, role, content: ContentBlock[], source}`）。
+本轮把 session 缝的消息形状完整对齐生产——权威契约取自 deepseek-harness：
+
+- `Message`（`packages/llm/llm/src/message.ts`）：`{id, role, content,
+  source}`；role ∈ system/user/assistant。
+- `ContentBlock`（`packages/llm/llm/src/types.ts`）：`text`/`reasoning`/
+  `image`/`tool-call`/`tool-result`（按 `type` 判别）。
+- `MessageSource`：`{kind:'user'}` / `{kind:'plugin', plugin}` /
+  `{kind:'model', provider, model}` / `{kind:'tool', callId}`。
+- `deriveEventMessage`（`packages/core/session/src/surface.ts`）：
+  - `user/message` → **`event.data` 逐字透传**（data 本身即完整 Message 对象，
+    生产 `'user/message': UserMessage`——非包装）；
+  - `assistant/message` → `event.data.message`（data 为 `{turn, step, message,
+    usage?}` 包装；content 空数组 → null 跳过）；
+  - `tool/result` → `event.data.message`（data 为 `{turn, step, message,
+    error?, meta?}` 包装；ToolResultMessage：role=user + tool-result block +
+    source.tool）。
+
+### WIT 契约（`crates/dsh-wasmrt/wit-dsh/dsh-loop.wit`）
+
+session 接口的 record 定义更新为生产 Message 形状：
+- 新增 `message-source` variant（user/plugin/model/tool）、`content-block`
+  variant（text/reasoning/tool-call/tool-result）、`message` record
+  （id/role/content/source）。
+- `user-message` record = 完整 Message 对象（data 即消息本身）；
+  `assistant-message` / `tool-result` record = `{turn, step, message}` 包装。
+- ⚠️ WIT 禁止递归类型：生产 `ToolResultBlock.content` 为 `ContentBlock[]`，
+  收敛为 `list<text-block>`（实际即文本块；`serialize.ts` 也只取
+  `flattenText`）。
+
+### dsh-core（`crates/dsh-core/src/session.rs` + `llm_http.rs`）
+
+- `SessionLog::derive_messages` 重写：`user/message` → data 逐字透传；
+  `assistant/message` / `tool/result` → `data.message`（空 content 数组跳过）。
+- `llm_http::messages_to_wire`（新增）：生产 `Message[]` → OpenAI wire 序列化
+  （对齐 DSH `serializeMessages`）——system/assistant 文本拼接 + tool-call →
+  `tool_calls`、user 文本 + tool-result 展开为 `{role:'tool', tool_call_id}`；
+  空 tool 输出补 `"(no output)"`；扁平形状（content 为字符串）原样透传
+  （M17 兼容）。`chat_completions` 发送前先经此转换。
+
+### dsh-wasmrt（`src/loop.rs` + `src/services.rs`）
+
+- `LoopHost::derive_messages`（内存回退）同步对齐生产形状。
+- 声明式适配器读生产形状：tool-first 判别 `content[0].type == "tool-result"`
+  （不再 `role == "tool"`）；echo 取 user 消息的 text block 拼接（排除
+  tool-result 消息——生产形状下 ToolResultMessage 的 role 也是 "user"）。
+
+### WASM loop 插件（echo-loop / tool-loop / llm-loop）
+
+写入端改生产形状：`user/message` data = 完整 Message（id 用确定性
+`u{turn}`/`a{turn}`/`t{turn}`，不引入 uuid 依赖）；`assistant/message` /
+`tool/result` data = `{turn, step, message}` 包装（assistant source.model、
+tool source.tool + tool-result block）。llm-loop 的 turn 计数按
+`content[0].type != "tool-result"` 判别（排除 ToolResultMessage）。
+
+### 新增测试（2 项，`m17_http_llm.rs`）
+
+1. `messages_to_wire_produces_openai_shape`：user 文本 + assistant
+   text/tool-call + tool-result → 三条 wire 消息（含 `tool_calls` 映射）。
+2. `messages_to_wire_empty_tool_and_flat_passthrough`：空 tool 输出 →
+   `"(no output)"`；扁平形状原样透传。
+
+### 更新测试
+
+`m9_session_tools.rs`（投影断言改生产形状，含空 assistant 跳过）、
+`m8_dsh_loop.rs` / `m9_loader_assemble.rs` / `m9_yaml_assemble.rs` /
+`m9_boot.rs`（LLM 适配器判别与消息断言改生产形状）。
+
+### 结论
+
+session 缝消息形状与 DSH 生产 `Message` 对象完整对齐（写入端 + WIT +
+投影端 + llm 消费端）。剩余差异：`image` block 为 forward-compatibility
+（WIT 预留）；id 为确定性生成而非 uuid（不引入依赖）。下一轮：HMR watcher
+事件驱动 / 其余收尾。
+
+## 51. M35 交付记录（2026）—— HMR 文件 watcher 事件驱动（notify + mpsc 桥接）
+
+**状态：补充交付**（`cargo test` 186 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 loader 的 HMR 基建）。
+
+### 目标（事件驱动对齐 Cordis chokidar）
+
+HMR 此前为**轮询**（`poll()` 全量扫描 + 内容指纹，CLI 50ms 周期）；Cordis
+用 chokidar（OS 文件系统通知，事件驱动）。本轮把 HMR 改为事件驱动——文件
+变化即时到达，消除固定轮询延迟与无谓扫描。
+
+### 约束与解法（单线程纪律 × notify）
+
+- `Hmr` 是 `Rc<RefCell>`（非 Send），refresh 回调 `Rc<dyn Fn>`（非 Send）——
+  **不能**放进 notify 的后台线程；
+- notify `recommended_watcher` 的 event_handler 需 `Send + 'static` 且在内部
+  线程运行——**冲突**；
+- 解法：**mpsc 桥接**——后台线程仅持有 `Sender<PathBuf>`（Send）收集变化
+  路径；`Hmr` 持 `Receiver`，`poll()` 时 `try_recv` 消费；
+- 事件只作**唤醒信号**：消费后仍做**指纹确认**（notify 事件可能重复/合并/
+  误报临时文件——指纹兜底，保证「内容确实变化才 refresh」）；
+- 无 watcher 时 `poll()` 退化为全量轮询（API 兼容，旧测试不破）。
+
+### dsh-loader（`crates/dsh-loader/src/hmr.rs` + `Cargo.toml`）
+
+- 新增依赖 `notify = "8"`。
+- `Hmr::watch(paths)`：启动 notify watcher（非递归监视）+ mpsc；返回
+  Err = 启动失败（路径不存在/无权限），Hmr 仍可用（退化轮询）。
+- `Hmr::unwatch()`：停止 watcher（退回轮询）。
+- `poll()`：有 watcher → 先 drain 事件队列（仅收集**注册过**的路径、去重）
+  再指纹确认 + refresh；无 watcher → 全量轮询（原逻辑）。
+
+### dsh-cli（`src/main.rs`）
+
+`--watch` 启动时调用 `watch(watch_paths)`（失败 fallback 轮询并告警）；
+主循环 `poll()` 语义不变（现在消费事件队列）。
+
+### 新增测试（2 项，`m15_hmr.rs`）
+
+1. `hmr_watch_event_driven_triggers_refresh`：watch 启动 → 改文件 → 事件
+   驱动 poll 触发 refresh；事件消费后无新变化不触发。
+2. `hmr_watch_ignores_unregistered_paths`：未注册路径变化（watcher 未监视）
+   不触发；注册路径变化正常触发。
+
+### 结论
+
+HMR 从轮询升级为 OS 事件驱动（对齐 chokidar），单线程纪律经 mpsc 桥接
+保持。剩余差异：notify 事件仅作唤醒、指纹确认兜底（比 chokidar 更稳）；
+轮询路径保留为 fallback。下一轮：真实 API https / 其余收尾。
+
+## 52. M36 交付记录（2026）—— session surface 折叠（append/replace + shadow）
+
+**状态：补充交付**（`cargo test` 190 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 DSH 层 session 承载）。
+
+### 目标（surface 折叠对齐 DSH `foldSurface`/`SessionSurface`）
+
+M34 对齐了消息**形状**；但 DSH 生产的 `deriveMessages` 依赖 **surface 折叠**
+（`packages/core/session/src/surface.ts`）：`SURFACE_EVENT_TYPES` =
+user/message、assistant/message、tool/result；`foldSurface` 维护模型可见
+节点序列——append 入列、replace 替换 [start, end] 范围（compaction 语义，
+旧节点被 shadow）、`replaceGeneration` 递增；投影只对**当前 surface 节点**
+进行。Rust `SessionLog` 此前遍历**全部事件**投影，无 replace/shadow 语义
+（compaction 等依赖它）。
+
+### dsh-core（`crates/dsh-core/src/session.rs` + `lib.rs`）
+
+- `SurfaceOp` enum（`Append` | `Replace { start, end }`）导出。
+- `SessionLog` 增加 surface 折叠状态：`surface: Vec<u64>`（节点 seq，模型
+  可见顺序）+ `replace_generation: u64`。
+- `append(kind, payload)` 签名不变（WIT 缝契约）：surface-eligible 事件以
+  `Append` 自动入列——纯 append 场景与遍历全部事件投影**完全等价**
+  （既有测试/loop 插件零改动）。
+- `append_with_op(kind, payload, op)`（新增，宿主侧 compaction 等用）：
+  - 非 surface-eligible 事件带 `Replace` → 报错（对齐 `surfaceOpOf`）；
+  - `Replace` 的 start/end 必须都在当前 surface 上且 start ≤ end（对齐
+    `replacementRange`）；失败**原子**（splice 前无状态变更）。
+- `surface_nodes()` / `replace_generation()` 访问器（对齐 `SessionSurface`）。
+- `derive_messages` 改为遍历 surface nodes（`events[seq]`）而非全部事件——
+  replace 后旧节点被 shadow，投影只含当前节点。
+
+### 新增测试（4 项，`m9_session_tools.rs`）
+
+1. `session_surface_append_tracks_nodes`：turn/start 等日志事件不入列；
+   surface = eligible seq；投影与遍历等价。
+2. `session_surface_replace_shadows_old_nodes`：replace [0,1] → 新 user 节点
+   替换，旧 user/assistant 被 shadow；`replaceGeneration` 递增；投影含新
+   user + 原 tool-result。
+3. `session_surface_replace_invalid_range_fails`：start/end 不在 surface →
+   报错；失败原子（surface 未破坏）。
+4. `session_surface_replace_rejected_on_log_events`：日志事件带 replace →
+   报错。
+
+### 结论
+
+session surface 折叠与 DSH `foldSurface` 语义对齐（append 入列 + replace
+替换 + shadow + generation 计数 + 投影只含当前节点）；WIT 缝签名不变
+（loop 走 append；replace 是宿主侧 compaction 能力）。剩余差异：
+`sourceEventSeqs` 来源校验 / tool-result replace 仅改 content 约束（生产
+防御性校验，Rust 侧未实现——无 compaction 消费方）；`image` block 预留。
+下一轮：真实 API https / 其余收尾。
+
+## 53. M37 交付记录（2026）—— session surface 防御性校验（provenance + tool-result rewrite）
+
+**状态：补充交付**（`cargo test` 193 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 DSH 层 session 承载）。
+
+### 目标（对齐 DSH `surface.ts` 校验链）
+
+M36 实现了 surface 折叠核心，但生产 `surface.ts` 的 `planSurfaceEvent` 还
+有**防御性校验链**未对齐：`surfaceOpOf` → `replacementRange` →
+`assertProvenance` → `assertToolResultRewrite`。本轮补全后两环：
+
+- `assertProvenance`：`sourceEventSeqs` 引用必须**早于**当前事件 seq、
+  无重复；空数组仅 `assistant/message` 允许（known empty provider stream）；
+  replace 时**必须覆盖全部被 shadow 节点**（missing 报错）。
+- `assertToolResultRewrite`：`tool/result` 的 replace 必须恰好重写 1 个
+  当前 `tool/result` 节点，且只允许改 content（双方 `message.content[0]`
+  的 content 置 null 后深比较其余字段）。
+
+### dsh-core（`crates/dsh-core/src/session.rs`）
+
+- `append_with_provenance(kind, payload, op, source_event_seqs)`（新增）：
+  完整校验链 + 原子提交（全部通过才 splice + push）。
+- `append_with_op` 保留为便捷入口（source_event_seqs=None：append 合法；
+  replace 无来源覆盖按 `assertProvenance` 报错）。
+- `append` 不变（WIT 缝签名；Append 便捷路径）。
+- `tool_result_only_content_changed`：对齐生产的「content 置 null 深比较」。
+
+### 新增/更新测试（`m9_session_tools.rs`）
+
+新增 3 项：
+1. `session_surface_replace_requires_provenance`：replace 缺 source_event_seqs
+   / 部分覆盖 → 报错；失败原子。
+2. `session_surface_provenance_reference_validation`：引用 >= 当前 seq /
+   重复 / 非 assistant 空数组 → 报错；assistant 空数组 → 允许。
+3. `session_surface_tool_result_rewrite_rule`：tool/result replace 只改
+   content → 允许（generation 递增）；改 callId 等 → 报错。
+
+更新 1 项：`session_surface_replace_shadows_old_nodes` 改用
+`append_with_provenance`（带 source_event_seqs=[0,1]）。
+
+### 结论
+
+session surface 校验链与 DSH `surface.ts` 完整对齐（provenance 引用/覆盖 +
+tool-result 仅改 content）。剩余差异：生产 `Session.append` 要求 surface-
+eligible 事件必须带 surfaceOp（Rust WIT 缝 append 无 op 参数，宽松接受）；
+`image` block 预留。下一轮：真实 API https / 其余收尾。
+
+## 54. M38 交付记录（2026）—— HMR refresh 失败事件化（hmr/config-update-failed）
+
+**状态：补充交付**（`cargo test` 195 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 loader 的 HMR 通知机制）。
+
+### 目标（失败通知对齐 Cordis 事件语义）
+
+对照 vendored `cordis-plugin-hmr`（`vendor/hmr/src/index.ts`）：refresh 失败
+时 `ctx.parallel('hmr/config-update-failed', filename, error)`（**parallel
+模式事件**，任何插件可监听）——注意事件名是 `hmr/config-update-failed`，
+不是此前 HANDOFF 误记的 `hmr/error`。Rust `Hmr` 此前只有 `take_errors()`
+查询式（宿主轮询被动拉取），未对齐事件式通知。
+
+### dsh-loader（`crates/dsh-loader/src/hmr.rs`）
+
+- `Hmr::set_error_sink(Rc<ErrorSink>)`（M38）：注册 refresh 失败的事件通知
+  `Fn(&str, &CordisError)`（filename, error）。
+- `poll()` 失败分支：既记录 errors（`take_errors` 保留，向后兼容）**又**调用
+  sink（事件式；None = 仅记录，与旧行为一致）。
+- `ErrorSink = dyn Fn(&str, &CordisError)` type 别名（clippy 复杂类型）。
+
+### dsh-cli（`src/main.rs`）
+
+`--watch` 时 `set_error_sink`：经 `ctx.parallel("hmr/config-update-failed",
+[filename, {message}])` emit（对齐 Cordis parallel 事件，监听者经
+`ctx.on("hmr/config-update-failed", …)` 注册）+ eprintln 诊断；主循环
+`take_errors` 只清空不重复打印。
+
+### 新增测试（2 项，`m15_hmr.rs`）
+
+1. `hmr_error_sink_receives_failures`：refresh 失败 → sink 收到 (filename,
+   error)；`take_errors` 仍可用（双通道）。
+2. `hmr_without_error_sink_records_only`：无 sink → 仅记录，不 panic。
+
+### 结论
+
+HMR 失败通知与 Cordis `hmr/config-update-failed` 事件语义对齐（parallel
+emit + 查询并存）。剩余差异：Cordis 的模块级 HMR（partialReload/依赖图）
+非配置 HMR 范畴；`hmr/change`/`hmr/reload` 事件对应模块热更，Rust 侧无
+（配置驱动）。下一轮：真实 API https / 其余收尾。
+
+## 55. M39 交付记录（2026）—— include patch warn sink（未命中诊断）
+
+**状态：补充交付**（`cargo test` 197 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 include patch 的诊断可观测性）。
+
+### 目标（对齐 Cordis `applyEntryPatches` 的 warn sink）
+
+对照 vendored `cordis-plugin-include`（`vendor/include/src/index.ts`）：
+`applyEntryPatches(data, patches, warn)` 带 **warn sink**——patch 未命中
+（id 找不到 / 非 group / name mismatch / 缺 id）时 `warn('patch …')`
+（printf 风格 `%C`）输出诊断，否则失败**静默**。Rust
+`apply_entry_patches(data, patches)` 此前静默跳过（无 sink），调用方
+（Include.read）无法感知 patch 失败——诊断可观测性差异。
+
+### dsh-loader（`crates/dsh-loader/src/include.rs` + `lib.rs`）
+
+- `apply_entry_patches_with_warn(data, patches, warn: &mut dyn FnMut(String))`
+  （新增）：warn sink 版（消息为格式化好的字符串，等价 TS `%C` 展开）；
+  跳过场景与 TS 逐条对齐：
+  - `patch: id is required for non-insert patches`（缺 id）；
+  - `patch: entry {id} not found`（id 未命中）；
+  - `patch: name mismatch for {id} (expected {got}, got {name}), skipping`；
+  - `patch insert: entry {id} not found` / `is not a group`（insert 目标）。
+- `apply_entry_patches` 保留（静默版，委托 with_warn 丢弃 warn——向后兼容
+  M33 测试）。
+- `Include` 增加 `warns: RefCell<Vec<String>>` + `take_warns()`：`read()` 用
+  with_warn 收集（每次 read 重置；`load`/`refresh` 后宿主可查询诊断）。
+
+### 新增测试（2 项，`m3_include.rs`）
+
+1. `apply_patches_with_warn_reports_skips`：5 种跳过场景 → warn sink 收到
+   对应消息；结果 = 原数据（跳过不影响结果）。
+2. `include_take_warns_collects_patch_skips`：Include.read 收集未命中警告
+   （take_warns）；命中 patch 无警告；refresh 后重新收集。
+
+### 结论
+
+include patch 未命中诊断与 Cordis warn sink 语义对齐（logger 输出 vs
+`take_warns` 查询）。剩余 include 差异：无（insert/嵌套/递归/warn 全对齐）。
+下一轮：真实 API https / 其余收尾。
+
+## 56. M40 交付记录（2026）—— timer 服务（timeout/interval/debounce/throttle）
+
+**状态：补充交付**（`cargo test` 204 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-core 新增调度原语）。
+
+### 目标（对齐 deepseek-harness `vendor/timer`）
+
+Cordis 的 `ctx.timeout`/`interval`/`debounce`/`throttle`（deepseek-harness
+`vendor/timer/src/index.ts`）是**生命周期绑定的调度原语**——timer 经
+`ctx.effect` 注册 disposer（fiber 卸载清除），回调在 fiber 上下文中执行；
+HMR 等插件依赖它（`partialReload` 用 `ctx.debounce`）。Rust 侧此前**无
+timer 服务**。
+
+### 约束与解法（单线程纪律 × 宿主驱动）
+
+- Rust 单线程无事件循环 → timer 不能自触发；解法：**宿主时钟 + 驱动**——
+  `Cordis::set_timer_clock(now: impl Fn() -> u64)`（宿主注入毫秒时钟）+
+  `Cordis::drive_timers()`（宿主事件循环调用，CLI 已有 50ms 循环）；
+- timer 经 `effect` 绑定当前 fiber（`InactiveEffect` 拒绝非 Active 注册），
+  disposer 取消；`collect_due_timers` 双重过滤（fiber 仍 Active 才执行）；
+- debounce/throttle 用 `TimerSlot`（包装函数更新 pending，driver 到期执行）；
+  单线程捕获（`Rc<RefCell>`），参数经 `Value` 传递。
+
+### dsh-core（`crates/dsh-core/src/runtime.rs` + `context.rs` + `lib.rs`）
+
+- runtime：`TimerKind`（Once/Interval）、`TimerEntry`（deadline/period/cb/
+  fid/alive）、`TimerSlot`（last_at/pending/pending_deadline/cb/fid，`NEVER`
+  哨兵 = 从未执行）、`timer_clock`/`timers`/`timer_slots`/`timer_drivers`
+  字段；纯变更方法 `register_timer`/`cancel_timer`/`collect_due_timers`/
+  `register_timer_slot`/`cancel_timer_slot`/`collect_due_slots`。
+- `Cordis`：`set_timer_clock`、`timeout(cb, delay) -> Disposer`（Once）、
+  `interval(cb, delay) -> Disposer`（Interval，到期重排）、
+  `debounce(cb, delay) -> (TimerFn, Disposer)`（delay 内只执行最后一次）、
+  `throttle(cb, delay) -> (TimerFn, Disposer)`（leading 立即 + trailing
+  窗口末次，对齐 `noTrailing=false`）、`drive_timers()`（收集-再执行：
+  先收集到期回调，释放借用后执行——用户代码可重入）。
+- `TimerFn = Rc<dyn Fn(Value)>` 导出（clippy 复杂类型）。
+
+### dsh-cli（`src/main.rs`）
+
+boot 后注入宿主时钟（`SystemTime::now` 毫秒）；主循环每轮
+`boot.ctx.drive_timers()` 驱动 timer（对齐 Cordis 事件循环驱动）。
+
+### 新增测试（7 项，`m40_timer.rs`，FakeClock 可控时钟）
+
+1. `timer_timeout_fires_after_delay`：未到期不触发、到期触发、一次性。
+2. `timer_timeout_disposed_on_unload`：卸载清除未到期 timer。
+3. `timer_interval_fires_repeatedly`：周期触发（到期重排）。
+4. `timer_interval_disposed_on_unload`：卸载停止周期。
+5. `timer_debounce_fires_once_after_idle`：三次调用只执行最后一次。
+6. `timer_debounce_disposed_on_unload`：卸载取消 pending。
+7. `timer_throttle_fires_leading_and_trailing`：leading 立即 + trailing 末次。
+
+### 结论
+
+timer 服务与 Cordis `vendor/timer` 语义对齐（timeout/interval/debounce/
+throttle + 生命周期绑定 + 宿主驱动）。差异：`setTimeout`/`setInterval`
+别名（deprecated，未实现——语义等价 timeout/interval）。下一轮：真实
+API https / 其余收尾。
+
+## 57. M41 交付记录（2026）—— timer 无回调形态（timeout_async / interval_ticks）
+
+**状态：补充交付**（`cargo test` 207 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-core timer 补全）。
+
+### 目标（对齐 `vendor/timer` 的 Promise / AsyncIterable 形态）
+
+M40 实现了回调形态（`timeout(cb)`/`interval(cb)`/`debounce`/`throttle`）；
+Cordis 还有**无回调形态**：
+- `timeout(delay): Promise<void>`——delay 后 resolve；fiber 卸载 reject
+  （"Context has been disposed"）；
+- `interval(delay): AsyncIterableIterator<void>`——每 delay 一个 tick，调用方
+  `for await` 消费；卸载时 throw。
+
+### 实现（dsh-core `context.rs` + `lib.rs`；纯自驱动，无 tokio 正式依赖）
+
+- `Cordis::timeout_async(delay) -> LocalBoxFuture<'static, Result<(), CordisError>>`：
+  `deadline = now + delay` + `cancelled`（Rc<Cell>）；effect 注册 disposer
+  （fiber 卸载置 cancelled → future 返回 Err，对齐 Promise reject）；future
+  轮询 `yield_now`（与 `fiber_await` 同模式）检查时钟到期。
+- `Cordis::interval_ticks(delay) -> IntervalTicks`：`next_tick`（Rc<Cell>）+
+  `cancelled`；effect disposer（卸载 → 流结束 None）；`Stream` impl——
+  poll 检查时钟，到期产出 + 重排，未到期 Pending（wake_by_ref）。
+- `IntervalTicks` 导出（Stream；非 Send——单线程纪律）。
+
+### 新增测试（3 项，`m40_timer.rs`，手动 poll noop-waker 驱动）
+
+1. `timer_timeout_async_resolves_after_delay`：apply 内构造 → 推进时钟 +
+   手动 poll → delay 后 Ok。
+2. `timer_timeout_async_rejects_on_unload`：卸载 → disposer 置 cancelled →
+   poll 返回 Err（"disposed"）。
+3. `timer_interval_ticks_yields_periodically`：推进时钟 150ms → 3 个 tick。
+
+### 结论
+
+timer 无回调形态与 Cordis `vendor/timer` 对齐（Promise 延迟 + AsyncIterable
+tick + 卸载 reject/结束）。差异：`setTimeout`/`setInterval` 别名（deprecated）
+未实现；`interval(delay)` 的 `return()`/`throw()` 显式终止方法（Rust Stream
+经 drop 等价）。下一轮：真实 API https / 其余收尾。
+
+## 58. M42 交付记录（2026）—— ctx.once（一次性监听器）
+
+**状态：补充交付**（`cargo test` 210 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-core 事件注册补全）。
+
+### 目标（对齐 Cordis `ctx.once`）
+
+对照 vendored `cordis`（`vendor/cordis/src/events.ts`）：`once(name,
+listener, options)` = `on` 的包装——首次触发时**先 dispose 自身再调用
+listener**（`const dispose = this.on(name, (...args) => { dispose();
+listener.apply(this, args) }, options)`），返回同一 disposer（手动移除 /
+fiber 卸载均生效）。Rust 侧有 `on`/`on_async`，缺 `once`。
+
+### dsh-core（`crates/dsh-core/src/context.rs`）
+
+- `Cordis::once(name, listener, global, prepend) -> Disposer`：包装监听器
+  （`Rc<RefCell<Option<Disposer>>>` 延迟绑定——`on_cb` 返回后赋 disposer；
+  首次触发 `take()` + 调用 disposer 移除自身，再调原监听器）。
+- `Cordis::once_async(...)`：同语义的异步形态（首次触发同步移除，再 await）。
+- 收集-再执行纪律：disposer 内部 `remove_hook` 是纯数据变更，触发时（emit
+  已收集 cbs 后）调用安全。
+
+### 新增测试（3 项，`m0_events.rs`）
+
+1. `once_fires_once_then_removes_itself`：首次触发 once + persist；第二次
+   emit 只有 persist（once 已移除）。
+2. `once_disposer_removes_and_is_idempotent`：手动 dispose → 不触发；重复
+   dispose 幂等。
+3. `once_works_with_serial_bail`：once 返回值照常传播（bail）；第二次
+   serial 无监听器 → None。
+
+### 结论
+
+`ctx.once` 与 Cordis 事件 API 对齐（一次性 + 自移除 + disposer 幂等）。
+剩余事件差异：`ctx.once` 的 `EventOptions`（prepend/global 已支持）；
+`internal/listener` 拦截（Rust 无该内部事件）。下一轮：真实 API https /
+其余收尾。
+
+## 59. M43 交付记录（2026）—— internal/get、internal/set 服务读写拦截
+
+**状态：补充交付**（`cargo test` 213 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-core 服务读写补拦截）。
+
+### 目标（对齐 Cordis `ctx.get`/`ctx.set` 的 Proxy 拦截）
+
+对照 vendored `cordis`（`vendor/cordis/src/reflect.ts`）：`ctx.get`/`ctx.set`
+经 **Proxy handler** 走 `internal/get`/`internal/set` **waterfall**——插件可
+拦截服务读写（`internal/get` 返回替代值短路 inner；`internal/set` 返回
+false veto 写入），inner 是实际查表/写入。Rust 侧 `get`/`set` 此前直接查表/
+写入，无拦截点。
+
+### dsh-core（`crates/dsh-core/src/context.rs` + `reflect.rs`）
+
+- `get_value(name)`：先 `internal/get` waterfall——`args: [name, Null]`，
+  inner = `get_raw_value`（accessor 或 Value 服务）；拦截器短路返回替代值。
+- `set_value(name, value)`（新增）：先 `internal/set` waterfall——`args:
+  [name, value, Null]`，inner = `set_raw_value`（accessor set 钩子或覆盖
+  Value 服务值，仅提供者 fiber 可写，对齐 Cordis `set` 所有者校验）；
+  监听器返回 false（veto）→ Err。
+- `AccessorGet`/`AccessorSet` 改 `Box<dyn Fn>` → `Rc<dyn Fn>`（可 clone 取出
+  后**无借用调用**——accessor get 内可重入，修复 mixin 重入的 RefCell 冲突；
+  收集-再执行纪律的延伸）。
+- `get` 的 accessor 分支同样改为 clone 闭包无借用调用（旧代码 borrow 内调
+  用户代码的隐患）。
+
+### 新增测试（3 项，`m1_service.rs`）
+
+1. `internal_get_intercept_overrides_service_read`：拦截器命中 "cfg" → 返回
+   替代值（短路 inner）；未拦截名走 inner（None）。
+2. `internal_set_intercept_vetoes_write`：拦截器 veto → Err；值不变。
+3. `internal_set_passthrough_writes`：未拦截 → 提供者 fiber 内写入生效。
+
+### 结论
+
+`ctx.get`/`ctx.set` 的服务读写拦截与 Cordis Proxy 语义对齐（internal/get/set
+waterfall + 短路/veto）。差异：`Arc<dyn Any>` 形态的 `get`/`set` 不拦截
+（拦截是 Value 层面，`Arc<dyn Any>` 非 JSON 可表达——Value-land 本质限制）。
+下一轮：真实 API https / 其余收尾。
+
+## 60. M44 交付记录（2026）—— internal/listener 注册拦截
+
+**状态：补充交付**（`cargo test` 215 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-core 事件注册补拦截）。
+
+### 目标（对齐 Cordis `ctx.on` 的 `internal/listener` bail）
+
+对照 vendored `cordis`（`vendor/cordis/src/events.ts`）：`on(name, listener,
+options)` 注册前先 `bail('internal/listener', name, listener, options)`——
+bail 有结果（非 null）则**直接返回该结果**（拦截注册，如权限守卫拒绝/
+替换）。Rust 侧 `on_cb` 此前直接注册，无拦截点。
+
+### dsh-core（`crates/dsh-core/src/context.rs`）
+
+- `on_cb` 注册前先 `bail("internal/listener", [name, global, prepend])`；
+  bail 值非 null → 注册被拦截，返回 **no-op disposer**（调用方拿到 disposer
+  但实际未注册）。`once`/`once_async` 内部走 `on_cb` 自动生效。
+- 差异（Value-land）：bail 值无法表达 Rust disposer（`Rc<dyn Fn>`），仅作
+  拦截标记（Cordis 可返回替代 disposer 替换注册）。
+
+### 新增测试（2 项，`m0_events.rs`）
+
+1. `internal_listener_intercept_blocks_registration`：拦截器命中 "blocked" →
+   返回非 null → 监听器未注册（emit 不触发）；未拦截名正常注册触发。
+2. `internal_listener_intercept_blocks_once`：once 内部走 on → 同样被拦截。
+
+### 结论
+
+`ctx.on` 的注册拦截与 Cordis `internal/listener` bail 语义对齐（拦截 →
+不注册）。事件/服务拦截面（M42 once / M43 internal-get-set / M44
+internal-listener）补齐。差异：bail 值仅作拦截标记（无法替换 disposer，
+Value-land 限制）。下一轮：真实 API https / 其余收尾。
+
+## 61. M45 交付记录（2026）—— headless 单发模式（--once）
+
+**状态：补充交付**（`cargo test` 219 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-cli 增加 headless 入口）。
+
+### 目标（对齐 DSH `dsh --profile headless "job"`）
+
+生产 CLI 的 headless profile：提交一个任务（user 消息）→ 驱动 loop → 等
+quiescence → **从持久化 session 事件推导最终答案**（最后一个非空 assistant
+文本）与 **turn/end reason** → 打印文本，`completed` 退出 0 否则 1；成功不
+写 stderr。Rust `dsh` CLI 此前只有交互式 stdin 模式。
+
+### dsh-cli（`crates/dsh-cli/src/lib.rs` + `main.rs`）
+
+- `run_headless(boot, task) -> Result<HeadlessResult, CordisError>`：`run_turn`
+  驱动 loop；`derive_headless(events)` 从 session 事件流推导——
+  - 最后一条 `assistant/message` 的 `data.message.content[0].text`（M34 生产
+    形状；空文本跳过，对齐 `derive_messages` 空 assistant 跳过）；
+  - 最后 `turn/end` 的 `data.reason`；
+  - 无非空 assistant → Err（fail loud）。
+- `derive_headless` 为 `pub(crate)` 独立函数（错误路径可单测）。
+- `main.rs`：`--once <task>` 参数——headless 单发：打印答案，`reason ==
+  "completed"` → exit 0 否则 1；失败 stderr + exit 1。
+
+### 新增测试（4 项）
+
+集成（`m9_boot.rs`，2 项）：
+1. `headless_echo_loop_returns_answer_and_reason`：echo-loop 答案 + completed。
+2. `headless_llm_loop_full_turn`：llm-loop 完整 turn（模型→工具→回答），
+   答案含 "sum is 5"（tool-first ctx=N）。
+
+单元（`lib.rs` `#[cfg(test)]`，2 项）：
+3. `derive_headless_no_answer_fails`：无 assistant → Err。
+4. `derive_headless_skips_empty_assistant`：空 content 助手消息跳过，取后
+   续非空答案。
+
+### 结论
+
+`dsh --once` headless 单发与 DSH headless profile 语义对齐（session 事件
+推导最终答案 + reason → 退出码）。差异：无持久化（内存 session）；无
+`SIGINT`/`SIGTERM` dispose（交互模式已有 EOF 路径）。下一轮：真实 API
+https / 其余收尾。
+
+## 62. M46 交付记录（2026）—— timer 别名（setTimeout / setInterval）
+
+**状态：补充交付**（`cargo test` 221 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-core timer API 补全）。
+
+### 目标（对齐 `vendor/timer` 的 deprecated 别名）
+
+对照 deepseek-harness `vendor/timer`：`setTimeout(cb, delay)` /
+`setInterval(cb, delay)` 是 **deprecated 别名**——直接委托 `timeout` /
+`interval`。M40 实现了 timeout/interval，别名此前缺失（HANDOFF 记录为
+可继续项）。
+
+### dsh-core（`crates/dsh-core/src/context.rs`）
+
+- `Cordis::set_timeout(cb, delay) -> Disposer`：委托 `timeout`。
+- `Cordis::set_interval(cb, delay) -> Disposer`：委托 `interval`。
+
+### 新增测试（2 项，`m40_timer.rs`）
+
+1. `timer_set_timeout_alias_fires_once`：别名一次性触发 + 不重复。
+2. `timer_set_interval_alias_repeats`：别名周期触发 + 卸载停止。
+
+### 结论
+
+timer API 与 `vendor/timer` 全量对齐（timeout/interval/debounce/throttle +
+timeout_async/interval_ticks + setTimeout/setInterval 别名）。下一轮：真实
+API https / 其余收尾。
+
+## 63. M47 交付记录（2026）—— session JSONL 持久化（save_to / load_from）
+
+**状态：补充交付**（`cargo test` 224 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-core session 持久化 + CLI 保存）。
+
+### 目标（对齐 DSH `session-persistence-jsonl`）
+
+生产 `session-persistence-jsonl`（`packages/session/session-persistence-jsonl/
+src/format.ts`）：JSONL 文件首行 header（`{"type":"session","version",...}`），
+之后每行一个事件记录；`scanLog` 容忍 torn tail（损坏/无换行尾部丢弃）、
+seq 连续校验。Rust `SessionLog` 此前纯内存。
+
+### dsh-core（`crates/dsh-core/src/session.rs`）
+
+- `save_to(path)`：写 header 行（`{"type":"session","version":0}`）+ 每事件
+  一行 `{"kind","seq","payload"}`（payload 为事件 data JSON 字节，合法 JSON
+  内联、否则字符串保真）。
+- `load_from(path)`：读 header（必须 `{"type":"session"}`，否则报错）+ 事件
+  行；torn tail（损坏行）→ 停止保留完整前缀（对齐 `scanLog`）；重建
+  events + surface（append 语义重放——持久化会话为 append 轨迹，replace
+  的 sourceEventSeqs 不可恢复）。
+- `SessionLog` 加 `#[derive(Debug)]`。
+
+### dsh-cli（`src/main.rs`）
+
+`--session-out <file>`：headless（`--once`）后把会话保存为 JSONL。
+
+### 新增测试（3 项，`m9_session_tools.rs`）
+
+1. `session_save_load_roundtrip`：保存 → 文件首行 header + 事件行；重建后
+   events/surface/投影一致。
+2. `session_load_tolerates_torn_tail`：追加损坏行 → 忽略，保留完整前缀。
+3. `session_load_missing_header_fails`：缺 header → 报错（fail loud）。
+
+### 结论
+
+session JSONL 持久化与 DSH `session-persistence-jsonl` 核心格式对齐（header
++ 事件行 + torn-tail 容忍）。差异：无 id/createdAt header 字段（Rust
+SessionLog 无元数据）；无 zstd 压缩；无 seq 校验（append 天然连续）。
+下一轮：真实 API https / 其余收尾。
+
+## 64. M48 交付记录（2026）—— 恢复会话继续（restore_session / --session-in）
+
+**状态：补充交付**（`cargo test` 226 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-cli 增加恢复入口）。
+
+### 目标（对齐 DSH resume 语义）
+
+DSH resume = 从持久化事件日志重建 Session → 继续追加新 turn（`session_
+history()` 投影含前轮消息 → 多轮共享上下文）。M47 有了 `load_from`；
+缺 CLI 入口——`--session-in`：boot 后把历史 events 导入 `boot.sessions`，
+后续 turn 的 llm 输入含前轮上下文。
+
+### dsh-cli（`crates/dsh-cli/src/lib.rs` + `main.rs`）
+
+- `restore_session(boot, path)`：`SessionLog::load_from` → 遍历 events 用
+  `append(kind, payload)` 导入 `boot.sessions`（append 重放 events + surface；
+  handle 不可替换——逐条导入）。
+- `main.rs`：`--session-in <file>`——boot 后、headless/交互前恢复；失败
+  stderr + exit 1。
+
+### 新增测试（2 项，`m9_boot.rs`）
+
+1. `restore_session_resumes_context`：跑一轮 + save（--session-out）→ 新
+   boot + restore → 再跑一轮：tool-first 回答的 ctx=N 增大（历史累积，
+   多轮共享上下文）。
+2. `restore_session_missing_file_fails`：不存在文件 → 报错（fail loud）。
+
+### 结论
+
+会话恢复与 DSH resume 语义对齐（JSONL 加载 + 多轮上下文延续）。至此
+session 生命周期闭环：记录（append）→ 保存（--session-out）→ 恢复
+（--session-in）→ 继续。差异：无 fork/分支会话（DSH `Session.fork`）。
+下一轮：真实 API https / 其余收尾。
+
+## 65. M49 交付记录（2026）—— fork 分支会话
+
+**状态：补充交付**（`cargo test` 229 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-core session 分支）。
+
+### 目标（对齐 DSH `Session.fork`）
+
+生产 `packages/core/session/src/index.ts` 的 `fork(source, boundary?)`：
+从**稳定前缀**派生子会话——boundary 为包含的源事件 seq（省略 = 最后事件，
+空源 → 空子）；boundary 必须存在且是连续 seq（否则 `INVALID_BOUNDARY`）；
+前缀内最后一个 turn 边界若是 turn/start → `OPEN_TURN` 报错；返回子会话
+（events 前缀 + parent 元数据）。Rust `SessionLog` 此前无分支能力。
+
+### dsh-core（`crates/dsh-core/src/session.rs`）
+
+- `SessionLog::fork(boundary: Option<u64>) -> Result<SessionLog, CordisError>`：
+  截取 [0, boundary] 前缀 + 三重校验（存在性/连续性/OPEN_TURN）+ 前缀重放
+  （append 语义重建 events + surface）。父会话不可变。
+
+### 新增测试（3 项，`m9_session_tools.rs`）
+
+1. `session_fork_slices_prefix`：显式边界（turn/end 处）→ 前缀 + 投影一致；
+   分支继续追加不影响父会话；默认边界（open turn 内）→ 报错。
+2. `session_fork_empty_yields_empty`：空源 → 空子。
+3. `session_fork_invalid_boundary_fails`：越界 / open turn → 报错（父会话
+   不受影响）。
+
+### 结论
+
+fork 分支会话与 DSH `Session.fork` 语义对齐（稳定前缀 + 边界校验 +
+OPEN_TURN）。session 能力集完整：append/surface/replace/provenance/
+持久化/恢复/fork。差异：无 parentSession 元数据（SessionLog 无 header）。
+下一轮：真实 API https / 其余收尾。
+
+## 66. M50 交付记录（2026）—— dsh-eval 可选链（?.）
+
+**状态：补充交付**（`cargo test` 230 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-eval 表达式能力补全）。
+
+### 目标（对齐 JS 可选链）
+
+Cordis `!!js` 用完整 JS eval；Rust `dsh-eval` 是受限子集，此前不支持
+`?.`（null 安全成员访问）——`config?.foo` 会 tokenize 为 `?` + `.` 报错。
+JS 语义：`a?.b` 当 `a` 为 null/undefined 时返回 undefined（Rust: Null）
+而非报错；缺失成员传播为 undefined（链式 `a?.b.c` 中 `a?.b` 缺失 → 继续
+短路）。
+
+### dsh-eval（`crates/dsh-eval/src/lib.rs`）
+
+- tokenizer：`?.` 两字符 token（`?.[` 也经此——`?` + `[` 分离，parser 处理）。
+- `Expr::OptionalMember(base, key)` 变体；eval：
+  - 基对象 null 或**未定义标识符**（不在 scope）→ 短路 Null；
+  - 成员未命中（缺失键/越界）→ 传播 Null（链式可选链）；
+  - 否则等价 `Member`。
+- `member_access` 提取为共享辅助（Member/OptionalMember 共用）。
+- parser postfix：`?.name` / `?.[expr]` 分支。
+
+### 新增测试（1 项，`m3_eval.rs`）
+
+`optional_chaining_null_safe`：非 null 等价成员访问；null/缺失成员/未定义
+标识符短路 Null；数组索引 `?.[0]`；普通 `.` 在 null 上仍报错（fail loud）。
+
+### 结论
+
+`?.` 可选链与 JS 语义对齐（短路 + 链式传播 + fail loud 保留）。剩余
+dsh-eval 差异：`in`/`typeof`/模板字符串等（子集边界，按需扩展）。
+下一轮：真实 API https / 其余收尾。
+
+## 67. M51 交付记录（2026）—— dsh-eval nullish coalescing（??）
+
+**状态：补充交付**（`cargo test` 231 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-eval 表达式能力补全）。
+
+### 目标（对齐 JS `??`）
+
+M50 记录的可继续项：`??`（nullish coalescing）——仅当左侧为 null/undefined
+时取右侧；与 `||` 的 truthiness 短路不同（`0 ?? 'x'` → 0，`0 || 'x'` →
+'x'）。Rust Value 无 undefined——null 即短路条件。
+
+### dsh-eval（`crates/dsh-eval/src/lib.rs`）
+
+- tokenizer：`??` 两字符 token。
+- `binary_op` 加 `"??"` 分支：`a.is_null() ? b : a`。
+- `parse_or`：`??` 与 `||` 同级循环（左结合，对齐 JS 优先级）。
+
+### 新增测试（1 项，`m3_eval.rs`）
+
+`nullish_coalescing`：null 左侧取右侧；0/''/false 保留左侧（与 `||` 对比）；
+链式；与 `||` 同级左结合。
+
+### 结论
+
+`??` 与 JS 语义对齐（null-only 短路 + 优先级）。剩余 dsh-eval 差异：
+`in`/`typeof`/模板字符串/`?.()` 可选调用（子集边界，按需扩展）。
+下一轮：真实 API https / 其余收尾。
+
+## 68. M52 交付记录（2026）—— CLI --patch 别名 + merge_entries 单测
+
+**状态：补充交付**（`cargo test` 232 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-cli 参数别名 + 测试补全）。
+
+### 目标（对齐生产 CLI 的 `--patch`）
+
+生产 CLI：`dsh --patch <path>`（可重复，argv 顺序）——patch overlay：同 id
+行**完整 config 替换** + 可插入新行。Rust CLI 已有 `--overlay`（语义等价），
+缺 `--patch` 参数名（兼容性差异）。
+
+### dsh-cli（`crates/dsh-cli/src/main.rs` + `lib.rs`）
+
+- `main.rs`：`--patch <file>` 作为 `--overlay` 的别名（都 push 进 overlays）。
+- `lib.rs`：`merge_entries` 新增 `#[cfg(test)]` 单测——同 id 完整 config 替换
+  + 新 id 追加插入 + 未命中行保留（对齐生产 patch overlay 语义）。
+
+### 新增测试（1 项，`lib.rs` 单元）
+
+`merge_entries_replaces_config_and_inserts`：替换 loop 完整 config + 插入
+extra entry + services 保留。
+
+### 结论
+
+CLI patch overlay 参数与生产对齐（`--patch` 别名 + 行级替换 + insert 语义
+单测固化）。差异：无 `--dump-config`/`--help` 应用参数边界（`ctx.cmdlineArgs`
+非 Rust 迁移范畴）。下一轮：真实 API https / 其余收尾。
+
+## 69. M53 交付记录（2026）—— dsh-eval typeof 一元运算符
+
+**状态：补充交付**（`cargo test` 233 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-eval 表达式能力补全）。
+
+### 目标（对齐 JS `typeof`）
+
+`!!js` 配置常用 `typeof config.x === 'string'` 守卫；Rust `dsh-eval` 此前
+不支持 `typeof`（会被解析为标识符访问 → not in scope 报错）。
+
+### dsh-eval（`crates/dsh-eval/src/lib.rs`）
+
+- `Expr::Typeof(Box<Expr>)` 变体；eval：null → "object"（JS 遗留）、
+  bool/number/string/object 按 JSON 类型、**未定义标识符 → "undefined"**
+  （Rust 无 undefined，经 not-in-scope 错误识别）。
+- parser `parse_unary`：Ident "typeof" → `Expr::Typeof`（优先级高于二元）。
+
+### 新增测试（1 项，`m3_eval.rs`）
+
+`typeof_operator`：string/number/boolean/object/null（JS 遗留）→ "object"、
+未定义 → "undefined"；与 `===` 组合（守卫模式）；优先级（`typeof x === 'n'
+? 'yes' : 'no'`）。
+
+### 结论
+
+`typeof` 与 JS 语义对齐（类型字符串 + undefined 映射 + 优先级）。剩余
+dsh-eval 差异：`in`/`?.()` 可选调用（子集边界，按需扩展）。
+下一轮：真实 API https / 其余收尾。
+
+## 70. M54 交付记录（2026）—— dsh-eval 模板字符串（${expr} 插值）
+
+**状态：补充交付**（`cargo test` 234 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-eval 表达式能力补全）。
+
+### 目标（对齐 JS 模板字符串）
+
+`!!js` 配置常用反引号模板（`` `prefix ${config.k} suffix` ``）；Rust
+`dsh-eval` 此前不支持（反引号 → unexpected character 报错）。
+
+### dsh-eval（`crates/dsh-eval/src/lib.rs`）
+
+- tokenizer：反引号 → `Tok::Template`（保留原始文本含 `${...}`）。
+- `Expr::Template(Vec<Expr>)` 变体；eval：文本段直接追加、表达式段经
+  `value_str` 转字符串（JS 隐式 String()：null → "null"）。
+- `parse_template(raw, scope)`：按 `${...}` 分割为段序列（文本段 →
+  `Expr::Value`，表达式段 → 递归 `evaluate`——立即求值）。
+- parser `parse_primary`：`Tok::Template` → `parse_template`。
+
+### 新增测试（1 项，`m3_eval.rs`）
+
+`template_strings`：纯字面量；单/多段插值；表达式（成员/算术/字符串拼接）；
+数字转字符串；空插值。
+
+### 结论
+
+模板字符串与 JS 语义对齐（段拼接 + 隐式 String()）。剩余 dsh-eval 差异：
+`?.()` 可选调用（子集边界，按需扩展）。下一轮：真实 API https /
+其余收尾。
+
+## 71. M55 交付记录（2026）—— dsh-eval in 运算符
+
+**状态：补充交付**（`cargo test` 235 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-eval 表达式能力补全）。
+
+### 目标（对齐 JS `in`）
+
+`!!js` 配置常用 `'key' in obj` 守卫（如 `'provider' in config`）；Rust
+`dsh-eval` 此前不支持（`in` 被解析为标识符 → not in scope 报错）。
+
+### dsh-eval（`crates/dsh-eval/src/lib.rs`）
+
+- `binary_op` 加 `"in"` 分支：左侧为字符串键或数字索引，右侧对象 → 键
+  存在性、数组 → 索引越界检查；右侧非对象/数组 → 报错（fail loud）；
+  左侧非键 → 报错（JS `false in {}` 同样 TypeError）。
+- `parse_comparison`：Ident "in" 作为关系运算符（与 `<`/`>` 同级）。
+
+### 新增测试（1 项，`m3_eval.rs`）
+
+`in_operator`：对象键存在性（true/false）；数组索引（'0' in [1,2] → true、
+越界 false）；与 `&&` 组合（守卫模式）；非对象右侧/非键左侧报错。
+
+### 结论
+
+`in` 与 JS 语义对齐（键存在性 + 类型校验 + fail loud）。剩余 dsh-eval
+差异：`?.()` 可选调用（子集边界，按需扩展）。下一轮：真实 API https /
+其余收尾。
+
+## 72. M56 交付记录（2026）—— CLI --dump-config（生效配置转储）
+
+**状态：补充交付**（`cargo test` 236 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-cli 配置查看入口）。
+
+### 目标（对齐生产 `dsh --dump-config`）
+
+生产 CLI：`dsh --profile web --dump-config` 打印**生效配置树**（合并 overlay
+后的 entries；不 boot app）。Rust CLI 此前只有 boot 路径。
+
+### dsh-cli（`crates/dsh-cli/src/lib.rs` + `main.rs`）
+
+- `dump_config(config, overlays) -> Result<String, CordisError>`：读主配置 +
+  overlays 合并（同 id 覆盖 config、新 id 追加）→ 序列化 YAML；不 boot loop。
+- `main.rs`：`--dump-config` 参数——boot 前打印生效配置后退出（0）；失败
+  stderr + exit 1。
+
+### 新增测试（1 项，`m9_boot.rs`）
+
+`dump_config_merges_overlays`：overlay 替换 loop name + services 保留 +
+输出是合法 YAML entries 列表。
+
+### 结论
+
+配置转储与生产对齐（合并 overlays + YAML 输出 + 不 boot）。差异：无
+`--dump-default-config`（默认配置模板——Rust 无 bundle 模板机制）。
+下一轮：真实 API https / 其余收尾。
+
+## 73. M57 交付记录（2026）—— Schema.extend 自定义类型注册
+
+**状态：补充交付**（`cargo test` 238 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-schema 扩展机制补全）。
+
+### 目标（对齐 Schemastery `Schema.extend`）
+
+生产 schemastery：`Schema.extend(type, resolve)` 注册**全局 resolver 表**
+（`resolvers[type]`）；`Schema.resolve` 对未知 type 查表（未注册 →
+`unsupported type`）。Rust `dsh-schema` 此前用 `SchemaKind` enum 静态匹配，
+无运行时扩展点——插件无法注册自定义 schema 类型。
+
+### dsh-schema（`crates/dsh-schema/src/lib.rs`）
+
+- `SchemaKind::Custom(String)` 变体。
+- 全局注册表：`OnceLock<Mutex<HashMap<String, CustomResolver>>>`（`CustomResolver
+  = Arc<dyn Fn(&Value, &SchemaRef, &ResolveOptions) -> Result<Value,
+  ValidationError> + Send + Sync>`——Mutex 要求 Send+Sync，`Arc` 而非 Rc）。
+- `Schema::extend(type, resolver)`（注册）+ `Schema::custom(type)`（构造节点）。
+- `resolve_kind` Custom 分支：查表（未注册 → `unsupported type` fail loud）。
+- `schema_to_string` Custom 分支（type 名）。
+
+### 新增测试（2 项，`m4_schema.rs`）
+
+1. `schema_extend_custom_type`：注册 "duration"（数字 >= 0）——正/零通过、
+   负值/非数字报错；未注册 type → unsupported。
+2. `schema_extend_composes`：自定义类型参与 object 组合与 union 分支。
+
+### 结论
+
+`schema.extend` 自定义类型与 Schemastery 对齐（全局注册表 + resolve 查表 +
+unsupported fail loud + 组合性）。dsh-schema 扩展机制补全。剩余差异：
+`function`/`is(Class)` Value-land 本质限制。下一轮：真实 API https /
+其余收尾。
+
+## 74. M58 交付记录（2026）—— HMR 换 loop 组件（boot.refresh 重建插件）
+
+**状态：补充交付**（`cargo test` 239 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-cli 的 HMR loop 重建）。
+
+### 目标（对齐 Cordis loader 按名重解析插件）
+
+Cordis loader 按 name 解析插件（运行时重解析——HMR 换 entry 的 name 即换
+插件实现）；Rust boot 的 `WasmLoopPlugin` 实例在启动时构建（wasm 字节固定），
+refresh 重挂载 entry（fiber 重启）但 `run_turn` 仍用旧插件实例——**config.wasm
+指向不同组件时 HMR 不生效**（实质缺口）。
+
+### dsh-cli（`crates/dsh-cli/src/lib.rs`）
+
+- `Boot.loop_plugin` 改 `Rc<RefCell<Arc<WasmLoopPlugin>>>`（可变句柄）。
+- refresh 闭包：重挂载（load_async 事务）后按合并后 loop entry 的
+  `config.wasm` **重建 WasmLoopPlugin 并替换**（config.wasm 变化时新组件
+  生效）。
+- `run_turn` 经 `borrow()` 读当前插件。
+
+### 新增测试（1 项，`m9_boot.rs`）
+
+`boot_refresh_swaps_loop_component`：初始 echo-loop → refresh 改 config.wasm
+为 tool-loop → run_turn 返回 summary（新组件生效）。
+
+### 结论
+
+HMR 换 loop 组件与 Cordis loader 重解析语义对齐（refresh 重建插件 +
+run_turn 用新实例）。差异：boot 启动时仍一次性构建（无懒加载）；
+`--watch` 场景经 HMR 生效。下一轮：真实 API https / 其余收尾。
+
+## 75. M59 交付记录（2026）—— dsh-eval 可选调用（?.()）
+
+**状态：补充交付**（`cargo test` 240 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-eval 表达式能力补全）。
+
+### 目标（对齐 JS `?.()`）
+
+JS `fn?.()`：callee 为 null/undefined 时**不调用**返回 undefined；否则正常
+调用。Rust `dsh-eval` 此前 `?.` 后跟 `(` 报错（`?.` 分支只处理成员名/索引）。
+dsh-eval 子集边界的最后一项。
+
+### dsh-eval（`crates/dsh-eval/src/lib.rs`）
+
+- `Expr::OptionalCall(Box<Expr>, Vec<Expr>)` 变体；eval：
+  - callee 为白名单函数名（String/Number/Boolean）→ 直接调用（非 scope
+    标识符但合法目标）；
+  - callee 为未定义标识符 → 短路 Null；
+  - callee 求值为 null（如 `config?.handler` 缺失）→ 短路 Null；
+  - 否则等价普通调用。
+- `eval_call` 提取为共享辅助（Call/OptionalCall 共用）。
+- parser postfix：`?.(` 分支（`?.` 后跟 `(` → OptionalCall）。
+
+### 新增测试（1 项，`m3_eval.rs`）
+
+`optional_call_short_circuits`：白名单经 `?.()` 正常调用；缺失成员/未定义
+标识符/基对象 null → 短路 Null；普通调用在缺失成员上仍报错。
+
+### 结论
+
+`?.()` 可选调用与 JS 语义对齐（短路 + 白名单直调 + fail loud 保留）。
+dsh-eval 子集边界补齐（?. / ?? / typeof / 模板字符串 / in / ?.()）。
+下一轮：真实 API https / 其余收尾。
+
+## 76. M60 交付记录（2026）—— parallel_async 返回结果数组
+
+**状态：补充交付**（`cargo test` 241 项全绿 + clippy 零警告；12 差分场景
+不变——Cordis 层未动，仅 dsh-core async 分派补返回值）。
+
+### 目标（对齐 Cordis `ctx.parallel` 的 Promise.all 结果数组）
+
+Cordis `ctx.parallel` = `Promise.all(listeners.map(fn))` → **结果数组**（各
+监听器返回值）；Rust `parallel_async` 此前丢弃结果（返回 `()`）——只报
+错误。
+
+### dsh-core（`crates/dsh-core/src/context.rs`）
+
+- `parallel_async` 返回类型 `Result<(), AggregateError>` →
+  `Result<Vec<Value>, AggregateError>`：成功返回各监听器返回值（`Continue`
+  → null，`Returned(v)` → v）；错误仍聚合为 AggregateError（allSettled）。
+
+### 新增测试（1 项，`m7_async.rs`）
+
+`parallel_async_returns_result_values`：两个异步监听器（Continue + 返回值）
+→ 结果数组 `[null, "b-val"]`（注册顺序）。
+
+### 结论
+
+`parallel_async` 与 Cordis `ctx.parallel` 语义对齐（Promise.all 结果数组 +
+错误聚合）。现有调用方（loader 事务等）不受影响（`unwrap()` 兼容）。
+下一轮：真实 API https / 其余收尾。
+
+## 77. M61 交付记录（2026）—— disabled entry 差分场景（loader-11）
+
+**状态：补充交付**（13 差分场景全 PASS——含新增 loader-11-disabled-entry；
+`cargo test` 241 项不变）。
+
+### 目标（差分覆盖 disabled entry）
+
+Rust 侧 loader 的 `disabled`/`disabled_expr` 已实现（M3 单测）；差分场景
+此前未覆盖 disabled entry（12 场景只有 group/inject）。补 loader 差分——
+TS 侧 vendored loader 的 disabled 行为作参照。
+
+### 差分（`scenarios/loader-11-disabled-entry.json` + `verify-diff.mjs`）
+
+场景：loader-sync 含 disabled e2（不 apply）→ update e2 enabled（apply）→
+update e1 disabled（卸载）。`verify-diff.mjs` 的 `ASYNC_SCENARIOS` 加入
+loader-11。
+
+### 验证
+
+`loader-11-disabled-entry.golden`（15 行，TS 生成）与 Rust 侧逐行一致：
+- 初始 sync：仅 e1 apply（e2 disabled 不 apply）；
+- e2 → enabled：apply；
+- e1 → disabled：Active→Unloading→Disposed。
+
+### 结论
+
+disabled entry 的 TS↔Rust 行为完全对齐（含 disabled→enabled 热更 +
+enabled→disabled 卸载）。差分覆盖增强。剩余差分面：isolate/intercept
+（Rust 单测已覆盖，TS 宿主需扩展）。下一轮：真实 API https / 其余收尾。

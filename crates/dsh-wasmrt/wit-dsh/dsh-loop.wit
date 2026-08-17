@@ -1,0 +1,145 @@
+// DSH 层缝的 WIT 世界：为「WASM 插件驱动/替换 agent loop」定义类型化契约。
+//
+// 对应 deepseek-harness 架构（docs/architecture.md）的核心缝：
+// - `session`：append-only 事件日志（turn/step 边界 + user/assistant/tool 消息）
+// - `tools`：工具注册与守卫执行（tool/call + tool/result）
+// - `llm`：模型适配（消息/响应）
+// - `agent-loop`：turn/step 驱动（从 session 派生历史 → llm → 工具循环）
+//
+// 本文件是「缝」的 WIT 表达：插件（native 或 WASM）实现其中若干接口即可
+// 参与 loop；宿主（dsh-core）负责把 WASM 组件桥接为 `Plugin` 与 `Service`。
+//
+// 与 `dsh:plugin`（插件载体契约）正交：`dsh:plugin` 回答「插件如何被加载」，
+// 本 world 回答「loop 的缝长什么样」。一个 DSH 插件组件同时实现两者。
+
+package dsh:dsh;
+
+/// 会话日志（append-only 事件流；模型可见即已记录）。
+///
+/// 消息形状对齐 DSH 生产 `Message` 对象（`packages/llm/llm/src/message.ts`）：
+/// `{id, role, content: ContentBlock[], source}`——投影（`derive-messages`）输出
+/// 该形状的消息序列，`deriveEventMessage` 规则见宿主投影实现。
+interface session {
+  /// 打开一个 turn（turn 号递增）。
+  record turn-start {
+    turn: u32,
+  }
+  /// 关闭一个 turn（reason: completed/blocked/max-tokens/aborted/error）。
+  record turn-end {
+    turn: u32,
+    reason: string,
+  }
+  /// 打开/关闭一个 step（一次模型请求 + 其工具执行）。
+  record step-boundary {
+    turn: u32,
+    step: u32,
+  }
+
+  /// 消息来源（生产 `MessageSource`，按 `kind` 判别；merge-extensible）。
+  variant message-source {
+    /// 普通用户输入。
+    user,
+    /// 插件注入的上下文（生产 `{kind:'plugin', plugin}`）。
+    plugin(string),
+    /// 模型产出（生产 `{kind:'model', provider, model}`）。
+    model(model-source),
+    /// 工具结果（生产 `{kind:'tool', callId}`）。
+    tool(tool-source),
+  }
+  record model-source {
+    provider: string,
+    model: string,
+  }
+  record tool-source {
+    call-id: string,
+  }
+
+  /// 内容块（生产 `ContentBlock`，按 `type` 判别；text/reasoning/tool-call/
+  /// tool-result；生产 `image` 为 forward-compatibility，此处预留）。
+  variant content-block {
+    text(string),
+    reasoning(string),
+    tool-call(tool-call-block),
+    tool-result(tool-result-block),
+  }
+  record tool-call-block {
+    id: string,
+    name: string,
+    arguments: string,
+  }
+  /// 工具结果内容块（生产 `ToolResultBlock.content` 为 `ContentBlock[]`，
+  /// 实际即文本块；WIT 禁止递归类型——收敛为 text-block 列表）。
+  record tool-result-block {
+    tool-call-id: string,
+    content: list<text-block>,
+    is-error: bool,
+  }
+  record text-block {
+    text: string,
+  }
+
+  /// 生产 `Message` 对象（id/role/content 数组/source）。
+  record message {
+    id: string,
+    role: string,
+    content: list<content-block>,
+    source: message-source,
+  }
+
+  /// `user/message` 事件 data：即完整 `Message` 对象（生产
+  /// `'user/message': UserMessage`——data 本身即消息，非包装）。
+  record user-message {
+    id: string,
+    role: string,
+    content: list<content-block>,
+    source: message-source,
+  }
+  /// `assistant/message` 事件 data：`{turn, step, message, usage?}` 包装
+  /// （生产 `{turn, step, message: AssistantMessage, usage?}`）。
+  record assistant-message {
+    turn: u32,
+    step: u32,
+    message: message,
+  }
+  /// `tool/result` 事件 data：`{turn, step, message, error?, meta?}` 包装
+  /// （生产 `{turn, step, message: ToolResultMessage, error?, meta?}`）。
+  record tool-result {
+    turn: u32,
+    step: u32,
+    message: message,
+  }
+
+  /// 追加一个事件并返回其序号。
+  append: func(kind: string, payload: list<u8>) -> u32;
+  /// 派生模型历史（从日志投影消息序列；输出 Message[] 的 JSON 字节）。
+  derive-messages: func() -> list<u8>;
+}
+
+/// 工具注册表与守卫执行。
+interface tools {
+  /// 执行一次工具调用（经 tools/pre-execute → execute → post-execute 管道）。
+  execute: func(name: string, arguments: list<u8>) -> list<u8>;
+  /// 注册一个工具（宿主侧登记 schema + 处理函数）。
+  register: func(name: string, schema: list<u8>, handler: u32) -> u32;
+}
+
+/// 模型适配缝。
+interface llm {
+  /// 生成：按 provider 选择适配器；输入消息序列 + 工具 schema，输出助手消息。
+  generate: func(provider: string, messages: list<u8>, tools: list<u8>) -> list<u8>;
+}
+
+/// agent-loop 驱动缝：loop 自身可替换（HANDOFF 方向 4 的验证目标）。
+interface agent-loop {
+  /// 驱动一个 turn：输入用户消息，返回 turn 结束原因。
+  run-turn: func(input: list<u8>, session: u32) -> list<u8>;
+}
+
+world dsh-loop {
+  import session;
+  import tools;
+  import llm;
+
+  /// 实现者（插件）若扮演 loop 则导出此接口；否则只 import 三个缝。
+  export agent-loop;
+}

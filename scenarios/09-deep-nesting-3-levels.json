@@ -1,0 +1,30 @@
+{
+  "name": "deep-nesting-3-levels",
+  "plugins": {
+    "a": {
+      "name": "a",
+      "apply": [
+        { "op": "log", "text": "a-apply" },
+        { "op": "plugin", "id": "b" },
+        { "op": "log", "text": "a-after-plugin" }
+      ]
+    },
+    "b": {
+      "name": "b",
+      "apply": [
+        { "op": "log", "text": "b-apply" },
+        { "op": "plugin", "id": "c" },
+        { "op": "log", "text": "b-after-plugin" }
+      ]
+    },
+    "c": {
+      "name": "c",
+      "apply": [
+        { "op": "log", "text": "c-apply" }
+      ]
+    }
+  },
+  "steps": [
+    { "op": "plugin", "id": "a" }
+  ]
+}

@@ -45,6 +45,8 @@ pub fn evaluate(scope: &Scope, expr: &str) -> Result<Value, EvalError> {
 enum Tok {
     Num(f64),
     Str(String),
+    /// M54：模板字符串原始文本（含 `${...}`；parser 拆段）。
+    Template(String),
     Ident(String),
     Punct(String),
 }
@@ -100,6 +102,26 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, EvalError> {
                 }
                 tokens.push(Tok::Str(s));
             }
+            '`' => {
+                // M54：模板字符串——反引号包裹，保留原始文本（含 `${...}`）
+                let mut s = String::new();
+                i += 1;
+                let mut closed = false;
+                while i < chars.len() {
+                    let ch = chars[i];
+                    if ch == '`' {
+                        closed = true;
+                        i += 1;
+                        break;
+                    }
+                    s.push(ch);
+                    i += 1;
+                }
+                if !closed {
+                    return Err(EvalError("unterminated template literal".into()));
+                }
+                tokens.push(Tok::Template(s));
+            }
             '0'..='9' => {
                 let start = i;
                 while i < chars.len() && chars[i].is_ascii_digit() {
@@ -142,7 +164,7 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, EvalError> {
                         .get(i..i + 2)
                         .map(|s| s.iter().collect())
                         .unwrap_or_default();
-                    if matches!(two.as_str(), "==" | "!=" | "<=" | ">=" | "&&" | "||") {
+                    if matches!(two.as_str(), "==" | "!=" | "<=" | ">=" | "&&" | "||" | "?." | "??") {
                         tokens.push(Tok::Punct(two));
                         i += 2;
                     } else if matches!(c, '(' | ')' | '[' | ']' | ',' | '?' | ':' | '+' | '-' | '*' | '/' | '%' | '!' | '<' | '>' | '.') {
@@ -165,10 +187,19 @@ enum Expr {
     Value(Value),
     Ident(String),
     Member(Box<Expr>, Box<Expr>),
+    /// M50：可选链成员访问（`a?.b` / `a?.[i]`）——基对象为 null/undefined
+    /// 时短路返回 Null（JS 语义），否则等价 [`Expr::Member`]。
+    OptionalMember(Box<Expr>, Box<Expr>),
+    /// M53：`typeof` 一元运算符（返回 JS 类型字符串）。
+    Typeof(Box<Expr>),
+    /// M54：模板字符串——段序列（字符串字面量 / 表达式交替），eval 拼接。
+    Template(Vec<Expr>),
     Unary(&'static str, Box<Expr>),
     Binary(&'static str, Box<Expr>, Box<Expr>),
     Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
+    /// M59：可选调用（`fn?.()`）——callee 为 null/未定义时短路返回 Null。
+    OptionalCall(Box<Expr>, Vec<Expr>),
 }
 
 impl Expr {
@@ -179,26 +210,54 @@ impl Expr {
                 .get(name)
                 .cloned()
                 .ok_or_else(|| EvalError(format!("identifier `{name}` is not in scope"))),
-            Expr::Member(base, key) => {
-                let base_val = base.eval(scope)?;
-                match key.eval(scope)? {
-                    Value::String(k) => {
-                        // 数组的 length 属性（JS Array.length）
-                        if k == "length" {
-                            if let Some(arr) = base_val.as_array() {
-                                return Ok(Value::from(arr.len()));
-                            }
-                        }
-                        base_val.get(&k).cloned().ok_or_else(|| {
-                            EvalError(format!("no member `{k}` on value"))
-                        })
-                    }
-                    Value::Number(n) => base_val
-                        .get(n.as_u64().map(|v| v as usize).unwrap_or(0))
-                        .cloned()
-                        .ok_or_else(|| EvalError("array index out of bounds".into())),
-                    other => Err(EvalError(format!("invalid member key {other}"))),
+            Expr::Member(base, key) => member_access(base.eval(scope)?, key.eval(scope)?),
+            Expr::OptionalMember(base, key) => {
+                // M50：基对象 null 或**未定义标识符**（不在 scope）→ 短路 Null；
+                // 成员未命中（缺失键/越界）也传播为 Null（JS：`a?.b.c` 中
+                // `a?.b` 缺失 → undefined 继续短路）；否则等价 Member。
+                let base_val = match base.eval(scope) {
+                    Ok(v) => v,
+                    Err(EvalError(m)) if m.contains("not in scope") => Value::Null,
+                    Err(e) => return Err(e),
+                };
+                if base_val.is_null() {
+                    return Ok(Value::Null);
                 }
+                match member_access(base_val, key.eval(scope)?) {
+                    Ok(v) => Ok(v),
+                    Err(EvalError(m))
+                        if m.starts_with("no member") || m.contains("index out of bounds") =>
+                    {
+                        Ok(Value::Null)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Expr::Typeof(inner) => {
+                // M53：JS typeof——未定义标识符 → "undefined"（Rust 无
+                // undefined）；null → "object"（JS 遗留）；其余按 JSON 类型。
+                let ty = match inner.eval(scope) {
+                    Ok(Value::Null) => "object", // JS 遗留（typeof null === 'object'）
+                    Ok(Value::Bool(_)) => "boolean",
+                    Ok(Value::Number(_)) => "number",
+                    Ok(Value::String(_)) => "string",
+                    Ok(_) => "object",
+                    Err(EvalError(m)) if m.contains("not in scope") => "undefined",
+                    Err(e) => return Err(e),
+                };
+                Ok(Value::String(ty.to_string()))
+            }
+            Expr::Template(parts) => {
+                // M54：段拼接——字符串字面量段直接追加；表达式段转字符串
+                // （JS 模板字符串的隐式 String()：null → "null"）。
+                let mut out = String::new();
+                for part in parts {
+                    match part {
+                        Expr::Value(Value::String(s)) => out.push_str(s),
+                        other => out.push_str(&value_str(&other.eval(scope)?)),
+                    }
+                }
+                Ok(Value::String(out))
             }
             Expr::Unary(op, inner) => {
                 let v = inner.eval(scope)?;
@@ -220,36 +279,113 @@ impl Expr {
                     f.eval(scope)
                 }
             }
-            Expr::Call(callee, args) => {
-                let name = match callee.as_ref() {
-                    Expr::Ident(n) => n.as_str(),
-                    Expr::Member(base, key) => {
-                        let base_name = match base.as_ref() {
-                            Expr::Ident(n) => n.clone(),
-                            _ => return Err(EvalError("unsupported call target".into())),
-                        };
-                        let key_name = match key.as_ref() {
-                            Expr::Ident(n) => n.clone(),
-                            Expr::Value(Value::String(n)) => n.clone(),
-                            _ => return Err(EvalError("unsupported call target".into())),
-                        };
-                        let full = format!("{base_name}.{key_name}");
-                        match full.as_str() {
-                            "Array.isArray" | "Object.keys" => {
-                                return call_whitelist(&full, args, scope);
-                            }
-                            _ => return Err(EvalError(format!("call `{full}` is not allowed"))),
+            Expr::OptionalCall(callee, args) => {
+                // M59：callee 为 null 或未定义标识符 → 短路 Null（不调用）；
+                // 白名单函数名（String/Number/Boolean）直接调用（非 scope 标识
+                // 符但合法调用目标）；否则等价普通调用。
+                match callee.as_ref() {
+                    Expr::Ident(n) if matches!(n.as_str(), "String" | "Number" | "Boolean") => {
+                        eval_call(callee, args, scope)
+                    }
+                    Expr::Ident(_) => {
+                        // 未定义标识符 → 短路
+                        if callee.eval(scope).is_err() {
+                            Ok(Value::Null)
+                        } else {
+                            eval_call(callee, args, scope)
                         }
                     }
-                    _ => return Err(EvalError("unsupported call target".into())),
-                };
-                match name {
-                    "String" | "Number" | "Boolean" => call_whitelist(name, args, scope),
-                    _ => Err(EvalError(format!("call `{name}` is not allowed"))),
+                    _ => {
+                        let callee_val = callee.eval(scope)?;
+                        if callee_val.is_null() {
+                            Ok(Value::Null)
+                        } else {
+                            eval_call(callee, args, scope)
+                        }
+                    }
                 }
             }
+            Expr::Call(callee, args) => eval_call(callee, args, scope),
         }
     }
+}
+
+/// 调用求值（Call 与 OptionalCall 共用）：白名单全局函数或 `base.key` 白名单。
+fn eval_call(callee: &Expr, args: &[Expr], scope: &Scope) -> Result<Value, EvalError> {
+    let name = match callee {
+        Expr::Ident(n) => n.as_str(),
+        Expr::Member(base, key) => {
+            let base_name = match base.as_ref() {
+                Expr::Ident(n) => n.clone(),
+                _ => return Err(EvalError("unsupported call target".into())),
+            };
+            let key_name = match key.as_ref() {
+                Expr::Ident(n) => n.clone(),
+                Expr::Value(Value::String(n)) => n.clone(),
+                _ => return Err(EvalError("unsupported call target".into())),
+            };
+            let full = format!("{base_name}.{key_name}");
+            match full.as_str() {
+                "Array.isArray" | "Object.keys" => {
+                    return call_whitelist(&full, args, scope);
+                }
+                _ => return Err(EvalError(format!("call `{full}` is not allowed"))),
+            }
+        }
+        _ => return Err(EvalError("unsupported call target".into())),
+    };
+    match name {
+        "String" | "Number" | "Boolean" => call_whitelist(name, args, scope),
+        _ => Err(EvalError(format!("call `{name}` is not allowed"))),
+    }
+}
+
+/// 成员访问（Member 与 OptionalMember 共用）：字符串键（含数组 length）或
+/// 数字索引；未命中/越界报错。
+fn member_access(base_val: Value, key: Value) -> Result<Value, EvalError> {
+    match key {
+        Value::String(k) => {
+            // 数组的 length 属性（JS Array.length）
+            if k == "length" {
+                if let Some(arr) = base_val.as_array() {
+                    return Ok(Value::from(arr.len()));
+                }
+            }
+            base_val.get(&k).cloned().ok_or_else(|| {
+                EvalError(format!("no member `{k}` on value"))
+            })
+        }
+        Value::Number(n) => base_val
+            .get(n.as_u64().map(|v| v as usize).unwrap_or(0))
+            .cloned()
+            .ok_or_else(|| EvalError("array index out of bounds".into())),
+        other => Err(EvalError(format!("invalid member key {other}"))),
+    }
+}
+
+/// M54：解析模板字符串——按 `${...}` 分割为段序列（文本段 → `Expr::Value`，
+/// 表达式段 → 递归 tokenize + parse）。
+fn parse_template(raw: String, scope: &Scope) -> Result<Expr, EvalError> {
+    let mut parts = Vec::new();
+    let mut rest: &str = &raw;
+    while let Some(start) = rest.find("${") {
+        let prefix = &rest[..start];
+        if !prefix.is_empty() {
+            parts.push(Expr::Value(Value::String(prefix.to_string())));
+        }
+        let after = &rest[start + 2..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| EvalError("unterminated template interpolation".into()))?;
+        let expr_text = &after[..end];
+        let inner = evaluate(scope, expr_text)?;
+        parts.push(Expr::Value(inner));
+        rest = &after[end + 1..];
+    }
+    if !rest.is_empty() {
+        parts.push(Expr::Value(Value::String(rest.to_string())));
+    }
+    Ok(Expr::Template(parts))
 }
 
 fn call_whitelist(name: &str, args: &[Expr], scope: &Scope) -> Result<Value, EvalError> {
@@ -302,6 +438,22 @@ fn binary_op(op: &str, a: Value, b: Value) -> Result<Value, EvalError> {
         "<=" => Ok(Value::Bool(cmp(&a, &b) != std::cmp::Ordering::Greater)),
         ">" => Ok(Value::Bool(cmp(&a, &b) == std::cmp::Ordering::Greater)),
         ">=" => Ok(Value::Bool(cmp(&a, &b) != std::cmp::Ordering::Less)),
+        "in" => {
+            // M55：`'key' in obj`——左侧为字符串键（或数字索引），右侧为
+            // 对象/数组；否则报错（fail loud）。
+            let key = match &a {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                other => return Err(EvalError(format!("`in` left operand must be a key, got {other}"))),
+            };
+            match &b {
+                Value::Object(map) => Ok(Value::Bool(map.contains_key(&key))),
+                Value::Array(arr) => Ok(Value::Bool(
+                    key.parse::<usize>().map(|i| i < arr.len()).unwrap_or(false),
+                )),
+                other => Err(EvalError(format!("`in` right operand must be object/array, got {other}"))),
+            }
+        }
         "&&" => {
             if truthy(&a) {
                 Ok(b)
@@ -314,6 +466,15 @@ fn binary_op(op: &str, a: Value, b: Value) -> Result<Value, EvalError> {
                 Ok(a)
             } else {
                 Ok(b)
+            }
+        }
+        "??" => {
+            // M51：nullish coalescing——仅当左侧为 null 时取右侧
+            // （0/''/false 保留左侧，与 `||` 的 truthiness 短路不同）。
+            if a.is_null() {
+                Ok(b)
+            } else {
+                Ok(a)
             }
         }
         _ => Err(EvalError(format!("unknown binary op {op}"))),
@@ -437,10 +598,15 @@ impl<'a> Parser<'a> {
 
     fn parse_or(&mut self) -> Result<Expr, EvalError> {
         let mut left = self.parse_and()?;
-        while matches!(self.peek(), Some(Tok::Punct(p)) if p == "||") {
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Punct(p)) if p == "||" => "||",
+                Some(Tok::Punct(p)) if p == "??" => "??", // M51：nullish coalescing
+                _ => break,
+            };
             self.next();
             let right = self.parse_and()?;
-            left = Expr::Binary("||", Box::new(left), Box::new(right));
+            left = Expr::Binary(op, Box::new(left), Box::new(right));
         }
         Ok(left)
     }
@@ -476,6 +642,8 @@ impl<'a> Parser<'a> {
         loop {
             let op = match self.peek() {
                 Some(Tok::Punct(p)) if matches!(p.as_str(), "<" | "<=" | ">" | ">=") => p.clone(),
+                // M55：`in` 关系运算符（关键字 token；`'k' in obj`）
+                Some(Tok::Ident(name)) if name == "in" => "in".to_string(),
                 _ => break,
             };
             self.next();
@@ -515,6 +683,12 @@ impl<'a> Parser<'a> {
 
     fn parse_unary(&mut self) -> Result<Expr, EvalError> {
         match self.peek() {
+            Some(Tok::Ident(name)) if name == "typeof" => {
+                // M53：`typeof` 一元运算符（关键字；优先级高于二元）
+                self.next();
+                let inner = self.parse_unary()?;
+                Ok(Expr::Typeof(Box::new(inner)))
+            }
             Some(Tok::Punct(p)) if p == "!" || p == "-" => {
                 let op = p.clone();
                 self.next();
@@ -529,6 +703,41 @@ impl<'a> Parser<'a> {
         let mut expr = self.parse_primary()?;
         loop {
             match self.peek() {
+                Some(Tok::Punct(p)) if p == "?." => {
+                    // M50：可选链——`?.name` / `?.[expr]`；M59：`?.(` 可选调用
+                    self.next();
+                    if matches!(self.peek(), Some(Tok::Punct(q)) if q == "(") {
+                        self.next();
+                        let mut args = Vec::new();
+                        if !matches!(self.peek(), Some(Tok::Punct(q)) if q == ")") {
+                            loop {
+                                args.push(self.parse_ternary()?);
+                                if matches!(self.peek(), Some(Tok::Punct(q)) if q == ",") {
+                                    self.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        self.expect_punct(")")?;
+                        expr = Expr::OptionalCall(Box::new(expr), args);
+                    } else if matches!(self.peek(), Some(Tok::Punct(q)) if q == "[") {
+                        self.next();
+                        let key = self.parse_ternary()?;
+                        self.expect_punct("]")?;
+                        expr = Expr::OptionalMember(Box::new(expr), Box::new(key));
+                    } else {
+                        let key = match self.next() {
+                            Some(Tok::Ident(name)) => Expr::Value(Value::String(name)),
+                            other => {
+                                return Err(EvalError(format!(
+                                    "expected member name after `?.`, got {other:?}"
+                                )))
+                            }
+                        };
+                        expr = Expr::OptionalMember(Box::new(expr), Box::new(key));
+                    }
+                }
                 Some(Tok::Punct(p)) if p == "." => {
                     self.next();
                     let key = match self.next() {
@@ -569,6 +778,7 @@ impl<'a> Parser<'a> {
         match self.next() {
             Some(Tok::Num(n)) => Ok(Expr::Value(num(n))),
             Some(Tok::Str(s)) => Ok(Expr::Value(Value::String(s))),
+            Some(Tok::Template(raw)) => parse_template(raw, self.scope),
             Some(Tok::Ident(name)) => match name.as_str() {
                 "true" => Ok(Expr::Value(Value::Bool(true))),
                 "false" => Ok(Expr::Value(Value::Bool(false))),

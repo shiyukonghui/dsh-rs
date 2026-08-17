@@ -1,11 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/dsh-core", "crates/dsh-loader", "crates/dsh-eval", "crates/dsh-schema", "crates/dsh-diff", "crates/dsh-wasmrt"]
+members = ["crates/dsh-core", "crates/dsh-loader", "crates/dsh-eval", "crates/dsh-schema", "crates/dsh-diff", "crates/dsh-wasmrt", "crates/dsh-cli"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# HANDOFF §8：工具链要求 Rust 1.94+；1.85 为 wit-bindgen/wasm-tools 组件模型的 MSRV 下限
+rust-version = "1.85"
 license = "MIT"
 
 [profile.release]

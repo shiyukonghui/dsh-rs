@@ -1,8 +1,16 @@
 //! 事件类型：分派模式、监听器签名、钩子记录（对应 PLAN §1.5）。
+//!
+//! M7 async 基建：监听器支持同步（[`Listener`]）与异步（[`AsyncListener`]）两种形态，
+//! 统一存为 [`HookCallback`]；同步分派（emit/bail/serial/waterfall）只处理
+//! `Sync` 变体（`Async` 跳过并记录差异），异步分派（`parallel_async`/`serial_async`）
+//! 两者都 await。
 
 use std::sync::Arc;
 
+use futures_util::future::LocalBoxFuture;
+
 use crate::context::Cordis;
+use crate::error::CordisError;
 use crate::types::{FiberId, HookId, ScopeId, Value};
 
 /// 事件分派策略（Cordis `DispatchMode`）。
@@ -10,7 +18,7 @@ use crate::types::{FiberId, HookId, ScopeId, Value};
 pub enum DispatchMode {
     /// 同步顺序观察，忽略返回值。
     Emit,
-    /// 全部监听器运行（M0 同步实现；await 语义 M1 引入）。
+    /// 全部监听器运行（M0 同步实现；M7 提供 `parallel_async` 真并发）。
     Parallel,
     /// 顺序运行，首个 bail 值即停。
     Serial,
@@ -52,9 +60,25 @@ impl HookResult {
 /// waterfall 中传给监听器的 `next` 引用。
 pub type NextRef<'a> = Option<&'a dyn Fn(&Cordis, &mut Vec<Value>) -> Option<Value>>;
 
-/// 监听器：`(ctx, args, next)`。非 waterfall 分派时 `next` 为 `None`。
+/// 同步监听器：`(ctx, args, next)`。非 waterfall 分派时 `next` 为 `None`。
 /// 监听器可以修改 `args`（waterfall 中后续 next() 可见，等价 JS 共享数组）。
 pub type Listener = Arc<dyn for<'a> Fn(&Cordis, &mut Vec<Value>, NextRef<'a>) -> HookResult + 'static>;
+
+/// 异步监听器：`(ctx, args) -> future<Result<HookResult>>`。
+///
+/// - `Ok(HookResult)`：与同步监听器相同的语义（bail/短路判定一致）。
+/// - `Err(CordisError)`：`parallel_async` 聚合为 `AggregateError`；`serial_async` 向上传播。
+///
+/// 参数按值传递（不可持有 `&mut` 跨 await；waterfall 的 next 语义暂不支持异步监听器）。
+pub type AsyncListener =
+    Arc<dyn Fn(&Cordis, Vec<Value>) -> LocalBoxFuture<'static, Result<HookResult, CordisError>> + 'static>;
+
+/// 已注册监听器的回调形态。
+#[derive(Clone)]
+pub enum HookCallback {
+    Sync(Listener),
+    Async(AsyncListener),
+}
 
 /// 已注册监听器记录（等价 Cordis `Hook`）。
 pub struct Hook {
@@ -67,5 +91,5 @@ pub struct Hook {
     pub prepend: bool,
     /// 监听器所在作用域（M0 恒为根作用域；isolate M1 引入）。
     pub scope: ScopeId,
-    pub cb: Listener,
+    pub cb: HookCallback,
 }

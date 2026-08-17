@@ -1,0 +1,14 @@
+{
+  "name": "loader-11-disabled-entry",
+  "plugins": {
+    "a": { "name": "a", "apply": [{ "op": "log", "text": "apply-a" }] }
+  },
+  "steps": [
+    { "op": "loader-sync", "entries": [
+      { "id": "e1", "name": "a", "config": { "k": 1 } },
+      { "id": "e2", "name": "a", "config": { "k": 2 }, "disabled": true }
+    ] },
+    { "op": "loader-update", "id": "e2", "options": { "id": "e2", "name": "a", "config": { "k": 3 }, "disabled": false } },
+    { "op": "loader-update", "id": "e1", "options": { "id": "e1", "name": "a", "config": { "k": 4 }, "disabled": true } }
+  ]
+}

@@ -11,7 +11,7 @@
 //! 非 Send 的运行时句柄。副作用（provide/on）经 dsh-core fiber 注册，随 fiber 卸载自动回滚。
 //! 能力检查在 host import 侧进行，被拒返回错误码并记日志。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -20,26 +20,43 @@ use wasmtime::{Caller, Engine, Instance, Linker, Memory, Module, Store};
 
 use crate::abi::*;
 
-/// 运行时状态（host import 可访问）。
+// apply 期间当前挂载上下文（host 回调经此访问 Cordis；单线程内安全）。
+// `WasmHostState` 不含 Cordis（非 Send）→ 满足 WASI preview1 `add_to_linker_sync<T: Send>`。
+thread_local! {
+    static CURRENT_CTX: RefCell<Option<Cordis>> = const { RefCell::new(None) };
+}
+
+/// 运行时状态（host import 可访问；Send 兼容——不含 Cordis）。
 pub struct WasmHostState {
-    /// 当前挂载上下文（apply 时设置，供 import 桥接回 Cordis）。
-    pub ctx: Option<Cordis>,
+    /// 当前挂载是否有效（fiber active 期间为 true）。
+    pub mounted: Cell<bool>,
     /// 能力集合。
     pub caps: Capabilities,
     /// 插件日志。
     pub log: Vec<String>,
     /// apply 期间注册的事件监听名（宿主在 apply 返回后统一注册）。
     pub listeners: Vec<String>,
+    /// WASI preview1 上下文（能力授予：caps 含 WASI 位时注入；否则 None）。
+    pub wasi: Option<wasmtime_wasi::preview1::WasiP1Ctx>,
 }
 
 impl WasmHostState {
     fn new(caps: Capabilities) -> Self {
         WasmHostState {
-            ctx: None,
+            mounted: Cell::new(false),
             caps,
             log: Vec::new(),
             listeners: Vec::new(),
+            wasi: caps.build_wasi_p1_ctx(),
         }
+    }
+
+    /// 取当前 Cordis（apply/事件期间；mounted 保护）。
+    fn ctx(&self) -> Option<Cordis> {
+        if !self.mounted.get() {
+            return None;
+        }
+        CURRENT_CTX.with(|c| c.borrow().clone())
     }
 }
 
@@ -84,6 +101,15 @@ impl WasmPlugin {
         let mut store = Store::new(&self.engine, WasmHostState::new(self.caps));
         let mut linker = Linker::<WasmHostState>::new(&self.engine);
 
+        // WASI preview1（C ABI core-module 路径；caps 含 WASI 位时注册，
+        // 插件 import wasi_snapshot_preview1 才可解析——无 WASI 位不注册）。
+        if store.data().wasi.is_some() {
+            wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |s| {
+                s.wasi.as_mut().expect("wasi ctx present")
+            })
+            .map_err(|e| CordisError::Internal(format!("linker wasi p1: {e}")))?;
+        }
+
         linker
             .func_wrap("env", IMPORT_LOG, |mut caller: Caller<'_, WasmHostState>, ptr: i32, len: i32| {
                 let text = read_str(&mut caller, ptr, len);
@@ -104,7 +130,7 @@ impl WasmPlugin {
                             .push("host_emit denied (capability)".to_string());
                         return;
                     }
-                    let Some(ctx) = caller.data().ctx.clone() else { return };
+                    let Some(ctx) = caller.data().ctx() else { return };
                     ctx.emit("wasm", vec![payload]);
                 },
             )
@@ -136,7 +162,7 @@ impl WasmPlugin {
                     }
                     let service = read_str(&mut caller, sptr, slen);
                     let value = read_json(&mut caller, vptr, vlen);
-                    let Some(ctx) = caller.data().ctx.clone() else { return -1 };
+                    let Some(ctx) = caller.data().ctx() else { return -1 };
                     match ctx.provide(&service, Arc::new(value)) {
                         Ok(_) => 0,
                         Err(e) => {
@@ -164,7 +190,7 @@ impl WasmPlugin {
                         return -1;
                     }
                     let service = read_str(&mut caller, sptr, slen);
-                    let Some(ctx) = caller.data().ctx.clone() else { return -1 };
+                    let Some(ctx) = caller.data().ctx() else { return -1 };
                     let value: Option<Value> = ctx
                         .get(&service)
                         .and_then(|v| v.downcast::<Value>().ok())
@@ -201,7 +227,9 @@ impl Plugin for WasmPlugin {
         let mut rt = self.runtime()?;
         {
             let runtime = rt.as_mut().expect("instance ready");
-            runtime.store.data_mut().ctx = Some(ctx.clone());
+            // 挂载：thread_local 注入当前 Cordis + mounted 置位（host 回调经此访问）
+            CURRENT_CTX.with(|c| *c.borrow_mut() = Some(ctx.clone()));
+            runtime.store.data_mut().mounted.set(true);
             runtime.store.data_mut().listeners.clear();
             let config_bytes = serde_json::to_vec(&config)
                 .map_err(|e| CordisError::Internal(format!("config encode: {e}")))?;

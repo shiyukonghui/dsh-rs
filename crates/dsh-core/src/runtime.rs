@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::error::CordisError;
-use crate::events::{Hook, Listener};
+use crate::events::{Hook, HookCallback};
 use crate::fiber::{FiberData, FiberState};
 use crate::logger::LoggerState;
 use crate::reflect::{CheckFn, Impl, Property};
@@ -36,6 +36,59 @@ pub enum DeferredWork {
     Finish(FiberId),
 }
 
+/// M7 async：微任务队列工作项（等价 Cordis `_reload` 的两个让出点之间的步骤）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncTask {
+    /// apply 前让出 → 运行 apply → 排入 `Finish`。
+    Apply(FiberId),
+    /// apply 后让出 → finish_load（Active + notify 依赖方）。
+    Finish(FiberId),
+}
+
+/// M40：timer 条目（等价 Cordis `ctx.timeout`/`interval` 内部注册的 timer）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerKind {
+    /// 一次性：到期触发后移除。
+    Once,
+    /// 周期：每次到期重新排期（对齐 `setInterval`）。
+    Interval,
+}
+
+/// M40：一个已注册的 timer。
+pub struct TimerEntry {
+    /// 到期时刻（宿主时钟毫秒）。
+    pub deadline: u64,
+    /// 周期毫秒（`Interval` 用；`Once` 为 0）。
+    pub period: u64,
+    /// 种类（Once/Interval）。
+    pub kind: TimerKind,
+    /// 回调（fiber Active 时执行）。
+    pub cb: Rc<dyn Fn()>,
+    /// 注册者 fiber。
+    pub fid: FiberId,
+    /// 是否有效（disposer 清除后 false）。
+    pub alive: bool,
+}
+
+/// M40：debounce/throttle 的调度状态（包装函数与 driver 共享）。
+pub struct TimerSlot {
+    /// 上次执行时刻（throttle）；`u64::MAX` = 从未执行（leading 立即触发）。
+    pub last_at: u64,
+    /// 待执行的 trailing 回调参数（throttle 窗口内最后一次调用的参数）。
+    pub pending: Option<Value>,
+    /// pending 的到期时刻。
+    pub pending_deadline: u64,
+    /// 用户回调（参数经 slot 传递；单线程捕获）。
+    pub cb: Rc<dyn Fn(Value)>,
+    /// 注册者 fiber。
+    pub fid: FiberId,
+}
+
+impl TimerSlot {
+    /// 从未执行（throttle leading 用；等价 Cordis `lastCall = -Infinity`）。
+    pub const NEVER: u64 = u64::MAX;
+}
+
 /// 运行时内部状态。
 pub struct Runtime {
     /// fiber 竞技场。
@@ -52,6 +105,22 @@ pub struct Runtime {
     pub pending_internal: Vec<(String, Vec<Value>)>,
     /// 待执行的延迟加载（插件 apply 期间触发的嵌套加载；M5 对齐 Cordis 微任务让出）。
     pub deferred: Vec<DeferredWork>,
+    /// M7 async：异步微任务队列（FIFO；等价 Cordis 微任务队列）。
+    /// `Apply` = apply 前让出 → apply → 排入 `Finish`；`Finish` = apply 后让出 → 收尾。
+    pub pending_async_loads: std::collections::VecDeque<AsyncTask>,
+    /// M7 async：是否正在异步加载驱动中（嵌套注册走 async 入队而非两阶段延迟）。
+    pub async_mode: bool,
+    /// M13 async：fire-and-forget 调度钩子（宿主注入 tokio/LocalSet 驱动；
+    /// 同步分派遇到 async listener 时经此驱动，无钩子则跳过）。
+    pub spawn: Option<Box<dyn Fn(futures_util::future::LocalBoxFuture<'static, ()>)>>,
+    /// M40：宿主时钟（毫秒；None = 未注入，timer 不触发）。
+    pub timer_clock: Option<Box<dyn Fn() -> u64>>,
+    /// M40：已注册 timer 队列。
+    pub timers: Vec<TimerEntry>,
+    /// M40：debounce/throttle 调度状态（slot id → 状态）。
+    pub timer_slots: HashMap<u64, Rc<std::cell::RefCell<TimerSlot>>>,
+    /// M40：debounce/throttle 的 driver 条目（每次 drive 检查 slot 到期）。
+    pub timer_drivers: Vec<u64>,
     /// Logger 状态。
     pub logger: LoggerState,
     /// 插件注册表（M0 按插件名键）。
@@ -92,6 +161,13 @@ impl Runtime {
             props: HashMap::new(),
             pending_internal: Vec::new(),
             deferred: Vec::new(),
+            pending_async_loads: std::collections::VecDeque::new(),
+            async_mode: false,
+            spawn: None,
+            timer_clock: None,
+            timers: Vec::new(),
+            timer_slots: HashMap::new(),
+            timer_drivers: Vec::new(),
             logger: LoggerState::new(),
             registry: HashMap::new(),
             current: Vec::new(),
@@ -131,10 +207,12 @@ impl Runtime {
             entry: None,
             isolate: HashMap::new(),
             state: FiberState::Pending,
+            await_children: false,
             inject,
             store: HashMap::new(),
             intercept: Vec::new(),
             disposers: Vec::new(),
+            async_disposers: Vec::new(),
             config,
             error: None,
             epoch: None,
@@ -149,6 +227,19 @@ impl Runtime {
 
     pub fn fiber_mut(&mut self, id: FiberId) -> Option<&mut FiberData> {
         self.fibers.get_mut(id as usize).and_then(|f| f.as_mut())
+    }
+
+    /// `id` 的 parent 链是否包含 `ancestor`（M27 Finish 延迟判定）。
+    pub fn fiber_chain_contains(&self, id: FiberId, ancestor: FiberId) -> bool {
+        let mut cur = id;
+        while let Some(f) = self.fiber(cur) {
+            match f.parent {
+                Some(p) if p == ancestor => return true,
+                Some(p) => cur = p,
+                None => return false,
+            }
+        }
+        false
     }
 
     /// 当前 fiber（栈顶）。
@@ -313,7 +404,7 @@ impl Runtime {
         owner: FiberId,
         global: bool,
         prepend: bool,
-        cb: Listener,
+        cb: HookCallback,
     ) -> HookId {
         let id = self.next_hook;
         self.next_hook += 1;
@@ -345,8 +436,8 @@ impl Runtime {
         false
     }
 
-    /// 收集命中（global 或作用域匹配）的监听器。M0 恒匹配根作用域。
-    pub fn collect_hooks(&self, name: &str, current_scope: ScopeId) -> Vec<Listener> {
+    /// 收集命中（global 或作用域匹配）的监听器，保持注册顺序。
+    pub fn collect_hooks(&self, name: &str, current_scope: ScopeId) -> Vec<HookCallback> {
         self.hooks
             .get(name)
             .map(|list| {
@@ -531,6 +622,7 @@ impl Runtime {
     pub fn finish_load(&mut self, fid: FiberId) -> Vec<Transition> {
         if let Some(f) = self.fiber_mut(fid) {
             f.error = None;
+            f.await_children = false;
         }
         self.set_state(fid, FiberState::Active);
         // 通知本 fiber 提供的服务（Cordis：fiber 变 ACTIVE 时 notify 已提供实现）
@@ -637,6 +729,125 @@ impl Runtime {
     /// 追加规范轨迹行（差分验证用）。
     pub fn trace_push(&mut self, line: &str) {
         self.trace.push(line.to_string());
+    }
+
+    // ---- M40：timer 纯变更 ----
+
+    /// 注册 timer（Once/Interval）到队列；返回条目下标（disposer 取消用）。
+    pub fn register_timer(
+        &mut self,
+        deadline: u64,
+        period: u64,
+        kind: TimerKind,
+        cb: Rc<dyn Fn()>,
+        fid: FiberId,
+    ) -> usize {
+        self.timers.push(TimerEntry {
+            deadline,
+            period,
+            kind,
+            cb,
+            fid,
+            alive: true,
+        });
+        self.timers.len() - 1
+    }
+
+    /// 取消 timer（disposer 调用；幂等）。
+    pub fn cancel_timer(&mut self, idx: usize) {
+        if let Some(t) = self.timers.get_mut(idx) {
+            t.alive = false;
+        }
+    }
+
+    /// 收集到期的 timer 回调（一次调用收集，门面在无借用时执行）。
+    /// 一次性 → 取消；周期 → 重新排期（deadline += period）。
+    /// 仅收集**注册者 fiber 仍 Active** 的 timer（对齐 Cordis：fiber 卸载后
+    /// timer 不执行——disposer 已取消，这里双重保险）。
+    /// 返回 `(cb, fid)` 列表。
+    pub fn collect_due_timers(&mut self, now: u64) -> Vec<(Rc<dyn Fn()>, FiberId)> {
+        // 先取待检查的下标（避免 timers 可变借用与 fiber 不可变借用冲突）
+        let idxs: Vec<usize> = self
+            .timers
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.alive)
+            .map(|(i, _)| i)
+            .collect();
+        let mut due = Vec::new();
+        for i in idxs {
+            let (fid, kind, deadline) = {
+                let t = &self.timers[i];
+                (t.fid, t.kind, t.deadline)
+            };
+            let fiber_active = self
+                .fiber(fid)
+                .map(|f| f.is_active())
+                .unwrap_or(false);
+            if !fiber_active {
+                continue;
+            }
+            if now < deadline {
+                continue;
+            }
+            let cb = match kind {
+                TimerKind::Once => {
+                    self.timers[i].alive = false;
+                    self.timers[i].cb.clone()
+                }
+                TimerKind::Interval => {
+                    self.timers[i].deadline = now + self.timers[i].period;
+                    self.timers[i].cb.clone()
+                }
+            };
+            due.push((cb, fid));
+        }
+        due
+    }
+
+    /// M40：注册 debounce/throttle 的调度 slot；返回 slot id。
+    pub fn register_timer_slot(&mut self, slot: Rc<RefCell<TimerSlot>>) -> u64 {
+        let id = self.next_uid;
+        self.next_uid += 1;
+        self.timer_slots.insert(id, slot);
+        self.timer_drivers.push(id);
+        id
+    }
+
+    /// 取消 slot（disposer 调用；幂等）。
+    pub fn cancel_timer_slot(&mut self, id: u64) {
+        self.timer_slots.remove(&id);
+        self.timer_drivers.retain(|&d| d != id);
+    }
+
+    /// 收集到期的 debounce/throttle driver（slot pending 到期且注册者 fiber
+    /// Active）；返回 `(slot, fid)` 列表（门面在无借用时执行 cb）。
+    pub fn collect_due_slots(&mut self, now: u64) -> Vec<(Rc<RefCell<TimerSlot>>, FiberId)> {
+        let mut due = Vec::new();
+        let driver_ids: Vec<u64> = self.timer_drivers.clone();
+        for id in driver_ids {
+            let (slot, fid, pending_deadline) = match self.timer_slots.get(&id) {
+                Some(s) => {
+                    let s = s.clone();
+                    let fid = s.borrow().fid;
+                    let deadline = s.borrow().pending_deadline;
+                    (s, fid, deadline)
+                }
+                None => continue,
+            };
+            let fiber_active = self
+                .fiber(fid)
+                .map(|f| f.is_active())
+                .unwrap_or(false);
+            if !fiber_active {
+                continue;
+            }
+            let should_run = slot.borrow().pending.is_some() && now >= pending_deadline;
+            if should_run {
+                due.push((slot, fid));
+            }
+        }
+        due
     }
 }
 

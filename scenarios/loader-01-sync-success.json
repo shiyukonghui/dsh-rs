@@ -1,0 +1,14 @@
+{
+  "name": "loader-01-sync-success",
+  "plugins": {
+    "a": { "name": "a", "apply": [{ "op": "log", "text": "apply-a" }] }
+  },
+  "steps": [
+    { "op": "loader-sync", "entries": [
+      { "id": "e1", "name": "a", "config": { "k": 1 } },
+      { "id": "e2", "name": "a", "config": { "k": 2 } }
+    ] },
+    { "op": "loader-update", "id": "e1", "options": { "id": "e1", "name": "a", "config": { "k": 3 } } },
+    { "op": "loader-remove", "id": "e2" }
+  ]
+}

@@ -241,3 +241,37 @@ fn duplicate_entry_id_fails() {
     let err = loader.create(options("a", "a", json!({}))).unwrap_err();
     assert!(err.to_string().contains("duplicate"), "{err}");
 }
+
+/// M22：group 入口的 Group 插件 fiber 形态——`plugin:Group`、子入口 parent =
+/// Group fiber、卸载时 Group disposer 递归 stop 子入口。
+#[test]
+fn group_plugin_fiber_mounts_children() {
+    let log = log();
+    let cordis = Cordis::new();
+    let loader = Loader::new(&cordis).unwrap();
+    loader.register_plugin("p1", plugin_p1(&log));
+    loader.register_plugin("p2", plugin_p2(&log));
+
+    let mut g = options("g", "g", json!([{ "id": "c1", "name": "p1" }, { "id": "c2", "name": "p2" }]));
+    g.group = true;
+    let gid = loader.create(g).unwrap();
+
+    // Group fiber 存在（group 入口现在有 fiber）
+    let gfid = loader.fiber(&gid).expect("group entry has Group fiber");
+    // 子入口 fiber 的 parent = Group fiber
+    let c1 = loader.fiber("c1").unwrap();
+    let c2 = loader.fiber("c2").unwrap();
+    let parent_c1 = cordis.with(|rt| rt.fiber(c1).and_then(|f| f.parent));
+    let parent_c2 = cordis.with(|rt| rt.fiber(c2).and_then(|f| f.parent));
+    assert_eq!(parent_c1, Some(gfid), "c1 parent is Group fiber");
+    assert_eq!(parent_c2, Some(gfid), "c2 parent is Group fiber");
+    assert_eq!(cordis.fiber_state(gfid), Some(FiberState::Active));
+
+    // 卸载 group → Group fiber 卸载，子入口递归 stop
+    loader.remove(&gid).unwrap();
+    assert!(loader.fiber("c1").is_none());
+    assert!(loader.fiber("c2").is_none());
+    assert_eq!(cordis.fiber_state(c1), Some(FiberState::Disposed));
+    assert_eq!(cordis.fiber_state(c2), Some(FiberState::Disposed));
+    assert_eq!(cordis.fiber_state(gfid), Some(FiberState::Disposed));
+}

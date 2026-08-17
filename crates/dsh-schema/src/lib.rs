@@ -17,6 +17,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
@@ -53,6 +54,20 @@ impl Meta {
 /// transform 回调：`fn(&Value) -> Result<Value, String>`。
 pub type TransformFn = Rc<dyn Fn(&Value) -> Result<Value, String>>;
 
+/// M57：自定义类型 resolver（对齐 Schemastery `Resolve`）——
+/// `fn(data, schema, options) -> Result<Value, ValidationError>`。
+/// `Arc`：全局注册表（`Mutex<HashMap>`）要求 Send + Sync。
+pub type CustomResolver =
+    Arc<dyn Fn(&Value, &SchemaRef, &ResolveOptions) -> Result<Value, ValidationError> + Send + Sync>;
+
+/// M57：自定义类型注册表（全局；对齐 `Schema.extend` 的 `resolvers` dict）。
+static CUSTOM_RESOLVERS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, CustomResolver>>> =
+    std::sync::OnceLock::new();
+
+fn custom_registry() -> &'static std::sync::Mutex<HashMap<String, CustomResolver>> {
+    CUSTOM_RESOLVERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
 /// lazy 惰性展开状态。
 pub struct LazyState {
     pub builder: Rc<dyn Fn() -> SchemaRef>,
@@ -86,6 +101,8 @@ pub enum SchemaKind {
         callback: TransformFn,
     },
     Lazy(Rc<LazyState>),
+    /// M57：自定义类型（`Schema::extend` 注册的 resolver；type 名）。
+    Custom(String),
 }
 
 /// Schema 节点。
@@ -186,13 +203,45 @@ impl Schema {
     pub fn union(list: Vec<SchemaRef>) -> SchemaRef {
         Schema::new(SchemaKind::Union(list))
     }
+
+    /// date（M26）：union[is(Date), transform(string 校验 RFC3339)]。
+    /// Value-land 中 is(Date) 恒失败；字符串经 datetime 校验后原样返回
+    /// （JSON 兼容；等价 TS `Schema.date` 的 string 分支）。
+    pub fn date() -> SchemaRef {
+        let inner = Schema::string();
+        let callback: TransformFn = Rc::new(|v| {
+            let s = v.as_str().unwrap_or_default();
+            match parse_datetime(s) {
+                Some(_) => Ok(v.clone()),
+                None => Err(format!("invalid date \"{s}\"")),
+            }
+        });
+        let string_branch = Schema::transform(inner, true, callback);
+        Schema::union(vec![Schema::is("Date"), string_branch])
+    }
+
+    /// regExp（M26）：union[is(RegExp), transform(string 校验可编译)]。
+    /// Value-land 中 is(RegExp) 恒失败；字符串校验为正则可编译后原样返回。
+    pub fn reg_exp(flag: &str) -> SchemaRef {
+        let flag = flag.to_string();
+        let inner = Schema::string();
+        let callback: TransformFn = Rc::new(move |v| {
+            let s = v.as_str().unwrap_or_default();
+            let expr = build_regex(s, &flag);
+            match regex::Regex::new(&expr) {
+                Ok(_) => Ok(v.clone()),
+                Err(e) => Err(format!("{e}")),
+            }
+        });
+        let string_branch = Schema::transform(inner, true, callback);
+        Schema::union(vec![Schema::is("RegExp"), string_branch])
+    }
     pub fn intersect(list: Vec<SchemaRef>) -> SchemaRef {
         Schema::new(SchemaKind::Intersect(list))
     }
     pub fn transform(inner: SchemaRef, preserve: bool, callback: TransformFn) -> SchemaRef {
         Schema::new(SchemaKind::Transform {
-            inner: Box::new(inner),
-            preserve,
+            inner: Box::new(inner),            preserve,
             callback,
         })
     }
@@ -201,6 +250,20 @@ impl Schema {
             builder,
             resolved: RefCell::new(None),
         })))
+    }
+
+    /// M57：注册自定义类型 resolver（对齐 Schemastery `Schema.extend(type,
+    /// resolve)`）——全局注册表；`resolve` 对 `SchemaKind::Custom(type)` 查表。
+    pub fn extend(type_name: &str, resolver: impl Fn(&Value, &SchemaRef, &ResolveOptions) -> Result<Value, ValidationError> + Send + Sync + 'static) {
+        custom_registry()
+            .lock()
+            .unwrap()
+            .insert(type_name.to_string(), Arc::new(resolver));
+    }
+
+    /// M57：构造自定义类型节点（`Schema::extend` 已注册的 type）。
+    pub fn custom(type_name: &str) -> SchemaRef {
+        Schema::new(SchemaKind::Custom(type_name.to_string()))
     }
 
     // ---- meta 链 ----
@@ -262,11 +325,15 @@ pub enum PathSeg {
     Index(usize),
 }
 
-/// 校验选项（Cordis `Schemastery.Options` 的 M4 子集）。
+/// 校验选项（Cordis `Schemastery.Options` 的 M4/M25 子集）。
 #[derive(Debug, Clone, Default)]
 pub struct ResolveOptions {
     pub path: Vec<PathSeg>,
     pub autofix: bool,
+    /// strict 模式（M25）：多余键/项不合并（object/tuple/intersect），
+    /// dict 的 sKey 校验失败跳过（非 strict 抛错）。对应 Cordis
+    /// `Schema.resolve(data, schema, options, strict)` 的第 4 参。
+    pub strict: bool,
 }
 
 /// 校验错误：消息 + 路径（前缀 `$.a.b[0]`）。
@@ -470,10 +537,16 @@ fn resolve_kind(data: &Value, schema: &SchemaRef, options: &ResolveOptions) -> R
             };
             let mut out = Map::new();
             for (key, value) in map {
-                // key 经 sKey 校验（失败即跳过，strict 语义）
+                // key 经 sKey 校验：strict 下失败跳过该键；非 strict 抛错
+                // （对应 Cordis dict 的 catch → strict ? continue : throw）。
                 let r_key = match resolve(&Value::String(key.clone()), s_key, options) {
                     Ok(v) => v.as_str().map(|s| s.to_string()).unwrap_or_else(|| key.clone()),
-                    Err(_) => continue,
+                    Err(e) => {
+                        if options.strict {
+                            continue;
+                        }
+                        return Err(e);
+                    }
                 };
                 let v = property(value, &PathSeg::Key(key.clone()), inner, options)?;
                 out.insert(r_key, v);
@@ -492,8 +565,10 @@ fn resolve_kind(data: &Value, schema: &SchemaRef, options: &ResolveOptions) -> R
                 let item = items.get(index).unwrap_or(&Value::Null);
                 out.push(property(item, &PathSeg::Index(index), inner, options)?);
             }
-            // 非 strict：追加多余项
-            out.extend(items.iter().skip(list.len()).cloned());
+            // 非 strict：追加多余项（strict 丢弃）
+            if !options.strict {
+                out.extend(items.iter().skip(list.len()).cloned());
+            }
             Ok(Value::Array(out))
         }
         SchemaKind::Object(dict) => {
@@ -522,10 +597,12 @@ fn resolve_kind(data: &Value, schema: &SchemaRef, options: &ResolveOptions) -> R
                     Err(e) => return Err(e),
                 }
             }
-            // 非 strict：合并多余键
-            for (key, value) in map {
-                if !dict.contains_key(key) {
-                    out.insert(key.clone(), value.clone());
+            // 非 strict：合并多余键（strict 丢弃）
+            if !options.strict {
+                for (key, value) in map {
+                    if !dict.contains_key(key) {
+                        out.insert(key.clone(), value.clone());
+                    }
                 }
             }
             Ok(Value::Object(out))
@@ -579,12 +656,14 @@ fn resolve_kind(data: &Value, schema: &SchemaRef, options: &ResolveOptions) -> R
                     }
                 }
             }
-            // 非 strict：合并剩余对象键
+            // 非 strict：合并剩余对象键（strict 丢弃）
             let mut result = result.unwrap_or_else(|| data.clone());
-            if let (Value::Object(r), Value::Object(m)) = (&mut result, data) {
-                for (k, v) in m {
-                    if !r.contains_key(k) {
-                        r.insert(k.clone(), v.clone());
+            if !options.strict {
+                if let (Value::Object(r), Value::Object(m)) = (&mut result, data) {
+                    for (k, v) in m {
+                        if !r.contains_key(k) {
+                            r.insert(k.clone(), v.clone());
+                        }
                     }
                 }
             }
@@ -607,6 +686,17 @@ fn resolve_kind(data: &Value, schema: &SchemaRef, options: &ResolveOptions) -> R
                 resolved.clone().unwrap()
             };
             resolve(data, &inner, options)
+        }
+        SchemaKind::Custom(type_name) => {
+            // M57：查全局注册表；未注册 → unsupported（fail loud）。
+            let registry = custom_registry().lock().unwrap();
+            match registry.get(type_name) {
+                Some(resolver) => resolver(data, schema, options),
+                None => Err(ValidationError::new(
+                    format!("unsupported type \"{type_name}\""),
+                    &options.path,
+                )),
+            }
         }
     }
 }
@@ -663,6 +753,88 @@ fn build_regex(source: &str, flags: &str) -> String {
         prefix.push_str("(?s)");
     }
     format!("{prefix}{source}")
+}
+
+/// RFC3339 日期时间校验（M26 date 组合子用）。
+/// 接受 `YYYY-MM-DDTHH:MM:SS[.frac]?(Z|±HH:MM)`；返回是否合法。
+/// 轻量实现（无 chrono 依赖）：校验字段格式与取值范围。
+pub fn parse_datetime(s: &str) -> Option<()> {
+    let bytes = s.as_bytes();
+    // 基本长度：YYYY-MM-DDTHH:MM:SS + 后缀（Z 或 ±HH:MM）≥ 20
+    if bytes.len() < 20 {
+        return None;
+    }
+    // 固定分隔符位置
+    if bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T'
+        || bytes[13] != b':' || bytes[16] != b':'
+    {
+        return None;
+    }
+    // 数字段
+    let digits = |start: usize, end: usize| -> Option<u32> {
+        if end > bytes.len() {
+            return None;
+        }
+        let mut v = 0u32;
+        for &b in &bytes[start..end] {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            v = v * 10 + (b - b'0') as u32;
+        }
+        Some(v)
+    };
+    let _year = digits(0, 4)?;
+    let month = digits(5, 7)?;
+    let day = digits(8, 10)?;
+    let hour = digits(11, 13)?;
+    let minute = digits(14, 16)?;
+    let second = digits(17, 19)?;
+    // 范围（u32 无负数；year 恒 ≥ 0）
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    // 小数秒（可选）
+    let mut i = 19;
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+    }
+    // 时区：Z 或 ±HH:MM
+    if i >= bytes.len() {
+        return None;
+    }
+    match bytes[i] {
+        b'Z' => i += 1,
+        b'+' | b'-' => {
+            i += 1;
+            let tz_h = digits(i, i + 2)?;
+            if bytes.get(i + 2) != Some(&b':') {
+                return None;
+            }
+            let tz_m = digits(i + 3, i + 5)?;
+            if tz_h > 23 || tz_m > 59 {
+                return None;
+            }
+            i += 5;
+        }
+        _ => return None,
+    }
+    if i != bytes.len() {
+        return None;
+    }
+    Some(())
 }
 
 /// 十进制安全取模检查（Cordis `isMultipleOf`/`decimalShift`）。
@@ -770,6 +942,7 @@ pub fn schema_to_string(schema: &SchemaRef) -> String {
             }
             SchemaKind::Transform { inner, .. } => fmt(inner, true),
             SchemaKind::Lazy(_) => "any".to_string(),
+            SchemaKind::Custom(name) => name.clone(),
         }
     }
     fmt(schema, false)

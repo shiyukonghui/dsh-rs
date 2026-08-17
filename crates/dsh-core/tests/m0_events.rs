@@ -3,6 +3,9 @@
 mod common;
 use common::*;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use dsh_core::*;
 
 fn host(cordis: &Cordis, name: &'static str, body: impl Fn(&Cordis) + 'static) -> FiberHandle {
@@ -297,4 +300,183 @@ fn waterfall_next_can_be_called_twice() {
     );
     assert_eq!(r, Some(json!("inner")));
     assert_eq!(snapshot(&log), vec!["l1", "l2"]);
+}
+
+/// M42：`ctx.once`——首次触发先移除自身再调用；后续 emit 不再调用。
+#[test]
+fn once_fires_once_then_removes_itself() {
+    let log = log();
+    let log2 = log.clone();
+    let cordis = Cordis::new();
+    let _fid = host(&cordis, "h", move |ctx| {
+        let l = log2.clone();
+        ctx.once("e1", make_listener(move |_ctx, _args, _next| {
+            push(&l, "once");
+            HookResult::Continue
+        }), false, false)
+        .unwrap();
+        // 常驻监听器：确认 once 移除后仍能收到第二次 emit
+        let l = log2.clone();
+        ctx.on("e1", make_listener(move |_ctx, _args, _next| {
+            push(&l, "persist");
+            HookResult::Continue
+        }))
+        .unwrap();
+    });
+    cordis.emit("e1", vec![]);
+    assert_eq!(snapshot(&log), vec!["once", "persist"]);
+
+    // 第二次 emit：once 已移除，只有 persist
+    cordis.emit("e1", vec![]);
+    assert_eq!(snapshot(&log), vec!["once", "persist", "persist"]);
+}
+
+/// M42：`ctx.once` 的 disposer——手动 dispose 后不触发；重复 dispose 幂等。
+#[test]
+fn once_disposer_removes_and_is_idempotent() {
+    let log = log();
+    let log2 = log.clone();
+    let cordis = Cordis::new();
+    let slot: Rc<RefCell<Option<Disposer>>> = Rc::new(RefCell::new(None));
+    let slot2 = slot.clone();
+    let _fid = host(&cordis, "h", move |ctx| {
+        let l = log2.clone();
+        let d = ctx.once("e1", make_listener(move |_ctx, _args, _next| {
+            push(&l, "once");
+            HookResult::Continue
+        }), false, false)
+        .unwrap();
+        *slot2.borrow_mut() = Some(d);
+    });
+
+    // 手动 dispose → 不触发；重复 dispose 幂等
+    let disposer = slot.borrow_mut().take().expect("disposer set");
+    disposer(&cordis);
+    disposer(&cordis);
+    cordis.emit("e1", vec![]);
+    assert_eq!(snapshot(&log), Vec::<String>::new());
+}
+
+/// M42：`ctx.once` 与 serial/bail 兼容（首次触发返回值照常传播）。
+#[test]
+fn once_works_with_serial_bail() {
+    let log = log();
+    let log2 = log.clone();
+    let cordis = Cordis::new();
+    let _fid = host(&cordis, "h", move |ctx| {
+        let l = log2.clone();
+        ctx.once("e1", make_listener(move |_ctx, _args, _next| {
+            push(&l, "once");
+            HookResult::Returned(Some(json!("bail-value")))
+        }), false, false)
+        .unwrap();
+    });
+    let r = cordis.serial("e1", vec![]);
+    assert_eq!(r, Some(json!("bail-value")));
+    assert_eq!(snapshot(&log), vec!["once"]);
+
+    // 已移除：第二次 serial 无监听器 → 无值
+    let r2 = cordis.serial("e1", vec![]);
+    assert_eq!(r2, None);
+}
+
+/// M44：`internal/listener` bail 拦截——注册 `ctx.on` 时先派发该事件，
+/// 拦截器返回非 null → 注册被拦截（`on` 返回 no-op disposer，实际未注册）。
+#[test]
+fn internal_listener_intercept_blocks_registration() {
+    let log = log();
+    let log2 = log.clone();
+    let cordis = Cordis::new();
+
+    // 拦截器：internal/listener 命中 "blocked" → 返回非 null（拦截注册）
+    let guard = FnPlugin::new("listener-guard", &[], move |ctx, _cfg| {
+        let l = log2.clone();
+        ctx.on_with(
+            "internal/listener",
+            make_listener(move |_ctx, args, _next| {
+                let name = args.first().and_then(|a| a.as_str()).unwrap_or("");
+                push(&l, format!("guard:{name}"));
+                if name == "blocked" {
+                    HookResult::Returned(Some(json!(true))) // 拦截
+                } else {
+                    HookResult::Continue
+                }
+            }),
+            true, // global：拦截器对所有 fiber 的注册生效
+            false,
+        )
+        .unwrap();
+        Ok(EffectOutcome::None)
+    });
+    cordis.plugin(guard, json!({})).unwrap();
+
+    // 被拦截的注册：on 返回 disposer 但监听器未注册
+    let l = log.clone();
+    host(&cordis, "reg-blocked", move |ctx| {
+        let l2 = l.clone();
+        let _d = ctx.on("blocked", make_listener(move |_ctx, _args, _next| {
+            push(&l2, "blocked-fired");
+            HookResult::Continue
+        }))
+        .unwrap();
+    });
+    cordis.emit("blocked", vec![]);
+    let s = snapshot(&log);
+    assert!(!s.iter().any(|e| e == "blocked-fired"), "blocked listener not registered: {s:?}");
+
+    // 未拦截的注册：正常注册并触发
+    let l2 = log.clone();
+    host(&cordis, "reg-ok", move |ctx| {
+        let l3 = l2.clone();
+        let _d = ctx.on("allowed", make_listener(move |_ctx, _args, _next| {
+            push(&l3, "allowed-fired");
+            HookResult::Continue
+        }))
+        .unwrap();
+    });
+    cordis.emit("allowed", vec![]);
+    let s2 = snapshot(&log);
+    assert!(s2.iter().any(|e| e == "allowed-fired"), "allowed listener fired: {s2:?}");
+}
+
+/// M44：`internal/listener` 拦截对 `once` 同样生效（once 内部走 on）。
+#[test]
+fn internal_listener_intercept_blocks_once() {
+    let log = log();
+    let log2 = log.clone();
+    let cordis = Cordis::new();
+
+    let guard = FnPlugin::new("listener-guard2", &[], move |ctx, _cfg| {
+        let l = log2.clone();
+        ctx.on_with(
+            "internal/listener",
+            make_listener(move |_ctx, args, _next| {
+                let name = args.first().and_then(|a| a.as_str()).unwrap_or("");
+                push(&l, format!("guard:{name}"));
+                if name == "blocked-once" {
+                    HookResult::Returned(Some(json!(true)))
+                } else {
+                    HookResult::Continue
+                }
+            }),
+            true,
+            false,
+        )
+        .unwrap();
+        Ok(EffectOutcome::None)
+    });
+    cordis.plugin(guard, json!({})).unwrap();
+
+    let l = log.clone();
+    host(&cordis, "reg-once", move |ctx| {
+        let l2 = l.clone();
+        let _d = ctx.once("blocked-once", make_listener(move |_ctx, _args, _next| {
+            push(&l2, "once-fired");
+            HookResult::Continue
+        }), false, false)
+        .unwrap();
+    });
+    cordis.emit("blocked-once", vec![]);
+    let s = snapshot(&log);
+    assert!(!s.iter().any(|e| e == "once-fired"), "blocked once not registered: {s:?}");
 }

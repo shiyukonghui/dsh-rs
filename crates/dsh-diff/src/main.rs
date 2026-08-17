@@ -4,6 +4,7 @@
 //! - `dsh-diff <scenario.json>`：执行并打印 trace。
 //! - `dsh-diff <scenario.json> --golden <file>`：执行并逐行对比 golden。
 //! - `dsh-diff <scenario.json> --record <file>`：执行并写入 golden。
+//! - `--async`：用 M7 异步编排执行（真实微任务让出；深嵌套场景与 TS 一致）。
 
 use std::path::PathBuf;
 
@@ -12,12 +13,13 @@ use dsh_diff::{Runner, diff_trace};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: dsh-diff <scenario.json> [--golden <file> | --record <file>]");
+        eprintln!("usage: dsh-diff <scenario.json> [--golden <file> | --record <file>] [--async]");
         std::process::exit(2);
     }
     let scenario_path = PathBuf::from(&args[1]);
     let mut golden: Option<PathBuf> = None;
     let mut record = false;
+    let mut use_async = false;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -29,6 +31,9 @@ fn main() {
                 record = true;
                 i += 1;
                 golden = Some(PathBuf::from(&args[i]));
+            }
+            "--async" => {
+                use_async = true;
             }
             other => {
                 eprintln!("unknown arg {other}");
@@ -42,8 +47,25 @@ fn main() {
     let scenario: dsh_diff::Scenario =
         serde_json::from_str(&text).expect("parse scenario JSON");
 
-    let mut runner = Runner::new();
-    let trace = runner.run(&scenario).expect("run scenario");
+    let trace = if use_async {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let mut runner = Runner::new();
+                    runner.run_async(&scenario).await
+                })
+                .await
+        })
+        .expect("run scenario async")
+    } else {
+        let mut runner = Runner::new();
+        runner.run(&scenario).expect("run scenario")
+    };
     let trace_text = trace.join("\n") + "\n";
 
     match (golden, record) {

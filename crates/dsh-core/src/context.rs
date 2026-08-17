@@ -9,22 +9,60 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::error::CordisError;
-use crate::events::{HookResult, Listener};
+use crate::error::{AggregateError, CordisError};
+use crate::events::{AsyncListener, HookCallback, HookResult, Listener};
 use crate::fiber::{Disposer, EffectBody, EffectOutcome, FiberHandle, FiberState, make_disposer};
 use crate::logger::{Exporter, ExporterConfig, Logger};
 use crate::reflect::{AccessorGet, AccessorSet, CheckFn, Property};
 use crate::registry::Plugin;
-use crate::runtime::{DeferredWork, Runtime, RuntimeCell, Transition};
+use crate::runtime::{AsyncTask, DeferredWork, Runtime, RuntimeCell, TimerKind, TimerSlot, Transition};
 use crate::service::Service;
 use crate::types::{FiberId, Value};
 
 /// waterfall 的最终内置行为（等价 Cordis 中 `args.pop()` 出的 inner）。
 pub type InnerFn = Box<dyn Fn(&mut Vec<Value>) -> Option<Value>>;
 
+/// M40：debounce/throttle 返回的包装函数（参数经 `Value` 传递；单线程捕获）。
+pub type TimerFn = Rc<dyn Fn(Value)>;
+
+/// M41：`ctx.interval(delay)` 的 tick 流（等价 AsyncIterable）——每 delay
+/// 毫秒产出一个 `()`；fiber 卸载（disposer 置 cancelled）→ 流结束。
+pub struct IntervalTicks {
+    next: Rc<Cell<u64>>,
+    cancelled: Rc<Cell<bool>>,
+    delay: u64,
+    clock: Option<Cordis>,
+}
+
+impl futures_util::Stream for IntervalTicks {
+    type Item = ();
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<()>> {
+        let this = self.get_mut();
+        if this.cancelled.get() {
+            return std::task::Poll::Ready(None);
+        }
+        let now = this
+            .clock
+            .as_ref()
+            .map(|c| c.timer_now())
+            .unwrap_or(0);
+        if now >= this.next.get() {
+            this.next.set(now + this.delay);
+            std::task::Poll::Ready(Some(()))
+        } else {
+            // 未到期：注册 waker（宿主驱动时再次 poll）
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+}
+
 /// waterfall 链状态：共享索引，next 可多次调用（等价 JS `cbs.shift()`）。
 struct WfChain {
-    cbs: Vec<Listener>,
+    cbs: Vec<HookCallback>,
     inner: InnerFn,
     idx: Cell<usize>,
 }
@@ -35,9 +73,17 @@ fn run_chain(state: &Rc<WfChain>, ctx: &Cordis, args: &mut Vec<Value>) -> Option
         state.idx.set(i + 1);
         let next: &dyn Fn(&Cordis, &mut Vec<Value>) -> Option<Value> =
             &|ctx, args| run_chain(state, ctx, args);
-        match (state.cbs[i])(ctx, args, Some(next)) {
-            HookResult::Continue => None,
-            HookResult::Returned(v) => v,
+        match &state.cbs[i] {
+            HookCallback::Sync(l) => match (l)(ctx, args, Some(next)) {
+                HookResult::Continue => None,
+                HookResult::Returned(v) => v,
+            },
+            // 同步 waterfall 对 async listener fire-and-forget（M18）：调用但不
+            // await（等价 Cordis `Reflect.apply` 丢弃 Promise，链继续）。
+            HookCallback::Async(a) => {
+                ctx.fire_async_listener(a.clone(), args.clone());
+                run_chain(state, ctx, args)
+            }
         }
     } else {
         (state.inner)(args)
@@ -60,6 +106,252 @@ impl Cordis {
     /// 内部访问（测试/宿主用）。
     pub fn with<T>(&self, f: impl FnOnce(&mut Runtime) -> T) -> T {
         f(&mut self.rt.borrow_mut())
+    }
+
+    /// 注入 fire-and-forget 调度钩子（async listener 的 emit 驱动；tokio/LocalSet 宿主用）。
+    /// `spawn` 接收一个非 Send future，驱动到完成（fire-and-forget）。
+    pub fn set_spawn(&self, spawn: impl Fn(futures_util::future::LocalBoxFuture<'static, ()>) + 'static) {
+        self.with(|rt| rt.spawn = Some(Box::new(spawn)));
+    }
+
+    // ---- M40：timer 服务（对齐 deepseek-harness `vendor/timer`） ----
+
+    /// 注入宿主时钟（毫秒；timer 到期判定用）。None = 未注入 → timer 不触发
+    /// （`drive_timers` 无 clock 时跳过，与 `set_spawn` 无钩子跳过一致）。
+    pub fn set_timer_clock(&self, clock: impl Fn() -> u64 + 'static) {
+        self.with(|rt| rt.timer_clock = Some(Box::new(clock)));
+    }
+
+    /// 宿主时钟毫秒（未注入 → 0）。
+    fn timer_now(&self) -> u64 {
+        self.with(|rt| rt.timer_clock.as_ref().map(|c| c()).unwrap_or(0))
+    }
+
+    /// 注册一次性 timer（等价 `ctx.timeout(cb, delay)`）：delay 毫秒后（宿主
+    /// `drive_timers` 驱动）执行 cb——仅当注册者 fiber 仍 Active。返回 disposer
+    /// （卸载/手动调用时取消 timer，生命周期绑定）。
+    pub fn timeout(&self, cb: Rc<dyn Fn()>, delay: u64) -> Result<Disposer, CordisError> {
+        let fid = {
+            let rt = self.rt.borrow();
+            match rt.current_fiber() {
+                Some(fid) if rt.fiber(fid).map(|f| f.is_active()).unwrap_or(false) => fid,
+                _ => return Err(CordisError::InactiveEffect),
+            }
+        };
+        let now = self.timer_now();
+        let idx = self.with(|rt| rt.register_timer(now + delay, 0, TimerKind::Once, cb, fid));
+        Ok(make_disposer(Box::new(move |ctx| {
+            ctx.with(|rt| rt.cancel_timer(idx));
+        })))
+    }
+
+    /// 注册周期 timer（等价 `ctx.interval(cb, delay)`）：每 delay 毫秒执行 cb
+    /// （驱动驱动）；返回 disposer（卸载取消）。
+    pub fn interval(&self, cb: Rc<dyn Fn()>, delay: u64) -> Result<Disposer, CordisError> {
+        let fid = {
+            let rt = self.rt.borrow();
+            match rt.current_fiber() {
+                Some(fid) if rt.fiber(fid).map(|f| f.is_active()).unwrap_or(false) => fid,
+                _ => return Err(CordisError::InactiveEffect),
+            }
+        };
+        let now = self.timer_now();
+        let idx = self.with(|rt| rt.register_timer(now + delay, delay, TimerKind::Interval, cb, fid));
+        Ok(make_disposer(Box::new(move |ctx| {
+            ctx.with(|rt| rt.cancel_timer(idx));
+        })))
+    }
+
+    /// 别名（M46，对齐 `vendor/timer` 的 deprecated `setTimeout`）：
+    /// 语义等价 [`Cordis::timeout`]——delay 毫秒后执行 cb（宿主驱动），返回
+    /// disposer（卸载取消）。
+    pub fn set_timeout(&self, cb: Rc<dyn Fn()>, delay: u64) -> Result<Disposer, CordisError> {
+        self.timeout(cb, delay)
+    }
+
+    /// 别名（M46，对齐 `vendor/timer` 的 deprecated `setInterval`）：
+    /// 语义等价 [`Cordis::interval`]——每 delay 毫秒执行 cb（宿主驱动），返回
+    /// disposer（卸载取消）。
+    pub fn set_interval(&self, cb: Rc<dyn Fn()>, delay: u64) -> Result<Disposer, CordisError> {
+        self.interval(cb, delay)
+    }
+
+    /// 防抖（等价 `ctx.debounce(cb, delay)`）：返回包装函数——delay 毫秒内多次
+    /// 调用只执行最后一次（每次调用重置计时）。返回的包装函数带 `.dispose()`？
+    /// Rust 侧：包装函数捕获 slot，调用更新 pending；driver 到期执行。
+    /// 返回 `(wrapper, disposer)`——wrapper 为 [`TimerFn`]（参数经 `Value`
+    /// 传递），disposer 取消调度（fiber 卸载）。
+    pub fn debounce(
+        &self,
+        cb: Rc<dyn Fn(Value)>,
+        delay: u64,
+    ) -> Result<(TimerFn, Disposer), CordisError> {
+        let fid = {
+            let rt = self.rt.borrow();
+            match rt.current_fiber() {
+                Some(fid) if rt.fiber(fid).map(|f| f.is_active()).unwrap_or(false) => fid,
+                _ => return Err(CordisError::InactiveEffect),
+            }
+        };
+        let now = self.timer_now();
+        let slot = Rc::new(RefCell::new(TimerSlot {
+            last_at: now,
+            pending: None,
+            pending_deadline: 0,
+            cb,
+            fid,
+        }));
+        let id = self.with(|rt| rt.register_timer_slot(slot.clone()));
+        let wrapper = {
+            let slot = slot.clone();
+            let clock = self.clone();
+            Rc::new(move |value: Value| {
+                let now = clock.timer_now();
+                let mut s = slot.borrow_mut();
+                s.last_at = now;
+                s.pending = Some(value);
+                s.pending_deadline = now + delay;
+            })
+        };
+        let disposer = make_disposer(Box::new(move |ctx| {
+            ctx.with(|rt| rt.cancel_timer_slot(id));
+        }));
+        Ok((wrapper, disposer))
+    }
+
+    /// 节流（等价 `ctx.throttle(cb, delay)`）：leading edge 立即执行；delay 内
+    /// 调用不立即执行，窗口结束时执行**最后一次**（trailing，对齐 Cordis 默认
+    /// `noTrailing=false`）。返回 `(wrapper, disposer)`。
+    pub fn throttle(
+        &self,
+        cb: Rc<dyn Fn(Value)>,
+        delay: u64,
+    ) -> Result<(TimerFn, Disposer), CordisError> {
+        let fid = {
+            let rt = self.rt.borrow();
+            match rt.current_fiber() {
+                Some(fid) if rt.fiber(fid).map(|f| f.is_active()).unwrap_or(false) => fid,
+                _ => return Err(CordisError::InactiveEffect),
+            }
+        };
+        let slot = Rc::new(RefCell::new(TimerSlot {
+            last_at: TimerSlot::NEVER,
+            pending: None,
+            pending_deadline: 0,
+            cb,
+            fid,
+        }));
+        let id = self.with(|rt| rt.register_timer_slot(slot.clone()));
+        let wrapper = {
+            let slot = slot.clone();
+            let clock = self.clone();
+            Rc::new(move |value: Value| {
+                let now = clock.timer_now();
+                let mut s = slot.borrow_mut();
+                // leading：从未执行 或 距上次执行 >= delay → 立即执行并记录时刻
+                if s.last_at == TimerSlot::NEVER || now >= s.last_at + delay {
+                    let cb = s.cb.clone();
+                    s.last_at = now;
+                    drop(s);
+                    cb(value);
+                } else {
+                    // trailing：记录窗口内最后一次调用，窗口结束时执行
+                    s.pending = Some(value);
+                    s.pending_deadline = s.last_at + delay;
+                }
+            })
+        };
+        let disposer = make_disposer(Box::new(move |ctx| {
+            ctx.with(|rt| rt.cancel_timer_slot(id));
+        }));
+        Ok((wrapper, disposer))
+    }
+
+    /// 宿主事件循环驱动：推进到期的 timer（once/interval）与 debounce/throttle
+    /// 的 trailing。收集-再执行：先收集到期回调，释放借用后执行（用户代码可
+    /// 重入）。fiber 卸载的 timer 已被 disposer 取消（collect 双重过滤 Active）。
+    pub fn drive_timers(&self) {
+        let now = self.timer_now();
+        // 1. once/interval timer
+        let due = self.with(|rt| rt.collect_due_timers(now));
+        for (cb, _fid) in due {
+            cb();
+        }
+        // 2. debounce/throttle trailing
+        let due_slots = self.with(|rt| rt.collect_due_slots(now));
+        for (slot, _fid) in due_slots {
+            let (cb, value) = {
+                let mut s = slot.borrow_mut();
+                match s.pending.take() {
+                    Some(v) => (s.cb.clone(), v),
+                    None => continue,
+                }
+            };
+            cb(value);
+        }
+    }
+
+    // ---- M41：timer 无回调形态（对齐 `vendor/timer` 的
+    // `timeout(delay): Promise` 与 `interval(delay): AsyncIterable`） ----
+
+    /// 延迟 future（等价 `await ctx.timeout(delay)`）：delay 毫秒后 resolve；
+    /// fiber 卸载（disposer 取消）→ 返回 `Err`（对齐 Promise reject
+    /// "Context has been disposed"）。宿主驱动：`yield_now` 轮询时钟（与
+    /// `fiber_await` 同模式；时钟经 `set_timer_clock` 注入）。
+    pub fn timeout_async(
+        &self,
+        delay: u64,
+    ) -> futures_util::future::LocalBoxFuture<'static, Result<(), CordisError>> {
+        let deadline = self.timer_now() + delay;
+        let cancelled = Rc::new(Cell::new(false));
+        let cancelled2 = cancelled.clone();
+        // disposer：fiber 卸载时置 cancelled（对齐 Promise reject on dispose）
+        let _disposer = self
+            .effect("ctx.timeout()", Box::new(move |_ctx| {
+                Ok(EffectOutcome::One(make_disposer(Box::new(move |_| {
+                    cancelled2.set(true);
+                }))))
+            }))
+            .expect("timeout_async registers effect");
+        let clock = self.clone();
+        Box::pin(async move {
+            loop {
+                if cancelled.get() {
+                    return Err(CordisError::Internal(
+                        "Context has been disposed".into(),
+                    ));
+                }
+                if clock.timer_now() >= deadline {
+                    return Ok(());
+                }
+                // 让出（宿主 block_on / LocalSet 驱动；单线程不阻塞）
+                Cordis::yield_now().await;
+            }
+        })
+    }
+
+    /// tick 流（等价 `for await (const _ of ctx.interval(delay))`）：
+    /// 每 delay 毫秒产出一个 `()`；fiber 卸载（disposer 取消）→ 流结束。
+    /// 自驱动：`next_tick` 存 `Rc<Cell>`，poll 检查时钟（不依赖 runtime 队列）。
+    pub fn interval_ticks(&self, delay: u64) -> IntervalTicks {
+        let first = self.timer_now() + delay;
+        let next = Rc::new(Cell::new(first));
+        let cancelled = Rc::new(Cell::new(false));
+        let cancelled2 = cancelled.clone();
+        let _disposer = self
+            .effect("ctx.interval()", Box::new(move |_ctx| {
+                Ok(EffectOutcome::One(make_disposer(Box::new(move |_| {
+                    cancelled2.set(true);
+                }))))
+            }))
+            .expect("interval_ticks registers effect");
+        let clock = self.clone();
+        IntervalTicks {
+            next,
+            cancelled,
+            delay,
+            clock: Some(clock),
+        }
     }
 
     /// 取规范轨迹（差分验证用）。
@@ -99,9 +391,164 @@ impl Cordis {
         Ok(fid)
     }
 
+    /// M7：异步注册插件（等价 `await ctx.plugin()`）。加载编排用真实 `yield_now`
+    /// 让出（替代两阶段延迟近似），嵌套加载按微任务 FIFO 顺序交错，与 Cordis
+    /// `_reload` 的 `await Promise.resolve()` 语义对齐（3 层以上深嵌套一致）。
+    pub async fn plugin_arc_async(
+        &self,
+        plugin: Arc<dyn Plugin>,
+        config: Value,
+    ) -> Result<FiberHandle, CordisError> {
+        let (fid, transitions) = {
+            let mut rt = self.rt.borrow_mut();
+            rt.async_mode = true;
+            rt.register_plugin(&plugin, config)?
+        };
+        self.drain_internal();
+        self.run_transitions_async(transitions).await;
+        // 收尾：等队列空（嵌套加载全部完成）
+        self.drive_async_loads().await;
+        {
+            let mut rt = self.rt.borrow_mut();
+            rt.async_mode = false;
+        }
+        Ok(fid)
+    }
+
+    /// 异步执行一组转换：Load 入队（Loading 同步 + 微任务 Apply）；Unload 同步执行。
+    pub(crate) async fn run_transitions_async(&self, transitions: Vec<Transition>) {
+        for t in transitions {
+            match t {
+                Transition::Load(fid) => {
+                    // Loading 状态同步（与 Cordis `_setEpoch` 一致）；apply 体排队
+                    let _ = {
+                        let mut rt = self.rt.borrow_mut();
+                        rt.begin_load(fid)
+                    };
+                    self.with(|rt| rt.pending_async_loads.push_back(AsyncTask::Apply(fid)));
+                }
+                Transition::Unload(fid) => {
+                    self.run_transition(t);
+                    let _ = fid;
+                }
+            }
+        }
+    }
+
+    /// 驱动异步微任务队列（FIFO）：
+    /// - `Apply(fid)`：yield_now（apply 前让出）→ apply（嵌套注册同步 Loading + 入队
+    ///   `Apply`）→ 排入 `Finish`（在已入队的嵌套之后）。
+    /// - `Finish(fid)`：yield_now（apply 后让出）→ finish_load（Active + notify 依赖方）。
+    ///
+    /// 该顺序精确复刻 Cordis：a 的 apply 后让出排在 b 的 apply 前让出之后，
+    /// 因此「b 的 apply 在 a Active 前、c 的 apply 在 a Active 后」。
+    pub(crate) async fn drive_async_loads(&self) {
+        loop {
+            let task = {
+                let mut rt = self.rt.borrow_mut();
+                rt.pending_async_loads.pop_front()
+            };
+            let Some(task) = task else { break };
+            match task {
+                AsyncTask::Apply(fid) => {
+                    // apply 前让出（等价 Cordis `_reload` 的 `await Promise.resolve()`）
+                    Self::yield_now().await;
+                    let plan = {
+                        let mut rt = self.rt.borrow_mut();
+                        rt.begin_load(fid)
+                    };
+                    let Some((plugin, config0)) = plan else { continue };
+                    match self.apply_body(fid, &plugin, config0) {
+                        Ok(outcome) => {
+                            // M27：apply 返回 `Await`（如 Group 的 `[Service.init]`）→
+                            // current 已保留（fid 在栈顶）→ await 完成（期间排入的
+                            // 子任务先入队；子入口注册 parent = Group）→ pop → 得最终
+                            // outcome。标记 await_children：Finish 等子任务完成后执行。
+                            let outcome = match outcome {
+                                EffectOutcome::Await(fut) => {
+                                    let o = fut.await;
+                                    {
+                                        let mut rt = self.rt.borrow_mut();
+                                        rt.current.pop();
+                                        if let Some(f) = rt.fiber_mut(fid) {
+                                            f.await_children = true;
+                                        }
+                                    }
+                                    o
+                                }
+                                other => other,
+                            };
+                            let _disposer = {
+                                let mut rt = self.rt.borrow_mut();
+                                rt.fiber_mut(fid)
+                                    .map(|f| f.collect_effect("plugin-apply", outcome))
+                            };
+                            // Finish 排到队尾（在 apply 期间入队的嵌套 Apply 之后）
+                            self.with(|rt| {
+                                rt.pending_async_loads.push_back(AsyncTask::Finish(fid))
+                            });
+                        }
+                        Err(e) => {
+                            // Await 失败路径：current 可能未 pop（apply_body 保留）——补 pop
+                            let mut rt = self.rt.borrow_mut();
+                            rt.current.retain(|&x| x != fid);
+                            rt.fail_fiber(fid, e);
+                        }
+                    }
+                }
+                AsyncTask::Finish(fid) => {
+                    // M27：`await_children` 标记的 fiber（Group）等待 Loading 后代
+                    // 完成后再 finish（等价 Cordis init await 子任务）。普通 fiber
+                    // 不受影响（_reload 的父先 Active 时序保持不变）。
+                    let should_wait = self.with(|rt| {
+                        rt.fiber(fid).map(|f| f.await_children).unwrap_or(false)
+                            && rt.fibers.iter().flatten().any(|f| {
+                                f.id != fid
+                                    && f.state == FiberState::Loading
+                                    && rt.fiber_chain_contains(f.id, fid)
+                            })
+                    });
+                    if should_wait {
+                        self.with(|rt| {
+                            rt.pending_async_loads.push_back(AsyncTask::Finish(fid))
+                        });
+                        Self::yield_now().await;
+                        continue;
+                    }
+                    // apply 后让出（等价 Cordis `await this._execute(...)` 的 await 同步值）
+                    Self::yield_now().await;
+                    let transitions = {
+                        let mut rt = self.rt.borrow_mut();
+                        rt.finish_load(fid)
+                    };
+                    self.run_transitions_async(transitions).await;
+                }
+            }
+            self.drain_internal();
+        }
+    }
+
     /// 执行转换；若正处某个插件的 apply 期间则延迟加载到 apply 收尾前后
     /// （对齐 Cordis 微任务让出：Loading 状态同步、apply 在父 Active 前、Active 在父 Active 后）。
     pub(crate) fn run_or_defer(&self, t: Transition) {
+        // M7 async 模式：嵌套注册入微任务队列（Loading 同步、apply 排队），
+        // 由 `drive_async_loads` 用真实 `yield_now` 驱动（替代两阶段延迟）。
+        if self.with(|rt| rt.async_mode) {
+            match t {
+                Transition::Load(fid) => {
+                    let _ = {
+                        let mut rt = self.rt.borrow_mut();
+                        rt.begin_load(fid)
+                    };
+                    self.with(|rt| rt.pending_async_loads.push_back(AsyncTask::Apply(fid)));
+                }
+                Transition::Unload(fid) => {
+                    let _ = fid;
+                    self.run_transition(t);
+                }
+            }
+            return;
+        }
         let mid_apply = self.with(|rt| {
             rt.current
                 .last()
@@ -152,7 +599,20 @@ impl Cordis {
             rt.current.push(fid);
         }
         let result = plugin.apply(self, config);
-        {
+        // M27：同步路径下 `Await`（如 Group 挂载子入口）在 current 上下文内
+        // now_or_never 立即完成（future 为同步体）；async 模式保留 Await 由
+        // `drive_async_loads` await（真异步完成、等子任务）。
+        let is_await = matches!(&result, Ok(EffectOutcome::Await(_)));
+        let result = if self.with(|rt| rt.async_mode) {
+            result
+        } else {
+            match result {
+                Ok(EffectOutcome::Await(fut)) => Ok(futures_util::FutureExt::now_or_never(fut)
+                    .unwrap_or(EffectOutcome::None)),
+                other => other,
+            }
+        };
+        if !is_await {
             let mut rt = self.rt.borrow_mut();
             rt.current.pop();
         }
@@ -303,6 +763,80 @@ impl Cordis {
         global: bool,
         prepend: bool,
     ) -> Result<Disposer, CordisError> {
+        self.on_cb(name, HookCallback::Sync(listener), global, prepend)
+    }
+
+    /// 注册异步监听器（等价 Cordis 中 async 函数监听器）。
+    /// 异步监听器只在 `parallel_async` / `serial_async` 分派中被 await；
+    /// 同步分派（emit/bail/serial/waterfall）跳过（记录差异）。
+    pub fn on_async(
+        &self,
+        name: &str,
+        listener: AsyncListener,
+        global: bool,
+        prepend: bool,
+    ) -> Result<Disposer, CordisError> {
+        self.on_cb(name, HookCallback::Async(listener), global, prepend)
+    }
+
+    /// 注册一次性同步监听器（M42，等价 `ctx.once()`）：首次触发时先移除自身
+    /// 再调用监听器；返回 disposer（与 `on` 同语义——移除监听器，幂等）。
+    pub fn once(
+        &self,
+        name: &str,
+        listener: Listener,
+        global: bool,
+        prepend: bool,
+    ) -> Result<Disposer, CordisError> {
+        let dispose_slot: Rc<RefCell<Option<Disposer>>> = Rc::new(RefCell::new(None));
+        // 包装：首次触发先 dispose 自身再调用监听器（对齐 Cordis `once`：
+        // `const dispose = this.on(name, (...args) => { dispose(); listener(...) })`）。
+        let wrapped: Listener = {
+            let dispose_slot = dispose_slot.clone();
+            Arc::new(move |ctx, args, next| {
+                if let Some(d) = dispose_slot.borrow_mut().take() {
+                    d(ctx);
+                }
+                listener(ctx, args, next)
+            })
+        };
+        let disposer = self.on_cb(name, HookCallback::Sync(wrapped), global, prepend)?;
+        *dispose_slot.borrow_mut() = Some(disposer.clone());
+        Ok(disposer)
+    }
+
+    /// 注册一次性异步监听器（M42，等价 `ctx.once()` 对 async 监听器）。
+    /// 首次触发时先移除自身再调用；异步分派（parallel_async/serial_async）await。
+    pub fn once_async(
+        &self,
+        name: &str,
+        listener: AsyncListener,
+        global: bool,
+        prepend: bool,
+    ) -> Result<Disposer, CordisError> {
+        let dispose_slot: Rc<RefCell<Option<Disposer>>> = Rc::new(RefCell::new(None));
+        let wrapped: AsyncListener = {
+            let dispose_slot = dispose_slot.clone();
+            Arc::new(move |ctx, args| {
+                // 首次触发先 dispose（同步移除），再 await 监听器
+                if let Some(d) = dispose_slot.borrow_mut().take() {
+                    d(ctx);
+                }
+                listener(ctx, args)
+            })
+        };
+        let disposer = self.on_cb(name, HookCallback::Async(wrapped), global, prepend)?;
+        *dispose_slot.borrow_mut() = Some(disposer.clone());
+        Ok(disposer)
+    }
+
+    fn on_cb(
+        &self,
+        name: &str,
+        cb: HookCallback,
+        global: bool,
+        prepend: bool,
+    ) -> Result<Disposer, CordisError> {
         let fid = {
             let rt = self.rt.borrow();
             match rt.current_fiber() {
@@ -310,11 +844,27 @@ impl Cordis {
                 _ => return Err(CordisError::InactiveEffect),
             }
         };
+        // M44：`internal/listener` bail 拦截（对齐 Cordis `ctx.on()`——
+        // `const result = this.bail(this.ctx, 'internal/listener', name, listener,
+        // options); if (result) return result`）。bail 值非 null → 注册被拦截，
+        // 返回 no-op disposer（调用方拿到 disposer 但实际未注册；Value-land
+        // 限制：bail 值无法表达 Rust disposer，仅作拦截标记）。
+        let intercepted = self.bail(
+            "internal/listener",
+            vec![
+                Value::String(name.to_string()),
+                Value::Bool(global),
+                Value::Bool(prepend),
+            ],
+        );
+        if intercepted.is_some() {
+            return Ok(crate::fiber::make_disposer(Box::new(|_| {})));
+        }
         let name_owned = name.to_string();
         self.effect("ctx.on()", Box::new(move |ctx| {
             let id = {
                 let mut rt = ctx.rt.borrow_mut();
-                rt.insert_hook(&name_owned, fid, global, prepend, listener)
+                rt.insert_hook(&name_owned, fid, global, prepend, cb)
             };
             Ok(EffectOutcome::One(crate::fiber::make_disposer(Box::new(
                 move |ctx| {
@@ -341,7 +891,35 @@ impl Cordis {
         let _ = scope;
         let mut args = args;
         for cb in cbs {
-            let _ = (cb)(self, &mut args, None);
+            match cb {
+                HookCallback::Sync(l) => {
+                    let _ = (l)(self, &mut args, None);
+                }
+                // fire-and-forget：经宿主注入的 spawn 钩子驱动异步监听器
+                // （等价 Cordis emit 调用 async listener 但不 await；无钩子则跳过）
+                HookCallback::Async(a) => {
+                    self.fire_async_listener(a, args.clone());
+                }
+            }
+        }
+    }
+
+    /// fire-and-forget 驱动异步监听器（emit 用；经 `Runtime.spawn` 钩子）。
+    /// 无 spawn 钩子（同步宿主）时跳过（记录 trace）。
+    fn fire_async_listener(&self, listener: AsyncListener, args: Vec<Value>) {
+        let ctx = self.clone();
+        let fut: futures_util::future::LocalBoxFuture<'static, ()> = Box::pin(async move {
+            let _ = listener(&ctx, args).await;
+        });
+        let spawned = self.with(|rt| match &rt.spawn {
+            Some(spawn) => {
+                spawn(fut);
+                true
+            }
+            None => false,
+        });
+        if !spawned {
+            self.with(|rt| rt.trace_push("async-listener-skipped"));
         }
     }
 
@@ -351,6 +929,7 @@ impl Cordis {
     }
 
     /// 顺序分派（等价 `ctx.serial()`）：await 语义，首个 bail 即停。
+    /// 同步路径：仅处理同步监听器（异步监听器跳过，见 `serial_async`）。
     pub fn serial(&self, name: &str, args: Vec<Value>) -> Option<Value> {
         self.run_serialish(name, args, "serial")
     }
@@ -369,7 +948,16 @@ impl Cordis {
         };
         let mut args = args;
         for cb in cbs {
-            let r = (cb)(self, &mut args, None);
+            let r = match cb {
+                HookCallback::Sync(l) => (l)(self, &mut args, None),
+                // 同步 bail/serial 对 async listener fire-and-forget（M18）：
+                // 调用但不 await（等价 Cordis `Reflect.apply` 丢弃 Promise，
+                // bail 值不可同步判定 → 继续）。
+                HookCallback::Async(a) => {
+                    self.fire_async_listener(a.clone(), args.clone());
+                    continue;
+                }
+            };
             if r.is_bailed() {
                 return r.value();
             }
@@ -378,6 +966,7 @@ impl Cordis {
     }
 
     /// 全部监听器运行（M0 同步实现，等价 `ctx.parallel()` 的顺序语义）。
+    /// 同步路径：仅处理同步监听器（异步监听器跳过，见 `parallel_async`）。
     pub fn parallel(&self, name: &str, args: Vec<Value>) {
         self.emit(name, args)
     }
@@ -402,6 +991,130 @@ impl Cordis {
         });
         let mut args = args;
         run_chain(&state, self, &mut args)
+    }
+
+    // ---- M7 async 分派 ----
+
+    /// 异步顺序分派：全部监听器并发执行（等价 `ctx.parallel()`），
+    /// 同步与异步监听器混跑；错误聚合为 `AggregateError`（allSettled 语义）。
+    /// 异步顺序分派：全部监听器并发执行（等价 `ctx.parallel()`——Promise.all
+    /// 结果数组），同步与异步监听器混跑；错误聚合为 `AggregateError`
+    /// （allSettled 语义）。M60：返回各监听器返回值（`Continue` → null）。
+    pub async fn parallel_async(&self, name: &str, args: Vec<Value>) -> Result<Vec<Value>, AggregateError> {
+        let cbs = {
+            let mut rt = self.rt.borrow_mut();
+            if !name.starts_with("internal/") {
+                rt.trace_push(&format!("parallel:{name}"));
+            }
+            let scope = rt
+                .current_fiber()
+                .and_then(|fid| rt.fiber(fid).map(|f| f.scope))
+                .unwrap_or(1);
+            rt.collect_hooks(name, scope)
+        };
+        let mut futs: Vec<futures_util::future::LocalBoxFuture<'static, Result<HookResult, CordisError>>> =
+            Vec::new();
+        for cb in cbs {
+            match cb {
+                HookCallback::Sync(l) => {
+                    let ctx = self.clone();
+                    let mut args = args.clone();
+                    futs.push(Box::pin(async move {
+                        Ok((l)(&ctx, &mut args, None))
+                    }));
+                }
+                HookCallback::Async(a) => {
+                    let ctx = self.clone();
+                    let args = args.clone();
+                    futs.push(a(&ctx, args));
+                }
+            }
+        }
+        let results = futures_util::future::join_all(futs).await;
+        let mut out = Vec::with_capacity(results.len());
+        let mut errors: Vec<CordisError> = Vec::new();
+        for r in results {
+            match r {
+                Ok(h) => out.push(h.value().unwrap_or(Value::Null)),
+                Err(e) => errors.push(e),
+            }
+        }
+        if errors.is_empty() {
+            Ok(out)
+        } else {
+            Err(AggregateError { errors })
+        }
+    }
+
+    /// 异步顺序分派：逐个 await 监听器，首个 bail 值即停（等价 `ctx.serial()`）。
+    /// 监听器错误向上传播（`Err`）。
+    pub async fn serial_async(
+        &self,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Option<Value>, CordisError> {
+        let cbs = {
+            let mut rt = self.rt.borrow_mut();
+            if !name.starts_with("internal/") {
+                rt.trace_push(&format!("serial:{name}"));
+            }
+            let scope = rt
+                .current_fiber()
+                .and_then(|fid| rt.fiber(fid).map(|f| f.scope))
+                .unwrap_or(1);
+            rt.collect_hooks(name, scope)
+        };
+        let mut args = args;
+        for cb in cbs {
+            let r = match cb {
+                HookCallback::Sync(l) => (l)(self, &mut args, None),
+                HookCallback::Async(a) => a(self, args.clone()).await?,
+            };
+            if r.is_bailed() {
+                return Ok(r.value());
+            }
+        }
+        Ok(None)
+    }
+
+    /// 让出当前异步任务（等价 Cordis 微任务边界 `await Promise.resolve()`）。
+    /// 无 `futures_util::task`（默认特性关闭）时自实现一个 ready 后再 pending 的 future。
+    pub async fn yield_now() {
+        struct YieldNow(bool);
+        impl std::future::Future for YieldNow {
+            type Output = ();
+            fn poll(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<()> {
+                if self.0 {
+                    std::task::Poll::Ready(())
+                } else {
+                    self.0 = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            }
+        }
+        YieldNow(false).await;
+    }
+
+    /// 等待 fiber 完成加载/卸载（等价 `fiber.await()`）：
+    /// 轮询直到状态离开 Loading/Unloading；FAILED 时返回错误。
+    pub async fn fiber_await(&self, fid: FiberHandle) -> Result<(), CordisError> {
+        loop {
+            let state = self.with(|rt| rt.fiber(fid).map(|f| f.state));
+            match state {
+                Some(FiberState::Loading) | Some(FiberState::Unloading) => {
+                    Self::yield_now().await;
+                }
+                _ => break,
+            }
+        }
+        if let Some(e) = self.fiber_error(fid) {
+            return Err(e);
+        }
+        Ok(())
     }
 
     // ---- 服务 ----
@@ -494,14 +1207,16 @@ impl Cordis {
 
     /// 读取服务（等价 `ctx.get(name)`）：accessor 优先，否则读全局服务仓库。
     pub fn get(&self, name: &str) -> Option<Arc<dyn Any + Send + Sync>> {
-        let accessor_value = {
+        // accessor 优先（先释放借用再调用 get——用户代码可重入）
+        let accessor_get = {
             let rt = self.rt.borrow();
             match rt.props.get(name) {
-                Some(Property::Accessor { get, .. }) => get(self),
+                Some(Property::Accessor { get, .. }) => Some(get.clone()),
                 _ => None,
             }
         };
-        if let Some(v) = accessor_value {
+        if let Some(get) = accessor_get {
+            let v = get(self);
             return Some(Arc::new(v));
         }
         let rt = self.rt.borrow();
@@ -515,10 +1230,95 @@ impl Cordis {
     }
 
     /// 读取 JSON 值形态的服务（accessor/mixin 用）。
+    /// M43：经 `internal/get` waterfall 拦截（对齐 Cordis `ctx.get` 的 Proxy
+    /// handler）——监听器可返回替代值（短路 inner 查表）或 next 委托。
     pub fn get_value(&self, name: &str) -> Option<Value> {
-        self.get(name)
-            .and_then(|v| v.downcast::<Value>().ok())
-            .map(|v| (*v).clone())
+        let this = self.clone();
+        let name_owned = name.to_string();
+        self.waterfall(
+            "internal/get",
+            vec![Value::String(name_owned), Value::Null],
+            Box::new(move |args| {
+                // inner：实际查表（accessor 或 Value 服务）
+                let name = args.first().and_then(|a| a.as_str()).unwrap_or("");
+                this.get_raw_value(name)
+            }),
+        )
+        .and_then(|v| {
+            // 拦截器短路值或 inner 返回值；Null 表示「未找到」
+            if v.is_null() {
+                None
+            } else {
+                Some(v)
+            }
+        })
+    }
+
+    /// 原始查表（不经拦截）：accessor 或 Value 服务（M43 inner）。
+    fn get_raw_value(&self, name: &str) -> Option<Value> {
+        // accessor 优先（clone 闭包，无借用调用——get 内可重入）
+        let accessor_get = {
+            let rt = self.rt.borrow();
+            match rt.props.get(name) {
+                Some(Property::Accessor { get, .. }) => Some(get.clone()),
+                _ => None,
+            }
+        };
+        if let Some(get) = accessor_get {
+            return get(self);
+        }
+        self.get(name).and_then(|v| v.downcast::<Value>().ok()).map(|v| (*v).clone())
+    }
+
+    /// 写 JSON 值形态的服务（M43：对齐 Cordis `ctx.set` 的 Proxy handler）。
+    /// 经 `internal/set` waterfall——监听器可 veto（返回 false，不调用 next）
+    /// 或 next 委托 inner 实际写入。inner 只对**当前 fiber 提供的** Value 服务
+    /// 有效（对齐 Cordis `set` 的所有者校验）；accessor 有 set 钩子则转发。
+    pub fn set_value(&self, name: &str, value: Value) -> Result<(), CordisError> {
+        let this = self.clone();
+        let name_owned = name.to_string();
+        let accepted = self
+            .waterfall(
+                "internal/set",
+                vec![Value::String(name_owned), value.clone(), Value::Null],
+                Box::new(move |args| {
+                    let name = args.first().and_then(|a| a.as_str()).unwrap_or("");
+                    let value = args.get(1).cloned().unwrap_or(Value::Null);
+                    // inner：accessor set 钩子优先；否则覆盖 Value 服务值
+                    let ok = this.set_raw_value(name, value);
+                    Some(Value::Bool(ok))
+                }),
+            )
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if accepted {
+            Ok(())
+        } else {
+            Err(CordisError::Internal(format!("set_value \"{name}\" rejected (vetoed or not writable)")))
+        }
+    }
+
+    /// 原始写入（不经拦截）：accessor set 钩子或覆盖 Value 服务值。
+    fn set_raw_value(&self, name: &str, value: Value) -> bool {
+        // accessor 优先（有 set 钩子则转发）
+        let is_accessor = {
+            let rt = self.rt.borrow();
+            matches!(rt.props.get(name), Some(Property::Accessor { set: Some(_), .. }))
+        };
+        if is_accessor {
+            let accepted = {
+                let rt = self.rt.borrow();
+                match rt.props.get(name) {
+                    Some(Property::Accessor { set: Some(set), .. }) => set(self, value),
+                    _ => false,
+                }
+            };
+            return accepted;
+        }
+        // 覆盖 Value 服务值（仅提供者 fiber 可写，对齐 Cordis `set` 所有者校验）
+        let mut rt = self.rt.borrow_mut();
+        let current = rt.current_fiber();
+        rt.set_impl_value(name, Arc::new(value), current).is_ok()
     }
 
     // ---- intercept / accessor / mixin ----
@@ -629,7 +1429,7 @@ impl Cordis {
             let key_owned = (*key).to_string();
             let d = self.accessor(
                 key,
-                Box::new(move |ctx| {
+                Rc::new(move |ctx| {
                     ctx.get_value(&source_name)
                         .and_then(|v| v.get(&key_owned).cloned())
                 }),
@@ -705,6 +1505,69 @@ impl Cordis {
             rt.dispose_fiber(fid)?;
         }
         self.run_transition(Transition::Unload(fid));
+        Ok(())
+    }
+
+    /// 异步卸载：同步 disposer 逆序执行 + 异步 disposer 并行执行（等价 Cordis
+    /// `_unload` 的 `Promise.all` 清理）。异步 disposer 的错误含化（记录 trace）。
+    pub async fn unload_async(&self, fid: FiberHandle) -> Result<(), CordisError> {
+        {
+            let mut rt = self.rt.borrow_mut();
+            rt.dispose_fiber(fid)?;
+        }
+        let (disposers, async_futs) = {
+            let mut rt = self.rt.borrow_mut();
+            let disposers = rt.begin_unload(fid);
+            let async_futs = rt
+                .fiber_mut(fid)
+                .map(|f| f.take_async_disposers())
+                .unwrap_or_default();
+            (disposers, async_futs)
+        };
+        // M28：卸载让出——多个 fiber 并行卸载（如 Group 子入口）时，Unloading
+        // 状态先全部提交，disposers/finish 再交错执行（对齐 TS `Promise.all`
+        // 卸载：先全部 Unloading 再逐个 Disposed）。
+        Self::yield_now().await;
+        // 同步 disposer：逆序
+        for d in disposers.iter().rev() {
+            d(self);
+        }
+        Self::yield_now().await;
+        // 异步 disposer：并行（join_all），错误含化
+        let cordis = self.clone();
+        let results = futures_util::future::join_all(async_futs.into_iter().map(|fut| {
+            let cordis = cordis.clone();
+            async move {
+                let outcome = fut.await;
+                let mut collected: Vec<Disposer> = Vec::new();
+                let mut stack: Vec<EffectOutcome> = vec![outcome];
+                while let Some(o) = stack.pop() {
+                    match o {
+                        EffectOutcome::None => {}
+                        EffectOutcome::One(d) => collected.push(d),
+                        EffectOutcome::Many(ds) => collected.extend(ds),
+                        EffectOutcome::Async(f) => stack.push(f.await),
+                        // 卸载时 Await 同 Async（await 得到最终 outcome）。
+                        EffectOutcome::Await(f) => stack.push(f.await),
+                    }
+                }
+                for d in collected.iter().rev() {
+                    d(&cordis);
+                }
+            }
+        }))
+        .await;
+        let _ = results;
+        // M28：finish 前让出——多个 fiber 并行卸载时 Disposed 状态交错提交。
+        Self::yield_now().await;
+        let next = {
+            let mut rt = self.rt.borrow_mut();
+            rt.finish_unload(fid)
+        };
+        if let Some(t) = next {
+            self.run_transition(t);
+        }
+        self.drain_internal();
         Ok(())
     }
 
@@ -838,12 +1701,22 @@ impl Cordis {
     }
 
     fn run_unload(&self, fid: FiberId) {
-        let disposers = {
+        let (disposers, has_async) = {
             let mut rt = self.rt.borrow_mut();
-            rt.begin_unload(fid)
+            let disposers = rt.begin_unload(fid);
+            // 同步 unload 无法 await 异步 disposer：显式取出并记录（不静默丢弃）。
+            // 需用异步卸载（`unload_async`）执行完整异步清理。
+            let has_async = rt
+                .fiber(fid)
+                .map(|f| !f.async_disposers.is_empty())
+                .unwrap_or(false);
+            (disposers, has_async)
         };
         for d in disposers.iter().rev() {
             d(self);
+        }
+        if has_async {
+            self.with(|rt| rt.trace_push("async-disposers-skipped"));
         }
         let next = {
             let mut rt = self.rt.borrow_mut();

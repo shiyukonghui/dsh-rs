@@ -1,0 +1,17 @@
+plugin:a
+status:a:Pending:Loading
+apply:a
+log:a-apply
+plugin:b
+status:b:Pending:Loading
+log:a-after-plugin
+apply:b
+log:b-apply
+plugin:c
+status:c:Pending:Loading
+log:b-after-plugin
+status:a:Loading:Active
+apply:c
+log:c-apply
+status:b:Loading:Active
+status:c:Loading:Active

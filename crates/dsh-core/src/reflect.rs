@@ -1,6 +1,7 @@
 //! 服务仓库与实现记录（对应 PLAN §1.3）。
 
 use std::any::Any;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::context::Cordis;
@@ -41,9 +42,10 @@ pub enum PropertyKind {
 }
 
 /// accessor 的 get 钩子：`(ctx) -> Option<Value>`。
-pub type AccessorGet = Box<dyn Fn(&Cordis) -> Option<Value>>;
+/// `Rc`：可 clone 取出后无借用调用（收集-再执行纪律——get 内可重入）。
+pub type AccessorGet = Rc<dyn Fn(&Cordis) -> Option<Value>>;
 /// accessor 的 set 钩子：`(ctx, value) -> bool`（返回 false 拒绝写入）。
-pub type AccessorSet = Box<dyn Fn(&Cordis, Value) -> bool>;
+pub type AccessorSet = Rc<dyn Fn(&Cordis, Value) -> bool>;
 
 /// 上下文属性（Cordis `Property.Service | Property.Accessor`）。
 pub enum Property {

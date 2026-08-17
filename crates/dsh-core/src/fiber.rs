@@ -4,6 +4,8 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use futures_util::future::LocalBoxFuture;
+
 use crate::context::Cordis;
 use crate::error::CordisError;
 use crate::types::{FiberId, ImplId, ScopeId, Value};
@@ -41,6 +43,13 @@ pub enum EffectOutcome {
     None,
     One(Disposer),
     Many(Vec<Disposer>),
+    /// 异步 effect：future resolve 后得到最终 outcome（支持嵌套 `Async`）。
+    /// 由 `unload_async` 在卸载时并行执行（等价 Cordis async disposer）。
+    Async(LocalBoxFuture<'static, EffectOutcome>),
+    /// apply 期间异步完成（M27：等价 Cordis `[Service.init]` async generator）：
+    /// future resolve 后得到最终 outcome；在此期间 fiber 保持 Loading，
+    /// 排入的子任务（如 Group 的子入口）先完成，之后才 finish（Active）。
+    Await(LocalBoxFuture<'static, EffectOutcome>),
 }
 
 /// effect 主体：`FnOnce(&Cordis) -> Result<EffectOutcome, CordisError>`。
@@ -64,6 +73,9 @@ pub struct FiberData {
     /// 对应 Cordis `ctx[Context.isolate]`。
     pub isolate: HashMap<String, ScopeId>,
     pub state: FiberState,
+    /// M27：apply 返回 `Await`——finish 前等待所有 Loading 后代完成
+    /// （等价 Cordis `[Service.init]` await 子任务；Group 挂载子入口用）。
+    pub await_children: bool,
     /// 依赖的服务名。
     pub inject: Vec<String>,
     /// 已解析的依赖：服务名 → 实现 id。
@@ -73,6 +85,8 @@ pub struct FiberData {
     pub intercept: Vec<(String, Value)>,
     /// 已注册的 disposer（注册顺序；卸载时逆序运行）。
     pub disposers: Vec<Disposer>,
+    /// 异步 disposer（M7；注册顺序；`unload_async` 并行执行）。
+    pub async_disposers: Vec<LocalBoxFuture<'static, EffectOutcome>>,
     /// 校验后的配置。
     pub config: Value,
     pub error: Option<CordisError>,
@@ -87,12 +101,23 @@ impl FiberData {
     ///
     /// 对应 Cordis `Fiber.effect()` 的收集/包装部分：产出按注册顺序保存，
     /// 运行时逆序执行；包装器带一次性标志，fiber 卸载与调用方共享同一实例。
+    ///
+    /// `EffectOutcome::Async` 被存入 `async_disposers`（同步 wrapper 不含该部分，
+    /// 由 `unload_async` 并行执行）。
     pub fn collect_effect(&mut self, label: &'static str, outcome: EffectOutcome) -> Disposer {
         let mut collected: Vec<Disposer> = Vec::new();
         match outcome {
             EffectOutcome::None => {}
             EffectOutcome::One(d) => collected.push(d),
             EffectOutcome::Many(ds) => collected.extend(ds),
+            EffectOutcome::Async(fut) => {
+                self.async_disposers.push(fut);
+                return make_disposer(Box::new(|_| {}));
+            }
+            // apply 期间的 Await 由 `drive_async_loads` 先 await 再 collect（不直接出现于此）。
+            EffectOutcome::Await(_) => {
+                return make_disposer(Box::new(|_| {}));
+            }
         }
         let ran = Rc::new(Cell::new(false));
         let _label = label;
@@ -117,5 +142,10 @@ impl FiberData {
     /// 卸载：取出全部 disposer（注册顺序），由调用方逆序执行。
     pub fn take_disposers(&mut self) -> Vec<Disposer> {
         std::mem::take(&mut self.disposers)
+    }
+
+    /// 取出异步 disposer（M7；`unload_async` 用）。
+    pub fn take_async_disposers(&mut self) -> Vec<LocalBoxFuture<'static, EffectOutcome>> {
+        std::mem::take(&mut self.async_disposers)
     }
 }

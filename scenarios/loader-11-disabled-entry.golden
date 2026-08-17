@@ -1,0 +1,15 @@
+loader-sync:[{"config":{"k":1},"id":"e1","name":"a"},{"config":{"k":2},"disabled":true,"id":"e2","name":"a"}]
+plugin:a
+status:a:Pending:Loading
+apply:a
+log:apply-a
+status:a:Loading:Active
+loader-update:e2:{"config":{"k":3},"disabled":false,"id":"e2","name":"a"}
+plugin:a
+status:a:Pending:Loading
+apply:a
+log:apply-a
+status:a:Loading:Active
+loader-update:e1:{"config":{"k":4},"disabled":true,"id":"e1","name":"a"}
+status:a:Active:Unloading
+status:a:Unloading:Disposed

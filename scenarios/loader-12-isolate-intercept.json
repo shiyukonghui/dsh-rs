@@ -1,0 +1,14 @@
+{
+  "name": "loader-12-isolate-intercept",
+  "plugins": {
+    "a": { "name": "a", "apply": [{ "op": "log", "text": "apply-a" }] }
+  },
+  "steps": [
+    { "op": "loader-sync", "entries": [
+      { "id": "e1", "name": "a", "config": { "k": 1 }, "isolate": { "svc": true } },
+      { "id": "e2", "name": "a", "config": { "k": 2 }, "intercept": { "svc": { "tag": "x" } } }
+    ] },
+    { "op": "loader-update", "id": "e2", "options": { "id": "e2", "name": "a", "config": { "k": 3 }, "isolate": { "svc": "global-a" }, "intercept": {} } },
+    { "op": "loader-update", "id": "e1", "options": { "id": "e1", "name": "a", "config": { "k": 4 }, "intercept": { "svc": { "tag": "y" } } } }
+  ]
+}

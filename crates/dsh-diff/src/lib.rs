@@ -44,6 +44,10 @@ pub struct PluginDesc {
     pub apply: Vec<ApplyOp>,
 }
 
+/// loader 场景的 entry 选项（与 `EntryOptions` 兼容的 JSON 形态）。
+/// 用原始 `serde_json::Value` 承载以保留键序（与 TS 输入原序一致）。
+pub type LoaderEntry = serde_json::Value;
+
 /// 插件 apply 操作（微型 DSL）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
@@ -114,6 +118,14 @@ pub enum Step {
     },
     Unload { id: String },
     Update { id: String, config: serde_json::Value },
+    /// loader 场景：整树同步（事务；对应 TS `ctx.loader.root.update`）。
+    LoaderSync { entries: Vec<LoaderEntry> },
+    /// loader 场景：创建入口（对应 TS `ctx.loader.root.create`）。
+    LoaderCreate { options: LoaderEntry },
+    /// loader 场景：更新入口（对应 TS `ctx.loader.update(id, options)`）。
+    LoaderUpdate { id: String, options: LoaderEntry },
+    /// loader 场景：移除入口（对应 TS `ctx.loader.remove(id)`）。
+    LoaderRemove { id: String },
 }
 
 /// 场景解释器（Rust 侧）。
@@ -121,6 +133,8 @@ pub struct Runner {
     pub ctx: Cordis,
     plugins: Rc<RefCell<HashMap<String, Arc<dyn Plugin>>>>,
     fibers: HashMap<String, FiberId>,
+    /// loader 场景专用（懒初始化；Loader 插件挂载在 ctx 上）。
+    loader: Option<dsh_loader::Loader>,
 }
 
 impl Runner {
@@ -129,11 +143,33 @@ impl Runner {
             ctx: Cordis::new(),
             plugins: Rc::new(RefCell::new(HashMap::new())),
             fibers: HashMap::new(),
+            loader: None,
         }
     }
 
     fn trace_line(&self, line: &str) {
         self.ctx.with(|rt| rt.trace.push(line.to_string()));
+    }
+
+    /// 懒初始化 loader（挂载 Loader 插件 + 注册场景插件到仓库）。
+    /// 挂载产生的 `plugin:loader`/`status:loader` trace 丢弃（TS 侧在框架
+    /// 监听注册前挂载 Loader，golden 不含这些行）。
+    fn ensure_loader(&mut self, scenario: &Scenario) -> Result<(), CordisError> {
+        if self.loader.is_some() {
+            return Ok(());
+        }
+        let loader = dsh_loader::Loader::new(&self.ctx)?;
+        // 注册场景插件（entry.name 直接解析）
+        for (id, desc) in &scenario.plugins {
+            let plugin: Arc<dyn Plugin> = Arc::new(ScenarioPlugin {
+                desc: desc.clone(),
+                plugins: self.plugins.clone(),
+            });
+            loader.register_plugin(id, plugin);
+        }
+        self.loader = Some(loader);
+        self.ctx.take_trace();
+        Ok(())
     }
 
     /// 执行整个场景，返回规范化 trace。
@@ -203,8 +239,98 @@ impl Runner {
                 let fid = self.fiber_of(id)?;
                 self.ctx.update(fid, config.clone())?;
             }
+            // loader 场景必须走 async 路径（事务 allSettled）
+            Step::LoaderSync { .. }
+            | Step::LoaderCreate { .. }
+            | Step::LoaderUpdate { .. }
+            | Step::LoaderRemove { .. } => {
+                return Err(CordisError::Internal(
+                    "loader scenario steps require --async".into(),
+                ))
+            }
         }
         Ok(())
+    }
+
+    /// M7：异步执行步骤（`plugin_arc_async` 真实微任务让出；深嵌套场景用）。
+    async fn run_step_async(&mut self, scenario: &Scenario, step: &Step) -> Result<(), CordisError> {
+        match step {
+            Step::Plugin { id } => {
+                let plugin = self
+                    .plugins
+                    .borrow()
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| CordisError::Internal(format!("scenario: unknown plugin {id}")))?;
+                let fid = self.ctx.plugin_arc_async(plugin, serde_json::json!({})).await?;
+                self.fibers.insert(id.to_string(), fid);
+            }
+            Step::PluginWithConfig { id, config } => {
+                let plugin = self
+                    .plugins
+                    .borrow()
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| CordisError::Internal(format!("scenario: unknown plugin {id}")))?;
+                let fid = self.ctx.plugin_arc_async(plugin, config.clone()).await?;
+                self.fibers.insert(id.to_string(), fid);
+            }
+            // ---- M20：loader 场景（事务 allSettled；对应 TS loader-host） ----
+            Step::LoaderSync { entries } => {
+                self.ensure_loader(scenario)?;
+                self.trace_line(&format!("loader-sync:{}", serde_json::to_string(entries).unwrap_or_default()));
+                let opts: Vec<dsh_loader::EntryOptions> =
+                    entries.iter().map(to_entry_options).collect();
+                match self.loader.as_ref().unwrap().sync_async(&opts).await {
+                    Ok(()) => {}
+                    Err(e) => self.trace_line(&format!("loader-error:{}", e.errors.len())),
+                }
+            }
+            Step::LoaderCreate { options } => {
+                self.ensure_loader(scenario)?;
+                self.trace_line(&format!("loader-create:{}", serde_json::to_string(options).unwrap_or_default()));
+                let opts = to_entry_options(options);
+                match self.loader.as_ref().unwrap().create_async(opts).await {
+                    Ok(_) => {}
+                    Err(_e) => self.trace_line(&format!("loader-error:{}", 1)),
+                }
+            }
+            Step::LoaderUpdate { id, options } => {
+                self.ensure_loader(scenario)?;
+                self.trace_line(&format!("loader-update:{id}:{}", serde_json::to_string(options).unwrap_or_default()));
+                let opts = to_entry_options(options);
+                match self.loader.as_ref().unwrap().update_async(id, opts).await {
+                    Ok(()) => {}
+                    Err(_e) => self.trace_line(&format!("loader-error:{}", 1)),
+                }
+            }
+            Step::LoaderRemove { id } => {
+                self.ensure_loader(scenario)?;
+                self.trace_line(&format!("loader-remove:{id}"));
+                match self.loader.as_ref().unwrap().remove_async(id).await {
+                    Ok(()) => {}
+                    Err(_e) => self.trace_line(&format!("loader-error:{}", 1)),
+                }
+            }
+            other => self.run_step(other)?,
+        }
+        Ok(())
+    }
+
+    /// M7：以异步编排执行整个场景（挂载走 `plugin_arc_async`）。
+    pub async fn run_async(&mut self, scenario: &Scenario) -> Result<Vec<String>, CordisError> {
+        let descs: Vec<(String, PluginDesc)> = scenario.plugins.clone().into_iter().collect();
+        for (id, desc) in &descs {
+            let plugin: Arc<dyn Plugin> = Arc::new(ScenarioPlugin {
+                desc: desc.clone(),
+                plugins: self.plugins.clone(),
+            });
+            self.plugins.borrow_mut().insert(id.clone(), plugin);
+        }
+        for step in &scenario.steps {
+            self.run_step_async(scenario, step).await?;
+        }
+        Ok(self.ctx.take_trace())
     }
 
     fn fiber_of(&self, id: &str) -> Result<FiberId, CordisError> {
@@ -446,4 +572,35 @@ pub fn diff_trace(actual: &[String], golden: &[String]) -> Vec<String> {
         }
     }
     diffs
+}
+
+/// loader 场景 entry（原始 JSON）→ `EntryOptions`（name 原样；disabled/group 透传）。
+fn to_entry_options(e: &LoaderEntry) -> dsh_loader::EntryOptions {
+    let id = e.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+    let name = e.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+    let mut opts = dsh_loader::EntryOptions::new(id, name);
+    if let Some(cfg) = e.get("config") {
+        if !cfg.is_null() {
+            opts.config = cfg.clone();
+        }
+    }
+    opts.disabled = e.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    opts.group = e.get("group").and_then(|v| v.as_bool()).unwrap_or(false);
+    // isolate / intercept 透传（M62）：服务隔离与拦截配置原样透传，使 Rust 侧
+    // 差分场景不静默丢弃 entry 的服务接线字段（与 TS 宿主 `{...e}` 透传一致）。
+    opts.isolate = obj_map(e, "isolate");
+    opts.intercept = obj_map(e, "intercept");
+    opts
+}
+
+/// 从 loader entry JSON 中取对象字段 → `HashMap<String, Value>`。
+fn obj_map(e: &LoaderEntry, key: &str) -> HashMap<String, Value> {
+    e.get(key)
+        .and_then(|v| v.as_object())
+        .map(|o| {
+            o.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }

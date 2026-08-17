@@ -1,0 +1,21 @@
+{
+  "name": "loader-10-group-nested",
+  "plugins": {
+    "a": { "name": "a", "apply": [{ "op": "log", "text": "apply-a" }] }
+  },
+  "steps": [
+    { "op": "loader-sync", "entries": [
+      { "id": "g1", "name": "group", "group": true, "config": [
+        { "id": "c1", "name": "a", "config": { "k": 1 } },
+        { "id": "c2", "name": "a", "config": { "k": 2 } }
+      ] }
+    ] },
+    { "op": "loader-sync", "entries": [
+      { "id": "g1", "name": "group", "group": true, "config": [
+        { "id": "c1", "name": "a", "config": { "k": 3 } },
+        { "id": "c3", "name": "a", "config": { "k": 4 } }
+      ] }
+    ] },
+    { "op": "loader-remove", "id": "g1" }
+  ]
+}

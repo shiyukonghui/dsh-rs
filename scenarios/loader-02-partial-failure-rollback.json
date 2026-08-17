@@ -1,0 +1,19 @@
+{
+  "name": "loader-02-partial-failure-rollback",
+  "plugins": {
+    "a": { "name": "a", "apply": [{ "op": "log", "text": "apply-a" }] }
+  },
+  "steps": [
+    { "op": "loader-sync", "entries": [
+      { "id": "e1", "name": "a", "config": { "k": 1 } }
+    ] },
+    { "op": "loader-sync", "entries": [
+      { "id": "e1", "name": "a", "config": { "k": 2 } },
+      { "id": "e2", "name": "a", "config": { "k": 3 } },
+      { "id": "e3", "name": "missing-plugin", "config": { "k": 4 } }
+    ] },
+    { "op": "loader-sync", "entries": [
+      { "id": "e1", "name": "a", "config": { "k": 1 } }
+    ] }
+  ]
+}

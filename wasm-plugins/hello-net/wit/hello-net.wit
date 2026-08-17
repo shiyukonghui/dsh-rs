@@ -1,0 +1,10 @@
+// hello-net 的 world：use dsh 插件契约的接口，导出 plugin-api。
+package dsh:hello-net;
+
+use dsh:plugin/plugin-api;
+use dsh:plugin/host-api;
+
+world dsh-plugin {
+  export plugin-api;
+  import host-api;
+}

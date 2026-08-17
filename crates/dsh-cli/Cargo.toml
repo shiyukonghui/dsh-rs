@@ -1,0 +1,22 @@
+[package]
+name = "dsh-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "DSH layer launcher: boot from cordis.yml (services + WASM loop), drive one turn."
+
+[[bin]]
+name = "dsh"
+path = "src/main.rs"
+
+[dependencies]
+dsh-core = { path = "../dsh-core" }
+dsh-loader = { path = "../dsh-loader" }
+dsh-wasmrt = { path = "../dsh-wasmrt" }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

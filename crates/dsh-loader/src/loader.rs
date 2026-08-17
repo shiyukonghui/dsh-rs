@@ -9,14 +9,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use dsh_core::{
-    Cordis, CordisError, EffectOutcome, FiberId, FiberState, HookResult, Listener, Plugin, ScopeId,
-    Value,
+    AggregateError, Cordis, CordisError, EffectOutcome, FiberId, FiberState, HookResult, Listener,
+    Plugin, ScopeId, Value,
 };
 
 use crate::entry::{Entry, EntryOptions};
 use crate::group::EntryGroup;
 
 const ROOT_GROUP: &str = "root";
+
+/// allSettled 并行 create/update 的 future 结果（id, result, is_new）。
+type SyncResult = (String, Result<(), CordisError>, bool);
 
 /// Loader 运行时状态（entry 树 + 插件仓库 + 反查索引）。
 #[derive(Default)]
@@ -263,6 +266,95 @@ pub struct Loader {
     pub state: Rc<RefCell<LoaderState>>,
     /// loader 插件 fiber。
     pub fid: FiberId,
+}
+
+/// Group 插件（M22：对应 Cordis `Group extends EntryGroup`）。
+///
+/// group 入口经本插件注册为真实 fiber（`plugin:Group`/`status:Group`），
+/// apply 时挂载子入口（同步 `plugin_arc` → 子入口 parent 自动 = Group fiber，
+/// 与 TS 的嵌套注册一致）；卸载时递归 stop 子入口。
+struct GroupPlugin {
+    /// 归属 Loader（经其挂载子入口）。
+    loader: Loader,
+    /// group 入口 id（apply 时经 pending_entry 关联；插件的 config 是子入口数组）。
+    entry_id: String,
+}
+
+impl Plugin for GroupPlugin {
+    fn name(&self) -> &'static str {
+        "Group"
+    }
+
+    fn apply(&self, ctx: &Cordis, config: Value) -> Result<EffectOutcome, CordisError> {
+        // 挂载子入口：config = 子 EntryOptions 数组。返回 `Await`——future 内
+        // 异步挂载子入口（M27：等价 Cordis `[Service.init]` await update）；
+        // 子入口 parent 自动 = Group fiber，且全部 Active 后 Group 才 finish。
+        let loader = self.loader.clone();
+        let gid = self.entry_id.clone();
+
+        // 卸载 disposer：递归卸载子入口（stop 语义；随 Group fiber 卸载执行）。
+        // 用 `EffectOutcome::Async`——`unload_async` 并行 await：子入口**并行**
+        // 卸载（对齐 TS `Promise.allSettled(stop)`：先全部 Unloading 再全部
+        // Disposed）。
+        let stop_loader = self.loader.clone();
+        let stop_gid = self.entry_id.clone();
+        ctx.effect(
+            "group-stop",
+            Box::new(move |_ctx| {
+                let loader = stop_loader.clone();
+                let gid = stop_gid.clone();
+                Ok(EffectOutcome::Async(Box::pin(async move {
+                    let children: Vec<String> = {
+                        let st = loader.state.borrow();
+                        match st.entries.get(&gid).and_then(|e| e.subgroup.clone()) {
+                            Some(sg) => st
+                                .groups
+                                .get(&sg)
+                                .map(|g| g.data.clone())
+                                .unwrap_or_default(),
+                            None => Vec::new(),
+                        }
+                    };
+                    // 并行卸载子入口（join_all；顺序无关——各自 Unloading→Disposed）
+                    let futs: Vec<_> = children.iter().map(|c| {
+                        let loader = loader.clone();
+                        let c = c.clone();
+                        async move { loader.dispose_entry_async(&c).await }
+                    }).collect();
+                    let _ = futures_util::future::join_all(futs).await;
+                    EffectOutcome::None
+                })))
+            }),
+        )?;
+
+        // 子入口 async 挂载（Await）：同步注册（async 模式入队由 drive 驱动）
+        // 或 async await（async 路径）。用 `start_entry`（同步注册，parent 正确）：
+        // async 模式下 run_or_defer 入队 → 子入口 Apply 在 Group 的 Await future
+        // 之后处理 → Finish 延迟逻辑保证子入口先 Active。
+        let children: Vec<EntryOptions> = match config {
+            Value::Array(items) => items
+                .iter()
+                .map(|v| serde_json::from_value(v.clone()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    CordisError::Internal(format!("group {gid} config invalid: {e}"))
+                })?,
+            _ => {
+                return Err(CordisError::Internal(format!(
+                    "group {gid} config must be an array of entries"
+                )))
+            }
+        };
+        let fut: futures_util::future::LocalBoxFuture<'static, EffectOutcome> = Box::pin(async move {
+            for child in children {
+                let cid = child.id.clone();
+                loader.insert_child(&gid, child);
+                loader.start_entry(&cid).ok();
+            }
+            EffectOutcome::None
+        });
+        Ok(EffectOutcome::Await(fut))
+    }
 }
 
 impl Loader {
@@ -536,6 +628,30 @@ impl Loader {
         Ok(())
     }
 
+    /// 等待入口树收敛（等价 `EntryTree.await()`）：轮询直到没有 fiber 处于
+    /// Loading/Unloading（同步核心下立即返回；异步加载路径下让出直到稳定）。
+    pub async fn await_idle(&self) -> Result<(), CordisError> {
+        loop {
+            let busy = {
+                let st = self.state.borrow();
+                st.entries.values().any(|e| {
+                    e.fiber
+                        .map(|f| {
+                            matches!(
+                                self.ctx.fiber_state(f),
+                                Some(FiberState::Loading) | Some(FiberState::Unloading)
+                            )
+                        })
+                        .unwrap_or(false)
+                })
+            };
+            if !busy {
+                return Ok(());
+            }
+            dsh_core::Cordis::yield_now().await;
+        }
+    }
+
     fn write(&self, record: &str) {
         self.state.borrow_mut().writes.push(record.to_string());
     }
@@ -554,10 +670,38 @@ impl Loader {
             st.entries.get(id).map(|e| e.options.group).unwrap_or(false)
         };
         if is_group {
-            self.mount_group_children(id)
+            self.load_group_plugin(id)
         } else {
             self.load_plugin(id)
         }
+    }
+
+    /// 注册 Group 插件（group 入口的 fiber 形态）：config = 子入口数组。
+    fn load_group_plugin(&self, id: &str) -> Result<(), CordisError> {
+        let config = {
+            let st = self.state.borrow();
+            st.entries
+                .get(id)
+                .map(|e| e.options.config.clone())
+                .unwrap_or_default()
+        };
+        let plugin = Arc::new(GroupPlugin {
+            loader: self.clone(),
+            entry_id: id.to_string(),
+        });
+        self.ctx.with(|rt| rt.pending_entry = Some(id.to_string()));
+        let fid = self.ctx.plugin_arc(plugin, config)?;
+        {
+            let mut st = self.state.borrow_mut();
+            if let Some(e) = st.entries.get_mut(id) {
+                e.fiber = Some(fid);
+            }
+            st.fiber_to_entry.insert(fid, id.to_string());
+        }
+        if let Some(err) = self.ctx.fiber_error(fid) {
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// 加载插件：pending_entry/isolate/intercept → plugin_arc → 关联 fiber。
@@ -634,34 +778,6 @@ impl Loader {
         Ok(())
     }
 
-    /// 组入口：挂载子入口（config 为子 EntryOptions 数组）。
-    fn mount_group_children(&self, id: &str) -> Result<(), CordisError> {
-        let children = self.parse_children(id)?;
-        let mut created: Vec<String> = Vec::new();
-        for child in children {
-            let cid = child.id.clone();
-            self.insert_child(id, child);
-            if let Err(e) = self.start_entry(&cid) {
-                for c in &created {
-                    let _ = self.dispose_entry(c);
-                    let mut st = self.state.borrow_mut();
-                    st.entries.remove(c);
-                    if let Some(g) = st
-                        .entries
-                        .get(id)
-                        .and_then(|e| e.subgroup.clone())
-                        .and_then(|gid| st.groups.get_mut(&gid))
-                    {
-                        g.data.retain(|x| x != c);
-                    }
-                }
-                return Err(e);
-            }
-            created.push(cid);
-        }
-        Ok(())
-    }
-
     /// 组入口：同步子入口（移除缺席、创建新增、更新既有）。
     fn sync_children(&self, id: &str) -> Result<(), CordisError> {
         let children = self.parse_children(id)?;
@@ -680,16 +796,8 @@ impl Loader {
             (sg, existing)
         };
         let new_ids: HashSet<String> = children.iter().map(|c| c.id.clone()).collect();
-        // 移除缺席
-        for cid in existing.iter().filter(|c| !new_ids.contains(*c)) {
-            self.dispose_entry(cid)?;
-            let mut st = self.state.borrow_mut();
-            st.entries.remove(cid);
-            if let Some(g) = st.groups.get_mut(&subgroup) {
-                g.data.retain(|x| x != cid);
-            }
-        }
-        // 创建新增 / 更新既有
+        // 创建新增 / 更新既有（先；对应 Cordis `EntryGroup.update` 顺序：
+        // allSettled create 全部 → 全成功后才移除缺席）
         for child in children {
             if new_ids.contains(&child.id) && existing.contains(&child.id) {
                 self.update(&child.id, child.clone())?;
@@ -697,6 +805,15 @@ impl Loader {
                 let cid = child.id.clone();
                 self.insert_child(id, child);
                 self.start_entry(&cid)?;
+            }
+        }
+        // 移除缺席（后）
+        for cid in existing.iter().filter(|c| !new_ids.contains(*c)) {
+            self.dispose_entry(cid)?;
+            let mut st = self.state.borrow_mut();
+            st.entries.remove(cid);
+            if let Some(g) = st.groups.get_mut(&subgroup) {
+                g.data.retain(|x| x != cid);
             }
         }
         Ok(())
@@ -757,29 +874,28 @@ impl Loader {
         }
     }
 
-    /// 卸载入口（组 → 递归子入口；普通 → 卸载 fiber）。`disposing` 保护 7-case case 6。
+    /// 卸载入口（组 → 卸载 Group fiber，disposer 递归 stop 子入口；普通 → 卸载 fiber）。
+    /// `disposing` 保护 7-case case 6。
     fn dispose_entry(&self, id: &str) -> Result<(), CordisError> {
-        // 组：先递归卸载子入口
-        let subgroup = {
+        // group 入口：同步路径无法 await Group 的 Async stop disposer——
+        // 先同步串行卸载子入口（Async 并行留给 unload_async 路径）
+        let is_group = {
             let st = self.state.borrow();
-            st.entries.get(id).and_then(|e| e.subgroup.clone())
+            st.entries.get(id).map(|e| e.options.group).unwrap_or(false)
         };
-        if let Some(sg) = subgroup {
-            let children = {
+        if is_group {
+            let children: Vec<String> = {
                 let st = self.state.borrow();
-                st.groups.get(&sg).map(|g| g.data.clone()).unwrap_or_default()
+                match st.entries.get(id).and_then(|e| e.subgroup.clone()) {
+                    Some(sg) => st.groups.get(&sg).map(|g| g.data.clone()).unwrap_or_default(),
+                    None => Vec::new(),
+                }
             };
-            for c in &children {
-                self.dispose_entry(c)?;
-            }
-            let mut st = self.state.borrow_mut();
-            st.groups.remove(&sg);
-            st.group_owner.remove(&sg);
-            if let Some(e) = st.entries.get_mut(id) {
-                e.subgroup = None;
+            for c in children {
+                self.dispose_entry(&c)?;
             }
         }
-        // 自身 fiber
+        // 自身 fiber（group 入口 = Group fiber；普通 = 插件 fiber）
         let fid = {
             let st = self.state.borrow();
             st.entries.get(id).and_then(|e| e.fiber)
@@ -801,6 +917,557 @@ impl Loader {
                 st.fiber_to_entry.remove(&fid);
             }
             r?;
+        }
+        // group 结构清理（子入口已卸载；此处移除 subgroup 引用）
+        {
+            let mut st = self.state.borrow_mut();
+            if let Some(sg) = st.entries.get(id).and_then(|e| e.subgroup.clone()) {
+                st.groups.remove(&sg);
+                st.group_owner.remove(&sg);
+                if let Some(e) = st.entries.get_mut(id) {
+                    e.subgroup = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ---- M14：async 生命周期（create/update/remove + allSettled 事务） ----
+
+    /// 异步创建入口（等价 `Loader::create`，加载走 `plugin_arc_async`）。
+    pub async fn create_async(&self, options: EntryOptions) -> Result<String, CordisError> {
+        let id = options.id.clone();
+        {
+            let mut st = self.state.borrow_mut();
+            if st.entries.contains_key(&id) {
+                return Err(CordisError::Internal(format!(
+                    "duplicate loader entry id: {id}"
+                )));
+            }
+            let root = st.root_group.clone();
+            st.entries.insert(
+                id.clone(),
+                Entry {
+                    id: id.clone(),
+                    options,
+                    fiber: None,
+                    parent_group: root.clone(),
+                    subgroup: None,
+                    disposing: 0,
+                },
+            );
+            if let Some(g) = st.groups.get_mut(&root) {
+                g.data.push(id.clone());
+            }
+        }
+        if !self.is_disabled(&id) {
+            if let Err(e) = self.start_entry_async(&id).await {
+                let _ = self.dispose_entry_async(&id).await;
+                let mut st = self.state.borrow_mut();
+                st.entries.remove(&id);
+                let root = st.root_group.clone();
+                if let Some(g) = st.groups.get_mut(&root) {
+                    g.data.retain(|x| x != &id);
+                }
+                return Err(e);
+            }
+        }
+        self.write(&format!("create:{id}"));
+        Ok(id)
+    }
+
+    /// 异步更新入口（四分支事务 + 回滚，生命周期走 async 路径）。
+    /// group 子入口更新经 Box::pin 递归（嵌套 group 不爆栈）。
+    pub async fn update_async(&self, id: &str, options: EntryOptions) -> Result<(), CordisError> {
+        let fut: futures_util::future::LocalBoxFuture<'_, Result<(), CordisError>> =
+            Box::pin(async move { self.update_one_async(id, options).await });
+        fut.await
+    }
+
+    /// 单入口更新（四分支）；group 分支子入口按 config 序立即处理（递归）。
+    async fn update_one_async(
+        &self,
+        id: &str,
+        options: EntryOptions,
+    ) -> Result<(), CordisError> {
+        let (prev, is_group, active) = {
+            let st = self.state.borrow();
+            let e = st
+                .entries
+                .get(id)
+                .ok_or_else(|| CordisError::Internal(format!("no such loader entry: {id}")))?;
+            let is_group = e.options.group;
+            // group 入口没有 fiber：以子组是否创建判定「已启动」
+            let active = if is_group {
+                e.subgroup.is_some()
+            } else {
+                e.fiber
+                    .map(|f| self.ctx.fiber_uid(f).is_some())
+                    .unwrap_or(false)
+            };
+            (e.options.clone(), is_group, active)
+        };
+        let mut candidate = prev.clone();
+        candidate.name = options.name;
+        candidate.config = options.config;
+        candidate.disabled = options.disabled;
+        // 部分更新语义（Cordis：仅合并传入的键）：None/空 = 保留现值
+        if options.disabled_expr.is_some() {
+            candidate.disabled_expr = options.disabled_expr;
+        }
+        candidate.group = options.group;
+        candidate.inject = options.inject;
+        if !options.isolate.is_empty() {
+            candidate.isolate = options.isolate;
+        }
+        if !options.intercept.is_empty() {
+            candidate.intercept = options.intercept;
+        }
+        let diff = options_diff(&prev, &candidate);
+        if diff.is_empty() {
+            return Ok(());
+        }
+        let replace = diff.name || diff.group || diff.inject;
+
+        // 写入候选配置（失败回滚 prev）
+        {
+            let mut st = self.state.borrow_mut();
+            st.entries.get_mut(id).unwrap().options = candidate.clone();
+        }
+
+        if !active {
+            // 分支 1：未启动 —— 设置配置；未禁用则启动
+            if !self.is_disabled(id) {
+                if let Err(e) = self.start_entry_async(id).await {
+                    self.rollback_options(id, &prev);
+                    return Err(e);
+                }
+            }
+            self.write(&format!("create:{id}"));
+            return Ok(());
+        }
+
+        if self.is_disabled(id) {
+            // 分支 2：候选禁用 —— 卸载
+            if let Err(e) = self.dispose_entry_async(id).await {
+                self.rollback_options(id, &prev);
+                return Err(e);
+            }
+            self.write(&format!("disable:{id}"));
+            return Ok(());
+        }
+
+        if is_group {
+            // 组入口：同步子入口（对应 Cordis `EntryGroup.update(config)` 顺序：
+            // allSettled create 全部 → 全成功后才移除缺席）
+            let children = self.parse_children(id)?;
+            let (subgroup, existing) = {
+                let st = self.state.borrow();
+                let sg = st
+                    .entries
+                    .get(id)
+                    .and_then(|e| e.subgroup.clone())
+                    .ok_or_else(|| CordisError::Internal(format!("group {id} not started")))?;
+                let existing = st
+                    .groups
+                    .get(&sg)
+                    .map(|g| g.data.clone())
+                    .unwrap_or_default();
+                (sg, existing)
+            };
+            let new_ids: HashSet<String> = children.iter().map(|c| c.id.clone()).collect();
+            // 按 config 顺序处理（对应 Cordis `config.map(create)`：create 对既有
+            // = update；顺序 = config 序）。更新既有立即处理（Box::pin 打破嵌套
+            // group 的 async 递归），新建立即 start——保持 c1 热更在 c3 新建之前。
+            for child in children {
+                if new_ids.contains(&child.id) && existing.contains(&child.id) {
+                    let id = child.id.clone();
+                    let opts = child.clone();
+                    let fut: futures_util::future::LocalBoxFuture<'_, Result<(), CordisError>> =
+                        Box::pin(async move {
+                            let r = self.update_one_async(&id, opts).await;
+                            r
+                        });
+                    fut.await?;
+                } else if !existing.contains(&child.id) {
+                    let cid = child.id.clone();
+                    self.insert_child(id, child);
+                    self.start_entry_async(&cid).await?;
+                }
+            }
+            // 移除缺席（后；对应 Cordis 全成功后的 remove）
+            for cid in existing.iter().filter(|c| !new_ids.contains(*c)) {
+                self.dispose_entry_async(cid).await?;
+                let mut st = self.state.borrow_mut();
+                st.entries.remove(cid);
+                if let Some(g) = st.groups.get_mut(&subgroup) {
+                    g.data.retain(|x| x != cid);
+                }
+            }
+            self.write(&format!("update:{id}"));
+            return Ok(());
+        }
+
+        if !replace {
+            // 分支 3：仅 config 变化 —— fiber.update（internal/update waterfall）
+            let config = candidate.config.clone();
+            let fid = {
+                let st = self.state.borrow();
+                st.entries.get(id).and_then(|e| e.fiber)
+            }
+            .ok_or_else(|| CordisError::Internal(format!("entry {id} has no fiber")))?;
+            if let Err(e) = self.ctx.update(fid, config) {
+                self.rollback_options(id, &prev);
+                let _ = self.ctx.update(fid, prev.config.clone());
+                return Err(e);
+            }
+            self.write(&format!("update:{id}"));
+            return Ok(());
+        }
+
+        // 分支 4：替换（name/group/inject 变化）—— dispose 旧 + start 新；失败回滚
+        if let Err(e) = self.dispose_entry_async(id).await {
+            self.rollback_options(id, &prev);
+            return Err(e);
+        }
+        match self.start_entry_async(id).await {
+            Ok(()) => {
+                self.write(&format!("replace:{id}"));
+                Ok(())
+            }
+            Err(e) => {
+                self.rollback_options(id, &prev);
+                // 回滚启动旧插件
+                if let Err(rb) = self.start_entry_async(id).await {
+                    return Err(CordisError::Internal(format!(
+                        "loader replace rollback failed for {id}: {e} (rollback: {rb})"
+                    )));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// 异步移除入口（含子组递归；生命周期走 async 路径）。
+    pub async fn remove_async(&self, id: &str) -> Result<(), CordisError> {
+        let parent_group = {
+            let st = self.state.borrow();
+            st.entries.get(id).map(|e| e.parent_group.clone())
+        };
+        self.dispose_entry_async(id).await?;
+        {
+            let mut st = self.state.borrow_mut();
+            st.entries.remove(id);
+            if let Some(g) = parent_group.and_then(|g| st.groups.get_mut(&g)) {
+                g.data.retain(|x| x != id);
+            }
+            // realm GC：本地 realm 清理 + 无引用的全局 realm 清理
+            st.local_realms
+                .retain(|k, _| !k.starts_with(&format!("{id}:")));
+            let live_labels: HashSet<String> = st
+                .entries
+                .values()
+                .flat_map(|e| e.options.isolate.values())
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            st.global_realms.retain(|label, _| live_labels.contains(label));
+        }
+        self.write(&format!("remove:{id}"));
+        Ok(())
+    }
+
+    /// **整树同步（async 事务，对应 Cordis `EntryGroup.update(config)`）**：
+    /// allSettled 语义——全部入口都尝试 create/update（一个失败不阻断其他），
+    /// 全部完成后聚合失败（1 个失败 = 原错误；多个失败 = AggregateError）。
+    /// 全成功才移除缺席旧入口；任一失败则**整事务回滚**（逆序移除新建 +
+    /// 重建旧配置），回滚错误并入 AggregateError。
+    pub async fn sync_async(&self, entries: &[EntryOptions]) -> Result<(), AggregateError> {
+        // 重复 id 校验（Cordis：seen set，重复直接抛错）
+        let mut seen = HashSet::new();
+        for e in entries {
+            if !seen.insert(e.id.clone()) {
+                return Err(AggregateError {
+                    errors: vec![CordisError::Internal(format!(
+                        "duplicate loader entry id: {}",
+                        e.id
+                    ))],
+                });
+            }
+        }
+        // old_map：仅**根组**入口（group 子入口由 group 分支管理——若收集全部，
+        // sync 的「移除缺席」会误删子入口：update_async(g) 已移除缺席子入口后
+        // 又被根级 remove 一次）。
+        let old_map: HashMap<String, EntryOptions> = {
+            let st = self.state.borrow();
+            let root = st.root_group.clone();
+            st.entries
+                .values()
+                .filter(|e| e.parent_group == root)
+                .map(|e| (e.id.clone(), e.options.clone()))
+                .collect()
+        };
+        let new_map: HashMap<String, EntryOptions> = entries
+            .iter()
+            .map(|e| (e.id.clone(), e.clone()))
+            .collect();
+
+        // allSettled：全部 create/update **并行**（join_all 交错，与 TS
+        // `Promise.allSettled(config.map(create))` 一致——plugin/status/apply
+        // 的 trace 交错顺序可复现；pending_* 在 register 同步段 take，无竞争）。
+        let futures: Vec<futures_util::future::LocalBoxFuture<'_, SyncResult>> = entries
+                .iter()
+                .map(|options| {
+                    let id = options.id.clone();
+                    let is_new = !old_map.contains_key(&id);
+                    let fut: futures_util::future::LocalBoxFuture<'_, SyncResult> = if is_new {
+                            let options = options.clone();
+                            let id = id.clone();
+                            Box::pin(async move {
+                                let r = self.create_async(options).await;
+                                (id, r.map(|_| ()), true)
+                            })
+                        } else {
+                            let options = options.clone();
+                            let id = id.clone();
+                            Box::pin(async move {
+                                let r = self.update_async(&id, options).await;
+                                (id, r, false)
+                            })
+                        };
+                    fut
+                })
+                .collect();
+        let results = futures_util::future::join_all(futures).await;
+        let mut failures: Vec<CordisError> = Vec::new();
+        let mut created_new: Vec<String> = Vec::new();
+        for (id, result, is_new) in results {
+            match result {
+                Ok(()) => {
+                    if is_new {
+                        created_new.push(id);
+                    }
+                }
+                Err(e) => failures.push(e),
+            }
+        }
+
+        // 全部成功：移除缺席旧入口
+        if failures.is_empty() {
+            for id in old_map.keys() {
+                if !new_map.contains_key(id) {
+                    if let Err(e) = self.remove_async(id).await {
+                        failures.push(e);
+                    }
+                }
+            }
+            if failures.is_empty() {
+                return Ok(());
+            }
+        }
+
+        // 失败 → 整事务回滚：逆序移除新建 + 重建旧配置
+        let mut rollback_errors: Vec<CordisError> = Vec::new();
+        for id in created_new.iter().rev() {
+            if let Err(e) = self.remove_async(id).await {
+                rollback_errors.push(e);
+            }
+        }
+        for (id, options) in &old_map {
+            // 重建旧配置：已在树中的入口用 update 恢复（保留位置），否则 create
+            let still_exists = self.state.borrow().entries.contains_key(id);
+            let r = if still_exists {
+                self.update_async(id, options.clone()).await
+            } else {
+                self.create_async(options.clone()).await.map(|_| ())
+            };
+            if let Err(e) = r {
+                rollback_errors.push(e);
+            }
+        }
+        let mut errors = failures.clone();
+        errors.extend(rollback_errors);
+        Err(AggregateError { errors })
+    }
+
+    /// 异步启动入口（group → 注册 Group 插件；否则按名加载插件）。
+    /// 迭代式（显式栈）避免 async 递归；顺序与原递归一致。
+    /// 中途失败 → 逆序清理全部已启动入口（含 group 结构），等价 `EntryGroup.create` 失败删除。
+    async fn start_entry_async(&self, id: &str) -> Result<(), CordisError> {
+        let mut started: Vec<String> = Vec::new();
+        let mut stack: Vec<String> = vec![id.to_string()];
+        while let Some(cur) = stack.pop() {
+            let is_group = {
+                let st = self.state.borrow();
+                st.entries.get(&cur).map(|e| e.options.group).unwrap_or(false)
+            };
+            if is_group {
+                // Group 插件 apply 内挂载子入口（async_mode 下入队并行驱动）
+                if let Err(e) = self.load_group_plugin_async(&cur).await {
+                    self.rollback_started(&started).await;
+                    return Err(e);
+                }
+            } else if let Err(e) = self.load_plugin_async(&cur).await {
+                self.rollback_started(&started).await;
+                return Err(e);
+            }
+            started.push(cur);
+        }
+        Ok(())
+    }
+
+    /// 异步注册 Group 插件（group 入口的 fiber 形态）：config = 子入口数组。
+    async fn load_group_plugin_async(&self, id: &str) -> Result<(), CordisError> {
+        let config = {
+            let st = self.state.borrow();
+            st.entries
+                .get(id)
+                .map(|e| e.options.config.clone())
+                .unwrap_or_default()
+        };
+        let plugin = Arc::new(GroupPlugin {
+            loader: self.clone(),
+            entry_id: id.to_string(),
+        });
+        self.ctx.with(|rt| rt.pending_entry = Some(id.to_string()));
+        let fid = self.ctx.plugin_arc_async(plugin, config).await?;
+        {
+            let mut st = self.state.borrow_mut();
+            if let Some(e) = st.entries.get_mut(id) {
+                e.fiber = Some(fid);
+            }
+            st.fiber_to_entry.insert(fid, id.to_string());
+        }
+        if let Some(err) = self.ctx.fiber_error(fid) {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// 逆序清理已启动入口：dispose（含子树）+ 从 entries/父组移除。
+    async fn rollback_started(&self, started: &[String]) {
+        for s in started.iter().rev() {
+            let _ = self.dispose_entry_async(s).await;
+            let pg = {
+                let st = self.state.borrow();
+                st.entries.get(s).map(|e| e.parent_group.clone())
+            };
+            let mut st = self.state.borrow_mut();
+            st.entries.remove(s);
+            if let Some(g) = pg.and_then(|g| st.groups.get_mut(&g)) {
+                g.data.retain(|x| x != s);
+            }
+        }
+    }
+
+    /// 异步加载插件：pending_entry/isolate/intercept → `plugin_arc_async` → 关联 fiber。
+    async fn load_plugin_async(&self, id: &str) -> Result<(), CordisError> {
+        let (name, config) = {
+            let st = self.state.borrow();
+            let e = st
+                .entries
+                .get(id)
+                .ok_or_else(|| CordisError::Internal(format!("no such loader entry: {id}")))?;
+            (e.options.name.clone(), e.options.config.clone())
+        };
+        let plugin = {
+            let st = self.state.borrow();
+            st.plugins.get(&name).cloned()
+        }
+        .ok_or_else(|| CordisError::Internal(format!("loader: unknown plugin \"{name}\"")))?;
+
+        // isolate / intercept 注入（与同步 `load_plugin` 相同）
+        let (isolate_opts, intercept_opts) = {
+            let st = self.state.borrow();
+            let e = st
+                .entries
+                .get(id)
+                .ok_or_else(|| CordisError::Internal(format!("no such loader entry: {id}")))?;
+            (e.options.isolate.clone(), e.options.intercept.clone())
+        };
+        let (isolate_map, intercept_vec) = {
+            let mut st = self.state.borrow_mut();
+            let mut iso = HashMap::new();
+            let mut ic = Vec::new();
+            for (sname, spec) in &isolate_opts {
+                let scope = match spec {
+                    Value::Bool(true) => {
+                        let key = format!("{id}:{sname}");
+                        *st.local_realms.entry(key).or_insert_with(|| {
+                            self.ctx.with(|rt| rt.alloc_scope())
+                        })
+                    }
+                    Value::String(label) => {
+                        let realms = st.global_realms.entry(label.clone()).or_default();
+                        *realms.entry(sname.clone()).or_insert_with(|| {
+                            self.ctx.with(|rt| rt.alloc_scope())
+                        })
+                    }
+                    _ => continue,
+                };
+                iso.insert(sname.clone(), scope);
+            }
+            for (k, v) in &intercept_opts {
+                ic.push((k.clone(), v.clone()));
+            }
+            (iso, ic)
+        };
+        if !isolate_map.is_empty() {
+            self.ctx.with(|rt| rt.pending_isolate = isolate_map);
+        }
+        if !intercept_vec.is_empty() {
+            self.ctx.with(|rt| rt.pending_intercept = intercept_vec);
+        }
+
+        self.ctx.with(|rt| rt.pending_entry = Some(id.to_string()));
+        let fid = self.ctx.plugin_arc_async(plugin, config).await?;
+        {
+            let mut st = self.state.borrow_mut();
+            if let Some(e) = st.entries.get_mut(id) {
+                e.fiber = Some(fid);
+            }
+            st.fiber_to_entry.insert(fid, id.to_string());
+        }
+        if let Some(err) = self.ctx.fiber_error(fid) {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// 异步卸载入口（组 → 卸载 Group fiber，disposer 递归 stop 子入口；普通 → `unload_async`）。
+    async fn dispose_entry_async(&self, id: &str) -> Result<(), CordisError> {
+        // 自身 fiber（group 入口 = Group fiber；普通 = 插件 fiber）
+        let fid = {
+            let st = self.state.borrow();
+            st.entries.get(id).and_then(|e| e.fiber)
+        };
+        if let Some(fid) = fid {
+            {
+                let mut st = self.state.borrow_mut();
+                if let Some(e) = st.entries.get_mut(id) {
+                    e.disposing += 1;
+                }
+            }
+            let r = self.ctx.unload_async(fid).await;
+            {
+                let mut st = self.state.borrow_mut();
+                if let Some(e) = st.entries.get_mut(id) {
+                    e.disposing = e.disposing.saturating_sub(1);
+                    e.fiber = None;
+                }
+                st.fiber_to_entry.remove(&fid);
+            }
+            r?;
+        }
+        // group 结构清理（子入口已由 Group disposer stop；此处移除 subgroup 引用）
+        {
+            let mut st = self.state.borrow_mut();
+            if let Some(sg) = st.entries.get(id).and_then(|e| e.subgroup.clone()) {
+                st.groups.remove(&sg);
+                st.group_owner.remove(&sg);
+                if let Some(e) = st.entries.get_mut(id) {
+                    e.subgroup = None;
+                }
+            }
         }
         Ok(())
     }

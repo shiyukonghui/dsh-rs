@@ -1,0 +1,40 @@
+// dsh 插件世界：组件模型（WIT）形态的「一切皆插件」契约。
+//
+// 与 C ABI（M6）等价的组件模型版本：
+// - 插件导出：apply（配置）/ handle-event（事件）/ dispose（清理）
+// - 插件导入：宿主能力 log / emit / on / provide / get（能力按实例授予）
+//
+// 差异：WIT 提供类型化边界（JSON 载荷仍为 bytes，保持 lossless JSON 纪律），
+// 组件模型天然内存隔离；后续可在此 world 上扩展 WASI preview2 能力授予。
+
+package dsh:plugin;
+
+/// 插件生命周期与事件入口（插件导出给宿主）。
+interface plugin-api {
+  /// 应用配置并安装副作用（等价 C ABI `plugin_apply`）。
+  /// 返回 0 = 成功；非 0 = 失败（宿主将 fiber 置 FAILED）。
+  apply: func(config: list<u8>) -> s32;
+  /// 转发宿主事件（等价 C ABI `plugin_handle_event`）。
+  handle-event: func(event: string, payload: list<u8>) -> s32;
+  /// 卸载清理（等价 C ABI `plugin_dispose`）。
+  dispose: func() -> s32;
+}
+
+/// 宿主能力（插件导入；可被配置授予/撤销）。
+interface host-api {
+  /// 记录日志。
+  log: func(message: string);
+  /// 触发宿主事件（能力位 EMIT）。
+  emit: func(payload: list<u8>);
+  /// 注册事件监听（能力位 ON）；宿主在 apply 返回后统一注册转发。
+  on: func(event: string);
+  /// 提供服务（能力位 PROVIDE）。返回 0 = 成功；-1 = 被拒/失败。
+  provide: func(service: string, value: list<u8>) -> s32;
+  /// 读取服务（能力位 GET）。返回服务值的 JSON 字节；空 = 不存在/被拒。
+  get: func(service: string) -> list<u8>;
+}
+
+world dsh-plugin {
+  export plugin-api;
+  import host-api;
+}
