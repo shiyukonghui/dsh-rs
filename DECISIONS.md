@@ -46,6 +46,47 @@
 
 ---
 
+## D-006（阶段2）：`/api/events.mux|host` 从 SSE 升级为真实 WebSocket downlink
+
+**日期**：2025（本机时间）
+
+**触发的问题**：前端 boot 时 `connection` 插件用 `WebApiClient`（浏览器端）经
+`new WebSocket("/api/events.mux")` 与 `/api/events.host` 建立下链——不是 SSE。
+`readSse`（streaming fetch）只是 node 半的物理载体；浏览器端 `readWebSocket`
+才走 `new WebSocket`。M71 的 SSE 下链在真实浏览器里**无法连接**，前端停在
+loading/连不上。必须提供同源真实 WebSocket。
+
+**考虑的选项**：
+1. **tiny_http 的 `upgrade()` + tungstenite `from_raw_socket(Role::Server)`
+   （本次采用）**：tiny_http 为 WebSocket 提供 `Request::upgrade(protocol,
+   response)`——完成 101 握手（写 `Upgrade`/`Connection` 头）并返回
+   `Box<dyn ReadWrite + Send>` 双工流。`Sec-WebSocket-Accept` 需自算
+   （base64(SHA1(key + GUID))），用成熟 `sha1` + `base64` crate。拿到流后
+   用 tungstenite（成熟 WebSocket 协议库，D-004 同理不手写帧）`from_raw_socket`
+   包成 `WebSocket<Box<dyn ReadWrite>>`，`send(Message::text(json))` 推帧。
+2. **手写 WebSocket 帧解析/封装**：直接对着双工流编解码。— 重复造轮子，违背
+   D-004「不手写协议」；帧掩码/分片/close 协商易错。
+3. **换 async 框架（axum/actix + tokio-tungstenite）**：功能全但引入 tokio
+   async 运行时，与单线程 `Rc<RefCell>` 运行时冲突（D-004 已否）。
+4. **仅 SSE，不接 WebSocket**：真实前端连不上。— 不满足阶段 2 验收。
+
+**最终选择**：选项 1。tiny_http 已内置 WebSocket upgrade 通道（其源码注释即言
+「main purpose is to support websockets」），配合 tungstenite 包帧，两个成熟库
+组合满足「同源 WebSocket downlink」，无需换运行时。`Sec-WebSocket-Accept` 是
+RFC 6455 固定算法（SHA1 + 魔数 GUID），用 sha1/base64 crate 计算。
+
+**选择理由**：保持 D-004 的约束（同步、不换 async 运行时、不手写 HTTP/协议）。
+tiny_http 负责握手与双工流，tungstenite 负责帧协议，各司其职均为成熟库。帧
+内容与 M71 的 SSE 帧一致（`session/subscribed` + `session/event` server-request
+信封），仅物理载体从 SSE 换 WebSocket。
+
+**预期影响与回滚点**：新增依赖 `tungstenite`（default-features=false，关
+handshake 特性因握手由 tiny_http 完成）、`sha1`、`base64`。`/api/events.mux|host`
+的 GET 请求若无 `Upgrade: websocket` 头则回落 SSE（兼容 curl/node 测试），有则
+升级 WebSocket。回滚：撤提交回到 SSE 版；不影响 HTTP RPC/静态。
+
+---
+
 ## D-005（阶段1）：注入 `__DSH_BOOT__` entry graph + 服务 `/plugins/<id>/client.js`
 
 **日期**：2025（本机时间）

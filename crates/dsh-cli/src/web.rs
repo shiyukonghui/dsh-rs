@@ -147,11 +147,35 @@ fn dispatch_request(
                 let _ = request.respond(resp);
             }
             (Method::Get, "events.mux") | (Method::Get, "events.host") => {
-                // SSE 下链：独立线程轮询共享 session 日志推帧。`into_writer`
-                // 拿到响应写句柄（Send），连同 `SessionHandle` 移入线程。
-                let writer = request.into_writer();
-                let sessions = sessions.clone();
-                std::thread::spawn(move || stream_sse_events(writer, &sessions));
+                let is_host = method == "events.host";
+                // 浏览器经 `new WebSocket` 下链：检测 `Upgrade: websocket` 头。
+                // 有 → tiny_http `upgrade()` 完成 101 握手，tungstenite 包帧推
+                // WebSocket；无 → 回落 SSE（兼容 curl/node 测试，对齐 M71）。
+                let upgrade = request
+                    .headers()
+                    .iter()
+                    .any(|h| h.field.equiv("Upgrade") && h.value.as_str().eq_ignore_ascii_case("websocket"));
+                if upgrade {
+                    let key = request
+                        .headers()
+                        .iter()
+                        .find(|h| h.field.equiv("Sec-WebSocket-Key"))
+                        .map(|h| h.value.as_str().to_string())
+                        .unwrap_or_default();
+                    let accept = websocket_accept(&key);
+                    let resp = Response::empty(101u16)
+                        .with_header(
+                            Header::from_bytes(&b"Sec-WebSocket-Accept"[..], accept.as_bytes())
+                                .unwrap(),
+                        );
+                    let stream = request.upgrade("websocket", resp);
+                    let sessions = sessions.clone();
+                    std::thread::spawn(move || stream_ws_events(stream, &sessions, is_host));
+                } else {
+                    let writer = request.into_writer();
+                    let sessions = sessions.clone();
+                    std::thread::spawn(move || stream_sse_events(writer, &sessions));
+                }
             }
             _ => {
                 let resp = json_response(
@@ -416,6 +440,85 @@ fn stream_sse_events(mut writer: Box<dyn std::io::Write + Send>, sessions: &Sess
         }
         std::thread::sleep(Duration::from_millis(300));
     }
+}
+
+/// 计算 WebSocket `Sec-WebSocket-Accept`（RFC 6455：base64(SHA1(key + GUID))）。
+fn websocket_accept(key: &str) -> String {
+    const GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    use base64::Engine;
+    use sha1::Digest;
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(GUID);
+    let digest = hasher.finalize();
+    base64::engine::general_purpose::STANDARD.encode(digest)
+}
+
+/// WebSocket 事件下链（阶段2）：tiny_http `upgrade()` 已完成 101 握手并返回
+/// 双工流；这里用 tungstenite 包成 WebSocket（成熟协议库，不手写帧），把共享
+/// session 日志的新事件推成 `session/subscribed` + `session/event`（mux）或
+/// `host/session-added`（host）server-request 帧。
+fn stream_ws_events(
+    stream: Box<dyn tiny_http::ReadWrite + Send>,
+    sessions: &SessionHandle,
+    is_host: bool,
+) {
+    use tungstenite::protocol::{Role, WebSocket, WebSocketConfig};
+    let mut ws = WebSocket::from_raw_socket(stream, Role::Server, Some(WebSocketConfig::default()));
+    let mut last_seq: u64 = {
+        let log = sessions.lock().unwrap();
+        log.events().len() as u64
+    };
+    // 握手帧：mux → session/subscribed；host → host/session-added。
+    let hello = if is_host {
+        serde_json::json!({
+            "type": "server-request",
+            "rpcId": format!("host-{last_seq}"),
+            "method": "host/event",
+            "payload": {
+                "type": "host/session-added",
+                "sessionId": "default",
+                "blank": true,
+            },
+        })
+    } else {
+        serde_json::json!({
+            "type": "server-request",
+            "rpcId": format!("sub-{last_seq}"),
+            "method": "session/subscribed",
+            "payload": {"type": "session/subscribed", "sessionId": "default", "lastSeq": last_seq},
+        })
+    };
+    if ws_send(&mut ws, &hello).is_none() {
+        return;
+    }
+    loop {
+        let (new_seq, frames) = {
+            let log = sessions.lock().unwrap();
+            let events = log.events();
+            let mut frames = Vec::new();
+            for e in events.iter().filter(|e| e.seq >= last_seq) {
+                frames.push(mux_session_event_frame(e));
+            }
+            (events.len() as u64, frames)
+        };
+        for frame in &frames {
+            if ws_send(&mut ws, frame).is_none() {
+                return;
+            }
+        }
+        last_seq = new_seq;
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// 推一条 WebSocket 文本帧；失败返回 None（连接关闭）。
+fn ws_send<W>(ws: &mut tungstenite::protocol::WebSocket<W>, value: &Value) -> Option<()>
+where
+    W: std::io::Read + std::io::Write,
+{
+    let json = serde_json::to_string(value).ok()?;
+    ws.send(tungstenite::Message::text(json)).ok()
 }
 
 /// 写原始字节；失败返回 None（连接关闭）。
@@ -796,6 +899,68 @@ mod tests {
         // 未知 id
         assert!(serve_plugin_bundle(&m, "/plugins/@deepseek-ai/nope/client.js").is_none());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 阶段2：websocket_accept 计算对齐 RFC 6455 规范测试向量
+    /// （key="dGhlIHNhbXBsZSBub25jZQ==" → accept="s3pPLMBiTxaQ9kYGzzhZRbK+xOo="）。
+    #[test]
+    fn websocket_accept_rfc6455_vector() {
+        let accept = websocket_accept("dGhlIHNhbXBsZSBub25jZQ==");
+        assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    /// 阶段2：`ws_send` 把 server-request 帧作为文本帧写进 tungstenite WebSocket，
+    /// 对端（浏览器同款 from_raw_socket 客户端）能读回同一 JSON。
+    #[test]
+    fn ws_send_roundtrips_text_frame() {
+        use std::cell::RefCell;
+        use std::io::{Read, Write};
+        use std::rc::Rc;
+        use tungstenite::protocol::{Role, WebSocket};
+
+        // 内存双工：两端共享同一个缓冲（模拟双工连接）。
+        #[derive(Clone)]
+        struct Duplex {
+            buf: Rc<RefCell<Vec<u8>>>,
+        }
+        impl Read for Duplex {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let mut b = self.buf.borrow_mut();
+                let n = out.len().min(b.len());
+                out[..n].copy_from_slice(&b[..n]);
+                b.drain(..n);
+                Ok(n)
+            }
+        }
+        impl Write for Duplex {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.buf.borrow_mut().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let shared = Rc::new(RefCell::new(Vec::new()));
+        let mut server = WebSocket::from_raw_socket(Duplex { buf: shared.clone() }, Role::Server, None);
+        let frame = serde_json::json!({
+            "type": "server-request", "rpcId": "sub-0", "method": "session/subscribed",
+            "payload": {"type": "session/subscribed", "sessionId": "default", "lastSeq": 0},
+        });
+        server
+            .send(tungstenite::Message::text(serde_json::to_string(&frame).unwrap()))
+            .unwrap();
+        // server.flush() 后缓冲含完整帧；客户端从同一缓冲读回。
+        server.flush().unwrap();
+
+        let mut client = WebSocket::from_raw_socket(Duplex { buf: shared }, Role::Client, None);
+        let msg = client.read().unwrap();
+        let text = msg.into_text().unwrap();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["type"], "server-request");
+        assert_eq!(parsed["method"], "session/subscribed");
+        assert_eq!(parsed["payload"]["lastSeq"], 0);
     }
 
     /// 阶段1：render_index_with_boot 注入 `window.__DSH_BOOT__` 到 <head>。

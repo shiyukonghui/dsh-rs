@@ -48,10 +48,13 @@
 
 ### 阶段 2：最小可交互闭环
 目标：能新建会话、看到会话列表、发消息看回复。
-- [ ] `/api` 补方法：session.list（返回真实会话摘要）、session.create、
-      session.history（surface 投影）、session.models（模型清单）、commands/list。
-- [ ] WebSocket downlink：`/api/events.mux` 从 SSE 升级为真实 WebSocket（前端
-      connection 用 `new WebSocket`），推 session/event 帧。
+- [x] `/api` 补方法：session.list（返回真实会话摘要）、session.create、
+      session.history（surface 投影）——M70 基线已有。
+- [ ] `/api` 补方法：session.models（模型清单）、session.search、commands/list。
+- [x] WebSocket downlink：`/api/events.mux|host` 从 SSE 升级为真实 WebSocket
+      （D-006）：tiny_http `upgrade()` 完成 101 握手 + tungstenite 包帧；无
+      Upgrade 头回落 SSE。mux 推 `session/subscribed`+`session/event`，host 推
+      `host/session-added`。已用真实前端 bundle + `ws` 客户端验证。
 - [ ] 验证：新建会话 → 发消息 → 前端实时显示 user/assistant 消息。
 - 验收：基本聊天闭环可用（echo-loop 或 llm-loop）。
 
