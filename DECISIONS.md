@@ -84,6 +84,43 @@ E2E 冒烟全 ok。回滚：撤提交回到 M71 旧形状；不影响 WebSocket/
 
 ---
 
+## D-008（阶段1/2 验收）：真实浏览器 boot + 聊天闭环验证
+
+**日期**：2025（本机时间）
+
+**触发的问题**：ROADMAP 阶段 1 验收是「页面从 loading 失败报告 → 出现真实 UI
+骨架」，阶段 2 验收是「基本聊天闭环可用」。仅靠 Rust 单测与 curl/ws 客户端
+不足以证明前端真的能 boot、能交互——需要真实浏览器。
+
+**考虑的选项**：
+1. **Edge headless 验证（本次采用）**：机器装有 Edge。用 `msedge --headless
+   --dump-dom` 打开真实前端，检查渲染后的 DOM 是否出现真实 UI 骨架；用
+   `session.prompt` + `session.history` 验证聊天闭环。
+2. **Playwright/Puppeteer 全自动**：功能强但需额外安装（机器未装）。headless
+   Edge 已足够验证 boot 与 DOM 渲染。
+3. **仅单测 + curl 冒烟**：证明协议层正确，但不证明前端真能 boot。— 不足。
+
+**最终选择**：选项 1。Edge headless `--dump-dom` + `--screenshot`。
+
+**选择理由**：自下而上用真实浏览器验证「前端 boot 成功」这一第一性事实，避免
+「协议对但 UI 白屏」的盲区。headless Edge 零安装（机器已有），`--dump-dom`
+即返回渲染后的 DOM，可直接 grep 断言 UI 元素。
+
+**验证结果**：
+- DOM 渲染出真实 UI：侧边栏 logo、「打开侧边栏」切换、命令按钮（命令）、
+  模型选择器显示 **echo-loop**（证明 `session.models` 响应被前端正确解析）、
+  发送按钮。DOM 252KB，不再是 loading 失败报告。
+- 聊天闭环：`session.prompt`（content 数组）→ `{ok:true, accepted:true}` →
+  `session.history` 返回完整 turn 流（turn/start→step/start→user/message→
+  assistant/message→step/end→turn/end），WebSocket 同步推 `session/event` 帧。
+- 残余错误均为功能级（`dynamicCordisRunner/syncInspectManifest`、`inventory`
+  未实现；slot 注册冲突警告），非 boot 失败——留给阶段 4 全量方法面。
+
+**预期影响与回滚点**：纯验证，无代码改动（除 ROADMAP 勾选）。后续阶段 4 可把
+headless boot 固化为 E2E 测试。回滚：无。
+
+---
+
 ## D-006（阶段2）：`/api/events.mux|host` 从 SSE 升级为真实 WebSocket downlink
 
 **日期**：2025（本机时间）

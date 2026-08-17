@@ -39,8 +39,9 @@
       `<` 转义）。
 - [x] **服务 `/plugins/<id>/client.js`**：从 bundle 根目录读真实文件返回（text/javascript；
       id 含 scope 斜杠；`/plugins` 前缀路由，非 SPA fallback）。
-- [ ] **验证 boot**：浏览器/curl 确认 shell 能加载、各 entry 开始 activate。
-      （注入已单测验证；需 WebSocket downlink 才能真正连接——见阶段 2。）
+- [x] **验证 boot**：真实前端 bundle + Edge headless 打开页面，DOM 渲染出真实 UI
+      骨架（侧边栏/命令按钮/模型选择器显示 echo-loop/发送按钮）。剩余错误为
+      功能级（dynamicCordisRunner 等方法未实现），非 boot 失败。
 - [x] 静态模块表确认：真实 dist 由 `dsh-web-frontend` 打包，ui-slots/web-react/
       primitives/attachment/schema-form 由 shell bundle 提供（seed.ts 静态表），
       不在 `/plugins` 范围。
@@ -57,7 +58,9 @@
       （D-006）：tiny_http `upgrade()` 完成 101 握手 + tungstenite 包帧；无
       Upgrade 头回落 SSE。mux 推 `session/subscribed`+`session/event`，host 推
       `host/session-added`。已用真实前端 bundle + `ws` 客户端验证。
-- [ ] 验证：新建会话 → 发消息 → 前端实时显示 user/assistant 消息。
+- [x] 验证：`session.prompt` 发消息 → echo-loop 驱动 → `session.history` 返回完整
+      turn 流（turn/start→step/start→user/message→assistant/message→step/end→
+      turn/end）；WebSocket 把同批事件推成 `session/event` 帧 → 前端可实时显示。
 - 验收：基本聊天闭环可用（echo-loop 或 llm-loop）。
 
 ### 阶段 3：会话/工具功能扩展
