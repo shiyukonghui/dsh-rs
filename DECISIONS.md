@@ -46,6 +46,44 @@
 
 ---
 
+## D-007（阶段2/3）：`/api` 方法面对齐前端 `UNARY_VALUE_SCHEMAS`
+
+**日期**：2025（本机时间）
+
+**触发的问题**：前端每个 unary 方法的响应 value 都过 zod 校验（`callUnary` →
+`UNARY_VALUE_SCHEMAS[method].parse(result.value)`）。M70 的 `dispatch` 返回的
+形状与前端 schema 不符：`session.list` 返回 `{sessions:[...]}` 但 schema 要
+`{items:[sessionSummarySchema]}`；`session.history` 返回 `{messages:[...]}` 但
+schema 要 `{events:[{event}], hasMore}`。更关键的是 boot 必需的方法
+`host.describe` 未实现——connection 插件 `start()` 里 `host.describe` 失败会
+直接 throw，前端停在 loading。即使 WebSocket 通了，boot 后 UI 一调用这些方法
+也会被前端 schema 校验拒绝。
+
+**考虑的选项**：
+1. **逐方法对齐 schema 形状（本次采用）**：重写 `dispatch`，让每个已实现方法
+   的 value 通过对应 zod schema；补齐 boot 必需方法（host.describe /
+   workspace.list / skill.list / agentPreset.list / session.search / commands）。
+   未实现的仍 `not-implemented` fail loud。
+2. **不校验形状，返回宽松 JSON**：前端校验直接拒。— 违背「boot 后 UI 可交互」
+   目标。
+3. **照搬前端 fixture 的完整方法面**：一次性实现所有方法（subagent/goals/
+   settings/credentials/llm...）。— 方法面极大，超出本阶段范围，留待阶段 4。
+
+**最终选择**：选项 1。以真实前端 schema 为准（自下而上核实 `client.js` 里的
+`UNARY_VALUE_SCHEMAS`），对齐 boot 必需 + 阶段2 核心会话/工作区方法形状。
+
+**选择理由**：第一性事实是「前端用 zod 严格校验响应」，所以形状对齐是 boot 后
+可交互的前提，不是锦上添花。逐方法对齐是增量、可测的（每方法一个 shape 单测）；
+补齐 boot 必需方法（尤其 host.describe）让前端能从 loading 走到真实 UI。
+`cwd` 取 `std::env::current_dir()`（对齐 host.describe 语义——宿主进程 cwd）。
+
+**预期影响与回滚点**：`dispatch` 返回形状改变——M70 的 `sessions`/`session.list`
+单测更新为 `items[].sessionId`。新增 6 个 shape 单测 + 12 个 boot-critical 方法
+E2E 冒烟全 ok。回滚：撤提交回到 M71 旧形状；不影响 WebSocket/静态。后续阶段 3
+扩展 selectModel/rename/fork/prompt/cancel 语义，阶段 4 补全量方法面。
+
+---
+
 ## D-006（阶段2）：`/api/events.mux|host` 从 SSE 升级为真实 WebSocket downlink
 
 **日期**：2025（本机时间）

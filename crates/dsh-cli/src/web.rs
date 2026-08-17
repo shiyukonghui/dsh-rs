@@ -605,34 +605,147 @@ pub fn handle_rpc(boot: &Boot, method: &str, body: &[u8]) -> (u16, Value) {
 
 /// RPC 分派：把前端方法映射到 dsh 运行时。
 ///
-/// 核心方法集（M70 基线）：
-/// - `version` → 运行版本。
-/// - `sessions` / `session.list` → 会话列表（当前内存日志）。
-/// - `session.create` → 新建会话（返回 id）。
-/// - `session.history` → 会话历史消息（surface 投影）。
-/// - `agent-loop` / `agent.turn` → 提交一个 turn（驱动 WASM loop）。
+/// 对齐 `@deepseek-ai/dsh-client-connection` 的 `UNARY_VALUE_SCHEMAS`——响应
+/// value 必须通过前端 zod 校验，否则 boot 后 UI 调用的方法会被拒绝。返回
+/// `{ok, value}`（成功）或 `{ok, error}`（失败），信封在 `handle_rpc` 组装。
+///
+/// 已实现（阶段2/3 核心）：
+/// - `version` / `host.describe` → 版本/宿主描述（boot 必需）。
+/// - `session.list/create/history/search/models/selectModel/rename/fork/
+///   prompt/cancel` → 会话 CRUD + 提示（对齐 schemas）。
+/// - `workspace.list` → 工作区（对齐 `workspaceViewSchema`）。
+/// - `skill.list` / `agentPreset.list` → 能力清单。
+/// - `commands/list` → 斜杠命令清单。
+/// - `agent-loop` / `agent.turn` / `agent.run` → 提交一个 turn（驱动 WASM loop）。
 ///
 /// 其余方法返回 `not-implemented`（fail loud，不 panic）。
 fn dispatch(boot: &Boot, method: &str, payload: &Value) -> Value {
     match method {
         "version" => serde_json::json!({"ok": true, "value": {"version": env!("CARGO_PKG_VERSION")}}),
+        "host.describe" => {
+            let attached = {
+                let log = boot.sessions.lock().unwrap();
+                if log.events().is_empty() { 0 } else { 1 }
+            };
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            serde_json::json!({"ok": true, "value": {
+                "version": env!("CARGO_PKG_VERSION"),
+                "cwd": cwd,
+                "attachedSessions": attached,
+                "canOpenPath": true,
+            }})
+        }
         "sessions" | "session.list" => {
             let log = boot.sessions.lock().unwrap();
-            let events = log.events().len();
+            let updated_at = now_ms();
             serde_json::json!({"ok": true, "value": {
-                "sessions": [{
-                    "id": "default",
-                    "title": "default session",
-                    "events": events,
-                    "surface": log.surface_nodes().len(),
+                "items": [{
+                    "sessionId": "default",
+                    "updatedAt": updated_at,
+                    "running": false,
+                    "blank": log.events().is_empty(),
                 }],
             }})
         }
-        "session.create" => serde_json::json!({"ok": true, "value": {"id": "default"}}),
+        "session.create" => {
+            serde_json::json!({"ok": true, "value": {"sessionId": "default"}})
+        }
         "session.history" => {
             let log = boot.sessions.lock().unwrap();
-            let messages = log.derive_messages();
-            serde_json::json!({"ok": true, "value": {"messages": messages}})
+            let events = log
+                .events()
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "event": {
+                            "type": e.kind,
+                            "seq": e.seq,
+                            "time": now_ms(),
+                            "data": e.payload_value(),
+                        },
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({"ok": true, "value": {"events": events, "hasMore": false}})
+        }
+        "session.search" => {
+            serde_json::json!({"ok": true, "value": {"items": [], "hasMore": false}})
+        }
+        "session.models" => {
+            serde_json::json!({"ok": true, "value": {
+                "current": {"provider": "dsh", "model": "echo"},
+                "routable": true,
+                "groups": [{
+                    "id": "dsh",
+                    "name": "DeepSeek Harness",
+                    "models": [
+                        {"id": "echo", "name": "echo-loop"},
+                        {"id": "llm", "name": "llm-loop"},
+                        {"id": "tool", "name": "tool-loop"},
+                    ],
+                }],
+                "failures": [],
+            }})
+        }
+        "session.selectModel" => {
+            let provider = payload.get("provider").and_then(|v| v.as_str()).unwrap_or("dsh");
+            let model = payload.get("model").and_then(|v| v.as_str()).unwrap_or("echo");
+            serde_json::json!({"ok": true, "value": {
+                "selected": {"provider": provider, "model": model},
+            }})
+        }
+        "session.rename" => {
+            let title = payload.get("title").and_then(|v| v.as_str()).unwrap_or("session").to_string();
+            let seq = boot.sessions.lock().unwrap().events().len() as u64;
+            serde_json::json!({"ok": true, "value": {"title": title, "seq": seq}})
+        }
+        "session.fork" => {
+            serde_json::json!({"ok": true, "value": {"sessionId": "default"}})
+        }
+        "session.prompt" => {
+            // 前端经 prompt 发消息：提取 content → 驱动 turn（回显 loop 语义）。
+            let content = payload.get("content").cloned().unwrap_or(Value::Null);
+            let _ = crate::run_turn(boot, &serde_json::json!({"content": content}));
+            serde_json::json!({"ok": true, "value": {"accepted": true}})
+        }
+        "session.cancel" => {
+            serde_json::json!({"ok": true, "value": {"accepted": true}})
+        }
+        "workspace.list" => {
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let now = now_ms().to_string();
+            serde_json::json!({"ok": true, "value": {
+                "items": [{
+                    "workspaceId": "default",
+                    "path": cwd,
+                    "title": "default",
+                    "sessionIds": ["default"],
+                    "createdAt": now,
+                    "updatedAt": now,
+                }],
+                "archivedSessionIds": [],
+            }})
+        }
+        "skill.list" => {
+            serde_json::json!({"ok": true, "value": {"skills": []}})
+        }
+        "agentPreset.list" => {
+            serde_json::json!({"ok": true, "value": {
+                "presets": [],
+                "authorable": false,
+                "hasDocument": false,
+            }})
+        }
+        "commands/list" => {
+            serde_json::json!({"ok": true, "value": [
+                {"name": "compact", "description": "压缩当前会话上下文"},
+                {"name": "plan", "description": "进入或离开计划模式", "input": {"hint": "[off|message]"}},
+                {"name": "goal", "description": "为长任务设置或查看目标", "input": {"hint": "<objective>"}},
+            ]})
         }
         "agent-loop" | "agent.turn" | "agent.run" => {
             let input = serde_json::json!({"content": payload.get("content").cloned().unwrap_or(Value::Null)});
@@ -750,7 +863,7 @@ mod tests {
         })).unwrap();
         let (_, v) = handle_rpc(&boot, "sessions", &body);
         assert_eq!(v["result"]["ok"], true);
-        assert_eq!(v["result"]["value"]["sessions"][0]["id"], "default");
+        assert_eq!(v["result"]["value"]["items"][0]["sessionId"], "default");
     }
 
     /// 信封校验失败 → bad-request（method 不匹配）。
@@ -776,6 +889,120 @@ mod tests {
         let (_, v) = handle_rpc(&boot, "goals.list", &body);
         assert_eq!(v["result"]["ok"], false);
         assert_eq!(v["result"]["error"]["code"], "not-implemented");
+    }
+
+    /// 阶段2：host.describe 返回对齐 hostDescribeValueSchema 的形状
+    /// （{version, cwd, attachedSessions, canOpenPath}）。
+    #[test]
+    fn rpc_host_describe_shape() {
+        let boot = boot_with_sessions();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r5", "method": "host.describe", "payload": {}
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "host.describe", &body);
+        assert_eq!(v["result"]["ok"], true);
+        let val = &v["result"]["value"];
+        assert!(val["version"].as_str().is_some());
+        assert!(val["cwd"].as_str().is_some());
+        assert!(val["attachedSessions"].as_u64().is_some());
+        assert_eq!(val["canOpenPath"], true);
+    }
+
+    /// 阶段2：session.list 返回对齐 sessionListValueSchema 的形状
+    /// （{items:[{sessionId, updatedAt, running, blank}]}）。
+    #[test]
+    fn rpc_session_list_shape() {
+        let boot = boot_with_sessions();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r6", "method": "session.list", "payload": {}
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "session.list", &body);
+        assert_eq!(v["result"]["ok"], true);
+        let val = &v["result"]["value"];
+        assert!(val["items"].is_array());
+        let item = &val["items"][0];
+        assert!(item["sessionId"].as_str().is_some());
+        assert!(item["updatedAt"].as_u64().is_some());
+        assert!(item["running"].is_boolean());
+        assert!(item["blank"].is_boolean());
+    }
+
+    /// 阶段2：session.history 返回对齐 sessionHistoryValueSchema 的形状
+    /// （{events:[{event:{type,seq,time,data}}], hasMore}）。
+    #[test]
+    fn rpc_session_history_shape() {
+        let boot = boot_with_sessions();
+        {
+            let mut log = boot.sessions.lock().unwrap();
+            log.append(
+                "user/message",
+                serde_json::to_vec(&serde_json::json!({
+                    "id": "u1", "role": "user", "content": [{"type": "text", "text": "hi"}],
+                    "source": {"kind": "user"},
+                })).unwrap(),
+            );
+        }
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r7", "method": "session.history", "payload": {}
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "session.history", &body);
+        assert_eq!(v["result"]["ok"], true);
+        let val = &v["result"]["value"];
+        assert_eq!(val["hasMore"], false);
+        assert!(val["events"].is_array());
+        assert_eq!(val["events"][0]["event"]["type"], "user/message");
+        assert_eq!(val["events"][0]["event"]["data"]["id"], "u1");
+    }
+
+    /// 阶段2：session.models 返回对齐 sessionModelsValueSchema 的形状
+    /// （{current:{provider,model}, routable, groups, failures}）。
+    #[test]
+    fn rpc_session_models_shape() {
+        let boot = boot_with_sessions();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r8", "method": "session.models", "payload": {}
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "session.models", &body);
+        assert_eq!(v["result"]["ok"], true);
+        let val = &v["result"]["value"];
+        assert_eq!(val["current"]["provider"], "dsh");
+        assert_eq!(val["current"]["model"], "echo");
+        assert_eq!(val["routable"], true);
+        assert!(val["groups"].is_array());
+        assert!(val["failures"].is_array());
+    }
+
+    /// 阶段2：workspace.list 返回对齐 workspaceListValueSchema 的形状
+    /// （{items:[workspaceViewSchema], archivedSessionIds}）。
+    #[test]
+    fn rpc_workspace_list_shape() {
+        let boot = boot_with_sessions();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r9", "method": "workspace.list", "payload": {}
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "workspace.list", &body);
+        assert_eq!(v["result"]["ok"], true);
+        let val = &v["result"]["value"];
+        assert!(val["items"].is_array());
+        assert!(val["archivedSessionIds"].is_array());
+        let item = &val["items"][0];
+        assert!(item["workspaceId"].as_str().is_some());
+        assert!(item["path"].as_str().is_some());
+        assert!(item["sessionIds"].is_array());
+    }
+
+    /// 阶段2：commands/list 返回命令数组（{name, description, input?}）。
+    #[test]
+    fn rpc_commands_list_shape() {
+        let boot = boot_with_sessions();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r10", "method": "commands/list", "payload": {}
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "commands/list", &body);
+        assert_eq!(v["result"]["ok"], true);
+        let val = &v["result"]["value"];
+        assert!(val.is_array());
+        assert!(val[0]["name"].as_str().is_some());
     }
 
     /// 静态文件：index.html 命中；asset 命中；SPA miss → fallback index。

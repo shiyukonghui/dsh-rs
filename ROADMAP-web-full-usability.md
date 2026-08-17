@@ -50,7 +50,9 @@
 目标：能新建会话、看到会话列表、发消息看回复。
 - [x] `/api` 补方法：session.list（返回真实会话摘要）、session.create、
       session.history（surface 投影）——M70 基线已有。
-- [ ] `/api` 补方法：session.models（模型清单）、session.search、commands/list。
+- [x] `/api` 补方法：session.models（模型清单）、session.search、commands/list
+      ——对齐 `UNARY_VALUE_SCHEMAS`，host.describe/workspace.list/skill.list/
+      agentPreset.list 一并实现（boot 必需，见 D-007）。
 - [x] WebSocket downlink：`/api/events.mux|host` 从 SSE 升级为真实 WebSocket
       （D-006）：tiny_http `upgrade()` 完成 101 握手 + tungstenite 包帧；无
       Upgrade 头回落 SSE。mux 推 `session/subscribed`+`session/event`，host 推
