@@ -58,4 +58,72 @@ git 提交信息引用决策编号。
 
 **选择理由**：让「为什么代码长这样」有单一权威来源，且与 git 历史互查。
 
+---
+
+## D-002（M69）：WASM `tools::register` 完整桥接——`tools-handler` 导出接口
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M68 只让宿主**记录** WASM 声明并给出明确错误，但「WASM 插件
+注册的工具真正可执行」仍未打通——宿主执行 WASM 注册的工具时需要**回调进
+WASM 组件**运行其 handler。
+
+**考虑的选项**：
+1. **完整桥接（本次采用）**：在 `dsh-loop.wit` world 增加 `export tools-handler`
+   接口（`execute(name, args) -> result`），由 WASM 插件实现；宿主
+   `WasmLoopPlugin::execute_tool` 对 WASM 注册的工具改调该导出。三个 loop
+   插件（echo/llm/tool）都实现（tool-loop 真实执行 `wasm_echo`，另两个空实现）。
+2. **WIT `handler: u32` 改为真实 `resource` 类型**（HANDOFF §7.13 早期设想）：
+   让 wit-bindgen 托管句柄表。— 改动更大、需处理 Store 重入，且 name 分发
+   已足够定位插件侧 handler，资源句柄是多余复杂度。
+3. **维持仅记录**：不打通执行。— 违背目标「真正可执行」。
+
+**最终选择**：选项 1。用「组件导出 `tools-handler` 接口 + 宿主按名回调」而非
+WIT resource——name 即足够定位 handler，避开 resource 句柄表与 Store 重入的
+复杂设计。
+
+**选择理由**：这是最贴合「WASM 声明 → WASM 可执行」语义的最小闭环：WASM
+插件既声明工具又实现其执行，宿主只负责路由。name 分发是幂等的、可测的、
+可扩展的（新增工具只需插件侧多一个分支）。选项 2 的 resource 化是为跨组件
+资源引用服务，此处用不上。
+
+**预期影响与回滚点**：`dsh-loop.wit` world 新增导出 → 所有 loop 组件需实现
+`tools-handler`（已补齐）。宿主 `execute_tool` 仅在 Store 空闲时回调（run_turn
+之外的宿主驱动路径）——run_turn 内自调用注册工具仍受 wasmtime Store 重入
+限制（已在 HANDOFF 注明）。回滚：撤提交即可回到 M68 仅记录态。
+
+---
+
+## D-003（M70）：`dsh web` 命令——复用现有 DeepSeek Harness 前端 + `/api` RPC
+
+**日期**：2025（本机时间）
+
+**触发的问题**：目标要求「支持 web 命令提供 web 页面服务，页面使用现有的
+deepseek harness web 页面」。前端是已构建的 SPA（`dsh-web-frontend/dist`），
+经 `location.origin` 推断后端基址——即**同源**服务。
+
+**考虑的选项**：
+1. **同源静态 + `/api` HTTP RPC（本次采用）**：Rust 侧既服务前端静态文件
+   （SPA fallback → index.html），又承载 `POST /api/<method>` 的 client-request/
+   server-response 信封传输（对齐 `@deepseek-ai/dsh-host-apiproxy`），桥接到
+   dsh 运行时（sessions/tools/run_turn）。事件下链先以 SSE（keepalive 占位）。
+2. **完整复刻 DSH Web 传输（HTTP RPC + trust fence + WebSocket downlink +
+   全量方法）**：一次性实现全部。— 方法面极大（dozens of method groups）、
+   需 WebSocket 帧协议与 trust fence，单轮不可达。
+3. **仅静态文件服务**：不承载 /api。— SPA 能加载但无法连接后端，不满足
+   「提供页面服务」的实质。
+
+**最终选择**：选项 1。先交付可加载、可连接、可驱动 turn 的同源 Web 服务基线，
+方法集（version/sessions/session.create/session.history/agent-loop）为可扩展
+骨架，未实现方法 fail loud。
+
+**选择理由**：用最小可验面覆盖「提供页面服务 + 连接后端 + 驱动 loop」的完整
+语义闭环，且手写 HTTP/1.1 保持单线程纪律（同 llm_http）。前端同源复用零改动。
+完整 DSH Web 传输（WebSocket downlink / 全量方法 / trust fence）作为后续增量，
+`/api/events.mux|host` 的 SSE 占位即为其接入点。
+
+**预期影响与回滚点**：新增 `dsh web` 子命令，不影响既有 stdin/headless/HMR
+路径。事件 downlink 目前仅 keepalive——session 事件推送到前端为后续增强。
+回滚：撤提交即移除子命令，不影响其他功能。
+
 **预期影响与回滚点**：纯文档，无运行时影响。

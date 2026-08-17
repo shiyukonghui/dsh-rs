@@ -55,7 +55,7 @@ cordis-plugin-loader 的完整功能面：
   loader 事务/部分失败回滚/group 嵌套/disabled/isolate-intercept、
   include 纯函数 patch（insert 进 group/顶层追加/嵌套命中/各 warn 诊断/
   通用 overrides 字段覆盖）。
-- **验证**：`cargo test --workspace` 266 项全绿、`cargo clippy --workspace
+- **验证**：`cargo test --workspace` 271 项全绿、`cargo clippy --workspace
   --all-targets` 零警告。
 - **二进制级冒烟（M62 轮）**：真实 `dsh.exe` 以 echo-loop 组件跑通完整
   生命周期——`--once "hello headless"` → 答案 `echo: hello headless`、reason=
@@ -258,6 +258,49 @@ EXIT=0（245 项）、clippy `-D warnings` 零警告。
 - **边界**：完整桥接（`handler` 资源化 + Store 重入 + WASM 导出回调）为 §7.13
   后续增强——`wasm_tools` 即将来 handler 桥接的登记表（见 §7.13）。
 
+**M69 WASM `tools::register` 完整桥接——`tools-handler` 导出接口**（§7.13 闭环，
+决策日志 D-002）：
+- **`dsh-loop.wit`**：新增 `tools-handler` 接口（`execute(name, args) -> result`）
+  并 `export tools-handler` 到 world——WASM 插件既声明工具又实现其执行。
+- **三个 loop 插件**实现 `tools-handler` Guest：`tool-loop` **真实执行** `wasm_echo`
+  （run_turn 内经 `tools::register` 声明 + 组件侧 `execute` 按名分发）；`echo-loop`/
+  `llm-loop` 空实现（不注册工具）。
+- **宿主 `WasmLoopPlugin::execute_tool`**：WASM 注册的工具 → **回调解插件的
+  `tools-handler::execute` 导出**（`runtime.plugin.dsh_dsh_tools_handler()
+  .call_execute`）；宿主注册表仍权威；未注册 → not registered。
+- **`m8_dsh_loop.rs` 测试** `wasm_registered_tool_executes_in_wasm`：tool-loop 注册
+  `wasm_echo` → 宿主执行 → WASM 侧 handler 返回 `{echo:…}`——「WASM 声明 → WASM
+  可执行」跨缝闭环。
+- 全量回归 `cargo test --workspace` 266 项全绿、clippy 零警告。
+- **边界**：宿主仅在 Store 空闲时回调（run_turn 之外的宿主驱动路径）；run_turn
+  内自调用注册工具仍受 wasmtime Store 重入限制（`call_execute` 需 `&mut store`，
+  与在用的 `call_run_turn` 冲突）——见 §7.13 完整判定。
+
+**M70 `dsh web` 命令——服务现有 DeepSeek Harness 前端 + `/api` RPC**（决策日志
+D-003）：
+- **`dsh-cli/src/web.rs`**：手写 HTTP/1.1 服务器（`std::net::TcpListener`，单线程
+  纪律，同 llm_http）：
+  - **静态文件**：服务前端 dist（MIME 表）+ **SPA fallback**（miss → index.html）；
+    目录穿越净化。
+  - **`POST /api/<method>`**：client-request 信封 `{type, rpcId, method, payload}`
+    → server-response `{type, rpcId, result:{ok,value|error}}`（对齐
+    `@deepseek-ai/dsh-host-apiproxy` 协约；信封校验 → bad-request）。
+  - **`GET /api/events.mux|host`**：SSE 下链（当前 keepalive 占位；完整
+    downlink——session 事件 → server-request 帧——为后续增强）。
+  - **RPC 分派**：`version` / `sessions` / `session.create` / `session.history` /
+    `agent-loop`（驱动 WASM loop）桥接到 dsh 运行时；其余方法 `not-implemented`
+    fail loud。
+- **`dsh web <cordis.yml> [--web-root] [--host] [--port] [--overlay] [--wasm-base]`**：
+  web-root 默认 env `DSH_WEB_ROOT` → 已安装 `DeepSeek Harness\...\dsh-web-frontend\dist`
+  → `./web-dist`；`--port 0` 系统分配并打印实际地址。
+- **单测**（web.rs）：rpc 信封/分派/静态 SPA fallback/目录穿越；**端到端冒烟**：
+  真实 Harness 前端 index 200 + `version`/`sessions`/`agent-loop`（echo 驱动 WASM
+  loop）/asset 全通。
+- 全量回归 `cargo test --workspace` 271 项全绿、clippy 零警告。
+- **边界**：事件 downlink 仅 keepalive（未推送 session 事件）；方法集为基线
+  （非全量 DSH API）；WebSocket downlink / trust fence 未实现（SSE 为最小可验
+  形态）——见 §7.14 web 计划。
+
 ## 2. 目录结构
 
 ```
@@ -330,7 +373,7 @@ dsh-rs/
 ## 4. 验证命令
 
 ```sh
-cargo test                # 266 项单元/集成测试（core/loader/eval/schema/diff/wasmrt/cli）
+cargo test                # 271 项单元/集成测试（core/loader/eval/schema/diff/wasmrt/cli）
 cargo clippy --all-targets # 必须零警告
 cargo run -p dsh-diff -- <scenario.json> [--golden f] [--async]   # 单场景差分
 cd diff/ts-host && node verify-diff.mjs                 # 全场景：TS 生成 golden + Rust 校验（16 场景含 loader/include）
@@ -649,9 +692,25 @@ cd diff/ts-host && node verify-diff.mjs                 # 全场景：TS 生成 
     - **宿主侧分流**：`execute_tool` 现统一代理到 Cordis `ToolRegistry`；需区分
       宿主注册工具与 WASM 注册工具两条路径。
     需要一个导出 handler 资源的 WASM 测试组件来打通验证。**M68 已落地第一步**
-    （声明登记 + 明确路由，见 §1.5），完整桥接仍属 DSH 层 WIT 缝的跨资源桥接
-    增强（非 Cordis 内核语义、涉及 WIT 契约 + Store 重入两处设计变更），不属
-    「迁移未完成」——核心迁移已完成且 266 项测试全绿。
+    （声明登记 + 明确路由，见 §1.5），**M69 已完整落地**（`tools-handler` 导出
+    接口 + 宿主按名回调——WASM 声明 → WASM 可执行，见 §1.5）。剩余边界：宿主
+    仅在 Store 空闲时回调（run_turn 内自调用仍受 wasmtime Store 重入限制）——
+    不属「迁移未完成」——核心迁移已完成且 271 项测试全绿。
+
+14. **`dsh web` Web 服务（M70 基线已落地，见 §1.5）**：复用现有 DeepSeek Harness
+    前端（`dsh-web-frontend/dist`）同源服务 + `/api` HTTP RPC 传输桥接 dsh 运行时。
+    后续增强（供后续阶段设计起点）：
+    - **事件 downlink 完整化**：`/api/events.mux`/`/api/events.host` 现为 SSE
+      keepalive 占位——把 session 事件（append/turn/step）经 server-request 帧
+      推送到前端（对齐 `dsh-client-connection` 的 mux/host frame schema）；
+      生产走 WebSocket downlink，SSE 为最小可验形态。
+    - **方法集扩展**：M70 基线只有 version/sessions/session.create/session.history/
+      agent-loop——完整 DSH API 面（agents/tools/llm/settings/goals/jobs/approvals/
+      subagents/skills/credentials 等，见 `dsh-host-apiproxy/lib/types/api/*.js`）
+      逐组实现，未实现方法现在 fail loud。
+    - **WebSocket downlink + trust fence**：浏览器 WebSocket 双通道
+      （`/api/events.mux`/`/api/events.host`）与 Host 头信任校验（`isTrustedApiRequest`
+      / loopback 判定）——完整浏览器体验需此（当前 SSE + 无 fence 为最小可验）。
 
 ## 8. 工具链要求
 
