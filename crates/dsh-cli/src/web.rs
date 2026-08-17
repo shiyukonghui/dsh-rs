@@ -747,6 +747,14 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value) -> Value {
                 {"name": "goal", "description": "为长任务设置或查看目标", "input": {"hint": "<objective>"}},
             ]})
         }
+        // cordis 插件清单 UI（dynamicCordisRunner remote）：host 侧无动态插件，
+        // inventory 空数组、syncInspectManifest 返回 null（对齐其 result schema）。
+        "dynamicCordisRunner/inventory" => {
+            serde_json::json!({"ok": true, "value": []})
+        }
+        "dynamicCordisRunner/syncInspectManifest" => {
+            serde_json::json!({"ok": true, "value": null})
+        }
         "agent-loop" | "agent.turn" | "agent.run" => {
             let input = serde_json::json!({"content": payload.get("content").cloned().unwrap_or(Value::Null)});
             match crate::run_turn(boot, &input) {
@@ -1003,6 +1011,42 @@ mod tests {
         let val = &v["result"]["value"];
         assert!(val.is_array());
         assert!(val[0]["name"].as_str().is_some());
+    }
+
+    /// 阶段3：dynamicCordisRunner inventory → []、syncInspectManifest → null
+    /// （对齐其 result schema，清除 cordis 清单 UI 的 boot 报错）。
+    #[test]
+    fn rpc_dynamic_cordis_runner_empty() {
+        let boot = boot_with_sessions();
+        for (m, expected) in [
+            ("dynamicCordisRunner/inventory", "[]"),
+            ("dynamicCordisRunner/syncInspectManifest", "null"),
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": m, "payload": {}
+            })).unwrap();
+            let (_, v) = handle_rpc(&boot, m, &body);
+            assert_eq!(v["result"]["ok"], true, "{m} ok");
+            assert_eq!(
+                serde_json::to_string(&v["result"]["value"]).unwrap(),
+                expected,
+                "{m} value"
+            );
+        }
+    }
+
+    /// 阶段2：session.prompt 驱动 turn 后 accepted:true，且 session 事件增长。
+    #[test]
+    fn rpc_session_prompt_runs_turn() {
+        let boot = boot_with_sessions();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "session.prompt",
+            "payload": {"content": [{"type": "text", "text": "hello"}]},
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "session.prompt", &body);
+        assert_eq!(v["result"]["ok"], true);
+        assert_eq!(v["result"]["value"]["accepted"], true);
+        assert!(!boot.sessions.lock().unwrap().events().is_empty());
     }
 
     /// 静态文件：index.html 命中；asset 命中；SPA miss → fallback index。
