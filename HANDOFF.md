@@ -39,7 +39,7 @@ disposer**）+ **HMR 热重载**（文件指纹轮询 → `Include::refresh` /
 `yield_now`）→ 多 fiber 并行卸载先全部 Unloading 再逐个 Disposed（对齐 TS
 `Promise.all`）——`loader-10-group-nested` 34 行逐行一致。
 
-## 1.5 迁移完成状态（M0–M65）
+## 1.5 迁移完成状态（M0–M66）
 
 **核心功能迁移已完成并验证。** 对照 npm 原版 cordis / vendored
 cordis-plugin-loader 的完整功能面：
@@ -209,6 +209,23 @@ inject 整体替换/isolate/intercept 对象替换/disabled_expr 转 String，�
 **缺口评审结论更新**：Cordis 内核四缺口（inject / internal/dispatch / update veto /
 getEffects）已全部闭环；原先误判的「`update` 丢弃返回值导致 veto 语义丢失」经验证
 **不成立**（`run_chain` 短路已正确拒绝 inner）——真实缺口是 eager config 赋值。
+
+**M66 `tools::list` 动态工具 schema**（回到缝层方向的第一块）：
+- **dsh-core `ToolRegistry` 承载 schema**：内部 `tools` 从 `HashMap<String, Arc<ToolFn>>`
+  改为 `HashMap<String, (Arc<ToolFn>, Value)>`（值 = 工具 schema JSON）。
+  `m66_tools_schema.rs`（4 测试）——新增 `register_with_schema(name, schema, f)`、
+  `list() -> Vec<(String, Value)>`（按名排序）、`schema(name)`；`register(name, f)`
+  委托（schema 记空对象 `{}`），**零破坏**既有调用点（m9_boot/services.rs 等）。
+- **WIT 缝 `tools::list-tools`**（`dsh-loop.wit`）：`list` 为 WIT 关键字，故命名
+  `list-tools`（→ host trait `list_tools`）；`LoopHost` 实现经 `ctx` 取 `ToolRegistry`
+  → `list()` 序列化返回。`WasmLoopPlugin::list_tools(&self, ctx)` 注入 CURRENT_CTX
+  后直接驱动 host trait 方法（供集成测试）。
+- **m8_dsh_loop.rs 集成测试** `list_tools_returns_registered_tools_with_schema`：
+  WASM loop 插件经 `list_tools` 返回宿主注册工具的 `(name, schema)`（add/echo 按名
+  排序、schema 原样保留）。
+- 全量回归 `cargo test --workspace` EXIT=0、clippy `-D warnings` 零警告。
+- **边界**：WIT `tools::register` 的 `handler: u32`（WASM 资源句柄）仍为 no-op——
+  跨 WIT 资源桥接（WASM 插件内注册工具→宿主闭包）为后续增强（见 §7）。
 
 ## 2. 目录结构
 
@@ -435,15 +452,24 @@ cd diff/ts-host && node verify-diff.mjs                 # 全场景：TS 生成 
   provide/emit/get/wasi-env/wasi-fs/wasi-net，`Capabilities::from_json`，缺省
   = abi_only）。**`dsh-cli` 启动器**：`boot(config, overlays, wasm_base)` →
   Include 挂载 → 多轮 run_turn。
-- **真实 HTTP llm（M17/M31）**：`dsh-core/src/llm_http.rs`——OpenAI 兼容
+- **真实 HTTP llm（M17/M31/M67）**：`dsh-core/src/llm_http.rs`——OpenAI 兼容
   `/chat/completions` 客户端（手写 HTTP/1.1，`std::net::TcpStream`；单线程
   纪律）；**M31：https 支持**（native-tls 包裹，`parse_base` 解析 https://
   默认 443）；`LlmService::register_http`/`register_http_default`；
   声明式 `llm: {provider, http: {base, api_key, model}}` 经 `DshServicesPlugin`
   注册（默认或按 provider）。本地 mock 服务器端到端验证（请求形状 Bearer/
   model、响应解析、非 2xx/形状不符/连接失败 → error JSON）；https TLS 路径
-  验证（openssl 自签证书 + native-tls 服务端——客户端证书验证拒绝自签，
-  证明 TLS 层可达；生产验证需可信证书）。
+  验证（证明 https 走 native-tls 连接器、握手失败收口为 error JSON；生产验证
+  需可信证书）。**M67 修复 https 集成测试的环境脆弱性**：本机 Windows
+  SChannel 无法构造任意服务端身份——`Identity::from_pkcs12` 对 openssl 生成
+  的 PKCS#12 导入恒失败（`No identity found in PKCS #12 archive`，1.1.1/3.6
+  各算法标志实测均失败），`from_pkcs8` 又因创建 Windows key 容器
+  PermissionDenied。故测试改为「https 客户端对**非 TLS 的裸 TCP 服务端**发起
+  握手必然失败」——TCP 连通 + TLS 握手失败 → error JSON 且不 panic，等价验证
+  https 路径被真实触发，且**零外部依赖**（不再 shell 出 openssl、无自编 pfx、
+  无需新增 crate）。该写法比旧版（openssl 子进程 + 硬编码 `OPENSSL_CONF` +
+  SChannel pfx 导入）更稳：无外部二进制、无凭运气的 pfx 格式、确定性强。
+
 
 - **session 缝投影（M32/M34/M36/M37/M47）**：`SessionLog::derive_messages`
   对齐 DSH `deriveEventMessage` 规则——`assistant/message` **空 content 跳过**（仅

@@ -242,69 +242,37 @@ fn http_provider_malformed_response() {
     assert!(r.get("error").is_some(), "{r}");
 }
 
-/// M31：https URL 解析（parse_base 走 https:// → 默认 443）与 TLS 路径。
-/// 本地用 openssl 自签证书起 TLS mock 服务器——客户端证书验证会拒绝自签
-/// （生产安全），验证「https 已走 TLS 层 + 握手失败返回 error JSON 不 panic」。
+/// M31/M67：https 走 TLS 层的验证——客户端（native-tls / SChannel）对
+/// 一个**非 TLS 的 TCP 服务端**发起 TLS 握手必然失败，证明 `register_http`
+/// 的 `https://` 路径确实构建了 TLS 连接器并尝试握手，且失败被正确收口为
+/// error JSON、不 panic。
+///
+/// 之所以用「裸 TCP 服务端」而非真 TLS 服务器：本机 Windows SChannel 无法
+/// 构造任意服务端身份——`Identity::from_pkcs12` 对 openssl 生成的 PKCS#12
+/// 导入恒失败（`No identity found in PKCS #12 archive`，1.1.1/3.6 各算法
+/// 均如此），`Identity::from_pkcs8` 又需创建 Windows key 容器而
+/// PermissionDenied（非管理员/沙箱）。用一个接受连接即关闭的裸服务端即可
+/// 判定「TCP 连通 + TLS 握手失败」，等价验证 https 路径被真实触发。
+///
+/// 附带 `https_base_defaults_to_443` 覆盖无端口 → 443 的解析。
 #[test]
 fn https_provider_tls_handshake_path() {
-    use std::process::Command;
+    use std::io::Read;
 
-    // openssl 生成自签证书（临时目录）；设 OPENSSL_CONF（Windows 无默认 cnf）
-    let dir = std::env::temp_dir().join(format!("dsh-m31-tls-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let key = dir.join("key.pem");
-    let cert = dir.join("cert.pem");
-    let pfx = dir.join("identity.pfx");
-    let mut req = Command::new("openssl");
-    req.env(
-        "OPENSSL_CONF",
-        "D:\\Anaconda\\Library\\ssl\\openssl.cnf",
-    )
-    .args(["req", "-x509", "-newkey", "rsa:2048", "-keyout"])
-    .arg(&key)
-    .arg("-out")
-    .arg(&cert)
-    .args(["-days", "1", "-nodes", "-subj", "/CN=localhost"]);
-    let status = req.status().expect("openssl req");
-    assert!(status.success(), "openssl self-signed cert");
-    let mut p12 = Command::new("openssl");
-    p12.env(
-        "OPENSSL_CONF",
-        "D:\\Anaconda\\Library\\ssl\\openssl.cnf",
-    )
-    .args(["pkcs12", "-export", "-out"])
-    .arg(&pfx)
-    .arg("-inkey")
-    .arg(&key)
-    .arg("-in")
-    .arg(&cert)
-    .args(["-password", "pass:test"]);
-    let status = p12.status().expect("openssl pkcs12");
-    assert!(status.success(), "openssl pkcs12 export");
-
-    // TLS 服务器（native-tls 服务端 + Identity）
-    let pfx_bytes = std::fs::read(&pfx).unwrap();
-    let identity = native_tls::Identity::from_pkcs12(&pfx_bytes, "test").expect("identity");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     thread::spawn(move || {
-        let acceptor = native_tls::TlsAcceptor::new(identity).expect("tls acceptor");
+        // 裸 TCP 服务端：接受连接、读掉 ClientHello、随即关闭 →
+        // 客户端 TLS 握手无法完成（非 TLS 对端）。
         for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
-            let Ok(mut tls) = acceptor.accept(stream) else { continue };
-            let mut buf = [0u8; 256];
-            let _ = tls.read(&mut buf);
-            let payload = r#"{"choices":[{"message":{"content":"https hello"}}]}"#;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                payload.len(),
-                payload
-            );
-            let _ = tls.write_all(resp.as_bytes());
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            // drop：关闭连接，迫使客户端握手失败
         }
     });
 
-    // https 客户端：连接自签服务器 → 证书验证失败（error JSON，不 panic）
+    // https 客户端：连上 TCP 但 TLS 握手失败 → error JSON，不 panic
     let llm: LlmHandle = new_llm();
     {
         let mut svc = llm.lock().unwrap();
@@ -315,9 +283,8 @@ fn https_provider_tls_handshake_path() {
     let msg = r["error"].to_string();
     assert!(
         msg.contains("tls") || msg.contains("handshake") || msg.contains("certificate"),
-        "TLS path reached (self-signed rejected), got: {msg}"
+        "TLS path reached (handshake failed against non-TLS peer), got: {msg}"
     );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// M31：https 端口解析（无显式端口 → 443）。
