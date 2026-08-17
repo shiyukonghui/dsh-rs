@@ -3,11 +3,13 @@ package dsh:tool-loop;
 
 use dsh:dsh/session;
 use dsh:dsh/tools;
+use dsh:dsh/tools-handler;
 use dsh:dsh/llm;
 use dsh:dsh/agent-loop;
 
 world dsh-loop {
   export agent-loop;
+  export tools-handler;
   import session;
   import tools;
   import llm;

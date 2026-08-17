@@ -19,6 +19,7 @@
 mod bindings;
 
 use bindings::exports::dsh::dsh::agent_loop::Guest;
+use bindings::exports::dsh::dsh::tools_handler::Guest as ToolsHandlerGuest;
 use serde_json::{json, Value};
 
 struct LlmLoop;
@@ -166,6 +167,14 @@ impl Guest for LlmLoop {
         append("turn/end", &json!({"turn": turn, "reason": "completed"}));
 
         serde_json::to_vec(&json!({"reason": "completed", "answer": answer, "turn": turn}))
+            .unwrap_or_default()
+    }
+}
+
+/// llm-loop 不注册/执行工具——空实现（宿主只会对注册过该工具名的组件回调）。
+impl ToolsHandlerGuest for LlmLoop {
+    fn execute(name: String, _arguments: Vec<u8>) -> Vec<u8> {
+        serde_json::to_vec(&json!({"error": format!("llm-loop: no tools, unknown \"{name}\"")}))
             .unwrap_or_default()
     }
 }

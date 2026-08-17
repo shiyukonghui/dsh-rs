@@ -540,11 +540,12 @@ fn wasm_tools_register_records_declaration() {
     assert_eq!(declared[1].1["title"], "v2");
 }
 
-/// M68（§7.13 第一步）：执行路由——WASM 声明但 handler 未桥接的工具给出**明确**
-/// 「桥接未实现」错误（而非误导「not registered」）；未声明且未注册 → "not
-/// registered"；宿主注册表命中的工具 → 权威实调。
+/// M68/M69（§7.13 桥接闭环）：**WASM 插件注册的工具真的可执行**——
+/// tool-loop 组件经 `tools::register` 声明 `wasm_echo`（handler 活在本组件内），
+/// 宿主执行该工具时回调解插件的 `tools-handler::execute` 导出，由 WASM 侧
+/// handler 计算并返回结果。证明「WASM 声明 → WASM 可执行」跨缝闭环。
 #[test]
-fn wasm_tools_execute_routes_bridge_error() {
+fn wasm_registered_tool_executes_in_wasm() {
     let cordis = Cordis::new();
     let tools = dsh_core::new_tool_registry();
     {
@@ -559,7 +560,7 @@ fn wasm_tools_execute_routes_bridge_error() {
             )
             .unwrap();
     }
-    // 宿主注册 add（权威执行）。
+    // 宿主注册 add（宿主侧工具，仍权威执行）。
     tools.lock().unwrap().register("add", |args| {
         let a = args.get("a").and_then(|v| v.as_i64()).unwrap_or(0);
         let b = args.get("b").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -567,24 +568,34 @@ fn wasm_tools_execute_routes_bridge_error() {
     });
 
     let plugin = Arc::new(
-        WasmLoopPlugin::new("echo-loop", &echo_loop_component(), Capabilities::all()).unwrap(),
+        WasmLoopPlugin::new("tool-loop", &tool_loop_component(), Capabilities::all()).unwrap(),
     );
     let _fid = cordis.plugin_arc(plugin.clone(), json!({})).unwrap();
 
-    // WASM 声明 wasm_echo，但宿主注册表没有它 → 明确桥接错误。
-    plugin.register_tool(&cordis, "wasm_echo", json!({"type":"object"}));
-    let out = plugin.execute_tool(&cordis, "wasm_echo", json!({}));
-    let err = out["error"].as_str().expect("bridge error is an error JSON");
+    // 跑一个 turn：tool-loop 在 run_turn 内注册 wasm_echo（WASM 侧 handler）。
+    plugin
+        .run_turn(&cordis, &json!({"content": "hi"}))
+        .unwrap();
+
+    // 断言声明已记录。
+    let declared = plugin.wasm_tools();
     assert!(
-        err.contains("declared by WASM plugin"),
-        "WASM-declared-but-unbridged tool -> explicit bridge error, got: {err}"
+        declared.iter().any(|(n, _)| n == "wasm_echo"),
+        "tool-loop registered wasm_echo during its turn"
     );
 
-    // 宿主注册表命中 add → 权威实调（2+3=5）。
-    let out = plugin.execute_tool(&cordis, "add", json!({"a": 2, "b": 3}));
-    assert_eq!(out["sum"], 5, "host-registered tool executes authoritatively");
+    // 宿主执行 WASM 注册的工具 → 回调解插件 tools-handler::execute → WASM 计算。
+    let out = plugin.execute_tool(&cordis, "wasm_echo", json!({"text": "hello from wasm"}));
+    assert_eq!(
+        out["echo"], "hello from wasm",
+        "WASM-registered tool executes via tools-handler bridge, got: {out}"
+    );
 
-    // 未声明且未注册 → not registered。
+    // 宿主注册表命中的工具 → 仍权威实调（add 走宿主，2+3=5）。
+    let out = plugin.execute_tool(&cordis, "add", json!({"a": 2, "b": 3}));
+    assert_eq!(out["sum"], 5, "host-registered tool still executes authoritatively");
+
+    // 未声明且未注册 → not registered（宿主注册表 + WASM 都未命中）。
     let out = plugin.execute_tool(&cordis, "nope", json!({}));
     assert!(out["error"].as_str().unwrap().contains("not registered"));
 }

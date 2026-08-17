@@ -18,9 +18,13 @@
 mod bindings;
 
 use bindings::exports::dsh::dsh::agent_loop::Guest;
+use bindings::exports::dsh::dsh::tools_handler::Guest as ToolsHandlerGuest;
 use serde_json::{json, Value};
 
 struct ToolLoop;
+
+/// WASM 插件注册并**自己执行**的工具名（§7.13 桥接演示）。
+const WASM_TOOL: &str = "wasm_echo";
 
 fn append(kind: &str, payload: &Value) {
     bindings::dsh::dsh::session::append(
@@ -94,6 +98,19 @@ impl Guest for ToolLoop {
         append("step/start", &json!({"turn": 1, "step": 1}));
         append("user/message", &user_message("u1", &text));
 
+        // §7.13：WASM 插件经 tools 缝注册一个**自己执行**的工具（handler 活在本
+        // 组件内，宿主经 tools-handler 导出回调）。此处登记声明（name+schema）。
+        let schema = json!({
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        });
+        bindings::dsh::dsh::tools::register(
+            WASM_TOOL,
+            &serde_json::to_vec(&schema).unwrap_or_default(),
+            0,
+        );
+
         // 调用 tools 缝（宿主执行 add 工具）
         let args = json!({"a": 2, "b": 3});
         let result_bytes = bindings::dsh::dsh::tools::execute(
@@ -119,6 +136,22 @@ impl Guest for ToolLoop {
         append("turn/end", &json!({"turn": 1, "reason": "completed"}));
 
         serde_json::to_vec(&json!({"reason": "completed", "summary": summary})).unwrap_or_default()
+    }
+}
+
+/// §7.13：WASM 插件**自己执行**其注册的工具——宿主经 `tools-handler` 导出回调，
+/// 本组件按 name 分发到自己的 handler。这里实现 `wasm_echo`：把 arguments 原样
+/// 回显为 `{echo: …}`。证明「WASM 声明 → WASM 可执行」桥接闭环。
+impl ToolsHandlerGuest for ToolLoop {
+    fn execute(name: String, arguments: Vec<u8>) -> Vec<u8> {
+        let args: Value = serde_json::from_slice(&arguments).unwrap_or(Value::Null);
+        if name == WASM_TOOL {
+            let echoed = args.get("text").cloned().unwrap_or(Value::Null);
+            return serde_json::to_vec(&json!({"echo": echoed})).unwrap_or_default();
+        }
+        // 宿主只对「本组件注册」的工具回调；理论上不会到这里，但防御性返回明确错误。
+        serde_json::to_vec(&json!({"error": format!("unknown wasm tool \"{name}\"")}))
+            .unwrap_or_default()
     }
 }
 

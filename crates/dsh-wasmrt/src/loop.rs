@@ -431,10 +431,36 @@ impl WasmLoopPlugin {
     }
 
     /// 驱动 host 侧 `tools::execute` 路由（注入 ctx 后调 `LoopHost::execute_tool`）。
-    /// 供测试核对执行分流：宿主注册工具 → 实调；WASM 声明但未桥接 → 明确错误；
+    /// 供测试核对执行分流：宿主注册工具 → 实调；WASM 注册工具 → **回调解插件的
+    /// `tools-handler::execute`**（§7.13 桥接，WASM 声明 → WASM 可执行）；
     /// 其它 → "not registered"。
+    ///
+    /// ⚠️ 仅在 Store 空闲时调用（不在 `run_turn` 内）——否则回调解插件的
+    /// `tools-handler` 导出是 Store 重入（wasmtime 禁止）。宿主驱动的工具执行
+    /// （agent loop / 测试 / 后续 CLI）都在 turn 之间，安全。
     pub fn execute_tool(&self, ctx: &Cordis, name: &str, args: Value) -> Value {
         let _ = self.runtime(); // 确保实例化
+        // WASM 注册的工具 → 回调解插件 tools-handler 导出（§7.13 桥接）。
+        let wasm_declared = self
+            .rt
+            .borrow()
+            .as_ref()
+            .map(|r| r.store.data().wasm_tools.iter().any(|(n, _)| n == name))
+            .unwrap_or(false);
+        if wasm_declared {
+            let mut rt = self.rt.borrow_mut();
+            let runtime = rt.as_mut().expect("loop runtime ready");
+            let args_bytes = serde_json::to_vec(&args).unwrap_or_default();
+            let result = runtime
+                .plugin
+                .dsh_dsh_tools_handler()
+                .call_execute(&mut runtime.store, name, &args_bytes)
+                .unwrap_or_default();
+            CURRENT_CTX.with(|c| *c.borrow_mut() = None);
+            return serde_json::from_slice(&result).unwrap_or(serde_json::json!({
+                "error": format!("wasm tool \"{name}\" decode failed")
+            }));
+        }
         CURRENT_CTX.with(|c| *c.borrow_mut() = Some(ctx.clone()));
         let out = self
             .rt

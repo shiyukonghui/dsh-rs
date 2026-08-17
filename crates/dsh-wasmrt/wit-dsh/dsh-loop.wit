@@ -120,10 +120,22 @@ interface tools {
   /// 执行一次工具调用（经 tools/pre-execute → execute → post-execute 管道）。
   execute: func(name: string, arguments: list<u8>) -> list<u8>;
   /// 注册一个工具（宿主侧登记 schema + 处理函数）。
+  ///
+  /// `handler`：WASM 插件自有的 handler 标识（整数句柄/序号）。宿主只登记
+  /// 声明（name+schema），执行时经 `tools-handler` 导出回调插件按名分发——
+  /// 跨 WIT 资源桥接不需要，name 即足够定位插件侧 handler。
   register: func(name: string, schema: list<u8>, handler: u32) -> u32;
   /// 枚举全部已注册工具：`[[name, schema], ...]` 的 JSON 字节（按名排序）。
   /// （WIT 中 `list` 为关键字，故以 `list-tools` 命名；等价 DSH `tools.list()`。）
   list-tools: func() -> list<u8>;
+}
+
+/// 工具处理器导出：宿主执行 **WASM 插件注册** 的工具时回调插件，由插件侧
+/// handler 真正计算并返回结果（§7.13 桥接：WASM 声明 → WASM 可执行）。
+interface tools-handler {
+  /// 执行一个工具（name + JSON 参数字节 → JSON 结果字节）。宿主只在工具由
+  /// **本组件** 注册时回调；插件按 name 分发到自己的 handler。
+  execute: func(name: string, arguments: list<u8>) -> list<u8>;
 }
 
 /// 模型适配缝。
@@ -145,4 +157,6 @@ world dsh-loop {
 
   /// 实现者（插件）若扮演 loop 则导出此接口；否则只 import 三个缝。
   export agent-loop;
+  /// 实现者若想让宿主能执行其注册的工具，则导出此接口（可选实现）。
+  export tools-handler;
 }

@@ -12,6 +12,7 @@
 mod bindings;
 
 use bindings::exports::dsh::dsh::agent_loop::Guest;
+use bindings::exports::dsh::dsh::tools_handler::Guest as ToolsHandlerGuest;
 use serde_json::{json, Value};
 
 struct EchoLoop;
@@ -83,6 +84,14 @@ impl Guest for EchoLoop {
         );
 
         serde_json::to_vec(&json!({"reason": "completed", "echo": echo})).unwrap_or_default()
+    }
+}
+
+/// echo-loop 不注册/执行工具——空实现（宿主只会对注册过该工具名的组件回调）。
+impl ToolsHandlerGuest for EchoLoop {
+    fn execute(name: String, _arguments: Vec<u8>) -> Vec<u8> {
+        serde_json::to_vec(&json!({"error": format!("echo-loop: no tools, unknown \"{name}\"")}))
+            .unwrap_or_default()
     }
 }
 

@@ -154,6 +154,10 @@ pub mod dsh {
             }
             #[allow(unused_unsafe, clippy::all)]
             /// 注册一个工具（宿主侧登记 schema + 处理函数）。
+            ///
+            /// `handler`：WASM 插件自有的 handler 标识（整数句柄/序号）。宿主只登记
+            /// 声明（name+schema），执行时经 `tools-handler` 导出回调插件按名分发——
+            /// 跨 WIT 资源桥接不需要，name 即足够定位插件侧 handler。
             pub fn register(name: &str, schema: &[u8], handler: u32) -> u32 {
                 unsafe {
                     let vec0 = name;
@@ -194,6 +198,43 @@ pub mod dsh {
                         )
                     };
                     ret as u32
+                }
+            }
+            #[allow(unused_unsafe, clippy::all)]
+            /// 枚举全部已注册工具：`[[name, schema], ...]` 的 JSON 字节（按名排序）。
+            /// （WIT 中 `list` 为关键字，故以 `list-tools` 命名；等价 DSH `tools.list()`。）
+            pub fn list_tools() -> _rt::Vec<u8> {
+                unsafe {
+                    #[cfg_attr(target_pointer_width = "64", repr(align(8)))]
+                    #[cfg_attr(target_pointer_width = "32", repr(align(4)))]
+                    struct RetArea(
+                        [::core::mem::MaybeUninit<
+                            u8,
+                        >; 2 * ::core::mem::size_of::<*const u8>()],
+                    );
+                    let mut ret_area = RetArea(
+                        [::core::mem::MaybeUninit::uninit(); 2
+                            * ::core::mem::size_of::<*const u8>()],
+                    );
+                    let ptr0 = ret_area.0.as_mut_ptr().cast::<u8>();
+                    #[cfg(target_arch = "wasm32")]
+                    #[link(wasm_import_module = "dsh:dsh/tools")]
+                    unsafe extern "C" {
+                        #[link_name = "list-tools"]
+                        fn wit_import1(_: *mut u8);
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    unsafe extern "C" fn wit_import1(_: *mut u8) {
+                        unreachable!()
+                    }
+                    unsafe { wit_import1(ptr0) };
+                    let l2 = *ptr0.add(0).cast::<*mut u8>();
+                    let l3 = *ptr0
+                        .add(::core::mem::size_of::<*const u8>())
+                        .cast::<usize>();
+                    let len4 = l3;
+                    let result5 = _rt::Vec::from_raw_parts(l2.cast(), len4, len4);
+                    result5
                 }
             }
         }
@@ -358,6 +399,86 @@ pub mod exports {
                         * ::core::mem::size_of::<*const u8>()],
                 );
             }
+            /// 工具处理器导出：宿主执行 **WASM 插件注册** 的工具时回调插件，由插件侧
+            /// handler 真正计算并返回结果（§7.13 桥接：WASM 声明 → WASM 可执行）。
+            #[allow(dead_code, async_fn_in_trait, unused_imports, clippy::all)]
+            pub mod tools_handler {
+                #[used]
+                #[doc(hidden)]
+                static __FORCE_SECTION_REF: fn() = super::super::super::super::__link_custom_section_describing_imports;
+                use super::super::super::super::_rt;
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
+                pub unsafe fn _export_execute_cabi<T: Guest>(
+                    arg0: *mut u8,
+                    arg1: usize,
+                    arg2: *mut u8,
+                    arg3: usize,
+                ) -> *mut u8 {
+                    #[cfg(target_arch = "wasm32")] _rt::run_ctors_once();
+                    let len0 = arg1;
+                    let bytes0 = _rt::Vec::from_raw_parts(arg0.cast(), len0, len0);
+                    let len1 = arg3;
+                    let result2 = T::execute(
+                        _rt::string_lift(bytes0),
+                        _rt::Vec::from_raw_parts(arg2.cast(), len1, len1),
+                    );
+                    let ptr3 = (&raw mut _RET_AREA.0).cast::<u8>();
+                    let vec4 = (result2).into_boxed_slice();
+                    let ptr4 = vec4.as_ptr().cast::<u8>();
+                    let len4 = vec4.len();
+                    ::core::mem::forget(vec4);
+                    *ptr3.add(::core::mem::size_of::<*const u8>()).cast::<usize>() = len4;
+                    *ptr3.add(0).cast::<*mut u8>() = ptr4.cast_mut();
+                    ptr3
+                }
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
+                pub unsafe fn __post_return_execute<T: Guest>(arg0: *mut u8) {
+                    let l0 = *arg0.add(0).cast::<*mut u8>();
+                    let l1 = *arg0
+                        .add(::core::mem::size_of::<*const u8>())
+                        .cast::<usize>();
+                    let base2 = l0;
+                    let len2 = l1;
+                    _rt::cabi_dealloc(base2, len2 * 1, 1);
+                }
+                pub trait Guest {
+                    /// 执行一个工具（name + JSON 参数字节 → JSON 结果字节）。宿主只在工具由
+                    /// **本组件** 注册时回调；插件按 name 分发到自己的 handler。
+                    fn execute(
+                        name: _rt::String,
+                        arguments: _rt::Vec<u8>,
+                    ) -> _rt::Vec<u8>;
+                }
+                #[doc(hidden)]
+                macro_rules! __export_dsh_dsh_tools_handler_cabi {
+                    ($ty:ident with_types_in $($path_to_types:tt)*) => {
+                        const _ : () = { #[unsafe (export_name =
+                        "dsh:dsh/tools-handler#execute")] unsafe extern "C" fn
+                        export_execute(arg0 : * mut u8, arg1 : usize, arg2 : * mut u8,
+                        arg3 : usize,) -> * mut u8 { unsafe { $($path_to_types)*::
+                        _export_execute_cabi::<$ty > (arg0, arg1, arg2, arg3) } }
+                        #[unsafe (export_name =
+                        "cabi_post_dsh:dsh/tools-handler#execute")] unsafe extern "C" fn
+                        _post_return_execute(arg0 : * mut u8,) { unsafe {
+                        $($path_to_types)*:: __post_return_execute::<$ty > (arg0) } } };
+                    };
+                }
+                #[doc(hidden)]
+                pub(crate) use __export_dsh_dsh_tools_handler_cabi;
+                #[cfg_attr(target_pointer_width = "64", repr(align(8)))]
+                #[cfg_attr(target_pointer_width = "32", repr(align(4)))]
+                struct _RetArea(
+                    [::core::mem::MaybeUninit<
+                        u8,
+                    >; 2 * ::core::mem::size_of::<*const u8>()],
+                );
+                static mut _RET_AREA: _RetArea = _RetArea(
+                    [::core::mem::MaybeUninit::uninit(); 2
+                        * ::core::mem::size_of::<*const u8>()],
+                );
+            }
         }
     }
 }
@@ -435,6 +556,14 @@ mod _rt {
         let layout = alloc::Layout::from_size_align_unchecked(size, align);
         alloc::dealloc(ptr, layout);
     }
+    pub unsafe fn string_lift(bytes: Vec<u8>) -> String {
+        if cfg!(debug_assertions) {
+            String::from_utf8(bytes).unwrap()
+        } else {
+            String::from_utf8_unchecked(bytes)
+        }
+    }
+    pub use alloc_crate::string::String;
     extern crate alloc as alloc_crate;
     pub use alloc_crate::alloc;
 }
@@ -464,6 +593,9 @@ macro_rules! __export_dsh_loop_impl {
         $($path_to_types_root)*::
         exports::dsh::dsh::agent_loop::__export_dsh_dsh_agent_loop_cabi!($ty
         with_types_in $($path_to_types_root)*:: exports::dsh::dsh::agent_loop);
+        $($path_to_types_root)*::
+        exports::dsh::dsh::tools_handler::__export_dsh_dsh_tools_handler_cabi!($ty
+        with_types_in $($path_to_types_root)*:: exports::dsh::dsh::tools_handler);
     };
 }
 #[doc(inline)]
@@ -474,9 +606,9 @@ pub(crate) use __export_dsh_loop_impl as export;
 )]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 1070] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xaf\x07\x01A\x02\x01\
-A\x08\x01B#\x01r\x01\x04turny\x04\0\x0aturn-start\x03\0\0\x01r\x02\x04turny\x06r\
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 1156] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x85\x08\x01A\x02\x01\
+A\x0a\x01B#\x01r\x01\x04turny\x04\0\x0aturn-start\x03\0\0\x01r\x02\x04turny\x06r\
 easons\x04\0\x08turn-end\x03\0\x02\x01r\x02\x04turny\x04stepy\x04\0\x0dstep-boun\
 dary\x03\0\x04\x01r\x02\x08providers\x05models\x04\0\x0cmodel-source\x03\0\x06\x01\
 r\x01\x07call-ids\x04\0\x0btool-source\x03\0\x08\x01q\x04\x04user\0\0\x06plugin\x01\
@@ -491,14 +623,16 @@ t-block\x03\0\x13\x01p\x14\x01r\x04\x02ids\x04roles\x07content\x15\x06source\x0b
 \x11assistant-message\x03\0\x1a\x01r\x03\x04turny\x04stepy\x07message\x17\x04\0\x0b\
 tool-result\x03\0\x1c\x01p}\x01@\x02\x04kinds\x07payload\x1e\0y\x04\0\x06append\x01\
 \x1f\x01@\0\0\x1e\x04\0\x0fderive-messages\x01\x20\x03\0\x0fdsh:dsh/session\x05\0\
-\x01B\x05\x01p}\x01@\x02\x04names\x09arguments\0\0\0\x04\0\x07execute\x01\x01\x01\
-@\x03\x04names\x06schema\0\x07handlery\0y\x04\0\x08register\x01\x02\x03\0\x0ddsh\
-:dsh/tools\x05\x01\x01B\x03\x01p}\x01@\x03\x08providers\x08messages\0\x05tools\0\
-\0\0\x04\0\x08generate\x01\x01\x03\0\x0bdsh:dsh/llm\x05\x02\x01B\x03\x01p}\x01@\x02\
-\x05input\0\x07sessiony\0\0\x04\0\x08run-turn\x01\x01\x04\0\x12dsh:dsh/agent-loo\
-p\x05\x03\x04\0\x16dsh:tool-loop/dsh-loop\x04\0\x0b\x0e\x01\0\x08dsh-loop\x03\0\0\
-\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-component\x070.227.1\x10wit-bind\
-gen-rust\x060.41.0";
+\x01B\x07\x01p}\x01@\x02\x04names\x09arguments\0\0\0\x04\0\x07execute\x01\x01\x01\
+@\x03\x04names\x06schema\0\x07handlery\0y\x04\0\x08register\x01\x02\x01@\0\0\0\x04\
+\0\x0alist-tools\x01\x03\x03\0\x0ddsh:dsh/tools\x05\x01\x01B\x03\x01p}\x01@\x03\x08\
+providers\x08messages\0\x05tools\0\0\0\x04\0\x08generate\x01\x01\x03\0\x0bdsh:ds\
+h/llm\x05\x02\x01B\x03\x01p}\x01@\x02\x05input\0\x07sessiony\0\0\x04\0\x08run-tu\
+rn\x01\x01\x04\0\x12dsh:dsh/agent-loop\x05\x03\x01B\x03\x01p}\x01@\x02\x04names\x09\
+arguments\0\0\0\x04\0\x07execute\x01\x01\x04\0\x15dsh:dsh/tools-handler\x05\x04\x04\
+\0\x16dsh:tool-loop/dsh-loop\x04\0\x0b\x0e\x01\0\x08dsh-loop\x03\0\0\0G\x09produ\
+cers\x01\x0cprocessed-by\x02\x0dwit-component\x070.227.1\x10wit-bindgen-rust\x06\
+0.41.0";
 #[inline(never)]
 #[doc(hidden)]
 pub fn __link_custom_section_describing_imports() {
