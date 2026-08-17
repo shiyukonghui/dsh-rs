@@ -126,4 +126,40 @@ deepseek harness web 页面」。前端是已构建的 SPA（`dsh-web-frontend/d
 路径。事件 downlink 目前仅 keepalive——session 事件推送到前端为后续增强。
 回滚：撤提交即移除子命令，不影响其他功能。
 
+---
+
+## D-004（M71）：`dsh web` 用成熟 HTTP 库 `tiny_http` + SSE 实时事件下链
+
+**日期**：2025（本机时间）
+
+**触发的问题**：用户反馈「web 功能调用使用成熟功能库，不要再自己手写轮子了」。
+M70 的 `dsh web` 手写 HTTP/1.1 解析（read_head/read_body/http_response）——
+既重复造轮子、易错（chunked/keep-alive/header 边界），又因**单线程 accept
+循环**在 SSE 长连接上阻塞所有 POST /api（SSE 卡死 RPC）。
+
+**考虑的选项**：
+1. **`tiny_http`（本次采用）**：成熟同步 HTTP 服务器——每请求独立线程自带
+   并发、完整解析 HTTP/1.1；贴合本项目单线程纪律（`Boot` 含 `Rc<RefCell>` 非
+   Send，RPC 留在调用线程；SSE 只在 `SessionHandle`（Arc<Mutex>, Send+Sync）
+   上跑，独立线程推帧）。RPC/静态逻辑保持纯函数（可测）。
+2. **async 框架（axum/actix-web）**：功能更全但引入 tokio async 运行时，与
+   单线程 `Rc<RefCell>` 运行时冲突，需大改 boot 的线程模型。
+3. **继续手写 + 每连接一线程**：保留手写解析只加线程。— 仍是造轮子，且解析
+   正确性风险仍在。
+
+**最终选择**：选项 1。`tiny_http` 提供 HTTP 解析与并发，同时不强制 async；
+RPC 与 SSE 分层（RPC 用 `&Boot`，SSE 用 `SessionHandle`）保持单线程纪律。
+
+**选择理由**：用户明确要求成熟库；`tiny_http` 是同步生态里最贴合本项目约束的
+选择——并发由库保证（每请求线程），SSE 长连接不再阻塞 RPC，且无需重构 boot
+的线程模型。M71 同时把 SSE 下链从 keepalive 占位升级为**实时事件推送**：
+握手 `session/subscribed` + 增量 `session/event` 帧（对齐 `muxFrameSchema`），
+让前端在 turn 进行时实时看到 user/assistant/tool 事件——这是「完整可交互」
+的关键。
+
+**预期影响与回滚点**：新增依赖 `tiny_http`（含 ascii/chunked_transfer/httpdate
+传递依赖）；行为变化：SSE 实时推送（此前仅 keepalive）+ 并发修复。回滚：撤
+提交回到手写版或 M70；不影响其它功能。后续增强：WebSocket downlink 替代 SSE、
+方法集扩展、trust fence（见 HANDOFF §7.14）。
+
 **预期影响与回滚点**：纯文档，无运行时影响。

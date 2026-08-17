@@ -55,7 +55,7 @@ cordis-plugin-loader 的完整功能面：
   loader 事务/部分失败回滚/group 嵌套/disabled/isolate-intercept、
   include 纯函数 patch（insert 进 group/顶层追加/嵌套命中/各 warn 诊断/
   通用 overrides 字段覆盖）。
-- **验证**：`cargo test --workspace` 271 项全绿、`cargo clippy --workspace
+- **验证**：`cargo test --workspace` 273 项全绿、`cargo clippy --workspace
   --all-targets` 零警告。
 - **二进制级冒烟（M62 轮）**：真实 `dsh.exe` 以 echo-loop 组件跑通完整
   生命周期——`--once "hello headless"` → 答案 `echo: hello headless`、reason=
@@ -301,6 +301,24 @@ D-003）：
   （非全量 DSH API）；WebSocket downlink / trust fence 未实现（SSE 为最小可验
   形态）——见 §7.14 web 计划。
 
+**M71 `dsh web` 用成熟库 `tiny_http` + SSE 实时事件下链**（决策日志 D-004）：
+- **弃用手写 HTTP/1.1**（用户反馈：web 用成熟库不造轮子）——`tiny_http`
+  （每请求独立线程自带并发）；RPC/静态逻辑保持纯函数（可测）。
+- **解决单线程 accept 的 SSE 阻塞**：此前 SSE 长连接卡死所有 POST /api；现在
+  tiny_http 并发 + SSE 独立线程（只在 `SessionHandle`（Arc<Mutex>, Send+Sync）
+  上轮询，`Boot` 留在调用线程）。
+- **SSE 实时事件推送**：`/api/events.mux` 握手发 `session/subscribed`，随后
+  **增量**把新 session 事件推成 `session/event` 帧（对齐 `muxFrameSchema`：
+  `{type:"session/event", sessionId, event:{type, seq, time, data}}`）；空转
+  keepalive。turn 进行时前端实时看到 turn/start、user/message、
+  assistant/message、step/end 等。
+- **单测**：`mux_session_event_frame_shape` + `sse_write_frame_and_keepalive`。
+- **E2E 冒烟**：真实 Harness 前端 index 200 + version/sessions/agent-loop +
+  SSE 实时收到 seq 递增的 `session/event` 帧。
+- 全量回归 `cargo test --workspace` 273 项全绿、clippy 零警告。
+- **边界**：downlink 仍是 SSE（生产走 WebSocket）；方法集为基线；trust fence
+  未实现——见 §7.14。
+
 ## 2. 目录结构
 
 ```
@@ -373,7 +391,7 @@ dsh-rs/
 ## 4. 验证命令
 
 ```sh
-cargo test                # 271 项单元/集成测试（core/loader/eval/schema/diff/wasmrt/cli）
+cargo test                # 273 项单元/集成测试（core/loader/eval/schema/diff/wasmrt/cli）
 cargo clippy --all-targets # 必须零警告
 cargo run -p dsh-diff -- <scenario.json> [--golden f] [--async]   # 单场景差分
 cd diff/ts-host && node verify-diff.mjs                 # 全场景：TS 生成 golden + Rust 校验（16 场景含 loader/include）
@@ -695,19 +713,21 @@ cd diff/ts-host && node verify-diff.mjs                 # 全场景：TS 生成 
     （声明登记 + 明确路由，见 §1.5），**M69 已完整落地**（`tools-handler` 导出
     接口 + 宿主按名回调——WASM 声明 → WASM 可执行，见 §1.5）。剩余边界：宿主
     仅在 Store 空闲时回调（run_turn 内自调用仍受 wasmtime Store 重入限制）——
-    不属「迁移未完成」——核心迁移已完成且 271 项测试全绿。
+    不属「迁移未完成」——核心迁移已完成且 273 项测试全绿。
 
-14. **`dsh web` Web 服务（M70 基线已落地，见 §1.5）**：复用现有 DeepSeek Harness
-    前端（`dsh-web-frontend/dist`）同源服务 + `/api` HTTP RPC 传输桥接 dsh 运行时。
-    后续增强（供后续阶段设计起点）：
-    - **事件 downlink 完整化**：`/api/events.mux`/`/api/events.host` 现为 SSE
-      keepalive 占位——把 session 事件（append/turn/step）经 server-request 帧
-      推送到前端（对齐 `dsh-client-connection` 的 mux/host frame schema）；
-      生产走 WebSocket downlink，SSE 为最小可验形态。
-    - **方法集扩展**：M70 基线只有 version/sessions/session.create/session.history/
-      agent-loop——完整 DSH API 面（agents/tools/llm/settings/goals/jobs/approvals/
-      subagents/skills/credentials 等，见 `dsh-host-apiproxy/lib/types/api/*.js`）
-      逐组实现，未实现方法现在 fail loud。
+14. **`dsh web` Web 服务（M70 基线 + M71 tiny_http + SSE 实时下链已落地，见 §1.5）**：
+    复用现有 DeepSeek Harness 前端（`dsh-web-frontend/dist`）同源服务 + `/api`
+    HTTP RPC 传输桥接 dsh 运行时；HTTP 层用成熟库 `tiny_http`（D-004，不手写
+    HTTP），SSE 下链实时推送 session 事件。后续增强（供后续阶段设计起点）：
+    - **事件 downlink 已完整化（M71）**：`/api/events.mux` SSE 实时推送
+      `session/event` 帧（握手 `session/subscribed` + 增量事件 + keepalive）。
+      剩余：**生产 WebSocket downlink** 替代 SSE（浏览器原生 EventSource 更稳
+      但生产走 `ws` 双通道 `events.mux`/`events.host`）；`events.host` 侧
+      host 帧（session-added/status 等）未实现。
+    - **方法集扩展**：基线只有 version/sessions/session.create/session.history/
+      agent-loop——完整 DSH API 面（agents/tools/llm/settings/goals/jobs/
+      approvals/subagents/skills/credentials 等，见 `dsh-host-apiproxy/lib/
+      types/api/*.js`）逐组实现，未实现方法现在 fail loud。
     - **WebSocket downlink + trust fence**：浏览器 WebSocket 双通道
       （`/api/events.mux`/`/api/events.host`）与 Host 头信任校验（`isTrustedApiRequest`
       / loopback 判定）——完整浏览器体验需此（当前 SSE + 无 fence 为最小可验）。
