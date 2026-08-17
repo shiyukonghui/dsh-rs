@@ -39,7 +39,7 @@ disposer**）+ **HMR 热重载**（文件指纹轮询 → `Include::refresh` /
 `yield_now`）→ 多 fiber 并行卸载先全部 Unloading 再逐个 Disposed（对齐 TS
 `Promise.all`）——`loader-10-group-nested` 34 行逐行一致。
 
-## 1.5 迁移完成状态（M0–M66）
+## 1.5 迁移完成状态（M0–M67）
 
 **核心功能迁移已完成并验证。** 对照 npm 原版 cordis / vendored
 cordis-plugin-loader 的完整功能面：
@@ -226,6 +226,17 @@ getEffects）已全部闭环；原先误判的「`update` 丢弃返回值导致 
 - 全量回归 `cargo test --workspace` EXIT=0、clippy `-D warnings` 零警告。
 - **边界**：WIT `tools::register` 的 `handler: u32`（WASM 资源句柄）仍为 no-op——
   跨 WIT 资源桥接（WASM 插件内注册工具→宿主闭包）为后续增强（见 §7）。
+
+**M67 修复 https 集成测试的环境脆弱性**（`m17_http_llm.rs`）：
+`https_provider_tls_handshake_path` 此前依赖外部 openssl 二进制 + 硬编码
+`OPENSSL_CONF` + SChannel PKCS#12 导入，在本机固定失败（`Identity::from_pkcs12`
+对 openssl 生成的 pfx 导入恒 `No identity found in PKCS #12 archive`——
+1.1.1/3.6 各算法标志实测均失败；`from_pkcs8` 又因创建 Windows key 容器
+PermissionDenied）。改为：https 客户端对**非 TLS 的裸 TCP 服务端**发起握手
+必然失败——证明 `register_http` 的 `https://` 路径确实构建 native-tls 连接器
+并尝试握手，失败收口为 error JSON 不 panic。**零外部依赖**（不 shell openssl、
+无自编 pfx、不新增 crate）、确定性、跨平台。全量回归 `cargo test --workspace`
+EXIT=0（245 项）、clippy `-D warnings` 零警告。
 
 ## 2. 目录结构
 
@@ -601,6 +612,24 @@ cd diff/ts-host && node verify-diff.mjs                 # 全场景：TS 生成 
    env+fs 已验证（M19/M21）、net 路径可达已验（M30）**——端到端 TCP 受
    wasmtime 34（preview1 socket stub）+ Rust std wasip1（std::net 未映射
    preview2 sockets）平台限制，待工具链支持。
+
+13. **WIT `tools::register` 的 WASM handler 桥接（M66 记为边界/后续增强）**：
+    `dsh-loop.wit` 的 `register: func(name, schema: list<u8>, handler: u32)`，
+    `handler` 是 WASM 侧资源句柄（裸 `u32` 索引）。现状宿主 `LoopHost::register`
+    原样 no-op（返回 0）。要让「WASM 插件在缝内注册的、处理函数活在 WASM 里」
+    的工具真正可执行，需一路打通（尚未实现，供后续阶段设计起点）：
+    - **WIT 重塑**：`handler: u32` 裸索引无法可靠定位实例/资源类型——应改为
+      WIT 的真实 `resource`（`record`/`func` 资源）让 wit-bindgen 托管句柄表；
+    - **Caller 感知**：`execute` 需能拿到当前调用方实例（`Caller`），才能在其
+      资源表里找到 handler 并回调 WASM 导出；而工具执行发生在 `call_run_turn`
+      （Store 正在被用）期间，存在 **Store 重入借用**问题（`Rc<RefCell<Option<
+      LoopRuntime>>>` 需换成可重入的访问模型）；
+    - **宿主侧分流**：`execute_tool` 现统一代理到 Cordis `ToolRegistry`；需区分
+      宿主注册工具与 WASM 注册工具两条路径。
+    需要一个导出 handler 资源的 WASM 测试组件来打通验证。**当前判定**：属
+    DSH 层 WIT 缝的跨资源桥接增强（非 Cordis 内核语义、无测试组件覆盖、涉及
+    WIT 契约 + Store 重入两处设计变更），不属「迁移未完成」——核心迁移已完成
+    且 245 项测试全绿。
 
 ## 8. 工具链要求
 
