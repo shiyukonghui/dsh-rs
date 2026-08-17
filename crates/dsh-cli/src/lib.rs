@@ -19,6 +19,9 @@ use dsh_core::*;
 use dsh_loader::{EntryOptions, Include, Loader};
 use dsh_wasmrt::{Capabilities, DshServicesPlugin, WasmLoopPlugin};
 
+/// `dsh web`——服务 DeepSeek Harness 前端 + `/api` RPC（M70）。
+pub mod web;
+
 /// 启动结果：运行时上下文 + loop 插件句柄（供驱动）。
 pub struct Boot {
     pub ctx: Cordis,

@@ -1,0 +1,8 @@
+- id: services
+  name: dsh:services
+  config:
+    services: [sessions, tools, llm]
+- id: loop
+  name: echo-loop
+  config:
+    wasm: echo-loop

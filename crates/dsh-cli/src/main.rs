@@ -34,7 +34,13 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("usage: dsh <cordis.yml> [--overlay <file> | --patch <file>]... [--wasm-base <dir>] [--watch] [--once <task>] [--session-in <file>] [--session-out <file>] [--dump-config]");
+        eprintln!("       dsh web <cordis.yml> [--web-root <dir>] [--host <h>] [--port <p>] [--overlay <file>]... [--wasm-base <dir>]");
         std::process::exit(2);
+    }
+    // M70：`dsh web <cordis.yml> ...` 子命令——服务前端 + /api RPC。
+    if args[1] == "web" {
+        web_main(&args[2..]);
+        return;
     }
     let config_path = PathBuf::from(&args[1]);
     let mut overlays: Vec<PathBuf> = Vec::new();
@@ -229,6 +235,112 @@ fn main() {
             thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+/// M70：`dsh web` 子命令——服务 DeepSeek Harness 前端 + `/api` RPC，桥接运行时。
+///
+/// `dsh web <cordis.yml> [--web-root <dir>] [--host <h>] [--port <p>]
+/// [--overlay <f>]... [--wasm-base <dir>]`
+///
+/// `--web-root`：前端 dist 根目录（含 index.html）。默认依次尝试环境变量
+/// `DSH_WEB_ROOT`、`D:\Program Files\DeepSeek Harness\resources\host\node_modules\@deepseek-ai\dsh-web-frontend\dist`、
+/// `./web-dist`。`--port 0` = 系统分配（打印实际地址）。
+fn web_main(args: &[String]) {
+    let mut config_path: Option<PathBuf> = None;
+    let mut web_root: Option<PathBuf> = None;
+    let mut host = "127.0.0.1".to_string();
+    let mut port: u16 = 0;
+    let mut overlays: Vec<PathBuf> = Vec::new();
+    let mut wasm_base = PathBuf::from("wasm-plugins");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--web-root" => {
+                i += 1;
+                web_root = Some(PathBuf::from(&args[i]));
+            }
+            "--host" => {
+                i += 1;
+                host = args[i].clone();
+            }
+            "--port" => {
+                i += 1;
+                port = args[i].parse().unwrap_or(0);
+            }
+            "--overlay" | "--patch" => {
+                i += 1;
+                overlays.push(PathBuf::from(&args[i]));
+            }
+            "--wasm-base" => {
+                i += 1;
+                wasm_base = PathBuf::from(&args[i]);
+            }
+            other if other.starts_with("--") => {
+                eprintln!("dsh web: unknown arg {other}");
+                std::process::exit(2);
+            }
+            other => {
+                if config_path.is_none() {
+                    config_path = Some(PathBuf::from(other));
+                } else {
+                    eprintln!("dsh web: unexpected positional {other}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        i += 1;
+    }
+    let config_path = config_path.unwrap_or_else(|| {
+        eprintln!("dsh web: missing <cordis.yml>");
+        std::process::exit(2);
+    });
+
+    // 前端 dist 根（默认搜索）
+    let web_root = web_root.unwrap_or_else(default_web_root);
+
+    let boot = match dsh_cli::boot(&config_path, &overlays, &wasm_base) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("boot failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    // timer 时钟（web 循环也驱动 timer 服务）
+    boot.ctx.set_timer_clock(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    });
+
+    let cfg = dsh_cli::web::WebConfig {
+        web_root,
+        host: host.clone(),
+        port,
+    };
+    match dsh_cli::web::serve(&boot, cfg) {
+        Ok(server) => {
+            println!("dsh web serving at {}", server.addr);
+        }
+        Err(e) => {
+            eprintln!("web serve failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 默认前端 dist 根（按优先级：env → 已安装 DeepSeek Harness → ./web-dist）。
+fn default_web_root() -> PathBuf {
+    if let Ok(p) = std::env::var("DSH_WEB_ROOT") {
+        return PathBuf::from(p);
+    }
+    let installed = PathBuf::from(
+        r"D:\Program Files\DeepSeek Harness\resources\host\node_modules\@deepseek-ai\dsh-web-frontend\dist",
+    );
+    if installed.join("index.html").exists() {
+        return installed;
+    }
+    PathBuf::from("web-dist")
 }
 
 /// 处理一行 stdin（JSON turn）。
