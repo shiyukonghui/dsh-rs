@@ -1,5 +1,5 @@
-//! `dsh web`——DSH 层 Web 服务（M70）：用**现有 DeepSeek Harness 前端**提供页面，
-//! 并承载 `/api` HTTP RPC 传输，桥接到 dsh 运行时。
+//! `dsh web`——DSH 层 Web 服务（M70/M71）：用**现有 DeepSeek Harness 前端**提供
+//! 页面，并承载 `/api` HTTP RPC 传输，桥接到 dsh 运行时。
 //!
 //! 第一性原理：
 //! - **页面**：复用已构建的 `dsh-web-frontend/dist`（SPA 静态资源）。前端经
@@ -9,19 +9,19 @@
 //!   `{type:"client-request", rpcId, method, payload}`；响应为 server-response
 //!   `{type:"server-response", rpcId, result}`（result = `{ok:true,value?}` 或
 //!   `{ok:false,error}`），对齐 `@deepseek-ai/dsh-host-apiproxy` 的信封协约。
-//! - **事件下链**：`/api/events.mux` 与 `/api/events.host` 为 SSE（浏览器
-//!   兼容；生产走 WebSocket downlink，SSE 为最小可验形态——见 HANDOFF §web）。
+//! - **事件下链**：`/api/events.mux` 与 `/api/events.host` 为 SSE——轮询共享
+//!   session 日志，把新事件推成 `session/event` server-request 帧（对齐
+//!   `muxFrameSchema`）。
 //!
-//! 实现：手写 HTTP/1.1 服务器（`std::net::TcpListener`；单线程纪律，同
-//! `llm_http` 的 TcpStream 风格）。静态文件 + RPC 分派 + SSE 下链。
+//! 实现：**成熟 HTTP 库 `tiny_http`**（D-004：不手写 HTTP/1.1 解析）——每请求
+//! 独立线程自带并发，解决手写单线程 accept 的 SSE 阻塞问题。RPC/静态逻辑仍是
+//! 纯函数（可测），SSE 下链只在 `SessionHandle`（Send+Sync）上跑。
 
-use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use dsh_core::*;
+use tiny_http::{Header, Method, Response, Server};
 
 use crate::Boot;
 
@@ -57,7 +57,7 @@ pub struct WebConfig {
     pub port: u16,
 }
 
-/// 一个已运行的 Web 服务器（持有 listener 的实际端口）。
+/// 一个已运行的 Web 服务器（持有实际监听地址）。
 pub struct WebServer {
     pub addr: String,
 }
@@ -65,14 +65,17 @@ pub struct WebServer {
 /// 启动 `dsh web`：服务前端 dist + `/api` RPC，桥接到 boot 运行时。
 ///
 /// 阻塞运行（直到服务器出错或关闭）。`boot` 用于 RPC 分派（sessions/tools/
-/// run_turn）。单线程纪律：逐连接顺序处理（`boot` 含 `Rc<RefCell>`，非 Send）。
+/// run_turn）。并发由 `tiny_http` 提供：每请求独立线程；SSE 下链在
+/// `SessionHandle`（Send+Sync）上轮询，不阻塞 RPC。
 pub fn serve(boot: &Boot, cfg: WebConfig) -> Result<WebServer, CordisError> {
-    let listener = TcpListener::bind((cfg.host.as_str(), cfg.port))
+    // tiny_http：解析 HTTP/1.1 + 每连接并发线程（成熟库，D-004）。
+    let server = Server::http((cfg.host.as_str(), cfg.port))
         .map_err(|e| CordisError::Internal(format!("web bind {}:{}: {e}", cfg.host, cfg.port)))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| CordisError::Internal(format!("web addr: {e}")))?
-        .port();
+    let port = server
+        .server_addr()
+        .to_ip()
+        .map(|a| a.port())
+        .unwrap_or(cfg.port);
     let addr = format!("http://{}:{port}", cfg.host);
 
     // 校验 web_root 存在且含 index.html（否则前端加载不了，早失败）
@@ -85,162 +88,57 @@ pub fn serve(boot: &Boot, cfg: WebConfig) -> Result<WebServer, CordisError> {
     }
 
     let web_root = cfg.web_root;
-    // 单线程纪律（boot 含 Rc<RefCell>，非 Send）：逐连接顺序处理。
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => handle_client(s, &web_root, boot),
-            Err(e) => {
-                eprintln!("web accept error: {e}");
-                break;
-            }
-        }
+    let sessions = boot.sessions.clone();
+    for request in server.incoming_requests() {
+        let root = web_root.clone();
+        let sessions = sessions.clone();
+        // tiny_http 每请求已在线程处理；这里再派发。RPC/静态用 `&Boot`
+        // （非 Send，留在调用线程），SSE 用 `SessionHandle`（Send+Sync）。
+        dispatch_request(request, &root, boot, &sessions);
     }
     Ok(WebServer { addr })
 }
 
-/// 解析 HTTP 请求首行 + 头（小请求；读至空行）。
-struct RequestHead {
-    method: String,
-    path: String,
-    headers: HashMap<String, String>,
-}
+/// 派发一个请求：`/api/*` RPC/SSE，否则静态文件（SPA fallback）。
+fn dispatch_request(mut request: tiny_http::Request, web_root: &Path, boot: &Boot, sessions: &SessionHandle) {
+    // 路径去 query
+    let path = request.url().split('?').next().unwrap_or("/").to_string();
 
-fn read_head(stream: &mut TcpStream) -> Result<Option<RequestHead>, CordisError> {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    // 读至 \r\n\r\n 或超时
-    loop {
-        match stream.read(&mut byte) {
-            Ok(0) => return Ok(None),
-            Ok(_) => {
-                buf.push(byte[0]);
-                if buf.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-                if buf.len() > 64 * 1024 {
-                    return Err(CordisError::Internal("web: request head too large".into()));
-                }
-            }
-            Err(e) => return Err(CordisError::Internal(format!("web read head: {e}"))),
-        }
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines = text.split("\r\n");
-    let request_line = lines.next().unwrap_or("").to_string();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("/").to_string();
-    let mut headers = HashMap::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_lowercase(), v.trim().to_string());
-        }
-    }
-    Ok(Some(RequestHead { method, path, headers }))
-}
-
-/// 读取 body（按 content-length）。
-fn read_body(stream: &mut TcpStream, head: &RequestHead) -> Vec<u8> {
-    let len: usize = head
-        .headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let mut body = vec![0u8; len];
-    let mut read = 0;
-    while read < len {
-        match stream.read(&mut body[read..]) {
-            Ok(0) => break,
-            Ok(n) => read += n,
-            Err(_) => break,
-        }
-    }
-    body.truncate(read);
-    body
-}
-
-fn write_all(stream: &mut TcpStream, data: &[u8]) {
-    let _ = stream.write_all(data);
-    let _ = stream.flush();
-}
-
-fn http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
-    let reason = match status {
-        200 => "OK",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        415 => "Unsupported Media Type",
-        500 => "Internal Server Error",
-        _ => "OK",
-    };
-    let mut out = Vec::new();
-    out.extend_from_slice(
-        format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes(),
-    );
-    out.extend_from_slice(body);
-    out
-}
-
-fn json_response(status: u16, value: &Value) -> Vec<u8> {
-    let body = serde_json::to_vec(value).unwrap_or_default();
-    http_response(status, "application/json", &body)
-}
-
-/// 处理一个连接（读请求 → 分派 → 响应）。
-fn handle_client(mut stream: TcpStream, web_root: &Path, boot: &Boot) {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .ok();
-    let head = match read_head(&mut stream) {
-        Ok(Some(h)) => h,
-        Ok(None) => return,
-        Err(_) => return,
-    };
-
-    // 只处理路径（去 query）
-    let raw_path = head.path.clone();
-    let path = raw_path.split('?').next().unwrap_or("/");
-
-    // /api 路由：POST /api/<method>；GET /api/events.mux|host（SSE 下链）
     if path.starts_with("/api") {
-        let method = path.trim_start_matches("/api/");
-        match (head.method.as_str(), method) {
-            ("POST", m) if !m.is_empty() => {
-                let body = read_body(&mut stream, &head);
+        let method = path.trim_start_matches("/api/").to_string();
+        match (request.method(), method.as_str()) {
+            (Method::Post, m) if !m.is_empty() => {
+                // 读 body → RPC 分派 → JSON 响应
+                let mut body = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut request.as_reader(), &mut body);
                 let (status, json) = handle_rpc(boot, m, &body);
-                write_all(&mut stream, &json_response(status, &json));
+                let resp = json_response(status, &json);
+                let _ = request.respond(resp);
             }
-            ("GET", "events.mux") | ("GET", "events.host") => {
-                // SSE 下链：保持连接，逐帧推送 server-request。
-                write_all(&mut stream, &sse_headers());
-                // 阻塞式逐事件推送；这里用简化实现——每 1s 推一个 keepalive。
-                // 完整 downlink（session 事件 → server-request 帧）见 HANDOFF §web。
-                loop {
-                    write_all(&mut stream, b": keepalive\n\n");
-                    std::thread::sleep(Duration::from_secs(1));
-                }
+            (Method::Get, "events.mux") | (Method::Get, "events.host") => {
+                // SSE 下链：独立线程轮询共享 session 日志推帧。`into_writer`
+                // 拿到响应写句柄（Send），连同 `SessionHandle` 移入线程。
+                let writer = request.into_writer();
+                let sessions = sessions.clone();
+                std::thread::spawn(move || stream_sse_events(writer, &sessions));
             }
             _ => {
                 let resp = json_response(
                     404,
                     &serde_json::json!({"error": "not found", "path": path}),
                 );
-                write_all(&mut stream, &resp);
+                let _ = request.respond(resp);
             }
         }
         return;
     }
 
     // 静态文件（SPA：miss → index.html）
-    serve_static(&mut stream, web_root, path);
-}
-
-fn serve_static(stream: &mut TcpStream, web_root: &Path, path: &str) {
-    let (status, ct, body) = static_response(web_root, path);
-    write_all(stream, &http_response(status, ct, &body));
+    let (status, ct, body) = static_response(web_root, &path);
+    let resp = Response::from_data(body)
+        .with_status_code(status)
+        .with_header(Header::from_bytes(&b"Content-Type"[..], ct.as_bytes()).unwrap());
+    let _ = request.respond(resp);
 }
 
 /// 静态响应（纯函数；可测）：命中文件 → 内容；目录/miss → index.html（SPA）。
@@ -268,14 +166,108 @@ fn static_response(web_root: &Path, path: &str) -> (u16, &'static str, Vec<u8>) 
     (404, "text/plain", b"not found".to_vec())
 }
 
-/// SSE 响应头。
-fn sse_headers() -> Vec<u8> {
-    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n".to_vec()
+/// 构造 JSON HTTP 响应（server-response 信封）。
+fn json_response(status: u16, value: &Value) -> Response<std::io::Cursor<Vec<u8>>> {
+    let body = serde_json::to_vec(value).unwrap_or_default();
+    Response::from_data(body)
+        .with_status_code(status)
+        .with_header(Header::from_bytes(&b"Content-Type"[..], b"application/json").unwrap())
+}
+
+/// SSE 事件下链（M71）：轮询共享 session 日志，把**新事件**推成 `session/event`
+/// mux 帧（对齐 `muxFrameSchema`）。运行在独立线程（`SessionHandle` Send+Sync）。
+/// 握手后发 `session/subscribed`，随后增量推帧 + keepalive；连接关闭即退出。
+fn stream_sse_events(mut writer: Box<dyn std::io::Write + Send>, sessions: &SessionHandle) {
+    // SSE 响应头（tiny_http 的 into_writer 是原始 socket 写；手写头 + data 帧）。
+    if write_err(&mut writer, b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n").is_none() {
+        return;
+    }
+    let mut last_seq: u64 = {
+        let log = sessions.lock().unwrap();
+        log.events().len() as u64
+    };
+    // 握手：session/subscribed（对齐 muxFrameSchema）
+    let subscribed = serde_json::json!({
+        "type": "server-request",
+        "rpcId": format!("sub-{last_seq}"),
+        "method": "session/subscribed",
+        "payload": {"type": "session/subscribed", "sessionId": "default", "lastSeq": last_seq},
+    });
+    if write_sse(&mut writer, &subscribed).is_none() {
+        return;
+    }
+    loop {
+        // 增量推送：比 last_seq 新的事件逐个推成 session/event 帧。
+        let (new_seq, frames) = {
+            let log = sessions.lock().unwrap();
+            let events = log.events();
+            let mut frames = Vec::new();
+            for e in events.iter().filter(|e| e.seq >= last_seq) {
+                frames.push(mux_session_event_frame(e));
+            }
+            (events.len() as u64, frames)
+        };
+        for frame in &frames {
+            if write_sse(&mut writer, frame).is_none() {
+                return;
+            }
+        }
+        last_seq = new_seq;
+        // keepalive 注释行（SSE 心跳；防止代理/浏览器断开空闲连接）
+        if write_sse(&mut writer, &Value::Null).is_none() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// 写原始字节；失败返回 None（连接关闭）。
+fn write_err<W: std::io::Write + ?Sized>(w: &mut W, data: &[u8]) -> Option<()> {
+    std::io::Write::write_all(w, data).ok()?;
+    std::io::Write::flush(w).ok()?;
+    Some(())
+}
+
+/// 写一条 SSE `data:` 帧；失败返回 None。
+fn write_sse<W: std::io::Write + ?Sized>(w: &mut W, value: &Value) -> Option<()> {
+    let body = if value.is_null() {
+        b": keepalive\n\n".to_vec()
+    } else {
+        let json = serde_json::to_string(value).unwrap_or_default();
+        format!("data: {json}\n\n").into_bytes()
+    };
+    write_err(w, &body)
+}
+
+/// 构造一个 `session/event` mux 帧（对齐 `muxFrameSchema`：
+/// `{type:"session/event", sessionId, event:{type, seq, time, data}}`）。
+fn mux_session_event_frame(e: &dsh_core::SessionEvent) -> Value {
+    serde_json::json!({
+        "type": "server-request",
+        "rpcId": format!("ev-{}", e.seq),
+        "method": "session/event",
+        "payload": {
+            "type": "session/event",
+            "sessionId": "default",
+            "event": {
+                "type": e.kind,
+                "seq": e.seq,
+                "time": now_ms(),
+                "data": e.payload_value(),
+            },
+        },
+    })
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// 处理一个 `/api/<method>` RPC：解析 client-request 信封 → 分派 → server-response。
-/// 返回 `(HTTP status, JSON body)`（body 为 server-response 信封；服务器负责加
-/// HTTP 帧，测试直接解析 body）。
+/// 返回 `(HTTP status, JSON body)`（body 为 server-response 信封）。
 pub fn handle_rpc(boot: &Boot, method: &str, body: &[u8]) -> (u16, Value) {
     let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let rpc_id = parsed
@@ -354,7 +346,7 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value) -> Value {
         }
         _ => serde_json::json!({"ok": false, "error": {
             "code": "not-implemented",
-            "message": format!("method \"{method}\" not implemented by dsh web (M70 baseline)"),
+            "message": format!("method \"{method}\" not implemented by dsh web"),
         }}),
     }
 }
@@ -513,5 +505,44 @@ mod tests {
         let (s, _, _) = static_response(&root, "/../secret.txt");
         assert_eq!(s, 200);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// M71：`mux_session_event_frame` 构造对齐 muxFrameSchema 的
+    /// `session/event` 帧——`{type, sessionId, event:{type, seq, time, data}}`。
+    #[test]
+    fn mux_session_event_frame_shape() {
+        let ev = dsh_core::SessionEvent {
+            seq: 3,
+            kind: "assistant/message".into(),
+            payload: serde_json::to_vec(&serde_json::json!({
+                "turn": 1, "step": 1,
+                "message": {"id": "a1", "role": "assistant", "content": [], "source": {"kind": "model"}},
+            }))
+            .unwrap(),
+        };
+        let frame = mux_session_event_frame(&ev);
+        assert_eq!(frame["type"], "server-request");
+        assert_eq!(frame["method"], "session/event");
+        assert_eq!(frame["payload"]["type"], "session/event");
+        assert_eq!(frame["payload"]["sessionId"], "default");
+        assert_eq!(frame["payload"]["event"]["type"], "assistant/message");
+        assert_eq!(frame["payload"]["event"]["seq"], 3);
+        assert!(frame["payload"]["event"]["time"].as_u64().unwrap() > 0);
+        assert_eq!(frame["payload"]["event"]["data"]["message"]["id"], "a1");
+    }
+
+    /// M71：`write_sse` 写出 `data: {json}` 帧；null → keepalive 注释行。
+    #[test]
+    fn sse_write_frame_and_keepalive() {
+        let mut buf = Vec::new();
+        let ok = write_sse(&mut buf, &serde_json::json!({"type": "server-request", "rpcId": "x"}));
+        assert!(ok.is_some());
+        let text = String::from_utf8(buf.clone()).unwrap();
+        assert!(text.starts_with("data: {"), "data frame: {text}");
+        assert!(text.ends_with("\n\n"));
+
+        buf.clear();
+        write_sse(&mut buf, &Value::Null).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), ": keepalive\n\n");
     }
 }
