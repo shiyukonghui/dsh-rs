@@ -22,7 +22,7 @@
 //! 消费 HMR 事件（OS 文件系统通知；事件驱动，见 `dsh_loader::Hmr::watch`）。
 
 use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
@@ -313,8 +313,10 @@ fn web_main(args: &[String]) {
             .unwrap_or(0)
     });
 
+    let plugin_root = default_plugin_root(&web_root);
     let cfg = dsh_cli::web::WebConfig {
         web_root,
+        plugin_root,
         host: host.clone(),
         port,
     };
@@ -341,6 +343,29 @@ fn default_web_root() -> PathBuf {
         return installed;
     }
     PathBuf::from("web-dist")
+}
+
+/// 默认 web 插件 bundle 根（阶段1）：web_root 的 `node_modules/@deepseek-ai` 父目录。
+/// 从 web_root（dist 在 `<pkg>/dist`）向上两级到 `@deepseek-ai`，再向上到 `node_modules`。
+fn default_plugin_root(web_root: &Path) -> PathBuf {
+    // 支持 env 覆盖
+    if let Ok(p) = std::env::var("DSH_PLUGIN_ROOT") {
+        return PathBuf::from(p);
+    }
+    // web_root = <node_modules>/@deepseek-ai/dsh-web-frontend/dist → 找 @deepseek-ai
+    let mut dir: PathBuf = web_root.to_path_buf();
+    // 向上到含 @deepseek-ai 的目录
+    for _ in 0..3 {
+        let parent = dir.parent();
+        if let Some(p) = parent {
+            let name: Option<&str> = p.file_name().and_then(|s| s.to_str());
+            if name == Some("@deepseek-ai") {
+                return p.to_path_buf();
+            }
+            dir = p.to_path_buf();
+        }
+    }
+    dir
 }
 
 /// 处理一行 stdin（JSON turn）。

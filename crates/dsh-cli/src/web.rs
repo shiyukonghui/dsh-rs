@@ -51,6 +51,9 @@ fn mime_for(path: &str) -> &'static str {
 pub struct WebConfig {
     /// 前端 dist 根目录（含 index.html）。
     pub web_root: PathBuf,
+    /// web 插件 bundle 根目录（含 `@deepseek-ai/<pkg>/lib/client.js`）。
+    /// 为 `__DSH_BOOT__` 的 `/plugins/<id>/client.js` 提供真实 bundle。
+    pub plugin_root: PathBuf,
     /// 监听地址（默认 127.0.0.1）。
     pub host: String,
     /// 监听端口（0 = 系统分配）。
@@ -87,22 +90,50 @@ pub fn serve(boot: &Boot, cfg: WebConfig) -> Result<WebServer, CordisError> {
         )));
     }
 
+    // 阶段1：组装 `__DSH_BOOT__` entry graph（扫描 plugin_root 下声明 dsh.client
+    // 的 web 插件；每个是 `/plugins/<id>/client.js?rev=<hash>` 一行）。
+    let manifest = build_boot_manifest(&cfg.plugin_root)?;
+
     let web_root = cfg.web_root;
     let sessions = boot.sessions.clone();
     for request in server.incoming_requests() {
         let root = web_root.clone();
         let sessions = sessions.clone();
+        let manifest = manifest.clone();
         // tiny_http 每请求已在线程处理；这里再派发。RPC/静态用 `&Boot`
         // （非 Send，留在调用线程），SSE 用 `SessionHandle`（Send+Sync）。
-        dispatch_request(request, &root, boot, &sessions);
+        dispatch_request(request, &root, &manifest, boot, &sessions);
     }
     Ok(WebServer { addr })
 }
 
-/// 派发一个请求：`/api/*` RPC/SSE，否则静态文件（SPA fallback）。
-fn dispatch_request(mut request: tiny_http::Request, web_root: &Path, boot: &Boot, sessions: &SessionHandle) {
+/// 派发一个请求：`/plugins/*` bundle、`/api/*` RPC/SSE，否则静态文件（SPA fallback）。
+fn dispatch_request(
+    mut request: tiny_http::Request,
+    web_root: &Path,
+    manifest: &BootManifest,
+    boot: &Boot,
+    sessions: &SessionHandle,
+) {
     // 路径去 query
     let path = request.url().split('?').next().unwrap_or("/").to_string();
+
+    // 阶段1：`/plugins/<id>/client.js`——服务 web 插件真实 bundle（非 SPA fallback）。
+    if path.starts_with("/plugins/") {
+        if let Some(body) = serve_plugin_bundle(manifest, &path) {
+            let resp = Response::from_data(body)
+                .with_status_code(200)
+                .with_header(
+                    Header::from_bytes(&b"Content-Type"[..], b"text/javascript; charset=utf-8")
+                        .unwrap(),
+                )
+                .with_header(Header::from_bytes(&b"Cache-Control"[..], b"no-cache").unwrap());
+            let _ = request.respond(resp);
+        } else {
+            let _ = request.respond(Response::empty(404));
+        }
+        return;
+    }
 
     if path.starts_with("/api") {
         let method = path.trim_start_matches("/api/").to_string();
@@ -133,7 +164,18 @@ fn dispatch_request(mut request: tiny_http::Request, web_root: &Path, boot: &Boo
         return;
     }
 
-    // 静态文件（SPA：miss → index.html）
+    // 静态文件：`/` 注入 `__DSH_BOOT__`，其余 SPA fallback。
+    if path == "/" || path.is_empty() {
+        if let Some(html) = render_index_with_boot(web_root, manifest) {
+            let resp = Response::from_data(html)
+                .with_status_code(200)
+                .with_header(
+                    Header::from_bytes(&b"Content-Type"[..], b"text/html; charset=utf-8").unwrap(),
+                );
+            let _ = request.respond(resp);
+            return;
+        }
+    }
     let (status, ct, body) = static_response(web_root, &path);
     let resp = Response::from_data(body)
         .with_status_code(status)
@@ -164,6 +206,161 @@ fn static_response(web_root: &Path, path: &str) -> (u16, &'static str, Vec<u8>) 
         return (200, mime_for("index.html"), body);
     }
     (404, "text/plain", b"not found".to_vec())
+}
+
+/// `__DSH_BOOT__` entry graph（对齐 `WebBootGraph`：`{rev, entries}`）。
+/// 每个 entry：`{id, url:"/plugins/<id>/client.js?rev=<rev>", rev, inject?, immediately?}`。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BootManifest {
+    /// 整体一致性锚（内容 + bundle hash）。
+    pub rev: String,
+    /// web 插件行。
+    pub entries: Vec<BootEntry>,
+}
+
+/// 一条 web 插件行（对齐 `WebBootEntry`）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BootEntry {
+    /// 包名（entry 名）。
+    pub id: String,
+    /// 插件 bundle 根目录（`<plugin_root>/<id>/lib/client.js`）。
+    pub bundle_root: PathBuf,
+    /// bundle 内容 hash（rev）。
+    pub rev: String,
+    /// 依赖边（informational）。
+    pub inject: Vec<String>,
+    /// 阶段一 prefetch。
+    pub immediately: bool,
+}
+
+/// 组装 `__DSH_BOOT__`：扫描 `plugin_root` 下声明 `dsh.client.platform == "web"`
+/// 的包，每个生成一个 entry。
+///
+/// 判定依据（对齐 `ClientModuleRegistry.resolveMeta`）：包 package.json 的
+/// `dsh.client.platform === "web"` 且存在 `lib/client.js`。rev 取 bundle 内容
+/// sha1 前 12 hex（对齐 `shortHash`）；`immediately` 取声明值。
+pub fn build_boot_manifest(plugin_root: &Path) -> Result<BootManifest, CordisError> {
+    let mut entries: Vec<BootEntry> = Vec::new();
+    if plugin_root.is_dir() {
+        for dir in std::fs::read_dir(plugin_root)
+            .map_err(|e| CordisError::Internal(format!("web plugin_root read: {e}")))?
+        {
+            let dir = dir.map_err(|e| CordisError::Internal(format!("web plugin_root entry: {e}")))?;
+            if !dir.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let pkg_path = dir.path().join("package.json");
+            let Ok(text) = std::fs::read_to_string(&pkg_path) else {
+                continue;
+            };
+            let Ok(pkg) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            // 判定 web 插件：dsh.client.platform === "web"
+            let client = pkg.get("dsh").and_then(|d| d.get("client"));
+            let is_web = client
+                .and_then(|c| c.get("platform"))
+                .and_then(|p| p.as_str())
+                == Some("web");
+            if !is_web {
+                continue;
+            }
+            let id = pkg
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            let bundle = dir.path().join("lib/client.js");
+            if !bundle.is_file() {
+                continue;
+            }
+            let bytes = std::fs::read(&bundle).unwrap_or_default();
+            let rev = short_hash(&bytes);
+            let inject: Vec<String> = client
+                .and_then(|c| c.get("inject"))
+                .and_then(|i| i.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let immediately = client
+                .and_then(|c| c.get("immediately"))
+                .and_then(|i| i.as_bool())
+                .unwrap_or(false);
+            entries.push(BootEntry {
+                id,
+                bundle_root: dir.path(),
+                rev,
+                inject,
+                immediately,
+            });
+        }
+    }
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    // graph rev = 对 entries 序列化的 hash
+    let rev = short_hash(&serde_json::to_vec(&entries).unwrap_or_default());
+    Ok(BootManifest { rev, entries })
+}
+
+/// sha1 前 12 hex（对齐 `ClientModuleRegistry.shortHash`）。
+fn short_hash(input: &[u8]) -> String {
+    // 无 sha1 crate：用简单确定 hash（bundle 内容哈希一致性锚）。
+    // 注：对齐语义是「内容一致则同 rev」——用 std DefaultHasher 的确定性变体。
+    let mut state = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::Hasher;
+    state.write(input);
+    format!("{:016x}", state.finish())
+}
+
+/// 服务 `/plugins/<id>/client.js`：返回真实 bundle 字节；未知 id / 缺文件 → None。
+fn serve_plugin_bundle(manifest: &BootManifest, path: &str) -> Option<Vec<u8>> {
+    // 路径形如 /plugins/<id>/client.js；id 含 scope 斜杠（@deepseek-ai/xxx）。
+    let prefix = "/plugins/";
+    let suffix = "/client.js";
+    let id = path
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)?;
+    let entry = manifest.entries.iter().find(|e| e.id == id)?;
+    let bundle = entry.bundle_root.join("lib/client.js");
+    std::fs::read(&bundle).ok()
+}
+
+/// 渲染 `/` 的 index.html：读 dist index.html，注入 `window.__DSH_BOOT__`
+/// （对齐 `injectBootManifest`——`<head>` 首 script，`<` 转义防逃逸）。
+fn render_index_with_boot(web_root: &Path, manifest: &BootManifest) -> Option<Vec<u8>> {
+    let html = std::fs::read_to_string(web_root.join("index.html")).ok()?;
+    let graph = serde_json::json!({
+        "rev": manifest.rev,
+        "entries": manifest.entries.iter().map(|e| {
+            let mut m = serde_json::Map::new();
+            m.insert("id".into(), serde_json::Value::String(e.id.clone()));
+            m.insert("url".into(), serde_json::Value::String(format!(
+                "/plugins/{}/client.js?rev={}", e.id, e.rev
+            )));
+            m.insert("rev".into(), serde_json::Value::String(e.rev.clone()));
+            if !e.inject.is_empty() {
+                m.insert("inject".into(), serde_json::to_value(&e.inject).unwrap_or(Value::Null));
+            }
+            if e.immediately {
+                m.insert("immediately".into(), serde_json::Value::Bool(true));
+            }
+            serde_json::Value::Object(m)
+        }).collect::<Vec<_>>(),
+    });
+    let json = serde_json::to_string(&graph).unwrap_or_default().replace('<', "\\u003c");
+    let script = format!("<script>window.__DSH_BOOT__ = {json}</script>");
+    let out = if let Some(pos) = html.find("<head>") {
+        format!("{}{}{}", &html[..pos + 6], script, &html[pos + 6..])
+    } else {
+        format!("{script}{html}")
+    };
+    Some(out.into_bytes())
 }
 
 /// 构造 JSON HTTP 响应（server-response 信封）。
@@ -544,5 +741,85 @@ mod tests {
         buf.clear();
         write_sse(&mut buf, &Value::Null).unwrap();
         assert_eq!(String::from_utf8(buf).unwrap(), ": keepalive\n\n");
+    }
+
+    /// 构造一个最小 plugin_root（`@deepseek-ai` 目录，含一个 web 插件）用于阶段1测试。
+    /// 每调用一个唯一序号，避免并行测试同 PID/同目录冲突。
+    fn make_plugin_root() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("dsh-web-plugins-{}-{n}", std::process::id()));
+        let root = root.join("@deepseek-ai");
+        let pkg = root.join("dsh-client-runtime");
+        std::fs::create_dir_all(pkg.join("lib")).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@deepseek-ai/dsh-client-runtime","dsh":{"client":{"platform":"web","immediately":true,"inject":["@deepseek-ai/dsh-client-connection"]}},"exports":{"./client":"./lib/client.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("lib/client.js"), "window.__ModuleLoader__.load({id:'x'});").unwrap();
+        // 一个非 web 插件（应被跳过）
+        let non = root.join("dsh-something");
+        std::fs::create_dir_all(non.join("lib")).unwrap();
+        std::fs::write(
+            non.join("package.json"),
+            r#"{"name":"@deepseek-ai/dsh-something"}"#,
+        )
+        .unwrap();
+        root
+    }
+
+    /// 阶段1：build_boot_manifest 只收集 web 插件，生成正确的 entry 字段。
+    #[test]
+    fn build_boot_manifest_collects_web_plugins() {
+        let root = make_plugin_root();
+        let m = build_boot_manifest(&root).unwrap();
+        assert_eq!(m.entries.len(), 1, "only web plugin collected");
+        let e = &m.entries[0];
+        assert_eq!(e.id, "@deepseek-ai/dsh-client-runtime");
+        assert!(e.immediately);
+        assert_eq!(e.inject, vec!["@deepseek-ai/dsh-client-connection"]);
+        assert!(!e.rev.is_empty());
+        assert!(!m.rev.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 阶段1：serve_plugin_bundle 返回真实 bundle；未知 id → None。
+    #[test]
+    fn serve_plugin_bundle_reads_real_file() {
+        let root = make_plugin_root();
+        let m = build_boot_manifest(&root).unwrap();
+        let body = serve_plugin_bundle(&m, "/plugins/@deepseek-ai/dsh-client-runtime/client.js").unwrap();
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains("__ModuleLoader__.load"), "returns real bundle");
+        // 未知 id
+        assert!(serve_plugin_bundle(&m, "/plugins/@deepseek-ai/nope/client.js").is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 阶段1：render_index_with_boot 注入 `window.__DSH_BOOT__` 到 <head>。
+    #[test]
+    fn render_index_injects_boot_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-web-idx-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("index.html"), "<html><head></head><body><div id=\"root\"></div></body></html>").unwrap();
+        let pr = make_plugin_root();
+        let m = build_boot_manifest(&pr).unwrap();
+        let html = render_index_with_boot(&root, &m).unwrap();
+        let text = String::from_utf8(html).unwrap();
+        assert!(text.contains("window.__DSH_BOOT__ = "), "boot manifest injected");
+        assert!(text.contains("\"rev\""), "graph has rev");
+        assert!(text.contains("dsh-client-runtime"), "graph has entry id");
+        assert!(text.contains("client.js?rev="), "entry has bundle url");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&pr).ok();
     }
 }

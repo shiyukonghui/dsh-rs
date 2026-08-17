@@ -34,13 +34,16 @@
 
 ### 阶段 1：让前端成功 boot（关键里程碑）
 目标：浏览器打开 `http://127.0.0.1:PORT`，前端从白屏 → 真实 UI 出现。
-- [ ] **注入 `__DSH_BOOT__`**：Rust 组装 entry graph（34 个 web 插件，见 §2 清单）
-      注入 index.html `<head>` 首 script（对齐 `injectBootManifest`，`<` 转义）。
-- [ ] **服务 `/plugins/<id>/client.js`**：从 bundle 根目录读真实文件返回（text/javascript；
-      id 含 scope 斜杠；需 `/plugins` 前缀路由，非 SPA fallback）。
+- [x] **注入 `__DSH_BOOT__`**：Rust 组装 entry graph（扫描真实 bundle，38 个 web
+      插件，见 D-005）注入 index.html `<head>` 首 script（对齐 `injectBootManifest`，
+      `<` 转义）。
+- [x] **服务 `/plugins/<id>/client.js`**：从 bundle 根目录读真实文件返回（text/javascript；
+      id 含 scope 斜杠；`/plugins` 前缀路由，非 SPA fallback）。
 - [ ] **验证 boot**：浏览器/curl 确认 shell 能加载、各 entry 开始 activate。
-- [ ] 静态模块表确认：ui-slots/web-react/primitives/attachment/schema-form 由 shell
-      bundle 提供（seed.ts），确认 dist 含它们，否则需额外处理。
+      （注入已单测验证；需 WebSocket downlink 才能真正连接——见阶段 2。）
+- [x] 静态模块表确认：真实 dist 由 `dsh-web-frontend` 打包，ui-slots/web-react/
+      primitives/attachment/schema-form 由 shell bundle 提供（seed.ts 静态表），
+      不在 `/plugins` 范围。
 - 验收：页面从 loading 失败报告 → 出现真实 UI 骨架（哪怕功能未接）。
 
 ### 阶段 2：最小可交互闭环

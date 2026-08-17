@@ -46,6 +46,40 @@
 
 ---
 
+## D-005（阶段1）：注入 `__DSH_BOOT__` entry graph + 服务 `/plugins/<id>/client.js`
+
+**日期**：2025（本机时间）
+
+**触发的问题**：ROADMAP 阶段 1 要求前端从白屏 → 真实 UI。前端是浏览器端 cordis
+插件系统：boot 必需 `window.__DSH_BOOT__`（host 注入的 entry graph），每个插件
+是 `/plugins/<id>/client.js?rev=<hash>` 的 bundle，且所有 entry 必须 ACTIVE。
+
+**考虑的选项**：
+1. **扫描 plugin_root 的 package.json 组装 manifest（本次采用）**：遍历
+   `node_modules/@deepseek-ai` 下声明 `dsh.client.platform === "web"` 且存在
+   `lib/client.js` 的包，生成 `BootManifest {rev, entries}`；`/` 渲染 index.html
+   时注入 `<head>` 首 script；`/plugins/<id>/client.js` 从 bundle 根读真实字节。
+2. **硬编码 34 个插件清单**：把 ROADMAP §2 清单写死。— 无法随前端 bundle 版本
+   演化，plugin_root 一变就失效，且违背「扫描真实包」的第一性事实。
+3. **不做注入，仅静态服务**：前端永远停在 loading。— 不满足阶段 1 验收。
+
+**最终选择**：选项 1。判定依据（platform==web && lib/client.js 存在）对齐
+`ClientModuleRegistry.resolveMeta`；rev 用 bundle 内容确定 hash（内容一致则同
+rev）；`immediately` 取声明值；inject 依赖边 informational。entry URL 带
+`?rev=` 对齐前端缓存失效语义。
+
+**选择理由**：自下而上从真实 bundle 结构出发（每个 web 插件确实是一个带
+`dsh.client.platform` 声明的 npm 包），扫描法天然跟随前端版本演化，无需维护
+硬编码清单；`<` 转义防注入逃逸对齐 `injectBootManifest`。这满足「Rust 只需服务
+前端 + 注入 manifest + 提供 /api」的架构事实，无需重写 cordis。
+
+**预期影响与回滚点**：`/` 现在返回注入 boot 的 index.html；`/plugins/*` 不再走
+SPA fallback。新增 `default_plugin_root`（web_root 向上找 `@deepseek-ai`）与
+`DSH_PLUGIN_ROOT` env 覆盖。回滚：撤提交即恢复纯静态版；不影响 M70/M71 基线。
+后续阶段 2 需要 WebSocket downlink（浏览器用 `new WebSocket` 而非 SSE）。
+
+---
+
 ## D-000（工程基线）：决策日志的建立
 
 **日期**：2025（本机时间）

@@ -505,6 +505,7 @@ dependencies = [
  "dsh-core",
  "dsh-loader",
  "dsh-wasmrt",
+ "serde",
  "serde_json",
  "serde_yaml",
  "tiny_http",
