@@ -15,9 +15,9 @@
 - 验证：`dsh-diff` —— 场景 DSL 双运行时差分（Rust 侧 vs npm 原版 cordis）。
 - 部署：`dsh-wasmrt` —— wasmtime 后端，WASM 插件适配为 `dsh-core::Plugin`。
 
-**里程碑全部完成**（M0–M61）：`cargo test` 241 项全绿，`cargo clippy --all-targets` 零警告；
-**13 个差分场景**（9 核心 + **4 个 loader 事务场景，含 group 嵌套 + disabled
-entry**）Rust↔TS trace 逐行一致；
+**里程碑全部完成**（M0–M65）：`cargo test` 全量绿，`cargo clippy --all-targets` 零警告；
+**16 个差分场景**（9 核心 + **5 个 loader 事务场景，含 group 嵌套 + disabled
+entry + isolate-intercept** + **2 个 include 纯函数场景**)Rust↔TS trace 逐行一致；
 组件模型路径（WASM 组件插件 + WASI preview2 精细授予 + host get bytes + PluginHost
 统一加载 + **能力按 entry 配置**）与 DSH 层缝 WIT 化；WASM loop 插件经 `Plugin`
 挂进 Cordis，三缝承载桥接，完整 loop 语义 + `dsh` CLI 交互式启动；
@@ -38,6 +38,42 @@ disposer**）+ **HMR 热重载**（文件指纹轮询 → `Include::refresh` /
 **group 差分已纳入（M29）**：`unload_async` 卸载让出（begin 后 + finish 前
 `yield_now`）→ 多 fiber 并行卸载先全部 Unloading 再逐个 Disposed（对齐 TS
 `Promise.all`）——`loader-10-group-nested` 34 行逐行一致。
+
+## 1.5 迁移完成状态（M0–M65）
+
+**核心功能迁移已完成并验证。** 对照 npm 原版 cordis / vendored
+cordis-plugin-loader 的完整功能面：
+
+- **字段级对齐**：Rust `EntryOptions`（id/name/config/group/disabled/
+  disabled_expr/inject/isolate/intercept）与 vendored TS `EntryOptions` 逐字段
+  一一对应；`dsh-core` 门面 API（timeout/interval/debounce/throttle + 别名 +
+  async、plugin/effect/on/once、emit/bail/serial/parallel/waterfall、provide/
+  set/get/value/intercept/resolve_config/accessor/mixin、unload/update/fiber 查询）
+  完整对齐 Cordis `ctx`。
+- **差分**：16 场景（9 核心 + 5 loader + 2 include）Rust↔TS trace 逐行一致，覆盖
+  effect/emit/serial/bail/waterfall/intercept/update/deep-nesting/依赖 gate、
+  loader 事务/部分失败回滚/group 嵌套/disabled/isolate-intercept、
+  include 纯函数 patch（insert 进 group/顶层追加/嵌套命中/各 warn 诊断/
+  通用 overrides 字段覆盖）。
+- **验证**：`cargo test --workspace` 245 项全绿、`cargo clippy --workspace
+  --all-targets` 零警告。
+- **二进制级冒烟（M62 轮）**：真实 `dsh.exe` 以 echo-loop 组件跑通完整
+  生命周期——`--once "hello headless"` → 答案 `echo: hello headless`、reason=
+  completed、退出码 0；`--session-out` 生成合法 JSONL（header +
+  turn/start + user/message + assistant/message + turn/end）；`--session-in`
+  恢复续接（seq 续接、多轮上下文）；`--dump-config` 转储生效配置（含
+  isolate/intercept 字段）。
+- **无遗留 TODO/unimplemented**。
+
+**剩余候选均为自觉边界（非未完成功能）**：
+- `image` block / uuid id / surfaceOp 必填：forward-compat（WIT 预留）+ 确定性
+  id（不引入 uuid 依赖）+ 缝 append 宽松接受——均为设计决策，不做。
+- 真实 API https：需可信证书（自签已被正确拒绝），无证书环境不可验。
+- C ABI net：wasmtime preview1 socket stub + Rust std wasip1 未映射 preview2
+  sockets——平台限制待工具链。
+- 模块级 HMR（依赖图/partialReload）、schema `function`/`is(Class)`：超出
+  当前迁移范围 / Value-land 本质限制。
+
 **M34 session 缝消息形状对齐**：消息承载对齐 DSH 生产 `Message` 对象
 （`{id, role, content: ContentBlock[], source}`）——WIT record 更新 +
 写入端（3 个 loop 插件）+ 投影端（`derive_messages` 对齐
@@ -127,6 +163,52 @@ AggregateError）。
 **M61 disabled entry 差分**：`loader-11-disabled-entry`（sync 含 disabled
 不 apply → update enabled 热更 apply → update disabled 卸载——TS↔Rust 15
 行逐行一致；差分增至 13 场景）。
+**M62 isolate/intercept 差分**：`loader-12-isolate-intercept`（sync 含
+`isolate:{svc:true}`/label 与 `intercept:{svc:{...}}` → update 切换接线字段
+触发卸载重载——TS↔Rust 23 行逐行一致）。`dsh_diff::to_entry_options` 补齐
+isolate/intercept 透传（修复 Rust 侧差分静默丢弃这两个服务接线字段；TS 宿主
+`{...e}` 原样透传天然对齐）。差分增至 14 场景。注：trace 层不体现服务 realm
+实例差异，本场景验证字段透传与事务稳定性。
+**M63 include 纯函数差分**：`include-01-apply-patches-full`（insert 进 group /
+顶层追加 / 嵌套命中 / 各 warn 诊断——TS↔Rust 7 行逐行一致，差分增至 15 场景）。
+`dsh_diff::run_include`（纯函数级 `apply_entry_patches_with_warn` 对比，无
+Fiber）+ `diff/ts-host/include-host.mjs`（vendored `@deepseek-ai/cordis-plugin-
+include@1.0.6` 经 `node_modules` 装入，`applyEntryPatches` 权威执行 + printf `%C`
+展开对齐）+ `Patch` 补 `Serialize, Deserialize`（JSON patch → 运行时 patch）。
+差分场景协约：entry 与 insert 显式全字段（含 `config:{}`），两侧规范化为按键
+字典序，嵌套 group 子入口保持原始 Value 视角。
+**M64 通用 overrides 字段覆盖**：`include-02-apply-patches-overrides`
+（inject/isolate/intercept/disabled_expr 覆盖 + 空数组替换——TS↔Rust 2 行
+逐行一致，差分增至 16 场景）。`Patch` 加 `#[serde(flatten)] overrides`（收集
+显式 config/disabled/group 之外的任意覆盖键，对齐 TS `{id, insert, name,
+...overrides} → target[key]=value`）+ `apply_entry_override`（逐字段类型收紧，
+inject 整体替换/isolate/intercept 对象替换/disabled_expr 转 String，未知键忽略），
+`patch_update` 应用显式字段后遍历 overrides。闭环了 include patch 的通用字段
+覆盖语义（此前仅 config/disabled/group，为真实缺口）。
+
+**M65 Cordis 内核缺口补齐**（三子代理审查确认的运行时正确性缺口，逐项 TDD 闭环）：
+- **`ctx.inject(deps, callback)`**：`m64_inject.rs`（4 测试全绿）——`InjectPlugin`
+  （name="inject"）+ `Cordis::inject` 薄语法糖，依赖由既有 `Plugin::inject()`
+  声明 → `check_impls` → `refresh_fiber` epoch 门控就绪后 `Load` 执行回调；
+  依赖未就绪时回调推迟、全部就绪后一次执行、fiber 可正常卸载。
+- **`internal/dispatch` 统一派发钩子**：`m64_dispatch.rs`（3 测试）——`report_dispatch`
+  在各公开分派方法（emit/bail/serial/parallel/waterfall）collect 监听器前同步
+  emit `internal/dispatch(mode, name, args, thisArg=Null)`；mode 照抄 Cordis
+  （parallel 报 "emit"）；`internal/` 前缀跳过。16 差分零回归（无 internal/dispatch
+  监听器时为 no-op）。
+- **`fiber.update` veto + noSave**：`m64_update.rs`（5 测试）——**修复真 bug**：
+  `config` 从瀑布前 eager 赋值移到 waterfall inner 内，**veto 的 update 不再使
+  config 生效**（对齐 Cordis `this.config` 在 waterfall 内赋值）；`update_with`
+  透传 `noSave`（loader write_back 依赖）；新增 `fiber_config` accessor；
+  `update(fid,config)` 委托 `update_with(...,false)`。16 差分零回归。
+- **`fiber.getEffects()`**：`m64_effects.rs`（2 测试）＋ `EffectMeta{label,children}`
+  ＋ `FiberData.effects`（注册序）＋ `get_effects` accessor；`begin_unload` 清空、
+  重载重收集（不累积）。`children` 恒空——dsh-core 无 effect 父子结构，树形与
+  `ctx.on→"ctx.on('ev')"` 精确语义标签为后续增强（见 §6）。
+
+**缺口评审结论更新**：Cordis 内核四缺口（inject / internal/dispatch / update veto /
+getEffects）已全部闭环；原先误判的「`update` 丢弃返回值导致 veto 语义丢失」经验证
+**不成立**（`run_chain` 短路已正确拒绝 inner）——真实缺口是 eager config 赋值。
 
 ## 2. 目录结构
 
@@ -141,7 +223,7 @@ dsh-rs/
 │   ├── dsh-diff/                  # 场景 DSL 解释器 + golden 校验 CLI
 │   ├── dsh-wasmrt/                # wasmtime 后端：WasmPlugin + WasmComponentPlugin + WasmLoopPlugin + Capabilities
 │   └── dsh-cli/                   # DSH 层启动器（bin dsh）：cordis.yml → 插件仓库 → Include → run_turn（--watch HMR）
-├── scenarios/                     # 12 个差分场景（*.json）：9 核心 + 3 loader 事务（含 group）+ golden
+├── scenarios/                     # 16 个差分场景（*.json）：9 核心 + 5 loader 事务（含 group/disabled/isolate-intercept）+ 2 include 纯函数 + golden
 ├── diff/ts-host/                  # npm 工程：cordis 场景宿主 + loader-host（vendored loader）+ 生成/校验脚本
 ├── wasm-plugins/                  # WASM 插件：hello（C ABI）、hello-component / echo-loop / tool-loop / llm-loop（组件模型）
 ├── PLAN-rust-cordis-equivalent-migration.md   # 迁移方案 + M0-M33 交付记录（§9-§49）
@@ -203,7 +285,7 @@ dsh-rs/
 cargo test                # 182 项单元/集成测试（core/loader/eval/schema/diff/wasmrt/cli）
 cargo clippy --all-targets # 必须零警告
 cargo run -p dsh-diff -- <scenario.json> [--golden f] [--async]   # 单场景差分
-cd diff/ts-host && node verify-diff.mjs                 # 全场景：TS 生成 golden + Rust 校验（11 场景含 loader）
+cd diff/ts-host && node verify-diff.mjs                 # 全场景：TS 生成 golden + Rust 校验（16 场景含 loader/include）
 # m6 需要 wasm32-unknown-unknown target；wasm 插件由测试按需 cargo build
 # m8 需要 cargo-component 0.21+（cargo install cargo-component --locked）与 wasm32-wasip1 target
 ```
@@ -438,8 +520,14 @@ cd diff/ts-host && node verify-diff.mjs                 # 全场景：TS 生成 
 ## 7. 下一步方向（建议顺序）
 
 1. **Group apply 异步化已落地（M27）、热更误删已修复（M28）、group 差分已
-   纳入（M29）、disabled 差分已纳入（M61）**——loader 事务/嵌套/disabled
-   语义与 TS 逐行一致。可继续：isolate/intercept 差分（TS 宿主需扩展）。
+   纳入（M29）、disabled 差分已纳入（M61）、isolate/intercept 差分已纳入
+   （M62）**——loader 事务/嵌套/disabled/服务接线字段与 TS 逐行一致。
+   M62：`dsh_diff::to_entry_options` 补齐 isolate/intercept 透传（修复 Rust
+   侧差分场景静默丢弃这两个服务接线字段），新增 `loader-12-isolate-intercept`
+   场景（含 `isolate:{svc:true}`/label 与 `intercept:{svc:{...}}` 及 update
+   切换，23 行逐行一致）；TS 宿主 `{...e}` 原样透传天然对齐。注：trace 层
+   （plugin/status/log）不体现服务 realm 实例差异，本场景验证的是字段透传与
+   事务稳定性。
 2. **session 缝消息形状已对齐（M34）+ surface 折叠（M36）与防御性校验
    （M37）已对齐**：消息承载为 DSH 生产 `Message` 对象（WIT + 写入端 +
    投影端 + llm wire 序列化）；surface append/replace + shadow 语义 +
@@ -453,7 +541,11 @@ cd diff/ts-host && node verify-diff.mjs                 # 全场景：TS 生成 
    refresh 失败经 `set_error_sink` → `hmr/config-update-failed` parallel
    事件（CLI 已接入）+ `take_errors` 查询。可继续：模块级 HMR（依赖图/
    partialReload，非配置驱动，超出当前迁移范围）。
-5. **include patch 已完整（M33 insert/嵌套 + M39 warn sink）**。
+5. **include patch 已完整（M33 insert/嵌套 + M39 warn sink + M63 差分 +
+   M64 通用 overrides）**：`include-01` 纯函数差分（insert 进 group/顶层追加/
+   嵌套命中/各 warn 诊断）+ `include-02` overrides 差分（inject/isolate/
+   intercept/disabled_expr 覆盖 + 空数组替换），TS↔Rust 逐行一致；`Patch`
+   serde 反序列化 + `#[flatten] overrides`（对齐 TS 任意 entry 字段覆盖）。
 6. **timer 服务已完整（M40 回调形态 + M41 无回调形态 + M46 别名）**：
    timeout/interval/debounce/throttle + timeout_async/interval_ticks
    （Promise/AsyncIterable 等价）+ setTimeout/setInterval 别名 + 宿主驱动

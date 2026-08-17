@@ -6,15 +6,23 @@
 //! 已知 M3 差异：`!!js` YAML 标签不支持，用 `{"__jsExpr": "..."}` 对象代替；
 //! patch 仅作用于根层（Cordis 支持向 group 内 insert，M4 补齐）。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use dsh_core::{AggregateError, CordisError, Value};
 
 use crate::entry::EntryOptions;
 use crate::loader::Loader;
 
 /// 运行时 patch（Cordis `PatchOptions` 的 M3 子集）。
-#[derive(Debug, Clone, Default)]
+///
+/// M63：加 `Serialize, Deserialize` 以承载差分场景（JSON patch → 运行时 patch）。
+/// M64：`overrides` 收集显式字段（config/disabled/group）之外的**任意覆盖键**
+/// （对齐 TS `applyEntryPatches` 的 `{ id, insert, name, ...overrides }`——
+/// 逐一 `target[key] = value`）。serde `flatten` 使剩余键进入该 map，序列化时
+/// 并回同一对象（与 TS patch 对象形态一致）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Patch {
     pub id: Option<String>,
     pub insert: Option<Vec<EntryOptions>>,
@@ -22,6 +30,9 @@ pub struct Patch {
     pub config: Option<Value>,
     pub disabled: Option<bool>,
     pub group: Option<bool>,
+    /// 显式字段之外的任意覆盖键（M64；serde `flatten` 收集，TS `overrides`）。
+    #[serde(flatten, default)]
+    pub overrides: HashMap<String, Value>,
 }
 
 /// 应用 patch 列表到入口列表（对齐 Cordis `applyEntryPatches`）。
@@ -92,6 +103,12 @@ pub fn apply_entry_patches_with_warn(
             }
             if let Some(g) = &patch.group {
                 target.group = *g;
+            }
+            // M64：通用 overrides——显式字段（config/disabled/group）之外的任意
+            // 覆盖键（inject/isolate/intercept/disabled_expr/...），对齐 TS
+            // `target[key] = value`。类型不符 → 忽略（EntryOptions 字段类型固定）。
+            for (key, value) in &patch.overrides {
+                apply_entry_override(target, key, value);
             }
         });
     }
@@ -335,5 +352,49 @@ impl Include {
         let out = apply_entry_patches_with_warn(&raw, &self.patches, &mut |w| warns.push(w));
         *self.warns.borrow_mut() = warns;
         Ok(out)
+    }
+}
+
+/// M64：把单个覆盖键应用到 `EntryOptions`（对齐 TS `applyEntryPatches` 的
+/// `target[key] = value`）。`key` 匹配 `EntryOptions` 字段名；类型不符时忽略
+/// （EntryOptions 字段类型固定，TS 宽松赋值在 Rust 处收紧）。
+fn apply_entry_override(target: &mut EntryOptions, key: &str, value: &Value) {
+    match key {
+        "config" => {
+            if !value.is_null() {
+                target.config = value.clone();
+            }
+        }
+        "disabled" => {
+            if let Some(b) = value.as_bool() {
+                target.disabled = b;
+            }
+        }
+        "group" => {
+            if let Some(b) = value.as_bool() {
+                target.group = b;
+            }
+        }
+        "inject" => {
+            if let Some(arr) = value.as_array() {
+                target.inject = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            }
+        }
+        "isolate" | "intercept" => {
+            if let Some(o) = value.as_object() {
+                let map: HashMap<String, Value> =
+                    o.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                if key == "isolate" {
+                    target.isolate = map;
+                } else {
+                    target.intercept = map;
+                }
+            }
+        }
+        "disabled_expr" => {
+            target.disabled_expr = value.as_str().map(String::from);
+        }
+        // 未知覆盖键：EntryOptions 无对应字段，忽略。
+        _ => {}
     }
 }

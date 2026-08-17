@@ -451,3 +451,57 @@ fn wasm_loop_full_turn_with_llm() {
         "model history: user + tool result + final answer (production Message shape)"
     );
 }
+
+/// M66：WIT `tools::list-tools` 缝的 host 桥接——`WasmLoopPlugin::list_tools`
+/// 返回宿主注册工具的 `(name, schema)` 对（按名排序）。工具 schema 经
+/// `ToolRegistry::register_with_schema` 记录，供 `llm.generate` 构造工具列表。
+#[test]
+fn list_tools_returns_registered_tools_with_schema() {
+    let cordis = Cordis::new();
+    let tools = dsh_core::new_tool_registry();
+
+    // 宿主注册 tools 服务。
+    {
+        let h = tools.clone();
+        cordis
+            .plugin(
+                FnPlugin::new("svc-tools", move |ctx, _| {
+                    ctx.provide("tools", std::sync::Arc::new(h.clone()))?;
+                    Ok(EffectOutcome::None)
+                }),
+                json!({}),
+            )
+            .unwrap();
+    }
+
+    // 注册两个带 schema 的工具（乱序，list 应按名排序）。
+    tools
+        .lock()
+        .unwrap()
+        .register_with_schema("echo", json!({"type":"object","properties":{"text":{"type":"string"}}}), |a| {
+            json!({"echo": a.get("text").cloned().unwrap_or(json!(null))})
+        });
+    tools.lock().unwrap().register_with_schema(
+        "add",
+        json!({"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}}}),
+        |args| {
+            let a = args.get("a").and_then(|v| v.as_i64()).unwrap_or(0);
+            let b = args.get("b").and_then(|v| v.as_i64()).unwrap_or(0);
+            json!({"sum": a + b})
+        },
+    );
+
+    let plugin = Arc::new(
+        WasmLoopPlugin::new("echo-loop", &echo_loop_component(), Capabilities::all()).unwrap(),
+    );
+    let _fid = cordis.plugin_arc(plugin.clone(), json!({})).unwrap();
+
+    let out = plugin.list_tools(&cordis);
+    let listed: Vec<(String, serde_json::Value)> = serde_json::from_slice(&out).unwrap();
+    // 按名排序：add, echo。
+    assert_eq!(listed.len(), 2, "list-tools returns both registered tools");
+    assert_eq!(listed[0].0, "add");
+    assert_eq!(listed[1].0, "echo");
+    assert_eq!(listed[0].1["type"], "object");
+    assert_eq!(listed[1].1["properties"]["text"]["type"], "string");
+}

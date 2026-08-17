@@ -33,7 +33,7 @@ pub mod value;
 pub use context::{Cordis, IntervalTicks, TimerFn};
 pub use error::{AggregateError, CordisError};
 pub use events::{AsyncListener, DispatchMode, HookCallback, HookResult, Listener, NextRef};
-pub use fiber::{Disposer, EffectBody, EffectOutcome, FiberHandle, FiberState};
+pub use fiber::{Disposer, EffectBody, EffectMeta, EffectOutcome, FiberHandle, FiberState};
 pub use llm::{new_llm, LlmHandle, LlmService};
 pub use logger::{format_message, hyphenate, Exporter, ExporterConfig, Logger, LoggerState, LoggerType, Message};
 pub use reflect::{AccessorGet, AccessorSet, CheckFn, Property, PropertyKind};

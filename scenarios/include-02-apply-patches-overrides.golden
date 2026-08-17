@@ -1,0 +1,2 @@
+include-data:[{"config":{},"disabled":false,"group":false,"id":"p","inject":[],"intercept":{},"isolate":{},"name":"p"},{"config":{},"disabled":false,"group":true,"id":"q","inject":[],"intercept":{},"isolate":{},"name":"q"}]
+include-result:[{"config":{},"disabled":false,"disabled_expr":"expr","group":false,"id":"p","inject":[],"intercept":{"svc4":{"tag":"x"}},"isolate":{"svc3":"global-a"},"name":"p"},{"config":{},"disabled":false,"group":true,"id":"q","inject":[],"intercept":{},"isolate":{},"name":"q"}]

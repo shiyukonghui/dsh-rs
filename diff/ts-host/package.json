@@ -5,6 +5,7 @@
   "version": "0.1.0",
   "description": "TS-side scenario host for Cordis-equivalence diff (M5).",
   "dependencies": {
+    "@deepseek-ai/cordis-plugin-include": "^1.0.6",
     "cordis": "4.0.0-rc.8"
   }
 }

@@ -94,6 +94,20 @@ pub struct FiberData {
     pub epoch: Option<String>,
     /// fiber 所属作用域（M0 恒为根作用域）。
     pub scope: ScopeId,
+    /// 已注册 effect 的元数据（M66；注册序，等价 Cordis `fiber.getEffects()`）。
+    /// 当前仅记录 label；`children` 恒空（dsh-core 无 effect 父子结构，树形为
+    /// 自觉边界）。卸载时清空。
+    pub effects: Vec<EffectMeta>,
+}
+
+/// effect 元数据（对应 Cordis `EffectMeta`：label + children 树）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectMeta {
+    /// 语义标签（当前为注册时的 `&'static str`，如 "plugin-apply"；
+    /// `ctx.on`→"ctx.on('ev')" 形式的精确标签为后续增强）。
+    pub label: String,
+    /// 子 effect（当前恒空）。
+    pub children: Vec<EffectMeta>,
 }
 
 impl FiberData {
@@ -105,6 +119,8 @@ impl FiberData {
     /// `EffectOutcome::Async` 被存入 `async_disposers`（同步 wrapper 不含该部分，
     /// 由 `unload_async` 并行执行）。
     pub fn collect_effect(&mut self, label: &'static str, outcome: EffectOutcome) -> Disposer {
+        // M66：记录 effect 元数据（注册序，含 async/await 去向）。
+        self.effects.push(EffectMeta { label: label.to_string(), children: Vec::new() });
         let mut collected: Vec<Disposer> = Vec::new();
         match outcome {
             EffectOutcome::None => {}

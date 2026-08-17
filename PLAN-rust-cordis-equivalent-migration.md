@@ -3111,3 +3111,156 @@ loader-11。
 disabled entry 的 TS↔Rust 行为完全对齐（含 disabled→enabled 热更 +
 enabled→disabled 卸载）。差分覆盖增强。剩余差分面：isolate/intercept
 （Rust 单测已覆盖，TS 宿主需扩展）。下一轮：真实 API https / 其余收尾。
+
+## 78. M62 交付记录（2026）—— isolate/intercept 差分场景（loader-12）
+
+**状态：补充交付**（14 差分场景全 PASS——含新增 loader-12-isolate-intercept；
+`cargo test` 241 项不变；`cargo clippy --all-targets` 零警告）。
+
+### 目标（差分覆盖服务接线字段）
+
+Rust 侧 `EntryOptions.isolate`/`intercept` 已实现（M3，loader.rs 注入
+pending_isolate/pending_intercept）；但 `dsh_diff::to_entry_options` 只透传
+id/name/config/disabled/group，差分场景里 entry 的 isolate/intercept 被静默
+丢弃——与 TS 宿主 `{...e}` 原样透传不一致。补齐透传并纳入差分。
+
+### 改动
+
+1. `crates/dsh-diff/src/lib.rs`：`to_entry_options` 补 `opts.isolate`/
+   `opts.intercept`（新增 `obj_map` 辅助，从 entry JSON 的 object 字段转
+   `HashMap<String, Value>`）。
+2. `scenarios/loader-12-isolate-intercept.json`：sync 含
+   `isolate:{svc:true}`（入口本地 realm）与 `intercept:{svc:{tag:"x"}}` →
+   update e2 切 `isolate:{svc:"global-a"}`（label）+ `intercept:{}` →
+   update e1 切 `intercept:{svc:{tag:"y"}}`。
+3. `diff/ts-host/verify-diff.mjs`：`ASYNC_SCENARIOS` 加入 loader-12。
+
+### 验证
+
+`loader-12-isolate-intercept.golden`（23 行，TS 生成）与 Rust 侧逐行一致：
+- line 1：`loader-sync` 行含 isolate/intercept 字段（规范化键序）；
+- line 12：update 切接线字段 → isolate/intercept 变化触发 e2 卸载重载；
+- line 18：e1 切 intercept → 重载；
+- fiber 轨迹（plugin/status/apply/log）与 TS 一致。
+
+### 结论
+
+服务接线字段（isolate/intercept）的 TS↔Rust 透传与事务稳定性逐行对齐。
+注：trace 层（plugin/status/log）不体现服务 realm 实例差异，本场景验证
+字段透传与事务稳定性；服务实例隔离语义由 Rust 单测覆盖。
+
+## 79. M63 交付记录（2026）—— include 纯函数差分场景（include-01）
+
+**状态：补充交付**（15 差分场景全 PASS——含新增 include-01-apply-patches-full；
+`cargo test` 242 项全绿（+1 新增测试）；`cargo clippy --all-targets` 零警告）。
+
+### 目标（include patch 差分覆盖）
+
+include patch（`apply_entry_patches`，M33/M39）此前仅有 Rust 单测，差分集
+未含 include 场景。本轮把 include 的**纯函数级**差分纳入：TS 侧以 vendored
+`@deepseek-ai/cordis-plugin-include@1.0.6`（经 `node_modules` 装入）的
+`applyEntryPatches(data, patches, warn)` 为权威，Rust 侧以
+`apply_entry_patches_with_warn` 对比，覆盖 insert 进 group / 顶层追加 / 嵌套
+命中 / 各 warn 诊断。
+
+### 改动
+
+1. `crates/dsh-loader/src/include.rs`：`Patch` 补 `Serialize, Deserialize`
+   derive（JSON patch → 运行时 patch，承载差分场景）。
+2. `crates/dsh-diff/src/lib.rs`：新增 `pub fn run_include(text)`——解析
+   `{data, patches}` 场景，`apply_entry_patches_with_warn` 执行，输出到
+   `include-data` / `include-warn` / `include-result` trace 行（Uniform
+   `sorted_json` 按键字典序，与 TS canonical 对齐）。
+3. `crates/dsh-diff/src/main.rs`：按场景顶层含 `patches` 键分发到 `run_include`
+   （否则 Scenario Runner）。
+4. `diff/ts-host/include-host.mjs`：include 场景宿主——用
+   `applyEntryPatches` 权威执行，`warn` 回调做 printf `%C` 展开（无颜色 =
+   原始字符串，与 Rust `format!` 逐字一致）。
+5. `diff/ts-host/verify-diff.mjs`：`include-` 前缀分发到 include-host.mjs。
+6. `scenarios/include-01-apply-patches-full.json` + `.golden`（7 行，TS 生成）。
+7. `crates/dsh-diff/tests/m63_include_diff.rs`：单测断言 data/warn/result 形态。
+
+### 差分协约（对齐细则）
+
+- 场景 entries 与 insert 显式给**全字段**（含 `config:{}`）——两侧序列化一致
+  （Rust `EntryOptions` 序列化补默认字段；TS canonical 输出原键）。
+- 顶层 data/result 以 `EntryOptions` 视图（全字段），嵌套 group 子入口保持
+  原始 `Value` 视角——Rust 的 group.config 是 `Value`，TS 的也是平 JSON。
+- `disabled_expr`：输入无则两侧均不输出（Rust `skip_serializing_if`）。
+- `%C` 展开（cordis `defaultFormatters.C` 无颜色）= 原始字符串：物理 `%s`。
+
+### 验证
+
+`include-01-apply-patches-full.golden`（7 行，TS 生成）与 Rust 侧逐行一致：
+- `include-data`：输入 a/g（含组子入口 c1），按键序。
+- 5 条 `include-warn` 按序：`entry ghost not found`、`entry a is not a
+  group`、`entry nope not found`、`id is required for non-insert patches`、
+  `name mismatch for a (expected a, got WRONG), skipping`。
+- `include-result`：a.config={k:2}、a.disabled=true、顶层追加 x、
+  g.config 插 c2、c1 嵌套命中 {nested:true}。
+
+### 结论
+
+include patch 的纯函数语义（insert 进 group / 顶层追加 / 嵌套命中 / warn
+诊断）TS↔Rust 逐行对齐，差分场景 15 个全 PASS。**剩余真实缺口**：TS
+`applyEntryPatches` 支持任意 entry 字段覆盖（`{id, insert, name, ...overrides}
+→ target[key]=value`），Rust `patch_update` 仅覆盖 config/disabled/group——
+通用 overrides 覆盖待补（下一轮候选）。
+
+## 80. M64 交付记录（2026）—— include patch 通用 overrides 字段覆盖
+
+**状态：补充交付**（16 差分场景全 PASS——含新增 include-02-apply-patches-
+overrides；`cargo test` 245 项全绿（+3 新增 overrides 测试）；`cargo clippy
+--all-targets` 零警告）。
+
+### 目标（补齐 include patch 的通用字段覆盖语义）
+
+M63 结论记录的**真实缺口**：TS `applyEntryPatches` 的 `{ id, insert, name,
+...overrides }` 把除 id/insert/name 外的**所有** patch 字段逐一 `target[key]
+= value` 覆盖到 entry；Rust `Patch`/`patch_update`（M33/M39）仅覆盖
+config/disabled/group 三个显式字段。本轮引入 `overrides` 收集，使任意 entry
+字段（inject/isolate/intercept/disabled_expr/...）的覆盖与 TS 对齐。
+
+### 改动
+
+1. `crates/dsh-loader/src/include.rs`：
+   - `Patch` 加 `#[serde(flatten, default)] overrides: HashMap<String, Value>`
+     ——显式字段（config/disabled/group）由具体字段消费，**其余任意键**在
+     反序列化时进入该 map；序列化时 flatten 并回同一对象（与 TS patch 对象
+     形态一致）。
+   - 新增 `apply_entry_override(&mut EntryOptions, key: &str, value)`：按
+     `EntryOptions` 字段名匹配——`inject`（`Vec<String>` 整体替换）、
+     `isolate`/`intercept`（对象整体替换）、`disabled_expr`（转 `String`）、
+     `config`/`disabled`/`group`（与显式路径重复但无损）；类型不符则忽略
+     （EntryOptions 字段类型固定，TS 宽松赋值在 Rust 处收紧）。
+   - `apply_entry_patches_with_warn` 的 `patch_update` 闭包在显式字段后遍历
+     `patch.overrides` 应用（合并后 = TS 的完整 overrides）。
+2. `scenarios/include-02-apply-patches-overrides.json` + `.golden`（2 行，TS 生成）。
+3. `crates/dsh-loader/tests/m3_include.rs`：3 项新增测试——
+   `apply_patches_overrides_any_entry_field`（inject/isolate/intercept/
+   disabled_expr 覆盖）、`patch_deserializes_flatten_overrides_and_roundtrips`
+   （JSON → overrides 收集 + round-trip 并回）、`apply_patches_overrides_
+   nested_group_child`（递归到 group 子入口）。
+
+### 差分协约（M63 扩展）
+
+- overrides 差分的 trace 观察面与 M63 一致：顶层 entry/insert 全字段、嵌套
+  group 子入口保持原始 Value 视角、`disabled_expr` 输入无则两侧均不输出。
+- `%C` 展开（cordis `defaultFormatters.C` 无颜色 = 原始字符串）逐字一致。
+- TS 侧无需改动——`applyEntryPatches` 天然支持任意 overrides 字段。
+
+### 验证
+
+`include-02-apply-patches-overrides.golden`（2 行，TS 生成）与 Rust 逐行一致：
+- patch `{id:p, inject:[svc1,svc2], isolate:{svc3:true}, intercept:{svc4:
+  {tag:'x'}}}` → p.inject 整体替换、isolate/intercept 对象替换；
+- `{id:p, disabled_expr}` → p 新增 disabled_expr:"expr"；
+- `{id:p, isolate:{svc3:'global-a'}}` → isolate 整体替换；
+- `{id:p, inject:[]}` → inject 清空。
+- include-data → 2 行含 p/q；include-result 反映全部覆盖。
+
+### 结论
+
+include patch 的通用字段覆盖语义与 TS `applyEntryPatches` 完全对齐（serde
+flatten overrides + 逐字段收紧），差分场景 16 个全 PASS。至此 include 的
+insert / 嵌套命中 / warn 诊断 / 通用字段覆盖四方面 TS↔Rust 逐行一致。

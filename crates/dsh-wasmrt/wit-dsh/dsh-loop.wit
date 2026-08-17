@@ -121,6 +121,9 @@ interface tools {
   execute: func(name: string, arguments: list<u8>) -> list<u8>;
   /// 注册一个工具（宿主侧登记 schema + 处理函数）。
   register: func(name: string, schema: list<u8>, handler: u32) -> u32;
+  /// 枚举全部已注册工具：`[[name, schema], ...]` 的 JSON 字节（按名排序）。
+  /// （WIT 中 `list` 为关键字，故以 `list-tools` 命名；等价 DSH `tools.list()`。）
+  list-tools: func() -> list<u8>;
 }
 
 /// 模型适配缝。

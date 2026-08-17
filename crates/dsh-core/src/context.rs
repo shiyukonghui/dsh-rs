@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::error::{AggregateError, CordisError};
 use crate::events::{AsyncListener, HookCallback, HookResult, Listener};
-use crate::fiber::{Disposer, EffectBody, EffectOutcome, FiberHandle, FiberState, make_disposer};
+use crate::fiber::{Disposer, EffectBody, EffectMeta, EffectOutcome, FiberHandle, FiberState, make_disposer};
 use crate::logger::{Exporter, ExporterConfig, Logger};
 use crate::reflect::{AccessorGet, AccessorSet, CheckFn, Property};
 use crate::registry::Plugin;
@@ -24,6 +24,42 @@ pub type InnerFn = Box<dyn Fn(&mut Vec<Value>) -> Option<Value>>;
 
 /// M40：debounce/throttle 返回的包装函数（参数经 `Value` 传递；单线程捕获）。
 pub type TimerFn = Rc<dyn Fn(Value)>;
+
+/// M64：`ctx.inject` 的回调体（等价 `Plugin::apply`：`(ctx, config) -> Outcome`）。
+/// 非 `Send`——单线程纪律（`Rc<dyn Fn>`）。
+pub type InjectBody = Rc<dyn Fn(&Cordis, Value) -> Result<EffectOutcome, CordisError>>;
+
+/// M64：`ctx.inject(deps, callback)` 的底层插件——`inject()` 返回依赖、`apply()`
+/// 调用回调。复用既有依赖驱动机制（`refresh_fiber` epoch + `notify`）实现
+/// 「等服务就绪后启动」（Cordis `inject` 即 `plugin({ inject, apply: callback })`）。
+pub struct InjectPlugin {
+    inject: &'static [&'static str],
+    body: InjectBody,
+}
+
+impl InjectPlugin {
+    pub fn new(
+        inject: &'static [&'static str],
+        body: impl Fn(&Cordis, Value) -> Result<EffectOutcome, CordisError> + 'static,
+    ) -> Self {
+        InjectPlugin {
+            inject,
+            body: Rc::new(body),
+        }
+    }
+}
+
+impl Plugin for InjectPlugin {
+    fn name(&self) -> &'static str {
+        "inject"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        self.inject
+    }
+    fn apply(&self, ctx: &Cordis, config: Value) -> Result<EffectOutcome, CordisError> {
+        (self.body)(ctx, config)
+    }
+}
 
 /// M41：`ctx.interval(delay)` 的 tick 流（等价 AsyncIterable）——每 delay
 /// 毫秒产出一个 `()`；fiber 卸载（disposer 置 cancelled）→ 流结束。
@@ -389,6 +425,23 @@ impl Cordis {
             self.run_or_defer(t);
         }
         Ok(fid)
+    }
+
+    /// 等服务就绪后运行回调（Cordis `ctx.inject(deps, callback)`）。
+    ///
+    /// 把 `(deps, callback)` 包装为 `{ inject, apply }` 插件（等价 Cordis
+    /// `plugin({ inject, apply: callback })`）。依赖服务**全部就绪**（提供者
+    /// active）后启动 fiber；未就绪则不启动，服务变更经 `notify` 重算依赖方
+    /// 再启动。回调收 `(ctx, config)`。
+    ///
+    /// M64：补齐 Cordis 公开 API（此前完全缺失；依赖等待复用既有
+    /// `refresh_fiber` epoch + `notify` 机制）。
+    pub fn inject(
+        &self,
+        deps: &'static [&'static str],
+        callback: impl Fn(&Cordis, Value) -> Result<EffectOutcome, CordisError> + 'static,
+    ) -> Result<FiberHandle, CordisError> {
+        self.plugin_arc(Arc::new(InjectPlugin::new(deps, callback)), Value::Object(Default::default()))
     }
 
     /// M7：异步注册插件（等价 `await ctx.plugin()`）。加载编排用真实 `yield_now`
@@ -875,8 +928,29 @@ impl Cordis {
         }))
     }
 
+    /// `internal/dispatch` 统一钩子（M65，对齐 Cordis `EventsService.dispatch`）：
+    /// 派发**非 internal** 事件前同步 emit `internal/dispatch(type, name, args,
+    /// thisArg)`。emit 语义（无 next、返回值丢弃）；`internal/` 前缀跳过。
+    /// 模式值照抄 Cordis：parallel 经 emit 报 "emit"；bail/serial/waterfall 各报
+    /// 自身。必须在 borrow `rt` 前调用（内部经 `emit` 重新 borrow）。
+    fn report_dispatch(&self, mode: &str, name: &str, args: &[Value]) {
+        if name.starts_with("internal/") {
+            return;
+        }
+        self.emit(
+            "internal/dispatch",
+            vec![
+                Value::String(mode.to_string()),
+                Value::String(name.to_string()),
+                Value::Array(args.to_vec()),
+                Value::Null,
+            ],
+        );
+    }
+
     /// 同步顺序分派（等价 `ctx.emit()`）。
     pub fn emit(&self, name: &str, args: Vec<Value>) {
+        self.report_dispatch("emit", name, &args);
         let (cbs, scope) = {
             let mut rt = self.rt.borrow_mut();
             let scope = rt
@@ -935,6 +1009,7 @@ impl Cordis {
     }
 
     fn run_serialish(&self, name: &str, args: Vec<Value>, tag: &str) -> Option<Value> {
+        self.report_dispatch(tag, name, &args);
         let cbs = {
             let mut rt = self.rt.borrow_mut();
             if !name.starts_with("internal/") {
@@ -973,6 +1048,7 @@ impl Cordis {
 
     /// 洋葱中间件分派（等价 `ctx.waterfall()`）。
     pub fn waterfall(&self, name: &str, args: Vec<Value>, inner: InnerFn) -> Option<Value> {
+        self.report_dispatch("waterfall", name, &args);
         let cbs = {
             let mut rt = self.rt.borrow_mut();
             if !name.starts_with("internal/") {
@@ -1599,10 +1675,28 @@ impl Cordis {
         self.with(|rt| rt.fiber(fid).and_then(|f| f.error.clone()))
     }
 
-    /// 更新 fiber 配置并重启（Cordis `fiber.update(config, noSave)`）。
-    /// 先按插件 schema 校验（失败返回 Err），再走 `internal/update` waterfall
-    /// （loader 写回监听器在此拦截），默认 inner = restart（卸载后按 epoch 重载）。
+    /// fiber 当前生效配置（`this.config`；veto 的 update 不更新它）。
+    pub fn fiber_config(&self, fid: FiberHandle) -> Option<Value> {
+        self.with(|rt| rt.fiber(fid).map(|f| f.config.clone()))
+    }
+
+    /// fiber 已注册 effect 的元数据列表（注册序；等价 Cordis `fiber.getEffects()`）。
+    /// 当前仅 label 有值，`children` 恒空（dsh-core 无 effect 父子结构）。
+    pub fn get_effects(&self, fid: FiberHandle) -> Option<Vec<EffectMeta>> {
+        self.with(|rt| rt.fiber(fid).map(|f| f.effects.clone()))
+    }
+
+    /// 更新 fiber 配置并重启（Cordis `fiber.update(config)`）。
+    /// 等价 `update_with(fid, config, false)`。
     pub fn update(&self, fid: FiberHandle, config: Value) -> Result<(), CordisError> {
+        self.update_with(fid, config, false)
+    }
+
+    /// 更新 fiber 配置并重启，带 `noSave`（提示持久化钩子跳过写回；loader 写回
+    /// 监听器依赖）。先按插件 schema 校验（失败返回 Err），再走 `internal/update`
+    /// waterfall（loader 写回监听器在此拦截），默认 inner = restart。`this.config`
+    /// 在 waterfall inner 内赋值（Cordis）——**veto 的 update 不致 config 生效**。
+    pub fn update_with(&self, fid: FiberHandle, config: Value, no_save: bool) -> Result<(), CordisError> {
         // schema 校验（Cordis `resolveConfig`）
         let validated = self.validate_config(fid, &config)?;
         let active = {
@@ -1611,7 +1705,8 @@ impl Cordis {
             if f.uid.is_none() {
                 return Err(CordisError::InactiveEffect);
             }
-            f.config = validated.clone();
+            // 注意：不在 waterfall 前 eager 赋 `config`——`this.config` 在 inner
+            // 内赋值，veto（inner 不执行）时配置不生效。
             f.state == FiberState::Active
         };
         if !active {
@@ -1620,10 +1715,14 @@ impl Cordis {
         let cordis = self.clone();
         let _ = self.waterfall(
             "internal/update",
-            vec![Value::from(fid), validated, Value::Bool(false)],
-            Box::new(move |_args| {
+            vec![Value::from(fid), validated, Value::Bool(no_save)],
+            Box::new(move |args| {
+                // inner：赋 config（生效）后重启（Cordis `this.config = config;
+                // return this.restart()`）。
+                let cfg = args.get(1).cloned().unwrap_or(Value::Null);
                 let mut rt = cordis.rt.borrow_mut();
                 if let Some(f) = rt.fiber_mut(fid) {
+                    f.config = cfg;
                     f.error = None;
                 }
                 drop(rt);

@@ -1,0 +1,13 @@
+{
+  "name": "include-02-apply-patches-overrides",
+  "data": [
+    { "id": "p", "name": "p", "config": {}, "disabled": false, "group": false, "inject": [], "isolate": {}, "intercept": {} },
+    { "id": "q", "name": "q", "config": {}, "disabled": false, "group": true, "inject": [], "isolate": {}, "intercept": {} }
+  ],
+  "patches": [
+    { "id": "p", "inject": [ "svc1", "svc2" ], "isolate": { "svc3": true }, "intercept": { "svc4": { "tag": "x" } } },
+    { "id": "p", "disabled_expr": "expr" },
+    { "id": "p", "isolate": { "svc3": "global-a" } },
+    { "id": "p", "inject": [] }
+  ]
+}

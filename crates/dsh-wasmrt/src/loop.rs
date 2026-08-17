@@ -19,6 +19,10 @@ use wasmtime::{Engine, Store};
 
 use crate::abi::Capabilities;
 
+// 使 `tools::Host::list_tools` 等方法可经 `.list_tools()` 直接调用。
+#[allow(unused_imports)]
+use dsh::dsh::tools::Host as _;
+
 // 编译期绑定 dsh-loop world（host 侧；生成顶层 DshLoop + dsh::dsh::* 模块）。
 wasmtime::component::bindgen!({
     path: "wit-dsh/dsh-loop.wit",
@@ -189,6 +193,19 @@ impl dsh::dsh::tools::Host for LoopHost {
     fn register(&mut self, _name: String, _schema: Vec<u8>, _handler: u32) -> u32 {
         0
     }
+    /// 枚举已注册工具（WIT `tools::list-tools` → `list_tools`）。
+    fn list_tools(&mut self) -> Vec<u8> {
+        let items: Vec<(String, Value)> = if let Some(ctx) = self.ctx() {
+            if let Some(handle) = ctx.get_typed::<ToolRegistryHandle>("tools") {
+                handle.lock().unwrap().list()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        serde_json::to_vec(&items).unwrap_or_default()
+    }
 }
 impl dsh::dsh::llm::Host for LoopHost {
     fn generate(&mut self, provider: String, messages: Vec<u8>, tools: Vec<u8>) -> Vec<u8> {
@@ -327,6 +344,22 @@ impl WasmLoopPlugin {
             .as_ref()
             .map(|r| r.store.data().derive_messages())
             .unwrap_or_default()
+    }
+
+    /// 枚举宿主已注册工具 `(name, schema)` 对（JSON 字节）。
+    /// 直接驱动 host 侧 `tools::list-tools` 桥接（注入 ctx 后调 `LoopHost`）；
+    /// 供测试验证 WIT `list-tools` 缝的 host 实现。
+    pub fn list_tools(&self, ctx: &Cordis) -> Vec<u8> {
+        let _ = self.runtime(); // 确保实例化
+        CURRENT_CTX.with(|c| *c.borrow_mut() = Some(ctx.clone()));
+        let out = self
+            .rt
+            .borrow_mut()
+            .as_mut()
+            .map(|r| r.store.data_mut().list_tools())
+            .unwrap_or_default();
+        CURRENT_CTX.with(|c| *c.borrow_mut() = None);
+        out
     }
 }
 

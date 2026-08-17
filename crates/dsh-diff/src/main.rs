@@ -44,27 +44,34 @@ fn main() {
     }
 
     let text = std::fs::read_to_string(&scenario_path).expect("read scenario");
-    let scenario: dsh_diff::Scenario =
+    let scenario_json: serde_json::Value =
         serde_json::from_str(&text).expect("parse scenario JSON");
 
-    let trace = if use_async {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build tokio runtime");
-        rt.block_on(async {
-            let local = tokio::task::LocalSet::new();
-            local
-                .run_until(async {
-                    let mut runner = Runner::new();
-                    runner.run_async(&scenario).await
-                })
-                .await
-        })
-        .expect("run scenario async")
+    // M63：include 差分场景（顶层含 `data`/`patches`，无 `steps`）→ 纯函数级。
+    let trace: Vec<String> = if scenario_json.get("patches").is_some() {
+        dsh_diff::run_include(&text).expect("run include scenario")
     } else {
-        let mut runner = Runner::new();
-        runner.run(&scenario).expect("run scenario")
+        let scenario: dsh_diff::Scenario = serde_json::from_value(scenario_json)
+            .unwrap_or_else(|e| panic!("parse scenario: {e}"));
+        if use_async {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build tokio runtime");
+            rt.block_on(async {
+                let local = tokio::task::LocalSet::new();
+                local
+                    .run_until(async {
+                        let mut runner = Runner::new();
+                        runner.run_async(&scenario).await
+                    })
+                    .await
+            })
+            .expect("run scenario async")
+        } else {
+            let mut runner = Runner::new();
+            runner.run(&scenario).expect("run scenario")
+        }
     };
     let trace_text = trace.join("\n") + "\n";
 

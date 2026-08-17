@@ -217,6 +217,7 @@ impl Runtime {
             error: None,
             epoch: None,
             scope: 1,
+            effects: Vec::new(),
         }));
         id
     }
@@ -653,7 +654,11 @@ impl Runtime {
     pub fn begin_unload(&mut self, fid: FiberId) -> Vec<Disposer> {
         self.set_state(fid, FiberState::Unloading);
         self.fiber_mut(fid)
-            .map(|f| f.take_disposers())
+            .map(|f| {
+                // M66：卸载清空 effect 元数据（重载后重新收集）。
+                f.effects.clear();
+                f.take_disposers()
+            })
             .unwrap_or_default()
     }
 

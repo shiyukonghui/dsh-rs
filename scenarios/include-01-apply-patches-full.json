@@ -1,0 +1,21 @@
+{
+  "name": "include-01-apply-patches-full",
+  "data": [
+    { "id": "a", "name": "a", "config": { "k": 1 }, "disabled": false, "group": false, "inject": [], "isolate": {}, "intercept": {} },
+    { "id": "g", "name": "g", "config": [
+      { "id": "c1", "name": "c1", "config": { "inner": 0 }, "disabled": false, "group": false, "inject": [], "isolate": {}, "intercept": {} }
+    ], "disabled": false, "group": true, "inject": [], "isolate": {}, "intercept": {} }
+  ],
+  "patches": [
+    { "id": "a", "config": { "k": 2 } },
+    { "insert": [ { "id": "x", "name": "x", "config": {}, "disabled": false, "group": false, "inject": [], "isolate": {}, "intercept": {} } ] },
+    { "id": "g", "insert": [ { "id": "c2", "name": "c2", "config": { "inner": 9 }, "disabled": false, "group": false, "inject": [], "isolate": {}, "intercept": {} } ] },
+    { "id": "a", "disabled": true },
+    { "id": "ghost", "config": {} },
+    { "id": "a", "insert": [ { "id": "e", "name": "e", "config": {}, "disabled": false, "group": false, "inject": [], "isolate": {}, "intercept": {} } ] },
+    { "id": "nope", "insert": [ { "id": "e2", "name": "e2", "config": {}, "disabled": false, "group": false, "inject": [], "isolate": {}, "intercept": {} } ] },
+    { "config": {} },
+    { "id": "a", "name": "WRONG", "config": { "z": 1 } },
+    { "id": "c1", "config": { "nested": true } }
+  ]
+}

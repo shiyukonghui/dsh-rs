@@ -18,7 +18,9 @@ pub type ToolFn = dyn Fn(Value) -> Value + Send + Sync;
 /// 工具注册表（内部 `Mutex` 满足服务仓库 Send+Sync 约束）。
 #[derive(Default)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<ToolFn>>,
+    /// 工具名 → (处理函数, schema)。schema 记录工具参数契约（供 `llm.generate`
+    /// 构造工具列表 / WASM `tools::list` 枚举；无 schema 时归一为空对象 `{}`）。
+    tools: HashMap<String, (Arc<ToolFn>, Value)>,
 }
 
 impl ToolRegistry {
@@ -28,17 +30,44 @@ impl ToolRegistry {
         }
     }
 
-    /// 注册一个工具（返回旧实现 if any；等价 WIT 缝 `tools::register`）。
+    /// 注册工具，带参数 schema（等价 WIT 缝 `tools::register` 的 schema 参数）。
+    /// 返回旧实现 if any。
+    pub fn register_with_schema(
+        &mut self,
+        name: &str,
+        schema: Value,
+        f: impl Fn(Value) -> Value + Send + Sync + 'static,
+    ) {
+        self.tools.insert(name.to_string(), (Arc::new(f), schema));
+    }
+
+    /// 注册工具（无 schema → 记为空对象 `{}`；等价 WIT 缝 `tools::register`）。
     pub fn register(&mut self, name: &str, f: impl Fn(Value) -> Value + Send + Sync + 'static) {
-        self.tools.insert(name.to_string(), Arc::new(f));
+        self.register_with_schema(name, Value::Object(Default::default()), f);
+    }
+
+    /// 工具 schema 单查（未注册 → None）。
+    pub fn schema(&self, name: &str) -> Option<Value> {
+        self.tools.get(name).map(|(_, s)| s.clone())
     }
 
     /// 执行工具（等价 WIT 缝 `tools::execute`）；未注册 → 返回错误 JSON。
     pub fn execute(&self, name: &str, arguments: Value) -> Value {
         match self.tools.get(name) {
-            Some(f) => f(arguments),
+            Some((f, _)) => f(arguments),
             None => serde_json::json!({"error": format!("tool \"{name}\" not registered")}),
         }
+    }
+
+    /// 枚举全部工具：`(name, schema)` 对，按名排序（等价 WIT 缝 `tools::list`）。
+    pub fn list(&self) -> Vec<(String, Value)> {
+        let mut items: Vec<(String, Value)> = self
+            .tools
+            .iter()
+            .map(|(n, (_, s))| (n.clone(), s.clone()))
+            .collect();
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        items
     }
 
     /// 已注册工具名（诊断）。

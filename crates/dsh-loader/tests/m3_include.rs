@@ -247,3 +247,86 @@ fn options_with_group(id: &str, children: Vec<Value>) -> EntryOptions {
     o.config = Value::Array(children);
     o
 }
+
+/// M64：通用 overrides 字段覆盖（对齐 TS `applyEntryPatches` 的
+/// `{ id, insert, name, ...overrides }` → `target[key] = value`）。
+/// 覆盖 inject / isolate / intercept / disabled_expr，并验证与显式
+/// config/disabled/group 合并（serde flatten 收集）。
+#[test]
+fn apply_patches_overrides_any_entry_field() {
+    use std::collections::HashMap;
+
+    let data = vec![options("a", "a", json!({"k": 1}))];
+
+    // 显式 config + overrides 其余键（inject/isolate/intercept 走 flatten map）。
+    let mut overrides = HashMap::new();
+    overrides.insert("inject".to_string(), json!(["svc1"]));
+    overrides.insert("isolate".to_string(), json!({"svc2": true}));
+    overrides.insert("intercept".to_string(), json!({"svc3": {"tag": "x"}}));
+    overrides.insert("disabled_expr".to_string(), json!("expr"));
+    let patches = vec![Patch {
+        id: Some("a".into()),
+        config: Some(json!({"k": 9})),
+        overrides,
+        ..Patch::default()
+    }];
+
+    let out = apply_entry_patches(&data, &patches);
+    assert_eq!(out.len(), 1);
+    let a = &out[0];
+    assert_eq!(a.config, json!({"k": 9}));
+    assert_eq!(a.inject, vec!["svc1"]);
+    assert_eq!(a.isolate, HashMap::from([("svc2".to_string(), Value::Bool(true))]));
+    assert_eq!(a.intercept, HashMap::from([("svc3".to_string(), json!({"tag": "x"}))]));
+    assert_eq!(a.disabled_expr.as_deref(), Some("expr"));
+}
+
+/// M64：JSON patch（serde 反序列化）→ overrides 收集——`inject` 等键从
+/// flatten map 落到运行时 patch，应用后生效；round-trip 序列化并回同对象。
+#[test]
+fn patch_deserializes_flatten_overrides_and_roundtrips() {
+    use dsh_loader::Patch;
+
+    let json = r#"{"id":"a","inject":["svc"],"isolate":{"svc":true},"config":{"k":2}}"#;
+    let patch: Patch = serde_json::from_str(json).unwrap();
+    // 显式字段消费 config；inject/isolate 进 overrides。
+    assert_eq!(patch.id.as_deref(), Some("a"));
+    assert_eq!(patch.config, Some(json!({"k": 2})));
+    assert_eq!(patch.overrides.get("inject"), Some(&json!(["svc"])));
+    assert_eq!(patch.overrides.get("isolate"), Some(&json!({"svc": true})));
+
+    // round-trip：flatten 并回同一对象（显式键 + overrides 键并回）。
+    let out: serde_json::Value = serde_json::to_value(&patch).unwrap();
+    let obj = out.as_object().unwrap();
+    assert_eq!(obj.get("inject"), Some(&json!(["svc"])));
+    assert_eq!(obj.get("isolate"), Some(&json!({"svc": true})));
+    assert_eq!(obj.get("config"), Some(&json!({"k": 2})));
+    assert_eq!(obj.get("id"), Some(&json!("a")));
+
+    // 应用到入口：overrides 生效。
+    let data = vec![options("a", "a", json!({"k": 1}))];
+    let res = apply_entry_patches(&data, std::slice::from_ref(&patch));
+    assert_eq!(res[0].inject, vec!["svc".to_string()]);
+    assert_eq!(res[0].config, json!({"k": 2}));
+}
+
+/// M64：overrides 应用到嵌套 group 子入口（递归 patch_update）。
+#[test]
+fn apply_patches_overrides_nested_group_child() {
+    use std::collections::HashMap;
+
+    let data = vec![options_with_group("g", vec![json!({"id": "c1", "name": "c1"})])];
+    let mut overrides = HashMap::new();
+    overrides.insert("inject".to_string(), json!(["dep"]));
+    let patches = vec![Patch {
+        id: Some("c1".into()),
+        overrides,
+        ..Patch::default()
+    }];
+
+    let out = apply_entry_patches(&data, &patches);
+    let g = &out[0];
+    let children = g.config.as_array().unwrap();
+    let c1: Value = children[0].clone();
+    assert_eq!(c1["inject"], json!(["dep"]), "{c1:?}");
+}

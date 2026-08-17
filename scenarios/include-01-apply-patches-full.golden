@@ -1,0 +1,7 @@
+include-data:[{"config":{"k":1},"disabled":false,"group":false,"id":"a","inject":[],"intercept":{},"isolate":{},"name":"a"},{"config":[{"config":{"inner":0},"disabled":false,"group":false,"id":"c1","inject":[],"intercept":{},"isolate":{},"name":"c1"}],"disabled":false,"group":true,"id":"g","inject":[],"intercept":{},"isolate":{},"name":"g"}]
+include-warn:patch: entry ghost not found
+include-warn:patch insert: entry a is not a group
+include-warn:patch insert: entry nope not found
+include-warn:patch: id is required for non-insert patches
+include-warn:patch: name mismatch for a (expected a, got WRONG), skipping
+include-result:[{"config":{"k":2},"disabled":true,"group":false,"id":"a","inject":[],"intercept":{},"isolate":{},"name":"a"},{"config":[{"config":{"nested":true},"disabled":false,"group":false,"id":"c1","inject":[],"intercept":{},"isolate":{},"name":"c1"},{"config":{"inner":9},"disabled":false,"group":false,"id":"c2","inject":[],"intercept":{},"isolate":{},"name":"c2"}],"disabled":false,"group":true,"id":"g","inject":[],"intercept":{},"isolate":{},"name":"g"},{"config":{},"disabled":false,"group":false,"id":"x","inject":[],"intercept":{},"isolate":{},"name":"x"}]

@@ -604,3 +604,40 @@ fn obj_map(e: &LoaderEntry, key: &str) -> HashMap<String, Value> {
         })
         .unwrap_or_default()
 }
+
+/// 把可序列化值规范化为**按键字典序**的 JSON 文本（`serde_json::Value` 的
+/// Object 默认是 `BTreeMap`）。与 TS 宿主 `canonical`（`Object.keys().sort()`）
+/// 对齐——include 差分场景的 `data`/`result` 行。
+fn sorted_json<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_string(&serde_json::to_value(v).unwrap_or_default()).unwrap_or_default()
+}
+
+/// M63：include 差分场景——纯函数级 `apply_entry_patches` 对比（无 Fiber）。
+///
+/// 场景 JSON：`{ "data": [entry...], "patches": [patch...] }`。执行
+/// `apply_entry_patches_with_warn`（对齐 TS `applyEntryPatches(data, patches,
+/// warn)`），输出规范化 trace：
+/// - `include-data:{json(data)}`    输入 entry 列表（按键序）
+/// - `include-warn:{message}`        每条 warn，按序（`%C` 已展开）
+/// - `include-result:{json(out)}`    最终 entry 列表（按键序）
+pub fn run_include(text: &str) -> Result<Vec<String>, String> {
+    #[derive(Debug, Deserialize)]
+    struct Inc {
+        #[serde(default)]
+        data: Vec<dsh_loader::EntryOptions>,
+        #[serde(default)]
+        patches: Vec<dsh_loader::Patch>,
+    }
+    let inc: Inc = serde_json::from_str(text).map_err(|e| format!("include parse: {e}"))?;
+    let mut warns: Vec<String> = Vec::new();
+    let out = dsh_loader::apply_entry_patches_with_warn(&inc.data, &inc.patches, &mut |w| {
+        warns.push(w);
+    });
+    let mut lines = Vec::new();
+    lines.push(format!("include-data:{}", sorted_json(&inc.data)));
+    for w in warns {
+        lines.push(format!("include-warn:{w}"));
+    }
+    lines.push(format!("include-result:{}", sorted_json(&out)));
+    Ok(lines)
+}
