@@ -685,6 +685,26 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value) -> Value {
                 "canOpenPath": true,
             }})
         }
+        "host.pickDirectory" => {
+            serde_json::json!({"ok": true, "value": {"path": null}})
+        }
+        "host.listDirectory" => {
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            serde_json::json!({"ok": true, "value": {
+                "path": cwd, "home": cwd, "crumbs": [], "entries": [], "truncated": false,
+            }})
+        }
+        "host.createDirectory" => {
+            let path = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            serde_json::json!({"ok": true, "value": {"path": path}})
+        }
+        "host.openPath" => {
+            serde_json::json!({"ok": true, "value": {"opened": true}})
+        }
         "sessions" | "session.list" => {
             let log = boot.sessions.lock().unwrap();
             let updated_at = now_ms();
@@ -761,6 +781,18 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value) -> Value {
         "session.cancel" => {
             serde_json::json!({"ok": true, "value": {"accepted": true}})
         }
+        "session.attachment" => {
+            serde_json::json!({"ok": true, "value": {
+                "attachment": {
+                    "attachmentId": "default", "mediaType": "image/png",
+                    "bytes": 0, "width": 1, "height": 1,
+                },
+                "data": "",
+            }})
+        }
+        "session.updateQueue" => {
+            serde_json::json!({"ok": true, "value": {"accepted": true}})
+        }
         "workspace.list" => {
             let cwd = std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
@@ -776,6 +808,47 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value) -> Value {
                     "updatedAt": now,
                 }],
                 "archivedSessionIds": [],
+            }})
+        }
+        "workspace.create" => {
+            let path = payload.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let now = now_ms().to_string();
+            serde_json::json!({"ok": true, "value": {
+                "workspace": {
+                    "workspaceId": "default", "path": path, "title": "default",
+                    "sessionIds": [], "createdAt": now, "updatedAt": now,
+                },
+                "created": false,
+            }})
+        }
+        "workspace.rename" => {
+            let path = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let now = now_ms().to_string();
+            serde_json::json!({"ok": true, "value": {
+                "workspace": {
+                    "workspaceId": "default", "path": path, "title": "default",
+                    "sessionIds": ["default"], "createdAt": now, "updatedAt": now,
+                },
+            }})
+        }
+        "workspace.delete" => {
+            serde_json::json!({"ok": true, "value": {"deleted": true}})
+        }
+        "workspace.insertBefore" => {
+            serde_json::json!({"ok": true, "value": {"workspaceIds": ["default"]}})
+        }
+        "workspace.insertSessionBefore" | "workspace.archiveSession" => {
+            let path = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let now = now_ms().to_string();
+            serde_json::json!({"ok": true, "value": {
+                "workspace": {
+                    "workspaceId": "default", "path": path, "title": "default",
+                    "sessionIds": ["default"], "createdAt": now, "updatedAt": now,
+                },
             }})
         }
         "skill.list" => {
@@ -804,6 +877,9 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value) -> Value {
         }
         "agentPreset.remove" => {
             serde_json::json!({"ok": true, "value": {}})
+        }
+        "agentPreset.openDocument" => {
+            serde_json::json!({"ok": true, "value": {"opened": true}})
         }
         "settings.describe" => {
             serde_json::json!({"ok": true, "value": {
@@ -1181,7 +1257,22 @@ mod tests {
             ("agentPreset.copy", "agentPreset", "str"),
             ("agentPreset.remove", "x", "miss"),
         ];
-        for (m, key, expect) in cases {
+        let cases2: &[(&str, &str, &str)] = &[
+            ("session.attachment", "attachment", "obj"),
+            ("session.updateQueue", "accepted", "bool"),
+            ("host.pickDirectory", "path", "null"),
+            ("host.listDirectory", "entries", "arr"),
+            ("host.createDirectory", "path", "str"),
+            ("host.openPath", "opened", "bool"),
+            ("workspace.create", "workspace", "obj"),
+            ("workspace.rename", "workspace", "obj"),
+            ("workspace.delete", "deleted", "bool"),
+            ("workspace.insertBefore", "workspaceIds", "arr"),
+            ("workspace.insertSessionBefore", "workspace", "obj"),
+            ("workspace.archiveSession", "workspace", "obj"),
+            ("agentPreset.openDocument", "opened", "bool"),
+        ];
+        for (m, key, expect) in cases.iter().chain(cases2.iter()) {
             let body = serde_json::to_vec(&serde_json::json!({
                 "type": "client-request", "rpcId": "r", "method": m, "payload": {}
             })).unwrap();
@@ -1194,6 +1285,7 @@ mod tests {
                 "obj" => assert!(val[*key].is_object(), "{m}.{key} obj"),
                 "arr" => assert!(val[*key].is_array(), "{m}.{key} arr"),
                 "str" => assert!(val[*key].as_str().is_some(), "{m}.{key} str"),
+                "null" => assert!(val[*key].is_null(), "{m}.{key} null"),
                 _ => assert_eq!(val[*key], Value::Null, "{m}.{key} absent"),
             }
         }
