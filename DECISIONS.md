@@ -84,6 +84,44 @@ E2E 冒烟全 ok。回滚：撤提交回到 M71 旧形状；不影响 WebSocket/
 
 ---
 
+## D-010（阶段3）：多会话支持——web 层会话注册表
+
+**日期**：2025（本机时间）
+
+**触发的问题**：ROADMAP 阶段 3 验收含「多会话切换」。M70 的 `session.create`
+恒返回 `"default"`、`session.list` 恒单会话——UI 无法新建/切换独立会话。但 WASM
+loop 是单引擎（`boot.sessions` 单个 `SessionHandle`），`run_turn` 把事件写到该
+单一 log。若硬改 loop 引擎为每会话一个实例，牵动 wasmrt 的 Store 模型，风险大。
+
+**考虑的选项**：
+1. **web 层会话注册表（本次采用）**：`SessionRegistry = Arc<Mutex<HashMap<String,
+   SessionLog>>>`，seed `default`。`session.create` mint 唯一 id 注册空 log；
+   `session.list` 返回全部；`session.history` 按 payload.sessionId 读对应 log；
+   `session.prompt` 经共享 loop 驱动后，把 turn 新产生的事件追加到目标 session
+   的 log（`run_turn` 前后 `boot.sessions.events().len()` 取差量）。loop 引擎
+   保持单例（共享上下文），各 session 历史独立。
+2. **每会话一个 WASM loop 实例**：wasmrt 层按 sessionId 建 Store。— 牵动
+   `WasmLoopPlugin` 的单 Store 模型、HMR 换组件、CURRENT_CTX thread_local 桥接，
+   改动大、回归风险高。
+3. **维持单会话**：不满足阶段 3 多会话验收。
+
+**最终选择**：选项 1。loop 仍是单一共享引擎（`boot.sessions`），但前端可见的
+「会话」是 web 层独立 `SessionLog`——创建/切换/各自历史都成立，UI 多会话交互
+可跑通，无需改 wasmrt 架构。
+
+**选择理由**：第一性区分「loop 引擎状态」与「前端会话视图」——多会话是 UI 级
+概念，不必然要求每会话独立 WASM Store。web 层 registry 以最小侵入实现多会话
+切换与独立历史，符合「Rust 服务前端 + 提供 /api」的架构事实。`handle_rpc` 保留
+单参包装（构造临时 default registry），既有测试签名不变；新增
+`handle_rpc_registry` 供服务器路径用。
+
+**预期影响与回滚点**：`session.create` 现在返回 `s2`/`s3`…（此前恒 default）；
+`session.list` 返回多会话；`session.history`/`prompt` 按 sessionId 路由；新增
+`session.fork` 复制事件到新会话。回滚：撤提交即恢复单会话（default），不影响
+loop/静态/WebSocket。测试新增 `rpc_multi_session_create_list_prompt`。
+
+---
+
 ## D-009（阶段4）：/api 与 /plugins 的 Host 头 trust fence
 
 **日期**：2025（本机时间）
