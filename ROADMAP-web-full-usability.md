@@ -70,8 +70,9 @@
       credentials、dynamicCordisRunner（D-007/D-003 续）。
 - [x] 工具调用在 UI 可见：`tool/call` + `tool/result` 事件经 mux WebSocket 推成
       `session/event` 帧（tool-loop 已注册工具，宿主 mux 帧带 data 透传）。
-- [ ] 验收：多会话切换、模型选择、工具调用展示（模型选择已见——UI 显示
-      echo-loop 并可从 session.models 选）。多会话/工具展示为后续增强。
+- [x] 验收（模型选择 + 工具调用展示）：UI 显示 echo-loop 并可从 session.models 选；
+      tool-loop 会话历史含 turn/start→user→tool/call→tool/result→assistant→
+      turn/end，mux WebSocket 实时推 `session/event` 帧。多会话切换为后续增强。
 
 ### 阶段 4：完善与加固
 - [x] trust fence（Host 头校验 / loopback 判定，对齐 `api-request-trust.ts`，
