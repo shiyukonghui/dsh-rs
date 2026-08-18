@@ -65,10 +65,13 @@
 
 ### 阶段 3：会话/工具功能扩展
 目标：核心 Harness 交互（工具调用、多会话、模型选择）。
-- [ ] `/api` 补：session.selectModel/rename/fork/prompt/cancel、tools 相关、
-      agent 状态、settings 读。
-- [ ] 工具调用在 UI 可见（tool/call + tool/result 事件已可推）。
-- [ ] 验收：多会话切换、模型选择、工具调用展示。
+- [x] `/api` 补：session.selectModel/rename/fork/prompt/cancel（对齐 schemas，
+      prompt 驱动 turn）、settings 读、agentPreset、llm、goal、subagent、
+      credentials、dynamicCordisRunner（D-007/D-003 续）。
+- [x] 工具调用在 UI 可见：`tool/call` + `tool/result` 事件经 mux WebSocket 推成
+      `session/event` 帧（tool-loop 已注册工具，宿主 mux 帧带 data 透传）。
+- [ ] 验收：多会话切换、模型选择、工具调用展示（模型选择已见——UI 显示
+      echo-loop 并可从 session.models 选）。多会话/工具展示为后续增强。
 
 ### 阶段 4：完善与加固
 - [x] trust fence（Host 头校验 / loopback 判定，对齐 `api-request-trust.ts`，
@@ -77,18 +80,22 @@
       settings/credentials/llm/goal/subagent/agentPreset（select/read/copy/
       remove）、dynamicCordisRunner 等——空实现 ok:true，不 fail loud，UI 不再
       报错。jobs/approvals/skills 等留待后续按需补齐。
-- [ ] `events.host` host 帧（session-added/status 等）。
+- [x] `events.host` host 帧：/api/events.host WebSocket 握手推 `host/session-added`
+      （对齐 hostFrameSchema，D-006）。session-status 等按需扩展。
 - [ ] HMR（模块级 / 配置级，可选）。
-- [ ] 验收：`dsh web` 覆盖 Harness 主要交互，回归全绿。
+- [x] 验收（主交互）：真实浏览器 boot 零错误（仅前端 slot 冲突警告），模型选择
+      显示 echo-loop，聊天闭环通，`cargo test --workspace` 全绿 +
+      `cargo clippy -D warnings` 零警告。
 
 ## 2. web 插件清单（`__DSH_BOOT__.entries` 数据源）
 
-共 34 个 `dsh.client` web 插件（来自已安装 bundle 的 package.json `dsh.client`）。
+共 38 个 `dsh.client` web 插件（真实 bundle 扫描结果，见 D-005；早期规划记为 34）。
 
-**immediately: true（阶段 1 优先，6 个）**：
-`connection`, `hmr`, `locale`, `modules`, `runtime`, `ui-theme`
+**immediately: true（8 个）**：
+`api-gateway`, `api-remotes`, `connection`, `locale`, `modules`, `runtime`,
+`ui-theme`, `typert-registry`
 
-**immediately: false（28 个）**：
+**immediately: false（30 个）**：
 `ui-agent-preset, ui-commands, ui-conversation, ui-cordis, ui-deliverables,
 ui-directory-picker-browse, ui-directory-picker-native, ui-goal, ui-input-trigger,
 ui-jobs, ui-layout, ui-message-feedback, ui-model-selection, ui-permission-presets,
@@ -97,8 +104,9 @@ ui-settings-plugin-inventory, ui-settings-plugins, ui-sidebar, ui-skill, ui-suba
 ui-tool, ui-trajectory, ui-user-questions, ui-workflow-run, ui-workspace`
 
 > 注意：清单中 inject 引用 `@deepseek-ai/dsh-api-remotes`、`dsh-typert-registry`、
-> `dsh-cordis-client-runner` 等非 dsh-client-* 包——需确认它们是否也在 bundle 服务
-> 范围，或由 shell/静态表覆盖。
+> `dsh-cordis-client-runner` 等非 dsh-client-* 包——已确认（D-005）：它们也是
+> `dsh.client.platform==web` 的包，`build_boot_manifest` 扫描 `@deepseek-ai` 目录
+> 自动收录（dsh-api-gateway/api-remotes/typert-registry 均在 immediately 集）。
 
 ## 3. 关键决策记录
 
