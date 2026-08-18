@@ -25,6 +25,42 @@ use tiny_http::{Header, Method, Response, Server};
 
 use crate::Boot;
 
+/// trust fence（阶段4）：判定请求 Host 头是否为 loopback 权威
+/// （对齐前端 `isLoopbackHostname`：localhost / `[::1]` / 127/8）。
+fn host_is_loopback(request: &tiny_http::Request) -> bool {
+    let host = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Host"))
+        .map(|h| h.value.as_str().to_string())
+        .unwrap_or_default();
+    hostname_is_loopback(&host)
+}
+
+/// 纯判定：Host 值（可含端口）是否为 loopback。对齐前端 `isLoopbackHostname`
+/// （localhost / `[::1]` / 127/8）。
+fn hostname_is_loopback(host: &str) -> bool {
+    let h = host.trim().to_lowercase();
+    // IPv6 括号形式：`[::1]` 或 `[::1]:port` → 取括号内主机名。
+    if let Some(inner) = h.strip_prefix('[') {
+        let hostname = inner.split(']').next().unwrap_or("");
+        return hostname == "::1";
+    }
+    // IPv4/localhost（按首个 ':' 去端口；localhost 无冒号也成立）。
+    let hostname = h.split(':').next().unwrap_or("");
+    if hostname == "localhost" {
+        return true;
+    }
+    // 127/8（IPv4）
+    if let Some(rest) = hostname.strip_prefix("127.") {
+        return !rest.is_empty()
+            && rest
+                .split('.')
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    }
+    hostname == "127.0.0.1"
+}
+
 /// 静态 MIME 映射（对齐 `dsh-host-frontend-static` 的 MIME 表子集）。
 fn mime_for(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
@@ -117,6 +153,18 @@ fn dispatch_request(
 ) {
     // 路径去 query
     let path = request.url().split('?').next().unwrap_or("/").to_string();
+
+    // 阶段4：trust fence——`/api` 与 `/plugins` 仅接受 loopback Host（防 DNS
+    // rebinding：攻击者域名解析到 127.0.0.1 时，拒绝其跨域读宿主 API）。判定
+    // 对齐前端 `isLoopbackHostname`（localhost / [::1] / 127/8）。
+    if (path.starts_with("/api") || path.starts_with("/plugins/")) && !host_is_loopback(&request) {
+        let resp = json_response(403, &serde_json::json!({
+            "error": "forbidden",
+            "message": "Host must be loopback",
+        }));
+        let _ = request.respond(resp);
+        return;
+    }
 
     // 阶段1：`/plugins/<id>/client.js`——服务 web 插件真实 bundle（非 SPA fallback）。
     if path.starts_with("/plugins/") {
@@ -1047,6 +1095,21 @@ mod tests {
         assert_eq!(v["result"]["ok"], true);
         assert_eq!(v["result"]["value"]["accepted"], true);
         assert!(!boot.sessions.lock().unwrap().events().is_empty());
+    }
+
+    /// 阶段4：trust fence 判定 Host 头是否 loopback（对齐前端 isLoopbackHostname）。
+    #[test]
+    fn host_is_loopback_classifies() {
+        for ok in ["127.0.0.1", "127.0.0.1:3000", "localhost", "localhost:3000", "[::1]", "127.0.0.2", "127.1.2.3"] {
+            assert!(hostname_is_loopback(ok), "should accept {ok}");
+        }
+        for bad in ["evil.com", "attacker.example", "127.abc", "10.0.0.1", "localhost.evil.com", ""] {
+            assert!(!hostname_is_loopback(bad), "should reject {bad}");
+        }
+        // "127" 无点：不应算 loopback（127/8 要求至少 127.x）。
+        assert!(!hostname_is_loopback("127"), "bare 127 is not loopback");
+        // 空 host 头：不应放行。
+        assert!(!hostname_is_loopback(""), "empty host is not loopback");
     }
 
     /// 静态文件：index.html 命中；asset 命中；SPA miss → fallback index。

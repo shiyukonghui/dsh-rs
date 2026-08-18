@@ -84,6 +84,38 @@ E2E 冒烟全 ok。回滚：撤提交回到 M71 旧形状；不影响 WebSocket/
 
 ---
 
+## D-009（阶段4）：/api 与 /plugins 的 Host 头 trust fence
+
+**日期**：2025（本机时间）
+
+**触发的问题**：`dsh web` 绑定 127.0.0.1 并提供 `/api`（可驱动 WASM loop、
+读写 session）与 `/plugins`（web 插件源码）。若攻击者的域名被解析到
+127.0.0.1（DNS rebinding），浏览器从该域名加载的恶意页面也能跨域发
+`POST /api/...` 到本机——读到/改到宿主状态。ROADMAP 阶段 4 要求 trust fence
+（Host 头校验 / loopback 判定，对齐 `api-request-trust.ts`）。
+
+**考虑的选项**：
+1. **Host 头 loopback 校验（本次采用）**：对 `/api` 与 `/plugins/` 请求，读
+   `Host` 头，仅当主机名为 loopback（localhost / `[::1]` / 127/8）才放行，
+   否则 403。判定对齐前端 `isLoopbackHostname`（浏览器同款语义）。
+2. **绑定非 loopback + Origin 校验**：绑定 0.0.0.0 靠 `Origin` 头白名单。—
+   绑定非 loopback 扩大了暴露面；`Origin` 易伪造，不如 Host 校验直接。
+3. **不做**：静态服务可被 rebinding 滥用。— 违背安全目标。
+
+**最终选择**：选项 1。只对带状态的 `/api` 与源码 `/plugins` 加 fence，静态资源
+（CSS/JS/图片）放行（无敏感状态，且 rebinding 读取静态无危害）。
+
+**选择理由**：Host 头校验是 DNS rebinding 的标准缓解（浏览器会拒绝与当前页面
+Host 不匹配的请求目标；服务端只信 loopback Host 则恶意域名无法命中）。判定
+语义与前端 `isLoopbackHostname` 一致，避免「前端认为 loopback、后端拒绝」的
+不一致。纯函数 `hostname_is_loopback` 可单测。
+
+**预期影响与回滚点**：`/api` 与 `/plugins` 非 loopback Host → 403 JSON。默认
+绑定 127.0.0.1 的访问不受影响。回滚：撤提交即移除 fence。后续阶段 4 可把
+headless boot 固化为 E2E（D-008 已记）。
+
+---
+
 ## D-008（阶段1/2 验收）：真实浏览器 boot + 聊天闭环验证
 
 **日期**：2025（本机时间）

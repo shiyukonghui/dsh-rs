@@ -71,7 +71,8 @@
 - [ ] 验收：多会话切换、模型选择、工具调用展示。
 
 ### 阶段 4：完善与加固
-- [ ] trust fence（Host 头校验 / loopback 判定，对齐 `api-request-trust.ts`）。
+- [x] trust fence（Host 头校验 / loopback 判定，对齐 `api-request-trust.ts`，
+      D-009）——`/api` 与 `/plugins` 仅接受 loopback Host，否则 403。
 - [ ] 全量方法面覆盖（goals/jobs/approvals/skills/credentials/subagents...）。
 - [ ] `events.host` host 帧（session-added/status 等）。
 - [ ] HMR（模块级 / 配置级，可选）。
