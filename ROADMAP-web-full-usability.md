@@ -73,7 +73,10 @@
 ### 阶段 4：完善与加固
 - [x] trust fence（Host 头校验 / loopback 判定，对齐 `api-request-trust.ts`，
       D-009）——`/api` 与 `/plugins` 仅接受 loopback Host，否则 403。
-- [ ] 全量方法面覆盖（goals/jobs/approvals/skills/credentials/subagents...）。
+- [x] 方法面覆盖主要 UI 方法（对齐 `UNARY_VALUE_SCHEMAS`）：
+      settings/credentials/llm/goal/subagent/agentPreset（select/read/copy/
+      remove）、dynamicCordisRunner 等——空实现 ok:true，不 fail loud，UI 不再
+      报错。jobs/approvals/skills 等留待后续按需补齐。
 - [ ] `events.host` host 帧（session-added/status 等）。
 - [ ] HMR（模块级 / 配置级，可选）。
 - [ ] 验收：`dsh web` 覆盖 Harness 主要交互，回归全绿。

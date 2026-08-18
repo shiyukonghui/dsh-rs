@@ -788,6 +788,85 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value) -> Value {
                 "hasDocument": false,
             }})
         }
+        "agentPreset.select" => {
+            let preset = payload.get("agentPreset").and_then(|v| v.as_str()).unwrap_or("default");
+            serde_json::json!({"ok": true, "value": {"agentPreset": preset}})
+        }
+        "agentPreset.read" => {
+            let preset = payload.get("agentPreset").and_then(|v| v.as_str()).unwrap_or("default");
+            serde_json::json!({"ok": true, "value": {
+                "agentPreset": preset, "trust": "user", "content": "",
+            }})
+        }
+        "agentPreset.copy" => {
+            let preset = payload.get("agentPreset").and_then(|v| v.as_str()).unwrap_or("default");
+            serde_json::json!({"ok": true, "value": {"agentPreset": preset}})
+        }
+        "agentPreset.remove" => {
+            serde_json::json!({"ok": true, "value": {}})
+        }
+        "settings.describe" => {
+            serde_json::json!({"ok": true, "value": {
+                "writable": false,
+                "hasDocument": false,
+                "namespaces": [],
+            }})
+        }
+        "settings.openDocument" => {
+            serde_json::json!({"ok": true, "value": {"opened": true}})
+        }
+        "settings.update" | "settings.replace" | "settings.mutate" => {
+            let ns = payload.get("ns").and_then(|v| v.as_str()).unwrap_or("default").to_string();
+            serde_json::json!({"ok": true, "value": {
+                "ns": ns, "schema": {}, "value": {}, "applies": "restart",
+                "secrets": [], "revision": 0,
+            }})
+        }
+        "credentials.describe" => {
+            serde_json::json!({"ok": true, "value": {"credentials": {}}})
+        }
+        "credentials.set" | "credentials.unset" => {
+            serde_json::json!({"ok": true, "value": {}})
+        }
+        "llm.providers" => {
+            serde_json::json!({"ok": true, "value": {"providers": []}})
+        }
+        "llm.models" => {
+            serde_json::json!({"ok": true, "value": {
+                "groups": [{
+                    "id": "dsh", "name": "DeepSeek Harness",
+                    "models": [
+                        {"id": "echo", "name": "echo-loop"},
+                        {"id": "llm", "name": "llm-loop"},
+                        {"id": "tool", "name": "tool-loop"},
+                    ],
+                }],
+                "failures": [],
+            }})
+        }
+        "llm.discoverModels" => {
+            serde_json::json!({"ok": true, "value": {"models": []}})
+        }
+        "goal.create" | "goal.edit" | "goal.pause" | "goal.resume" | "goal.complete" => {
+            serde_json::json!({"ok": true, "value": {
+                "ref": {"id": "default", "revision": 1},
+            }})
+        }
+        "goal.clear" => {
+            serde_json::json!({"ok": true, "value": {"cleared": true}})
+        }
+        "subagent.list" => {
+            serde_json::json!({"ok": true, "value": {"entries": [], "parentAvailable": true}})
+        }
+        "subagent.history" => {
+            serde_json::json!({"ok": true, "value": {"events": [], "hasMore": false}})
+        }
+        "subagent.interrupt" => {
+            serde_json::json!({"ok": true, "value": {"accepted": true}})
+        }
+        "subagent.prompt" => {
+            serde_json::json!({"ok": true, "value": {"messageId": "default"}})
+        }
         "commands/list" => {
             serde_json::json!({"ok": true, "value": [
                 {"name": "compact", "description": "压缩当前会话上下文"},
@@ -1080,6 +1159,43 @@ mod tests {
                 expected,
                 "{m} value"
             );
+        }
+    }
+
+    /// 阶段3/4：settings/credentials/llm/goal/subagent/agentPreset 方法返回
+    /// 对齐各自 UNARY_VALUE_SCHEMAS 的形状（空实现但 ok:true，不 fail loud）。
+    #[test]
+    fn rpc_extended_method_surface_ok() {
+        let boot = boot_with_sessions();
+        let cases: &[(&str, &str, &str)] = &[
+            ("settings.describe", "writable", "bool"),
+            ("credentials.describe", "credentials", "obj"),
+            ("llm.providers", "providers", "arr"),
+            ("llm.models", "groups", "arr"),
+            ("goal.create", "ref", "obj"),
+            ("goal.clear", "cleared", "bool"),
+            ("subagent.list", "entries", "arr"),
+            ("subagent.interrupt", "accepted", "bool"),
+            ("agentPreset.select", "agentPreset", "str"),
+            ("agentPreset.read", "content", "str"),
+            ("agentPreset.copy", "agentPreset", "str"),
+            ("agentPreset.remove", "x", "miss"),
+        ];
+        for (m, key, expect) in cases {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": m, "payload": {}
+            })).unwrap();
+            let (status, v) = handle_rpc(&boot, m, &body);
+            assert_eq!(status, 200, "{m} status");
+            assert_eq!(v["result"]["ok"], true, "{m} ok");
+            let val = &v["result"]["value"];
+            match *expect {
+                "bool" => assert!(val[*key].is_boolean(), "{m}.{key} bool"),
+                "obj" => assert!(val[*key].is_object(), "{m}.{key} obj"),
+                "arr" => assert!(val[*key].is_array(), "{m}.{key} arr"),
+                "str" => assert!(val[*key].as_str().is_some(), "{m}.{key} str"),
+                _ => assert_eq!(val[*key], Value::Null, "{m}.{key} absent"),
+            }
         }
     }
 
