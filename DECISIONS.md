@@ -6,6 +6,41 @@
 
 ---
 
+## D-015（M1a）：dsh-session 运行时以「纯语义 + 最小观察者表」承载 Session/Surface/Store
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M1 需把 `dsh-session` 从 M0 类型面升级为生产语义运行时（append/
+surface/deriveMessages/Store/fork/repair/invariant）。TS 侧 `SessionStore` 依赖 Cordis
+`context` 的事件总线（`session/created`/`session/event` 的 scoped emit、`session/flush`
+的 drain）。Rust 侧核心是单线程 `Rc<RefCell>` 纪律（D-004/D-006 否定 async 运行时），
+且 web.rs 集成要能订阅 `session/event` 推 WS。
+
+**考虑的选项**：
+1. **纯语义内核 + 最小观察者表（本次采用）**：`Session` 不依赖任何事件总线；`append`
+   提交后同步调用可替换的 `on_event: Option<Box<dyn Fn(&SessionEvent)>>` 钩子；
+   `SessionStore`（Rc<Self>）持 `on_created/on_disposed/on_event/on_flush` 回调表，
+   `enter` 时用 `Weak<Self>` 把会话 append 钩子引向 store 的观察者表（避免循环引用）。
+   surface 校验（validate-then-commit）与 TS `SurfaceManager` 逐字段对齐。
+2. **在 dsh-session 内实现完整 Cordis 事件总线**：引入 fiber/emit 语义，偏离核心单线程
+   纪律，且与 M2 的关联（agent-loop 承载）耦合过早。
+3. **不做观察者，Store 暴露轮询读取**：持久化插件自行 diff log——违背
+   「session/event 同步通知 + flush 检查点」缝隙形态（第一性原理 §1.2 第五点）。
+
+**最终选择**：选项 1。`Session` 保持纯数据语义（可差分、可单测、可在任意线程上
+以 `&self` 调用）；观察者是**挂载点**而非核心逻辑。store 用 `Rc<Self>` 形态以便在
+闭包中捕获；`Weak` 引用避免 store→session→store 环。
+
+**选择理由**：「模型可见 ⟺ 已记录」「日志是唯一事实源」等不变量在 Session 内核里，
+与事件分发无关；观察者表是 M1 里最接近 Cordis 总线的最小形态，M2 迁 agent-loop 时
+可把表换成真实 emit 而无需改 Session 内核对事件的构造。
+
+**预期影响与回滚点**：新增 `surface.rs`/`runtime.rs`/`store.rs`/`repair.rs`/`invariant.rs`/
+`request_header.rs` 六模块 + `tests/m1_session_runtime.rs`（61 项测试 + 17 项 surface 单测）。
+回滚：撤提交即回到 M0 类型面，不影响 dsh-core 等旧 crate。
+
+---
+
 ## D-011（M0）：契约基建的 crate 划分——新增 `dsh-brand`（SharedIds）与四块数据面
 
 **日期**：2025（本机时间）
