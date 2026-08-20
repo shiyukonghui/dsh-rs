@@ -1,0 +1,2 @@
+===== session.search =====
+{"type":"server-response","rpcId":"r16","result":{"ok":false,"error":{"code":"bad-request","message":"invalid payload for session.search","details":{"issues":[{"expected":"string","code":"invalid_type","path":["query"],"message":"Invalid input: expected string, received undefined"}]}}}}

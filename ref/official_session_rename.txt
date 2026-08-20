@@ -1,0 +1,2 @@
+===== session.rename =====
+{"type":"server-response","rpcId":"r3","result":{"ok":false,"error":{"code":"bad-request","message":"invalid payload for session.rename","details":{"issues":[{"expected":"string","code":"invalid_type","path":["sessionId"],"message":"Invalid input: expected string, received undefined"},{"expected":"string","code":"invalid_type","path":["title"],"message":"Invalid input: expected string, received undefined"}]}}}}

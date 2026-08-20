@@ -1,0 +1,2 @@
+===== session.fork =====
+{"type":"server-response","rpcId":"r4","result":{"ok":false,"error":{"code":"bad-request","message":"invalid payload for session.fork","details":{"issues":[{"expected":"string","code":"invalid_type","path":["sessionId"],"message":"Invalid input: expected string, received undefined"}]}}}}
