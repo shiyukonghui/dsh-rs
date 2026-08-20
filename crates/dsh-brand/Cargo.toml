@@ -1,0 +1,13 @@
+[package]
+name = "dsh-brand"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "M0 契约基建：跨界品牌新类型（SharedIds），镜像 TS @deepseek-ai/dsh-brand。"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

@@ -1,0 +1,66 @@
+{
+  "$comment": "RPC 四象限消息模型——权威转译自 rpc.ts / rpc.schema.ts（four-quadrant message model：HTTP/WS/SSE 只是物理 carrier，逻辑消息与信道解耦，构成带判别式 type 的四成员并集）。",
+  "$provenance": "deepseek-harness @ 47f943859b; packages/host/apiproxy/src/api/{rpc,rpc.schema}.ts",
+  "messages": {
+    "client-request": {
+      "discriminant": "type",
+      "fields": [
+        { "name": "type", "shape": "literal", "value": "client-request" },
+        { "name": "rpcId", "shape": "string" },
+        { "name": "method", "shape": "string" },
+        { "name": "payload", "shape": "unknown" }
+      ],
+      "carrier": "POST /api/<method> body"
+    },
+    "server-response": {
+      "discriminant": "type",
+      "fields": [
+        { "name": "type", "shape": "literal", "value": "server-response" },
+        { "name": "rpcId", "shape": "string" },
+        { "name": "result", "shape": "rpcResult" }
+      ],
+      "carrier": "the HTTP response body of that POST"
+    },
+    "server-request": {
+      "discriminant": "type",
+      "fields": [
+        { "name": "type", "shape": "literal", "value": "server-request" },
+        { "name": "rpcId", "shape": "string" },
+        { "name": "method", "shape": "string" },
+        { "name": "payload", "shape": "unknown" }
+      ],
+      "carrier": "downstream stream frame (mux/host WebSocket or SSE)",
+      "note": "answerable interactions (approval/question requested) reuse a stable rpcId on replay; pure pushes mint a fresh one"
+    },
+    "client-response": {
+      "discriminant": "type",
+      "fields": [
+        { "name": "type", "shape": "literal", "value": "client-response" },
+        { "name": "rpcId", "shape": "string" },
+        { "name": "result", "shape": "rpcResult" }
+      ],
+      "carrier": "POST /api/respond body"
+    }
+  },
+  "rpcResult": {
+    "discriminant": "ok",
+    "ok": { "ok": true, "value": "unknown" },
+    "error": { "ok": false, "error": "rpcError" }
+  },
+  "rpcError": {
+    "discriminant": "code",
+    "fields": [
+      { "name": "code", "shape": "error-code (errors.json)" },
+      { "name": "message", "shape": "string" },
+      { "name": "details", "shape": "per-code details (errors.json)" }
+    ],
+    "note": "details is required (internal uses an explicit empty object)"
+  },
+  "rpcReceipt": {
+    "oneOf": [
+      { "accepted": true },
+      { "accepted": false, "reason": { "enum": ["not-pending", "bad-response"] } }
+    ],
+    "note": "carrier receipt, not an RpcMessage — HTTP status describes only the carrier"
+  }
+}

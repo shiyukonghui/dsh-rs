@@ -499,6 +499,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-api"
+version = "0.1.0"
+dependencies = [
+ "dsh-brand",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dsh-brand"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dsh-cli"
 version = "0.1.0"
 dependencies = [
@@ -545,6 +562,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-llm"
+version = "0.1.0"
+dependencies = [
+ "dsh-brand",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dsh-loader"
 version = "0.1.0"
 dependencies = [
@@ -559,10 +585,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-persistence"
+version = "0.1.0"
+dependencies = [
+ "dsh-brand",
+ "dsh-session",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dsh-schema"
 version = "0.1.0"
 dependencies = [
  "regex",
+ "serde_json",
+]
+
+[[package]]
+name = "dsh-session"
+version = "0.1.0"
+dependencies = [
+ "dsh-brand",
+ "dsh-llm",
+ "serde",
  "serde_json",
 ]
 

@@ -1,0 +1,319 @@
+{
+  "$comment": "session 域 request/value 的 JSON Schema 转译——机械转译自 sessions.schema.ts（示例域；其它域在 M3 各自 dispatch 落地时按同一模板补交，见 spec/README.md）。zod→JSON Schema：z.string→type:string(+minLength/maxLength/pattern)；z.number().int().nonnegative→type:integer, minimum:0；z.literal→const；z.optional→不列 required；z.unknown/z.looseObject→宽松（示意）。",
+  "$provenance": "deepseek-harness @ 47f943859b; packages/host/apiproxy/src/api/sessions.schema.ts",
+  "$defs": {
+    "sessionId": { "type": "string", "minLength": 1, "title": "SessionId brand" },
+    "messageId": { "type": "string", "minLength": 1, "title": "MessageId brand" },
+    "workspaceId": { "type": "string", "minLength": 1, "title": "WorkspaceId brand" },
+    "attachmentId": { "type": "string", "minLength": 1, "title": "AttachmentIdType brand" },
+    "sessionEvent": {
+      "type": "object",
+      "required": ["type", "seq", "time", "data"],
+      "properties": {
+        "type": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 0 },
+        "time": { "type": "number" },
+        "data": {},
+        "sourceEventSeqs": { "type": "array", "items": { "type": "integer" } },
+        "surfaceOp": {},
+        "ignorable": { "const": true }
+      },
+      "additionalProperties": false,
+      "title": "SessionEvent strict envelope + wide data"
+    },
+    "sessionSummary": {
+      "type": "object",
+      "required": ["sessionId", "updatedAt", "running", "blank"],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "updatedAt": { "type": "number" },
+        "running": { "type": "boolean" },
+        "blank": { "type": "boolean" },
+        "parentSessionId": { "$ref": "#/$defs/sessionId" },
+        "origin": { "const": "subagent" },
+        "cwd": { "type": "string" },
+        "agentPreset": { "type": "string" },
+        "projections": { "$ref": "#/$defs/sessionProjectionsBlock" }
+      }
+    },
+    "sessionSearchItem": {
+      "type": "object",
+      "required": ["sessionId", "snippet"],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "snippet": { "type": "string", "maxLength": 240 }
+      }
+    },
+    "toolEventView": {
+      "oneOf": [
+        { "type": "object", "required": ["for", "view"], "properties": { "for": { "const": "call" }, "view": { "type": "object" } } },
+        { "type": "object", "required": ["for", "view"], "properties": { "for": { "const": "result" }, "view": { "type": "object" } } }
+      ]
+    },
+    "historyEntry": {
+      "type": "object",
+      "required": ["event"],
+      "properties": {
+        "event": { "$ref": "#/$defs/sessionEvent" },
+        "view": { "$ref": "#/$defs/toolEventView" }
+      }
+    },
+    "sessionProjectionsBlock": {
+      "type": "object",
+      "required": ["asOfSeq", "values"],
+      "properties": {
+        "asOfSeq": { "type": "integer", "minimum": -1 },
+        "values": { "type": "object" }
+      }
+    },
+    "modelSelection": {
+      "type": "object",
+      "required": ["provider", "model"],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "reasoningEffort": { "type": "string", "minLength": 1 }
+      }
+    },
+    "modelReasoning": {
+      "type": "object",
+      "required": ["efforts"],
+      "properties": {
+        "efforts": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/modelReasoningEffort" } },
+        "defaultEffort": { "type": "string", "minLength": 1 }
+      }
+    },
+    "modelReasoningEffort": {
+      "type": "object",
+      "required": ["id", "name"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" }
+      }
+    },
+    "modelCatalogModel": {
+      "type": "object",
+      "required": ["id", "name"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "reasoning": { "$ref": "#/$defs/modelReasoning" }
+      }
+    },
+    "modelProviderGroup": {
+      "type": "object",
+      "required": ["id", "name", "models"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "models": { "type": "array", "items": { "$ref": "#/$defs/modelCatalogModel" } }
+      }
+    },
+    "modelCatalogFailure": {
+      "type": "object",
+      "required": ["id", "name", "message"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "message": { "type": "string" }
+      }
+    },
+    "imageMediaType": { "enum": ["image/png", "image/jpeg", "image/webp", "image/gif"] },
+    "promptContentPart": {
+      "oneOf": [
+        { "type": "object", "required": ["type", "text"], "properties": { "type": { "const": "text" }, "text": { "type": "string" } } },
+        { "type": "object", "required": ["type", "mediaType", "data"], "properties": { "type": { "const": "image" }, "mediaType": { "$ref": "#/$defs/imageMediaType" }, "data": { "type": "string" }, "name": { "type": "string" } } }
+      ]
+    },
+    "imageAttachmentRef": {
+      "type": "object",
+      "required": ["attachmentId", "mediaType", "bytes", "width", "height"],
+      "properties": {
+        "attachmentId": { "$ref": "#/$defs/attachmentId" },
+        "mediaType": { "$ref": "#/$defs/imageMediaType" },
+        "bytes": { "type": "integer", "minimum": 1 },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "name": { "type": "string" }
+      }
+    }
+  },
+  "requests": {
+    "session.list": { "type": "object", "properties": { "cursor": { "type": "string" } } },
+    "session.search": {
+      "type": "object",
+      "required": ["query"],
+      "properties": {
+        "query": { "type": "string", "minLength": 1, "maxLength": 500, "pattern": "^[^\u0000]*$" }
+      }
+    },
+    "session.create": {
+      "type": "object",
+      "properties": {
+        "workspaceId": { "$ref": "#/$defs/workspaceId" },
+        "cwd": { "type": "string" },
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "agentPreset": { "type": "string" }
+      },
+      "title": "at most one of workspaceId / cwd"
+    },
+    "session.history": {
+      "type": "object",
+      "required": ["sessionId"],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "beforeSeq": { "type": "integer", "minimum": 0 },
+        "maxMessages": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "session.models": { "type": "object", "required": ["sessionId"], "properties": { "sessionId": { "$ref": "#/$defs/sessionId" } } },
+    "session.selectModel": {
+      "type": "object",
+      "required": ["sessionId", "provider", "model"],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "provider": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "reasoningEffort": { "type": "string", "minLength": 1 }
+      }
+    },
+    "session.rename": {
+      "type": "object",
+      "required": ["sessionId", "title"],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "title": { "type": "string" }
+      }
+    },
+    "session.fork": {
+      "type": "object",
+      "required": ["sessionId"],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "atSeq": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "session.prompt": {
+      "type": "object",
+      "required": ["sessionId", "mode", "content"],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "mode": { "enum": ["queue", "steer"] },
+        "content": { "type": "array", "items": { "$ref": "#/$defs/promptContentPart" } },
+        "clientTimeZone": { "type": "string" }
+      }
+    },
+    "session.attachment": {
+      "type": "object",
+      "required": ["sessionId", "attachmentId"],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "attachmentId": { "$ref": "#/$defs/attachmentId" }
+      }
+    },
+    "session.updateQueue": {
+      "type": "object",
+      "required": ["sessionId", "itemId", "action"],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "itemId": { "$ref": "#/$defs/messageId" },
+        "action": {
+          "oneOf": [
+            { "type": "object", "required": ["kind", "content"], "properties": { "kind": { "const": "edit" }, "content": { "type": "array", "items": { "type": "object", "required": ["type"], "properties": { "type": { "type": "string" } } } } } },
+            { "type": "object", "required": ["kind"], "properties": { "kind": { "const": "remove" } } },
+            { "type": "object", "required": ["kind"], "properties": { "kind": { "const": "steer" } } }
+          ]
+        }
+      }
+    },
+    "session.cancel": { "type": "object", "required": ["sessionId"], "properties": { "sessionId": { "$ref": "#/$defs/sessionId" } } }
+  },
+  "values": {
+    "session.list": { "type": "object", "required": ["items"], "properties": { "items": { "type": "array", "items": { "$ref": "#/$defs/sessionSummary" } } } },
+    "session.search": {
+      "type": "object",
+      "required": ["items", "hasMore"],
+      "properties": {
+        "items": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/sessionSearchItem" } },
+        "hasMore": { "type": "boolean" }
+      }
+    },
+    "session.create": {
+      "type": "object",
+      "required": ["sessionId"],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "agentPreset": { "type": "string" }
+      }
+    },
+    "session.history": {
+      "type": "object",
+      "required": ["events", "hasMore"],
+      "properties": {
+        "events": { "type": "array", "items": { "$ref": "#/$defs/historyEntry" } },
+        "hasMore": { "type": "boolean" },
+        "projections": { "$ref": "#/$defs/sessionProjectionsBlock" }
+      }
+    },
+    "session.models": {
+      "type": "object",
+      "required": ["current", "routable", "groups", "failures"],
+      "properties": {
+        "current": { "$ref": "#/$defs/modelSelection" },
+        "routable": { "type": "boolean" },
+        "groups": { "type": "array", "items": { "$ref": "#/$defs/modelProviderGroup" } },
+        "failures": { "type": "array", "items": { "$ref": "#/$defs/modelCatalogFailure" } }
+      }
+    },
+    "session.selectModel": {
+      "type": "object",
+      "required": ["selected"],
+      "properties": { "selected": { "$ref": "#/$defs/modelSelection" } }
+    },
+    "session.rename": {
+      "type": "object",
+      "required": ["title", "seq"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "seq": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "session.fork": {
+      "type": "object",
+      "required": ["sessionId"],
+      "properties": { "sessionId": { "$ref": "#/$defs/sessionId" } }
+    },
+    "session.prompt": {
+      "type": "object",
+      "required": ["accepted"],
+      "properties": {
+        "accepted": { "const": true },
+        "command": {
+          "type": "object",
+          "required": ["kind"],
+          "properties": { "kind": { "const": "success" }, "text": { "type": "string" } }
+        }
+      }
+    },
+    "session.attachment": {
+      "type": "object",
+      "required": ["attachment", "data"],
+      "properties": {
+        "attachment": { "$ref": "#/$defs/imageAttachmentRef" },
+        "data": { "type": "string" }
+      }
+    },
+    "session.updateQueue": {
+      "type": "object",
+      "required": ["accepted"],
+      "properties": { "accepted": { "const": true } }
+    },
+    "session.cancel": {
+      "type": "object",
+      "required": ["accepted"],
+      "properties": { "accepted": { "const": true } }
+    }
+  }
+}

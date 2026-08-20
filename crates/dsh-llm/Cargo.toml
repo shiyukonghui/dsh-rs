@@ -1,0 +1,18 @@
+[package]
+name = "dsh-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "M0 契约基建 (dsh-llm:types)：Message/ContentBlock/StreamChunk/TokenUsage/LlmFailure/ToolSchema/GenerateOptions/call-config。"
+
+[dependencies]
+dsh-brand = { path = "../dsh-brand" }
+serde = { version = "1", features = ["derive"] }
+# 键序策略（D-014）：serde_json 默认 BTreeMap 规范序——与 dsh-diff sorted_json
+# （对齐 TS canonical = Object.keys().sort()）一致；JSON 语义等价不依赖键序，
+# 前端 zod 解析与差分规范化均忽略键序，故不用 preserve_order。
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"

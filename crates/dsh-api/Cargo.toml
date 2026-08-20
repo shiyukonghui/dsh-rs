@@ -1,0 +1,15 @@
+[package]
+name = "dsh-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "M0 契约基建 (dsh-api:spec)：Remote 契约仓库（52 方法 + 39 错误码 + 消息模型 + JSON Schema 转译）。"
+
+[dependencies]
+dsh-brand = { path = "../dsh-brand" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"
