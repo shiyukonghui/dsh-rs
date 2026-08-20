@@ -542,3 +542,44 @@ RPC 与 SSE 分层（RPC 用 `&Boot`，SSE 用 `SessionHandle`）保持单线程
 方法集扩展、trust fence（见 HANDOFF §7.14）。
 
 **预期影响与回滚点**：纯文档，无运行时影响。
+
+---
+
+## D-016（M1b）：dsh-llm 同步运行时 + DeepSeek 适配器；transport 以「服务层线程桥」推迟
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M1b 需交付 LLM 能力层——`dsh-llm` 运行时（retry/assembler/runtime/
+模型元数据）与 `dsh-llm-deepseek` 适配器（SSE 解析/wire 序列化/translate/adapter），
+并让 `LlmRuntime` + `DeepSeekAdapter` + `BlockAssembler` 全链可测。但核心是单线程
+`Rc<RefCell>` 纪律（D-004/D-006）：真实 HTTP + SSE 字节 IO 需要线程、连接池与
+阻塞语义，不能进核心。
+
+**考虑的选项**：
+1. **同步 `LlmAdapter` 缝 + 服务层线程桥（本次采用）**：`LlmAdapter::stream` 返回
+   同步 `Box<dyn Iterator<Item=StreamChunk>>`；`DeepSeekAdapter` 只做纯函数组装——
+   序列化、SSE 行解析、wire→chunk 翻译全在核心内（可差分、可单测）。真实 HTTP +
+   SSE 字节 IO 由 `resolve_payloads`（transport thunk）抽象：适配器拿到 payloads
+   后同步 translate，transport thunk 由服务层（M1e web.rs 线程桥）在桥内解析。
+   连接事实（`DeepSeekConnection`）每次操作重读，配置文件变更无需重注册即达
+   下一次请求。
+2. **异步适配器（stream 返回 async Stream）**：功能最全但把 tokio async 运行时
+   引入核心 seam，违背 D-004/D-006，且差分测试需 await 编排。
+3. **适配器内直接做真实 HTTP**：核心掺入网络 IO 与连接管理，破坏纯函数可测性。
+
+**最终选择**：选项 1。`stream` 同步迭代 + `PayloadsResolver` transport thunk；
+`LlmRuntime` 在 `prepare_call` 绑定单次派发（dispatched-once guard + 配置漂移
+检查），`defaultMaxTokens`/`defaultEffort` 在 resolve 阶段物化；`for_adapter`
+replay 过滤器在 M1b 以 `adapter_owns_provider=true`（恒真）占位，M1e 接注册表
+归属后落地。
+
+**选择理由**：保持核心纯语义（可单测/可差分），把唯一非确定性源（真实网络）隔离在
+服务层线程桥，与 dsh-session 的「纯语义内核 + 观察者表」同构。TS 常量/词汇在
+`sese/serialize/translate` 单测覆盖，wire 字段名 snake_case 与 `types.ts` 逐字节对齐
+（`golden_request_json_anchors_wire_parity` 锚定）。
+
+**预期影响与回滚点**：新增 `dsh-llm-deepseek` crate（依赖 dsh-llm/dsh-brand/serde/
+serde_json）。回滚：撤 M1b 提交即可；不影响 M0/M1a。M1e 线程桥是 transport 唯一
+接线点；若桥延迟受阻，adapter 仍可用测试 thunk 全链验证。wire 字段名是兼容面，
+改动需连同黄金测试更新。
+

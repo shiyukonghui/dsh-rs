@@ -4,10 +4,19 @@
 //! 本 crate 只承载类型/纯函数；适配器、运行时、组装器（`LlmAdapter`/`LlmRuntime`/
 //! `BlockAssembler`）为 M1b 交付。
 
+pub mod assembler;
 pub mod call_config;
+pub mod retry;
+pub mod runtime;
 pub mod types;
 
+pub use assembler::BlockAssembler;
 pub use call_config::{call_config_equals, CallConfig, CallConfigAdapterDefaults};
+pub use retry::{
+    local_delay, resolve_retry_policy, BackoffConfig, ResolvedRetryPolicy, RetryPolicyConfig,
+    DEFAULT_INITIAL_DELAY_MS, DEFAULT_MAX_DELAY_MS, DEFAULT_MAX_RETRIES, DEFAULT_RETRYABLE_CODES,
+    EMPTY_RESPONSE_CODE,
+};pub use runtime::{LlmAdapter, LlmError, LlmRuntime, PreparedLlmCall};
 pub use types::*;
 
 // 品牌 id 归属：dsh-llm 拥有 MessageId/CallId/ProviderRequestId/ReasoningEffortId

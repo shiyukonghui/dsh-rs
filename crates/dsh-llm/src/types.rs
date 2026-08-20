@@ -893,6 +893,129 @@ pub struct GenerateOptions {
     pub purpose: Option<Purpose>,
 }
 
+// ---- 路由/模型元数据（对齐 TS `llm/llm/src/types.ts` 的 LlmProviderInfo/…）----
+
+/// 一个已注册 provider 路由的展示元数据。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmProviderInfo {
+    /// `GenerateOptions.provider` 使用的路由键。
+    pub id: String,
+    /// 供选择器/诊断使用的人类可读 provider 名。
+    pub name: String,
+}
+
+/// 合并可扩展的 provider 模型模态词表（`ModelModality`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelModality {
+    Text,
+    Image,
+    /// 扩展词（未知模态保留原串）。
+    Unknown(String),
+}
+
+impl ModelModality {
+    pub fn as_str(&self) -> &str {
+        match self {
+            ModelModality::Text => "text",
+            ModelModality::Image => "image",
+            ModelModality::Unknown(s) => s,
+        }
+    }
+}
+
+impl serde::Serialize for ModelModality {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+impl<'de> serde::Deserialize<'de> for ModelModality {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = String::deserialize(d)?;
+        Ok(match v.as_str() {
+            "text" => ModelModality::Text,
+            "image" => ModelModality::Image,
+            other => ModelModality::Unknown(other.to_string()),
+        })
+    }
+}
+
+/// 适配器发现的一条模型；目录成员是建议性的，不构成请求校验。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmModelInfo {
+    /// 拥有这条模型条目的 provider 路由。
+    pub provider: String,
+    /// 传入 `GenerateOptions.model` 的模型 id。
+    pub id: String,
+    /// 供选择器使用的人类可读模型名。
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 接受的请求模态；缺席 = 未知，显式空 = 负面能力。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<ModelModality>>,
+}
+
+impl LlmModelInfo {
+    pub fn new(provider: impl Into<String>, id: impl Into<String>, name: impl Into<String>) -> Self {
+        LlmModelInfo {
+            provider: provider.into(),
+            id: id.into(),
+            name: name.into(),
+            description: None,
+            input_modalities: None,
+        }
+    }
+}
+
+/// provider 拥有的单条精确 provider/model 路由的上下文容量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmModelContext {
+    /// 合并的请求+响应上下文 token 上限。
+    pub context_window: u64,
+}
+
+/// 适配器拥有的可选推理强度（供选择器展示）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmReasoningEffortInfo {
+    pub id: ReasoningEffortId,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// 单条精确 provider/model 路由可选的推理强度。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmModelReasoningInfo {
+    pub efforts: Vec<LlmReasoningEffortInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<ReasoningEffortId>,
+}
+
+/// 由所属适配器解析的精确路由模型元数据。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmResolvedModelInfo {
+    pub provider: String,
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<ModelModality>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<LlmModelContext>,
+    /// 调用方省略时物化为请求的适配器配置输出上限。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<LlmModelReasoningInfo>,
+}
+
 // ---- JSON 辅助提取 ----
 
 fn req<T: serde::de::DeserializeOwned>(obj: &Map<String, Value>, key: &str) -> Result<T, serde_json::Error> {
@@ -910,5 +1033,26 @@ fn opt<T: serde::de::DeserializeOwned>(obj: &Map<String, Value>, key: &str) -> R
     match obj.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(v) => serde_json::from_value(v.clone()).map(Some),
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn model_info_camel_case_roundtrip() {
+        let info = LlmModelInfo {
+            provider: "deepseek".into(),
+            id: "deepseek-chat".into(),
+            name: "DeepSeek Chat".into(),
+            description: Some("desc".into()),
+            input_modalities: Some(vec![ModelModality::Text]),
+        };
+        let v = serde_json::to_value(&info).unwrap();
+        assert_eq!(v["inputModalities"][0], serde_json::json!("text"));
+        assert_eq!(v["description"], serde_json::json!("desc"));
+        let back: LlmModelInfo = serde_json::from_value(v).unwrap();
+        assert_eq!(back, info);
     }
 }

@@ -571,6 +571,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-llm-deepseek"
+version = "0.1.0"
+dependencies = [
+ "dsh-brand",
+ "dsh-llm",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dsh-loader"
 version = "0.1.0"
 dependencies = [
