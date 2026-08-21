@@ -13,6 +13,7 @@
 pub mod json_schema;
 pub mod runtime;
 pub mod schema;
+pub mod ts_types;
 pub mod types;
 
 pub use json_schema::{
@@ -27,6 +28,7 @@ pub use schema::{
     define_tool, parameter_schema_spec_to_json_schema, validate_args, value_schema_spec_to_json_schema,
     DefineToolOptions, ToolArgsError, ToolDefinitionError,
 };
+pub use ts_types::{json_schema_to_ts, render_tools_sdk, ToolSdkSchema, SDK_INSTRUCTIONS};
 pub use types::{
     ToolArn, ToolCallView, ToolDefinition, ToolExecution, ToolExecutionError,
     ToolExecutionSnapshot, ToolExecute, ToolFailureData, ToolFinalize, ToolIsConcurrencySafe,

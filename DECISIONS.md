@@ -1015,4 +1015,49 @@ execution_mode`；M2f 在 `execute_inner` 的 guard 段前插 approval 判定。
 
 ---
 
+## D-026（M2b-3）：TS/Python SDK 代码生成（tools:sdk 提示区）——TS 味分步交付
+
+**日期**：2025（本机时间）
+
+**触发的问题**：Code Mode（`mode: 'code'`）下模型从 `tools:sdk` 提示区读取工具签名
+（原生 schema 被省略），`tools/sdk` 区由 `renderToolsSdk`/`renderToolsSdkPy` 生成。
+这是 M2b-2 交付注册表后可独立验收的最后一块纯语义（输出逐字节可锚）。
+
+**第一性原理拆解**：两味渲染器的模型面语义 =（a）固定使用说明文本
+（`SDK_INSTRUCTIONS`，逐字节固定）+（b）schema → 类型文本的纯映射（TS/Python 两组
+映射表）+（c）完整声明组装（字典序排序 + 固定骨架）。TS 味纯 ASCII/确定性，可在 Rust
+逐字节对齐；Python 味依赖 JS 引擎/CPython 各自的 Unicode 表（XID/NFKC/`toUpperCase`、
+UTF-16 码元计数），版本偏斜无法在本环境基准内逐字节验证（上游自身也已把 case-mapping
+暴露记为 deferral）。因此按 D-024 的分步精神拆成两次提交：M2b-3a = TS 味（本提交），
+M2b-3b = Python 味（含已知偏斜声明）。
+
+**考虑的选项**：
+1. **先交付 TS 味（本次采用）**：`ts_types.rs` = `json_schema_to_ts`（total：
+   断言/解析失败 → `"unknown"`，绝不抛）+ `render_tools_sdk` + `SDK_INSTRUCTIONS`
+   逐字节，11 项映射/锚定测试。
+2. 两味一起：Python 味偏斜判定需先立起来，Red 期长，违背「不长期红」。
+3. 不做 SDK 生成：M2e 无 `tools:sdk` 区，Code Mode 集成缺模型面协议。
+
+**最终选择**：选项 1。
+
+**差异声明（Rust 面）**：
+- 类型文档用与 TS 相同的「可组合文档」结构（`Part::Text`/`Part::Doc` +
+  `contains_union_or_intersection`）：字符串段扫描 `|`/`&`、文档段用子标志，精确复刻
+  `typeDocumentFrom` 的逐段判定（const/enum 值含 `|` 时 X 数组项加括号的边角也一致）。
+- 数字展示：`serde_json::Number::to_string()`（整数无小数点、float ryu 最短往返）。
+  与 JS `JSON.stringify` 的差异仅（记入本条目，测试不依赖）：超大整数（serde_json
+  保 u64/i64 精确，JS 双精度已舍入——Rust 更精确）；指数形式（JS `1e+21` vs ryu
+  `1e21`）；`1.0` 写法（JS 归一为 `1`）。
+- 排序：Rust `str cmp` ≤ JS UTF-16 lexicographic；差异只在含 astral 字符的名字落入
+  BMP private-use 附近，现实工具名不涉及，记入而不测。
+- 空白折叠：`split_whitespace`（Unicode White_Space）≈ JS `\s+`，差仅在极端空白。
+
+**预期影响与回滚点**：新增 `ts_types.rs` + `tests/m2b_tools_sdk_ts.rs`（11 测试）。
+回滚：撤提交。增量：M2b-3b 交付 `py_types.rs`（Python 味）；M2c/M2e 把 `sdkSection`
+（order 150，native→''）接到 systemPrompt+agent-loop。
+
+---
+
+---
+
 
