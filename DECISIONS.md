@@ -1151,6 +1151,48 @@ additive 不动既有 API）；workspace 98 二进制全绿 + clippy 零告警�
 
 ---
 
+## D-030（M2d-2）：dsh-agent 活体生命周期（AgentBus/Registry/initiator/dispatch/invariant/model-selection）
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M2d 二轮落地「活体」部分——subject 作用域事件派发、注册表有序
+生命周期、initiator 作用域、dispatch 融合、agent-invariant、model-selection 双钩。
+这些依赖 Cordis `ctx.events` 语义在 Rust 的最小复刻，且 Cordis/dsh-core 的事件是
+fiber-ScopeId 过滤（非 subject）——故按 D-023 的既定裁定走 dsh-agent 自带总线。
+
+**考虑的选项**：
+1. **自建 `AgentBus`（本次采用）**：专为 agent-subject 派发；模式支持 emit（通知，
+   逐 listener catch_unwind 包含、不可 veto）、emit_veto（首抛传播=发布否决）、
+   serial/waterfall（next 短路链）；收集-再执行（重入安全）；用 dsh-scope
+   `ScopeCarrier::adopts` 做路由过滤。不入 dsh-core（那是 fiber 过滤），复用
+   dsh-scope 路由原语。
+2. 扩 dsh-scope `ScopedContext`：其 `emit` 无包含/veto 区分、非重入，改它违反
+   「不跨界改已交付包」纪律。
+
+**差异声明（Rust 面）**：
+- initiator 为**同步栈**（with/without/current/require + 'active→'closing→'disposed'；
+  边界守卫防泄漏），无 Promise drain/branded Promise/cross-realm（报告 A.7 承认）；
+  读/写都要求 'active'，'closing'/'disposed' → `agent initiator scope is disposed` 逐字。
+- created 监听器**同步抛 = veto**（register 抛同错误 + 回滚 disposed:vetoed）；
+  无 async reject，故 `agent/created listener rejected` warn 不产生（D-029 已有声明）。
+- 通知 warn 为同步 throw 词形：`agent event "<name>" listener threw: <e>`、
+  `agent "<id>": agent/disposed listener threw: <e>`（rejected 变体无 async 不产生）。
+- dispose 事件 payload 的 `agent` 字段为 Agent 的可串化投影 `{"id": ...}`（live 事件
+  不入 log，测试按 `.agent.id` 断言；D-029 同类口径）。
+- model-selection 只安装（无 disposer 组合）；拆除由 M2e loop 的 agent scope 拆除
+  承担（TS 同语义：安装在 agent scope 内由 teardown 卸载）。`assemble_context_for`
+  Rust 面无 signal（D-028），只在 scope 字段携带 agent。
+- registry 的 create/resume 把 `owner` 从当前 initiator 快照传给 factory（无
+  Fiber 重追踪，报告 A.7 承认）。
+
+**预期影响与回滚点**：新增 `agent_bus.rs`/`registry.rs`/`dispatch.rs`/
+`invariant.rs`/`model_selection.rs`（+21 测试）；dsh-agent 合计 44 测试；
+workspace 815 测试全绿 + clippy 零告警。回滚：撤提交。增量：M2e agent-loop 的
+`agent/request` 水岭消费 assembled、状态机在 `agent/status` 上转移并经 invariant
+守卫；M2d-2 生命周期链在 agent dispose 时关闭 initiator + 拆 scoped 世界。
+
+---
+
 ## D-029（M2d-1）：dsh-agent 的 durable/记账核心（Inbox + foldConsumedWork）
 
 **日期**：2025（本机时间）
@@ -1182,10 +1224,6 @@ model-selection/invariant/initiator 依赖一个**作用域事件总线设计的
 **预期影响与回滚点**：新增 `crates/dsh-agent`（types + inbox + consumed_work +
 23 测试）；workspace 成员 +1。回滚：撤提交。增量：M2d-2 在 `with_notify` 钩子上
 接作用域事件，并交付 AgentRegistry/initiator/model-selection/invariant。
-
----
-
----
 
 ---
 

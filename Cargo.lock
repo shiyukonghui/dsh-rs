@@ -504,7 +504,9 @@ version = "0.1.0"
 dependencies = [
  "dsh-brand",
  "dsh-llm",
+ "dsh-scope",
  "dsh-session",
+ "dsh-system-prompt",
  "serde",
  "serde_json",
 ]

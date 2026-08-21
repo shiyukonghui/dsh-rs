@@ -35,6 +35,16 @@ pub enum AgentStatus {
     Running,
 }
 
+impl AgentStatus {
+    /// wire 字面量（'idle' / 'running'）。
+    pub fn wire_str(&self) -> &'static str {
+        match self {
+            AgentStatus::Idle => "idle",
+            AgentStatus::Running => "running",
+        }
+    }
+}
+
 /// `SessionStartSource`：标识「初始化已关闭的无输入 turn」的来源（水岭仅发一次）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
