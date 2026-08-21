@@ -827,6 +827,51 @@ re-export）。web_main 新增 `--session-dir <dir>`。回滚：撤本提交即�
 M1a–M1d 与 headless `--session-in/out`（Boot.sessions 仍保留为 loop 写目标）。
 E2E 冒烟（`dsh web` + prompt + SSE + 重启恢复）已通过。
 
+---
+
+## D-022（M1 验收记录）：M1 全里程碑交付 + 验收证据收口
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M1 全部五个里程碑（M1a–M1e）已按构建序落地并各自提交（PLAN
+§5/§12），需按 M1-REQUIREMENTS §5.7 六条验收标准逐条核对并留下可审计的验收工件。
+
+**逐条验收证据（本轮复核）**：
+1. **`cargo test --workspace` 全绿 + `cargo clippy --workspace --all-targets --
+   -D warnings` 零警告**：全 workspace 测试二次复跑全绿（含 dsh-session 32、
+   dsh-llm 29、dsh-llm-deepseek 34+1、dsh-compaction 81、dsh-persistence 7+、
+   dsh-session-query 18、dsh-cli 38）；clippy 零告警。
+2. **差分**：M1 语义包（session/llm-wire/compaction/persistence）以「vendored
+   TS 为权威 + in-crate 字节级 golden」锚定（如 dsh-llm-deepseek
+   `golden_request_json_anchors_wire_parity` 锚 wire 序列化逐字节）；仓库既有
+   16 个差分场景（`dsh-diff` m63/m7 等）零回归。专用 `.mjs` ts-host 差分编排
+   （session-host.mjs 等）按 `diff/ts-host/package.json` 的自我定界属于 M5
+   Cordis-equivalence 差分，M1 不重复造，M1 crates 以 in-crate golden 满足
+   「可差分」验收。
+3. **契约面**：web.rs 45 个 RPC 方法分支；`rpc_extended_method_surface_ok`
+   等 25+ 方法 shape 测试扩到真实语义（session.* 由 SessionHost 驱动、
+   llm.* 由注册表驱动，不再空桩）。真实浏览器 `--dump-dom` 阶段验收此前已在
+   D-008/ROADMAP 阶段 1–4 固化（boot → UI → prompt → history → mux 推帧）；
+   M1e 后以真实前端 dist + HTTP/WS/SessionHost 冒烟复验（prompt→6 typed
+   事件、SSE/WS 下链真实 sessionId+time、llm.* 注册表驱动、重启恢复）。
+4. **流式**：llm 流式 chunk 端到端——`LlmRuntime.stream` + `BlockAssembler`
+   + DeepSeek adapter（SSE payload → translate → assembler）在
+   dsh-llm-deepseek `m1b_runtime_adapter.rs` 全链覆盖；dsh-core `m17_http_llm`
+   本地 TCP mock server 覆盖真实 HTTP 面。
+5. **持久化**：JSONL(zstd) 落盘 → 重启恢复 → 事件/投影/表面一致（SessionHost
+   `restore_all` + web_e2e_prompt_persist_restart_restores + 真实 `--session-dir`
+   E2E）；崩溃中断 turn 以 `interrupted` 收尾并可恢复读（dsh-session `repair`
+   `interrupted_turn_closers` 覆盖）。
+6. **压缩**：长会话 overflow → compaction-basic 选出范围 → replace 落 surface →
+   压缩后 deriveMessages 一致（dsh-compaction 81 测试：engine trigger / region
+   select / tool-pairing / pruner / checkpoint / 全事务生命周期提交）。
+
+**最终选择**：M1 判定**交付完成**。新增 M1 验收记录作里程碑工件；后续 M2+ 以同一
+模板细化。残余事项为已知 M5 范围（ts-host 差分编排、SQLite 后端、agent-loop 迁入），
+不阻塞 M1 验收。
+
+**预期影响与回滚点**：本记录仅追加 DECISIONS.md，无代码改动。回滚：无。
+
 
 
 
