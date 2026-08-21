@@ -10,7 +10,7 @@ members = [
   "crates/dsh-session-query",
   # M2 运行时（PLAN §6）：agent 驱动链 —— 作用域原语 / 工具能力缝 / 系统提示 /
   # agent 注册表 / agent loop / interaction 审批链
-  "crates/dsh-scope",
+  "crates/dsh-scope", "crates/dsh-tools",
 ]
 
 [workspace.package]

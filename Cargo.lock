@@ -657,6 +657,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-tools"
+version = "0.1.0"
+dependencies = [
+ "dsh-llm",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dsh-wasmrt"
 version = "0.1.0"
 dependencies = [

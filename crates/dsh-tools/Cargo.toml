@@ -1,0 +1,16 @@
+[package]
+name = "dsh-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "M2b: 工具能力缝核心（author DSL→JSON Schema 编译 / 强制子集断言 / 参数校验 / defineTool），镜像 TS @deepseek-ai/dsh-tools 的 schema+json-schema。"
+
+[dependencies]
+dsh-llm = { path = "../dsh-llm" }
+serde = { version = "1", features = ["derive"] }
+# D-014：serde_json 默认 BTreeMap 规范序（与 dsh-diff 一致），不用 preserve_order。
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"

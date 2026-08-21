@@ -918,3 +918,45 @@ scope 提供给 dsh-agent/dsh-agent-loop 一个**测试完备、语义逐条对�
 （`tests/m2_scope.rs`，移植 scope/store/invariant 三 spec 的 24 条可观察行为）。
 回滚：撤提交即移除，不影响既有 crate。增量：dsh-agent 等消费方在 M2d+ 接入。
 
+---
+
+## D-024（M2b）：dsh-tools 迁为分步交付——首批纯语义层（schema + json-schema + defineTool）
+
+**日期**：2025（本机时间）
+
+**触发的问题**：`packages/core/tools` 是 M2 最大的包（schema/json-schema/ts-types/
+py-types/code-mode/index+types/testing 七个文件、~5600 行 TS、~8200 行测试）。
+一次全迁进单个提交既难审又难保绿；PLAN §12 明确允许按能力切子步。工具缝的**可观察
+语义**集中在极纯、零集成的水文件里：作者 DSL 编译、强制子集断言、值校验、SDK 代码
+生成——它们的输出是逐字节/逐字可锚的，且被 agent-loop/model-facing schema 全量消费。
+
+**第一性原理拆解**：tools 的「模型可见协议面」= `parameters` JSON Schema + 校验诊断；
+这本就是纯函数。注册表/执行管线虽大，但**依赖**这些纯函数，且与 scope/Cordis 事件
+耦合深（restriction 交集、staged scheduler）。所以正确顺序是：先交付并锁定纯语义层
+（稳定协议面），再在其上交付注册表管线。
+
+**考虑的选项**：
+1. **分批地平线（本次 M2b-1）**：schema + json-schema + types + defineTool 全量迁移
+   （编译产物 / 断言消息 / 校验消息逐字锚定，28+ 测试）。注册表 + 执行管线 + Code
+   Mode + ts/py SDK 生成留待 M2b-2/3 各自提交。
+2. 一次全迁：单提交巨大、红期长，违背 TDD「不长期红」纪律。
+3. 只迁 DSL 不迁校验：丢最核心的「非法参数诊断」，model-facing 校验无处安放。
+
+**最终选择**：选项 1。首批 4 个模块即生产可用协议面（defineTool/validateArgs/
+assertSupportedJsonSchema/validateJsonSchemaValue），后续提交（runtime/sdk-gen）在
+稳定协议面上增量。
+
+**差异声明（Rust 面）**：
+- `execute: Promise<...>` → 同步 `Result<Value, ToolFailureData>`（单线程核心
+  D-004/D-006）；`ToolArgsError`/`JsonSchemaError` 以 data 载体（message+code+
+  violations）承载，宿主尚未有统一 HarnessError 类型。
+- 键序沿用 D-014（BTreeMap 规范序）；TS 保插入序——诊断顺序在 Rust 收敛为字典序
+  （单违规消息不受影响，已在测试里按确定序锚定）。
+- `AbortSignal` → `ToolSignal`（`Rc<Cell<bool>>` + reason `RefCell`）；code-mode/scheduler
+  是 M5 范围（依赖 dsh-code-runtime），本次只保留 `run_code` 名称保留与错误 code 常量。
+
+**预期影响与回滚点**：新增 crate `dsh-tools`（首批：schema/json_schema/types，28
+测试，workspace 全绿 + clippy 零告警）。回滚：撤提交。增量：M2b-2 注册表
+（dsh-scope ScopedLayers restriction）+ M2b-3 SDK 生成，M2e agent-loop 消费协议面。
+
+
