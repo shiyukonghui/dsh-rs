@@ -959,4 +959,60 @@ assertSupportedJsonSchema/validateJsonSchemaValue），后续提交（runtime/sd
 测试，workspace 全绿 + clippy 零告警）。回滚：撤提交。增量：M2b-2 注册表
 （dsh-scope ScopedLayers restriction）+ M2b-3 SDK 生成，M2e agent-loop 消费协议面。
 
+---
+
+## D-025（M2b-2）：dsh-tools ToolRuntime 注册表 + 执行管线（本轮提交）
+
+**日期**：2025（本机时间）
+
+**触发的问题**：在 M2b-1 交付纯语义层后，需要给 M2d/M2e 一块可用的注册表面：注册/
+遮蔽/限制/呈现/执行。TS `packages/core/tools/index.ts` 的 `ToolRuntime` 整个架构挂在
+Cordis 事件总线上（`tools/pre-execute`、`tools/post-execute`、approval gates、
+`static inject`、`scheduler`、`member: ctx.layers`），这些在 Rust 单线程核心没有
+Cordis 总线实体（D-004/D-006/D-023）。
+
+**第一性原理拆解**：真正能被 M2e 消费的注册表语义 =（1）**view 解析**：全局基 +
+作用域链遮蔽 + 限制交集 + 自有覆盖 + run_code 注入（纯函数、逐字节可锚）；（2）
+**restriction/presentation**：可安置在 scoped layer 上的 effect 条目（依赖
+dsh-scope 的 ScopedLayers，D-023 已交付）；（3）**执行管线**的「无 approval 主干」：
+resolve → guard → body → output 校验 → render → finalize → 取消合成。approval 判定
+与 staged scheduler（prepare/dispatch/finalize/finish waterfall）是 M2f/M2e 的接线
+条目，不是注册表本身。
+
+**考虑的选项**：
+1. **交付注册表 + 视图 + 限制 + 呈现 + 无 approval 执行主干（本次采用）**：把
+   `ToolRuntime` 的 Cordis 事件面收敛为 `Rc<dyn Fn()` 变更通知（对齐 dsh-scope 的
+   `on_change`），approval 留 M2f 在 `execute` 前插桩。
+2. 空窗口期一次交付完整 approval/scheduler：跨 M2e/M2f 依赖、红期长、违背 TDD。
+3. 只交付注册表不做执行：M2e 无执行入口，集成无从谈起。
+
+**最终选择**：选项 1。
+
+**差异声明（Rust 面）**：
+- `tool.execute: Promise<ToolOutput>` → 同步 `Result<Value, ToolFailureData>`；取消
+  用 `ToolSignal`（D-024 已定型）：body 前取消 → `ABORTED_BEFORE_DISPATCH`，body 后
+  取消 → `ABORTED`。
+- 呈现桶（`presentCall`/`presentResult`/`sdkSection`/`collapseSection`/
+  `CODE_ONLY_INSTRUCTION`）随 protocols/UI 属 M5；本轮 view 只给 `parameters`
+  allowlist（`to_tool_schema`）。run_code 注入占位（执行给「需 code runtime」精确
+  错误），name 保留在 register/restrict 两层无条件拦截。
+- guards 存 layer（`Rc<RefCell<Vec<...>>>` 内部共享句柄，effect action 拿 `&L` 时
+  经句柄写入/回滚）；同步执行。技术选型强制：`ToolLayer` 可变字段一律
+  `Rc<RefCell<...>>`，顺应 ScopedLayers effect 的 `&L` 面（行动作与 undo 都只持
+  共享句柄，不裸指针）。
+- `ToolExecutionMode::Both` 语义收敛为「可同时 native/code 呈现」；本轮 collapse 仅
+  针对 `mode==='code'`（与 TS `collapses` 判定一致）。
+- `executionMode` fail-closed：仅 `is_concurrency_safe` 显式返回 `true` → parallel
+  （含 catch_unwind 兜底抛错 → exclusive）。
+- `ToolExecutionResult`（规范化：value/content/content_annotation/is_error/error/
+  additional_contexts）+ `ToolErrorInfo{message,info?}` 对应 TS；原始执行身份
+  `ToolExecution`/`ToolExecutionSnapshot` 保持 M2b-1 形态（finalize 钩子消费）。
+
+**预期影响与回滚点**：新增 `runtime.rs` + `tests/m2b_tools_runtime.rs`（26 测试，
+workspace 全绿、clippy 零告警，总额 dsh-tools 54 + workspace ①）。回滚：撤提交。
+增量：M2e agent-loop 将 `registry` 于 initiator scope 挂载并消费 `schemas/execute/
+execution_mode`；M2f 在 `execute_inner` 的 guard 段前插 approval 判定。
+
+---
+
 

@@ -11,6 +11,7 @@
 //!   `ToolArgsErrorData` 等轻量载体（宿主至今未引入统一 HarnessError 类型）。
 
 pub mod json_schema;
+pub mod runtime;
 pub mod schema;
 pub mod types;
 
@@ -18,13 +19,17 @@ pub use json_schema::{
     assert_object_json_schema, assert_supported_json_schema, validate_json_schema_value,
     JsonSchemaError, JsonSchemaNode, JsonSchemaScalar, JsonSchemaType, ObjectJsonSchema,
 };
+pub use runtime::{
+    ToolErrorInfo, ToolExecutionClass, ToolExecutionInput, ToolExecutionMode, ToolExecutionResult,
+    ToolGuard, ToolRegistry, ToolRestriction, ToolView,
+};
 pub use schema::{
     define_tool, parameter_schema_spec_to_json_schema, validate_args, value_schema_spec_to_json_schema,
     DefineToolOptions, ToolArgsError, ToolDefinitionError,
 };
 pub use types::{
     ToolArn, ToolCallView, ToolDefinition, ToolExecution, ToolExecutionError,
-    ToolExecutionResult, ToolExecute, ToolFailureData, ToolFinalize, ToolIsConcurrencySafe,
+    ToolExecutionSnapshot, ToolExecute, ToolFailureData, ToolFinalize, ToolIsConcurrencySafe,
     ToolOutputDefinition, ToolPresentCall, ToolPresentResult, ToolPresentationMeta, ToolRender,
     ToolResult, ToolResultView, ToolRunContext, ToolSignal,
 };

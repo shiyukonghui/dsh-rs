@@ -46,7 +46,7 @@ pub type ToolPresentationMeta = Rc<dyn Fn(&Value, &Value) -> Value>;
 pub type ToolExecute = Rc<dyn Fn(&Value, &ToolRunContext) -> Result<Value, ToolFailureData>>;
 /// 每个归一化结果的最后内容变换（返回 None 保留原内容）。
 pub type ToolFinalize =
-    Rc<dyn Fn(&ToolExecution, &ToolExecutionResult) -> Option<Vec<ContentBlock>>>;
+    Rc<dyn Fn(&ToolExecution, &ToolExecutionSnapshot) -> Option<Vec<ContentBlock>>>;
 /// 仅返回 `true` 才允许并行。
 pub type ToolIsConcurrencySafe = Rc<dyn Fn(&Value) -> bool>;
 /// 待执行态呈现。
@@ -137,12 +137,13 @@ pub struct ToolExecution {
     pub args: Value,
 }
 
-/// 规范化的执行结果（验证后、物化前）。
+/// 规范化过程中的结果快照（finalize 钩子收到；对齐 TS `ToolExecutionResult` 的
+/// 前归一化形态：value + 渲染内容）。
 #[derive(Debug, Clone)]
-pub struct ToolExecutionResult {
+pub struct ToolExecutionSnapshot {
     /// 验证过的 canonical value（output.schema 保证）。
     pub value: Value,
-    /// 已渲染的 model-facing 内容块。
+    /// 已渲染的 model-facing 内容块（未 finalize）。
     pub content: Vec<ContentBlock>,
     /// 呈现专用的注解块（可选传给 UI，model 不可见）。
     pub content_annotation: Option<ContentBlock>,

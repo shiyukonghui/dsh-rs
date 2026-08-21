@@ -661,6 +661,7 @@ name = "dsh-tools"
 version = "0.1.0"
 dependencies = [
  "dsh-llm",
+ "dsh-scope",
  "serde",
  "serde_json",
 ]
