@@ -1270,4 +1270,66 @@ invariant + 18 测试），workspace 成员 +1，815→833 全绿 + clippy 零�
 
 ---
 
+## D-032（M2e-2）：ReactLoopAgent 同步驱动（turn/preStep/step 状态机 + send/steer/cancel + 水岭接线）
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M2e 第二步需要把请求重建层接到**驱动状态机**：Phase（Idle/Maintenance/
+Running）→ agent/status、send/followup/steer/inject → wakeDriver/kick 与 reentrant latch、
+turn()/preStep()/step() 完整链路（含 pre-step 决策水岭、turn-stopping serial、request-error
+重试、max-tokens 粘性、中断前缀），并以 mock 流完成全部生命周期测试。tool 调度/MockAdapter/
+AgentLoop 服务/runtime-context 投影留 M2e-3。
+
+**考虑的选项**：
+1. **同步 inline 驱动（本次采用）**：send——唤起 driver 即同步排空（kick 内整段完成）；
+   对应 TS async 列表的「此刻可完成的推进」子集；无 Promise 队列、无 AbortController。
+2. 引入同线程任务队列模拟 async 调度点：复杂度高，与订单态机同步纪律冲突，收益仅是
+   测试形态更接近 JS。
+
+**差值声明（sync 语义，逐项核对后）**：
+- **无 AbortSignal**：取消 = `Phase.abort_reason: Option<AgentCancelCause>`（合作式）。检查点
+  对齐 TS `signal.throwIfAborted()` 位置：turn 首行（try 外——取消→无 turn 记录，Err 直返）、
+  turn 循环顶、pre_step 装配后、step/start 前、step 内 while 顶、stream try 前、逐 chunk 前、
+  stream 后、tool 执行后、turn-stopping serial 后。**中流抢占不可达**（sync 流物化为预取
+  Vec；每 chunk 前仍有检查，但只对「流已整体返回后额外取消」有意义）；TS caught-mid-stream
+  的 `interruptedBlocks` 前缀路径保留代码但正常测试不可达（D-028 同款 declared divergence）。
+- **wakeDriver 内联同步**：TS `wakeDriver()` 在 idle 时以 `withInitiator(+index)` 真异步排空；
+  Rust idle-分支在 `with_initiator` 内**同步**跑 kick；running/maintenance 分支同 latch（
+  `abort_reason!=Disposed && (maintenance || wakeAfterAbort)` 才 latch）。kick 内 re-wake
+  （踢完仍 latch+hasPending）在同一次 with_initiator 边界内重开相位——initiator 权威等同
+  TS 的嵌套 withInitiator，一次 send 的整段都受同一发起人作用域约束。
+- **每 turn 一 signal → 每 turn 一 abort_reason**：续 turn 前清 abort_reason+wake_requested、
+  step 归零（fresh controller，对齐 TS `phase.abort = new AbortController()`）。
+- **stream = `&dyn Fn(&GenerateOptions) -> Result<Vec<StreamChunk>, LlmError>`** 同步物化
+  Vec（无后端本轮）；`preparedCall.stream ?? llm.stream` 的选择**留 M2e-3**（本轮恒用 hook）。
+  finish `error|aborted` → `agent/request-error` 水岭（payload 含 turn/step/provider/failure；
+  `retryPolicy` **M2e-2 未序列化**，M2e-3 接 `prepared.retryPolicy`）；`kind!='retry'`→
+  throw LlmError → turn error（turnEnds=Error{failure}）。
+- **错误分层**：`Halt::Aborted(cause)`/`Halt::Failed(LlmFailure)` 内部类型。非 abort 错误在
+  turn catch 统一 emit `agent/error {turn,step,error}` + turnEnds=Error；abort 路径静默
+  （turnEnds=Aborted{reason}）；turn/start、turn/end 追加失败各自 emit（含无 turn/end 的
+  前置失败，对齐 TS 的独立 try/catch）。
+- **监听器抛错**：bus `waterfall/serial` 链监听器 panic 由驱动 `catch_unwind` 收窄为
+  `Halt::Failed("{name} listener threw: …")`（同 emit 的 skip-errors 纪律）；agent/request
+  水岭内同款收窄，返回给 build_request 的 propose。
+- **辅助接线**：live `agent/inbox/{inserted,discarded,claimed}` 事件由驱动构造时经
+  `Agent::set_inbox_notify` 注入（新增 dsh-agent 小刀：Inbox::set_notify +
+  Agent::set_inbox_notify；`AgentEventDispatch` 补 Clone）。project_context 本轮收
+  `&PromptAssembly -> Option<Message>`（M2e-3 接 RuntimeContextProjection 的 joined
+  sections）。tool_exec 收 `ToolExecCtx`（M2e-3 接 executeToolCalls + scheduler）。
+- 模型文本/事件形状对照 agent.ts：pre-step 水岭 payload `{messages,turn,step}`（+agent
+  融合）；默认决策 enter=`{kind:'enter', messages: claimed或claimed+context}`；空 enter
+  决策「初始 turn 无步完成」与「turnEnds 后再空则 break」双分支逐行；user/message 在
+  step/start 之后逐条 append；assistant/message `{turn,step,message,usage?}` +
+  surfaceOp=append + sourceEventSeqs=chunk seqs；turn-stopping serial `{turn}`；
+  `agent/status` payload `{status}`。
+
+**预期影响与回滚点**：`crates/dsh-agent-loop` 新增 `agent.rs`（驱动）+ `tests/m2e2_driver.rs`
+（13 测试）；`build_request` 签名扩展（`turn/step` 透传 + `propose(c,t,s)`）并更新 m2e1 全调用；
+dsh-agent 增 3 处小刀。833→846 全绿 + clippy 零告警。回滚：撤销本提交。
+增量：M2e-3 把 tool_exec/stream/project_context 换成真实 scheduler/MockAdapter/
+RuntimeContextProjection，`preparedCall.stream` 选择归一，request-error 补 retryPolicy。
+
+---
+
 

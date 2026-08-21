@@ -79,6 +79,11 @@ impl Agent {
         self.inbox.append_msg(target, message)
     }
 
+    /// 把 live `agent/inbox/*` 通知接收器挂到本 agent 的 inbox（M2e loop 构造时调用）。
+    pub fn set_inbox_notify(&self, notify: crate::inbox::InboxNotify) {
+        self.inbox.set_notify(notify);
+    }
+
     pub fn cancel(&self, _cause: AgentCancelCause, _keep_inbox: bool) {
         // M2e 由 loop 消费；本层只保留签名（status 转移 + 事件发射在 loop）。
         let _ = _cause;

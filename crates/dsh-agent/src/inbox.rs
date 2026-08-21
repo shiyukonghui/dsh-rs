@@ -113,8 +113,7 @@ impl Inbox {
             next_turn: Vec::new(),
             next_step: Vec::new(),
             notify,
-        };
-        let events = inner.session.events();
+        };        let events = inner.session.events();
         for event in events.iter().skip(seed_length) {
             if event.kind != EventKind::AgentInboxSpliced {
                 continue;
@@ -130,6 +129,11 @@ impl Inbox {
         Ok(Inbox {
             inner: Rc::new(RefCell::new(inner)),
         })
+    }
+
+    /// 运行时替换通知接收器（M2e loop 构造时挂 live `agent/inbox/*` 事件发射）。
+    pub fn set_notify(&self, notify: InboxNotify) {
+        self.inner.borrow_mut().notify = notify;
     }
 
     // ---- getters ----

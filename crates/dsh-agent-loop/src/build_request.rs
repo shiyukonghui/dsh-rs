@@ -47,13 +47,13 @@ pub struct BuiltRequest {
 
 /// 构建一步模型请求（对齐 `agent.ts#buildRequest`）。
 ///
-/// - `propose`：`agent/request` 水岭（默认恒等）。M2e-2 起接作用域总线；本层收
-///   纯函数以保持可测（sync 纪律；`agent/request` 的 `{turn,step,signal}` 在 M2e-2
-///   由驱动线程化）。
+/// - `propose`：`agent/request` 水岭（默认恒等）。M2e-1 收纯函数以保持可测；M2e-2
+///   驱动把总线 waterally（`agent/request` 的 `{turn,step,signal}` payload）包成该
+///   闭包，`turn`/`step` 以参数传入（sync 纪律：信号不入 Rust 面，D-032）。
 /// - `prepare_call`：`llm.prepareCall`。`NO_ADAPTER` 降级为透传 config（允许
 ///   llm/stream 插件短路未注册路由）；其它错误传播。
 /// - `boundary_messages`：派生消息（`session.deriveMessages()`），请求的唯一消息源。
-#[allow(clippy::too_many_arguments)] // 1:1 对齐 buildRequest 输入面（8 参数，拒绝包壳失真）
+#[allow(clippy::too_many_arguments)] // 1:1 对齐 buildRequest 输入面（10 参数，拒绝包壳失真）
 pub fn build_request(
     session: &Rc<Session>,
     options: &AgentOptions,
@@ -61,7 +61,9 @@ pub fn build_request(
     tools: &[ToolSchema],
     system: &str,
     boundary_messages: Vec<Message>,
-    propose: &dyn Fn(CallConfig) -> Result<CallConfig, String>,
+    turn: u64,
+    step: u64,
+    propose: &dyn Fn(CallConfig, u64, u64) -> Result<CallConfig, String>,
     prepare_call: &dyn Fn(CallConfig) -> Result<PreparedLlmCall, LlmError>,
 ) -> Result<BuiltRequest, String> {
     let persisted_header = session.request_header();
@@ -97,7 +99,7 @@ pub fn build_request(
         }
     };
 
-    let proposed_config = propose(seed_config)?;
+    let proposed_config = propose(seed_config, turn, step)?;
     if proposed_config.provider.is_empty() || proposed_config.model.is_empty() {
         return Err(format!(
             "agent \"{}\" has no provider/model: set AgentOptions.provider and AgentOptions.model or supply both via the agent/request waterfall",

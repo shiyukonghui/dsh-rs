@@ -16,6 +16,7 @@ pub fn fuse_agent(agent: &Agent, mut payload: Value) -> Value {
 }
 
 /// `agentEvents(ctx, agent, carrier?)` 的 Rust 形态：常驻 dispatcher。
+#[derive(Clone)]
 pub struct AgentEventDispatch {
     bus: AgentBus,
     carrier: ScopeCarrier,

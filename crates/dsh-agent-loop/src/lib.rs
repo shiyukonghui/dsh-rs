@@ -6,11 +6,13 @@
 //!   request-reconstruction invariant（THEOREM 的执行化证明，fail 文本逐字）。
 //! - M2e-2+：ReactLoopAgent turn/step 驱动、tool 调度、AgentLoop 服务。
 
+pub mod agent;
 pub mod build_request;
 pub mod constants;
 pub mod invariant;
 pub mod settings;
 
+pub use agent::{LoopDeps, PreStepDecision, ReactLoopAgent, ToolExecCtx, ToolExecOutcome};
 pub use build_request::{build_request, request_proposal, BuiltRequest};
 pub use constants::*;
 pub use invariant::{check_loop_request, AgentLoopRequest};

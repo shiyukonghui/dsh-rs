@@ -102,7 +102,7 @@ fn go(
     }
 }
 
-fn ident_propose(c: CallConfig) -> Result<CallConfig, String> {
+fn ident_propose(c: CallConfig, _turn: u64, _step: u64) -> Result<CallConfig, String> {
     Ok(c)
 }
 
@@ -153,10 +153,12 @@ fn default_build(
     tools: &[ToolSchema],
     system: &str,
     boundary: Vec<Message>,
-    propose: &dyn Fn(CallConfig) -> Result<CallConfig, String>,
+    propose: &dyn Fn(CallConfig, u64, u64) -> Result<CallConfig, String>,
     prepare: &dyn Fn(CallConfig) -> Result<PreparedLlmCall, LlmError>,
 ) -> Result<BuiltRequest, String> {
-    build_request(s, opts, logged, tools, system, boundary, propose, prepare)
+    build_request(
+        s, opts, logged, tools, system, boundary, 1u64, 1u64, propose, prepare,
+    )
 }
 
 fn request_headers(s: &Rc<Session>) -> Vec<(Value, String)> {
@@ -451,7 +453,7 @@ fn build_request_proposal_strips_filled_dimensions_next_step() {
     .unwrap();
     // 第二次：seed = requestProposal(persistedHeader) → 两维度剥除
     let last = RefCell::new(None::<CallConfig>);
-    let propose = |c: CallConfig| -> Result<CallConfig, String> {
+    let propose = |c: CallConfig, _t: u64, _s: u64| -> Result<CallConfig, String> {
         *last.borrow_mut() = Some(c.clone());
         Ok(c)
     };
@@ -506,7 +508,7 @@ fn build_request_restores_explicit_effort_on_same_route() {
     )
     .unwrap();
     let last = RefCell::new(None::<CallConfig>);
-    let propose = |c: CallConfig| -> Result<CallConfig, String> {
+    let propose = |c: CallConfig, _t: u64, _s: u64| -> Result<CallConfig, String> {
         *last.borrow_mut() = Some(c.clone());
         Ok(c)
     };

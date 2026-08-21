@@ -517,6 +517,7 @@ version = "0.1.0"
 dependencies = [
  "dsh-agent",
  "dsh-llm",
+ "dsh-scope",
  "dsh-session",
  "dsh-system-prompt",
  "serde",
