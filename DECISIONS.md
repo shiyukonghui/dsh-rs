@@ -1151,6 +1151,40 @@ additive 不动既有 API）；workspace 98 二进制全绿 + clippy 零告警�
 
 ---
 
+## D-029（M2d-1）：dsh-agent 的 durable/记账核心（Inbox + foldConsumedWork）
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M2d 首轮需落地 dsh-agent 中「协议关键、语义可逐字节锚定」的部分：
+Inbox 的 durable 双队列投影（JS `Array.prototype.splice` 标准化算术 + 
+`agent/inbox/spliced` wire）+ `foldConsumedWork` 记账。注册表/dispatch/
+model-selection/invariant/initiator 依赖一个**作用域事件总线设计的接入**（M2d-2
+再评——dsh-scope 的 `ScopedContext`/emit_scoped 是候选）。
+
+**考虑的选项**：
+1. **首轮只交付 durable/记账核心（本次采用）**：落 `types.rs`（AgentOptions/
+   AgentStatus/InboxTarget/ModelSelection/ConsumedWork 全类型面）+ `inbox.rs` +
+   `consumed_work.rs`；23 测试对齐 agent.spec 的 Inbox 与 consumed-work.spec 全场景。
+2. 首轮直接全量 dsh-agent：注册表生命周期/initiator ALS 等价物/事件总线量过大，
+   与既有水岭分步（M2b 三拆）一致，风险集中到一轮。
+
+**差异声明（Rust 面）**：
+- `agent/inbox/spliced` wire：可选字段（`removedCount`/`outcome`）缺省即省略；
+  `removedCount` 仅当 >0 出现（与 fold「removedCount 缺省 = 纯插入」口径一致）。
+- 重建语义：`Inbox::new` 重放 `header.seedLength`（缺省 0）之后的持久 splice，
+  错误包装 `invalid persisted inbox splice at session seq <seq>` 逐字。
+- `claim` 的持久事件**无 outcome**（discardRemoved=false）；`clear`/`remove`/
+  `replace` 有 outcome='canceled'；`0 删 0 插` 不写事件。
+- 通知三素（inserted/discarded/claimed）以 `InboxNotify = Rc<dyn Fn>` 钩子暴露；
+  live 总线事件（agent/inbox/inserted 等作用域事件）M2d-2 在此钩子上发射。
+- 无其它行为差异；算术 `f64::trunc`/NaN→0/负坐标/上界截断对齐 JS。
+
+**预期影响与回滚点**：新增 `crates/dsh-agent`（types + inbox + consumed_work +
+23 测试）；workspace 成员 +1。回滚：撤提交。增量：M2d-2 在 `with_notify` 钩子上
+接作用域事件，并交付 AgentRegistry/initiator/model-selection/invariant。
+
+---
+
 ---
 
 ---
