@@ -1227,4 +1227,47 @@ model-selection/invariant/initiator 依赖一个**作用域事件总线设计的
 
 ---
 
+## D-031（M2e-1）：dsh-agent-loop 的请求重建层（constants/settings/requestProposal/buildRequest/invariant）
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M2e 首轮需要落地 agent-loop 中「请求可由 session 日志逐字节重建」（THEOREM）
+的**构造侧 + 校验侧**纯内核：settings 严格验证、requestProposal、buildRequest 的
+initial/resume/change header-锚点与 request/context 增量、loop 标记、request-reconstruction
+invariant。驱动状态机（turn/preStep/step）与 tool 调度、AgentLoop 服务留 M2e-2/3。
+
+**考虑的选项**：
+1. **先做请求重建纯内核（本次采用）**：constants + settings 验证 + `requestProposal` +
+   `build_request`（propose/prepare_call 以**纯函数钩子**收口，M2e-2 再接作用域总线）+
+   `check_loop_request`（fail 逐字）；与 M2d 两次拆分的瀑布尺寸一致，风险集中度低。
+2. 首次直接全量 ReactLoopAgent 驱动：turn/step/tool 调度绑定过宽，MockAdapter 尚未就位，
+   与瀑布「先接口契约再状态机」冲突。
+
+**差值声明：Rust 面**：
+- `AgentLoopRequest(GenerateOptions)` 包装类型 = TS `markAgentLoopRequest` 的 symbol 标记；
+  `isAgentLoopRequest` 的**运行时门**在 Rust 变**类型面保证**（loop 唯一生产者；TS 的门
+  存在只因事件边界是动态的）。frozen 检查同理：Rust 不可变值为恒冻结，无运行时检查
+  （`a loop-built request must be frozen` 与 messages-frozen 两词形 Rust 不可达，测试不锚定）。
+- `check_loop_request(request, Option<&Rc<Session>>) -> Result<(), String>`：**无 session**
+  = TS `ctx.sessions.get(id)` 未中 → `a loop-built request must carry a live session id,
+  got "<id>"`（`session_id` 缺失先于其触发，与 TS 源顺序一致）；fail 为**首个违例即失败**
+  （TS `fail: () => never` 抛错，非累积）。
+- `build_request` 无 AbortSignal（sync 纪律，D-028 同款）；`agent/request` 水岭在 M2e-1 是
+  `&dyn Fn(CallConfig) -> CallConfig` 恒等钩子（`{turn,step,signal}` 上下文 M2e-2 由驱动
+  线程化），其余 buildRequest 语义逐行移植：seed = `requestProposal(persistedHeader)` /
+  `{...route, reasoningEffort?, maxTokens?}`；显式 effort 仅当 provider+model 同且非适配器
+  填充时恢复；prepareCall `NO_ADAPTER` 降级透传 config；`canonicalHeader` 空 system/tools
+  不写字段；reason 'initial'（无基线）/'resume'/'change'；request/context 仅在变化时记录。
+- settings 验证消息逐字：`maxParallelToolCalls must be a positive integer`、
+  `agent maxTokens must be a positive safe integer`；缺省 `DEFAULT_MAX_PARALLEL_TOOL_CALLS=10`。
+- invariant 的 6 条可达 fail 文本逐字节对齐 `agent-loop/src/invariant.ts`（缺 session id /
+  无活 session / 无 step-start / 无 request-header / 派生消息分歧 / 折叠头分歧）。
+
+**预期影响与回滚点**：新增 `crates/dsh-agent-loop`（constants/settings/build_request/
+invariant + 18 测试），workspace 成员 +1，815→833 全绿 + clippy 零告警。回滚：撤销提交。
+增量：M2e-2 ReactLoopAgent 驱动把 `build_request` 的水岭绑到 AgentBus、在
+`llm/stream` 派发点装配 `check_loop_request`。
+
+---
+
 

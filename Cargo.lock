@@ -512,6 +512,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-agent-loop"
+version = "0.1.0"
+dependencies = [
+ "dsh-agent",
+ "dsh-llm",
+ "dsh-session",
+ "dsh-system-prompt",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dsh-api"
 version = "0.1.0"
 dependencies = [
