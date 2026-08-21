@@ -520,8 +520,11 @@ name = "dsh-cli"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "dsh-brand",
  "dsh-core",
  "dsh-loader",
+ "dsh-persistence",
+ "dsh-session",
  "dsh-wasmrt",
  "serde",
  "serde_json",

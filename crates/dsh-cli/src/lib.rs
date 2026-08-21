@@ -22,6 +22,10 @@ use dsh_wasmrt::{Capabilities, DshServicesPlugin, WasmLoopPlugin};
 /// `dsh web`——服务 DeepSeek Harness 前端 + `/api` RPC（M70）。
 pub mod web;
 
+/// M1e SessionHost：把 WASM loop 的 SessionLog 事件 adopt 进 dsh-session store，
+/// 并挂载持久化（dsh-persistence coordinator event 回调）。
+pub mod session_host;
+
 /// 启动结果：运行时上下文 + loop 插件句柄（供驱动）。
 pub struct Boot {
     pub ctx: Cordis,
@@ -29,6 +33,8 @@ pub struct Boot {
     pub loop_plugin: Rc<std::cell::RefCell<Arc<WasmLoopPlugin>>>,
     /// 可用服务句柄（诊断）。
     pub sessions: dsh_core::SessionHandle,
+    /// M1e：llm 服务句柄（`llm.providers`/`llm.models` 目录来源）。
+    pub llm: dsh_core::LlmHandle,
     /// HMR refresh 回调：重读主配置 + overlays → 重新挂载（watch 模式用；
     /// 对应 Cordis Include 插件的 `internal/update → refresh` 路径）。
     pub refresh: Rc<dyn Fn() -> Result<(), CordisError>>,
@@ -114,6 +120,13 @@ pub fn boot(
         .as_ref()
         .clone();
 
+    // M1e：llm 服务句柄（真实模型适配器注册处；web `llm.providers`/`llm.models`
+    // 的目录来源）。sessions 服务必有，但 llm 可能未注册——缺省给空服务。
+    let llm: dsh_core::LlmHandle = cordis
+        .get_typed::<dsh_core::LlmHandle>("llm")
+        .map(|a| a.as_ref().clone())
+        .unwrap_or_else(dsh_core::new_llm);
+
     // HMR refresh：重读主配置 + overlays → 重新挂载（async 事务 `load_async` →
     // `sync_async` allSettled + 整事务回滚；经 current_thread runtime block_on 驱动）。
     let refresh_loader = loader.clone();
@@ -165,6 +178,7 @@ pub fn boot(
         ctx: cordis,
         loop_plugin: loop_cell,
         sessions,
+        llm,
         refresh,
     })
 }

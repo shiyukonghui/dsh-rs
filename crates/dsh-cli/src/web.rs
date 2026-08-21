@@ -18,12 +18,13 @@
 //! 纯函数（可测），SSE 下链只在 `SessionHandle`（Send+Sync）上跑。
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
 use std::time::Duration;
 
 use dsh_core::*;
 use tiny_http::{Header, Method, Response, Server};
 
+use crate::session_host::{EventSink, SessionHost};
 use crate::Boot;
 
 /// trust fence（阶段4）：判定请求 Host 头是否为 loopback 权威
@@ -95,17 +96,15 @@ pub struct WebConfig {
     pub host: String,
     /// 监听端口（0 = 系统分配）。
     pub port: u16,
+    /// 会话持久化根（`session/event` → append，`session/flush` → flush 落盘）。
+    /// 缺省 = 纯内存（不落盘）。
+    pub session_dir: Option<PathBuf>,
 }
 
 /// 一个已运行的 Web 服务器（持有实际监听地址）。
 pub struct WebServer {
     pub addr: String,
 }
-
-/// 会话注册表（阶段3 多会话）：sessionId → 独立 `SessionLog`。seed `default`。
-/// `session.prompt` 经共享 loop 引擎驱动后，把产生的新事件按 sessionId 追加到
-/// 对应 log，实现「多会话各自独立历史」。
-pub type SessionRegistry = Arc<Mutex<std::collections::HashMap<String, dsh_core::SessionLog>>>;
 
 /// 启动 `dsh web`：服务前端 dist + `/api` RPC，桥接到 boot 运行时。
 ///
@@ -137,21 +136,23 @@ pub fn serve(boot: &Boot, cfg: WebConfig) -> Result<WebServer, CordisError> {
     let manifest = build_boot_manifest(&cfg.plugin_root)?;
 
     let web_root = cfg.web_root;
-    let sessions = boot.sessions.clone();
-    // 阶段3：会话注册表——seed 一个 `default`（多会话入口）。
-    let registry: SessionRegistry = Arc::new(Mutex::new({
-        let mut m = std::collections::HashMap::new();
-        m.insert("default".to_string(), dsh_core::SessionLog::new());
-        m
-    }));
+    // M1e：SessionHost——SessionStore（权威历史）+ 可选持久化挂载 + EventSink
+    // 下链。loop 仍写 `boot.sessions`（SessionLog）；`session.prompt` adopt 进
+    // 目标会话；`session/event` 下链走 EventSink（Send+Sync 供 SSE/WS 线程）。
+    let host = match &cfg.session_dir {
+        Some(dir) => SessionHost::with_root(dir),
+        None => SessionHost::in_memory(),
+    };
+    // seed `default`（前端会话入口）。
+    let _ = host.session("default");
+    let sink = host.sink.clone();
     for request in server.incoming_requests() {
         let root = web_root.clone();
-        let sessions = sessions.clone();
         let manifest = manifest.clone();
-        let registry = registry.clone();
+        let sink = sink.clone();
         // tiny_http 每请求已在线程处理；这里再派发。RPC/静态用 `&Boot`
-        // （非 Send，留在调用线程），SSE 用 `SessionHandle`（Send+Sync）。
-        dispatch_request(request, &root, &manifest, boot, &sessions, &registry);
+        // （非 Send，留在调用线程），SSE/WS 用 `EventSink`（Send+Sync）。
+        dispatch_request(request, &root, &manifest, boot, &host, &sink);
     }
     Ok(WebServer { addr })
 }
@@ -162,8 +163,8 @@ fn dispatch_request(
     web_root: &Path,
     manifest: &BootManifest,
     boot: &Boot,
-    sessions: &SessionHandle,
-    registry: &SessionRegistry,
+    host: &Rc<SessionHost>,
+    sink: &crate::session_host::EventSink,
 ) {
     // 路径去 query
     let path = request.url().split('?').next().unwrap_or("/").to_string();
@@ -204,7 +205,7 @@ fn dispatch_request(
                 // 读 body → RPC 分派 → JSON 响应
                 let mut body = Vec::new();
                 let _ = std::io::Read::read_to_end(&mut request.as_reader(), &mut body);
-                let (status, json) = handle_rpc_registry(boot, m, &body, registry);
+                let (status, json) = handle_rpc_host(boot, m, &body, host);
                 let resp = json_response(status, &json);
                 let _ = request.respond(resp);
             }
@@ -231,12 +232,12 @@ fn dispatch_request(
                                 .unwrap(),
                         );
                     let stream = request.upgrade("websocket", resp);
-                    let sessions = sessions.clone();
-                    std::thread::spawn(move || stream_ws_events(stream, &sessions, is_host));
+                    let sink = sink.clone();
+                    std::thread::spawn(move || stream_ws_events(stream, &sink, is_host));
                 } else {
                     let writer = request.into_writer();
-                    let sessions = sessions.clone();
-                    std::thread::spawn(move || stream_sse_events(writer, &sessions));
+                    let sink = sink.clone();
+                    std::thread::spawn(move || stream_sse_events(writer, &sink));
                 }
             }
             _ => {
@@ -457,18 +458,21 @@ fn json_response(status: u16, value: &Value) -> Response<std::io::Cursor<Vec<u8>
         .with_header(Header::from_bytes(&b"Content-Type"[..], b"application/json").unwrap())
 }
 
-/// SSE 事件下链（M71）：轮询共享 session 日志，把**新事件**推成 `session/event`
-/// mux 帧（对齐 `muxFrameSchema`）。运行在独立线程（`SessionHandle` Send+Sync）。
-/// 握手后发 `session/subscribed`，随后增量推帧 + keepalive；连接关闭即退出。
-fn stream_sse_events(mut writer: Box<dyn std::io::Write + Send>, sessions: &SessionHandle) {
+/// SSE 事件下链（M71/M1e）：轮询 SessionHost 下链日志（EventSink），把**新事件**
+/// 推成 `session/event` mux 帧（对齐 `muxFrameSchema`；每帧带真实 sessionId +
+/// 真实 `time`）。运行在独立线程（`EventSink` Send+Sync）。握手后发
+/// `session/subscribed`，随后增量推帧 + keepalive；连接关闭即退出。
+fn stream_sse_events(mut writer: Box<dyn std::io::Write + Send>, sink: &EventSink) {
     // SSE 响应头（tiny_http 的 into_writer 是原始 socket 写；手写头 + data 帧）。
-    if write_err(&mut writer, b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n").is_none() {
+    if write_err(
+        &mut writer,
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
+    ).is_none() {
         return;
     }
-    let mut last_seq: u64 = {
-        let log = sessions.lock().unwrap();
-        log.events().len() as u64
-    };
+    // 每连接独立游标：从当前下链日志末尾起读，只推连接建立后的新事件。
+    let mut cursor = sink_len(sink);
+    let last_seq = cursor as u64;
     // 握手：session/subscribed（对齐 muxFrameSchema）
     let subscribed = serde_json::json!({
         "type": "server-request",
@@ -480,22 +484,21 @@ fn stream_sse_events(mut writer: Box<dyn std::io::Write + Send>, sessions: &Sess
         return;
     }
     loop {
-        // 增量推送：比 last_seq 新的事件逐个推成 session/event 帧。
-        let (new_seq, frames) = {
-            let log = sessions.lock().unwrap();
-            let events = log.events();
+        // 增量推送：cursor 之后的新事件逐个推成 session/event 帧（真实 time）。
+        let (new_cursor, frames) = {
+            let log = sink.lock().unwrap();
             let mut frames = Vec::new();
-            for e in events.iter().filter(|e| e.seq >= last_seq) {
-                frames.push(mux_session_event_frame(e));
+            for (session_id, ev) in log.iter().skip(cursor) {
+                frames.push(mux_session_event_frame(session_id, ev));
             }
-            (events.len() as u64, frames)
+            (log.len(), frames)
         };
         for frame in &frames {
             if write_sse(&mut writer, frame).is_none() {
                 return;
             }
         }
-        last_seq = new_seq;
+        cursor = new_cursor;
         // keepalive 注释行（SSE 心跳；防止代理/浏览器断开空闲连接）
         if write_sse(&mut writer, &Value::Null).is_none() {
             return;
@@ -517,20 +520,18 @@ fn websocket_accept(key: &str) -> String {
 }
 
 /// WebSocket 事件下链（阶段2）：tiny_http `upgrade()` 已完成 101 握手并返回
-/// 双工流；这里用 tungstenite 包成 WebSocket（成熟协议库，不手写帧），把共享
-/// session 日志的新事件推成 `session/subscribed` + `session/event`（mux）或
-/// `host/session-added`（host）server-request 帧。
+/// 双工流；这里用 tungstenite 包成 WebSocket（成熟协议库，不手写帧），把
+/// SessionHost 下链日志（EventSink）的新事件推成 `session/subscribed` +
+/// `session/event`（mux）或 `host/session-added`（host）server-request 帧。
 fn stream_ws_events(
     stream: Box<dyn tiny_http::ReadWrite + Send>,
-    sessions: &SessionHandle,
+    sink: &EventSink,
     is_host: bool,
 ) {
     use tungstenite::protocol::{Role, WebSocket, WebSocketConfig};
     let mut ws = WebSocket::from_raw_socket(stream, Role::Server, Some(WebSocketConfig::default()));
-    let mut last_seq: u64 = {
-        let log = sessions.lock().unwrap();
-        log.events().len() as u64
-    };
+    let mut cursor = sink_len(sink);
+    let last_seq = cursor as u64;
     // 握手帧：mux → session/subscribed；host → host/session-added。
     let hello = if is_host {
         serde_json::json!({
@@ -555,21 +556,20 @@ fn stream_ws_events(
         return;
     }
     loop {
-        let (new_seq, frames) = {
-            let log = sessions.lock().unwrap();
-            let events = log.events();
+        let (new_cursor, frames) = {
+            let log = sink.lock().unwrap();
             let mut frames = Vec::new();
-            for e in events.iter().filter(|e| e.seq >= last_seq) {
-                frames.push(mux_session_event_frame(e));
+            for (session_id, ev) in log.iter().skip(cursor) {
+                frames.push(mux_session_event_frame(session_id, ev));
             }
-            (events.len() as u64, frames)
+            (log.len(), frames)
         };
         for frame in &frames {
             if ws_send(&mut ws, frame).is_none() {
                 return;
             }
         }
-        last_seq = new_seq;
+        cursor = new_cursor;
         std::thread::sleep(Duration::from_millis(300));
     }
 }
@@ -601,49 +601,44 @@ fn write_sse<W: std::io::Write + ?Sized>(w: &mut W, value: &Value) -> Option<()>
     write_err(w, &body)
 }
 
+/// 下链日志当前长度（Send+Sync 读；避免在调用处引入竞态）。
+fn sink_len(sink: &EventSink) -> usize {
+    sink.lock().unwrap().len()
+}
+
 /// 构造一个 `session/event` mux 帧（对齐 `muxFrameSchema`：
-/// `{type:"session/event", sessionId, event:{type, seq, time, data}}`）。
-fn mux_session_event_frame(e: &dsh_core::SessionEvent) -> Value {
+/// `{type:"session/event", sessionId, event:{type,seq,time,data}}`）。
+/// 事件直接复用 dsh-session 的 strict-envelope 序列化（type/seq/time/data +
+/// 可选 sourceEventSeqs/surfaceOp/ignorable）——与前端 `sessionEventSchema`
+/// 逐字段一致；time 为会话 append 的真实 epoch ms。
+fn mux_session_event_frame(session_id: &str, e: &dsh_session::types::SessionEvent) -> Value {
+    let event = serde_json::to_value(e).unwrap_or(Value::Null);
     serde_json::json!({
         "type": "server-request",
         "rpcId": format!("ev-{}", e.seq),
         "method": "session/event",
         "payload": {
             "type": "session/event",
-            "sessionId": "default",
-            "event": {
-                "type": e.kind,
-                "seq": e.seq,
-                "time": now_ms(),
-                "data": e.payload_value(),
-            },
+            "sessionId": session_id,
+            "event": event,
         },
     })
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// 处理一个 `/api/<method>` RPC：解析 client-request 信封 → 分派 → server-response。
 /// 返回 `(HTTP status, JSON body)`（body 为 server-response 信封）。
 pub fn handle_rpc(boot: &Boot, method: &str, body: &[u8]) -> (u16, Value) {
-    handle_rpc_registry(boot, method, body, &Arc::new(Mutex::new({
-        let mut m = std::collections::HashMap::new();
-        m.insert("default".to_string(), dsh_core::SessionLog::new());
-        m
-    })))
+    let host = SessionHost::in_memory();
+    let _ = host.session("default");
+    handle_rpc_host(boot, method, body, &host)
 }
 
-/// 带会话注册表版本（阶段3 多会话）。
-pub fn handle_rpc_registry(
+/// 带 SessionHost 版本（M1e 多会话；serve 用同一共享 host）。
+pub fn handle_rpc_host(
     boot: &Boot,
     method: &str,
     body: &[u8],
-    registry: &SessionRegistry,
+    host: &Rc<SessionHost>,
 ) -> (u16, Value) {
     let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let rpc_id = parsed
@@ -668,7 +663,7 @@ pub fn handle_rpc_registry(
             }),
         );
     }
-    let result = dispatch(boot, method, &payload, registry);
+    let result = dispatch(boot, method, &payload, host);
     (
         200,
         serde_json::json!({
@@ -695,7 +690,78 @@ pub fn handle_rpc_registry(
 /// - `agent-loop` / `agent.turn` / `agent.run` → 提交一个 turn（驱动 WASM loop）。
 ///
 /// 其余方法返回 `not-implemented`（fail loud，不 panic）。
-fn dispatch(boot: &Boot, method: &str, payload: &Value, registry: &SessionRegistry) -> Value {
+/// LLM 目录：`(current, groups)`——由 `Boot.llm`（dsh-core LlmService）注册表
+/// 驱动；空注册表回退内置 loop 目录组（`dsh` 组：echo/llm/tool 是本仓真实可
+/// 运行的 WASM loop 组件）。对齐 `sessionModelsValueSchema`/`llmModelsValueSchema`
+/// （`{id,name,models:[{id,name}]}`）。
+fn llm_catalog(boot: &Boot) -> (Value, Value) {
+    let registered = boot.llm.lock().unwrap().providers();
+    if registered.is_empty() {
+        // 空注册表：内置 loop 目录组（echo/llm/tool 真实存在）。
+        let groups = serde_json::json!([{
+            "id": "dsh", "name": "DeepSeek Harness",
+            "models": [
+                {"id": "echo", "name": "echo-loop"},
+                {"id": "llm", "name": "llm-loop"},
+                {"id": "tool", "name": "tool-loop"},
+            ],
+        }]);
+        let current = serde_json::json!({"provider": "dsh", "model": "echo"});
+        (current, groups)
+    } else {
+        // 注册表驱动：每个 provider 一个组，模型 id 同 provider。
+        let groups: Vec<Value> = registered
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id,
+                    "name": p.id,
+                    "models": p
+                        .models
+                        .iter()
+                        .map(|m| serde_json::json!({"id": m, "name": m}))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let first = &registered[0];
+        let current = serde_json::json!({
+            "provider": first.id,
+            "model": first.models.first().cloned().unwrap_or_else(|| first.id.clone()),
+        });
+        (current, serde_json::Value::Array(groups))
+    }
+}
+
+/// LLM provider 目录（`llm.providers`）——由 `Boot.llm` 注册表驱动，对齐
+/// `configurableProviderViewSchema`（{provider, displayName, settingsNs,
+/// settingsPath, active}）。空注册表 → 空数组（前端隐藏 provider 面板）。
+fn llm_providers(boot: &Boot) -> Vec<Value> {
+    boot.llm
+        .lock()
+        .unwrap()
+        .providers()
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "provider": p.id,
+                "displayName": p.id,
+                "settingsNs": "",
+                "settingsPath": [],
+                "active": true,
+            })
+        })
+        .collect::<Vec<_>>()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) -> Value {
     match method {
         "version" => serde_json::json!({"ok": true, "value": {"version": env!("CARGO_PKG_VERSION")}}),
         "host.describe" => {
@@ -734,17 +800,18 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, registry: &SessionRegist
             serde_json::json!({"ok": true, "value": {"opened": true}})
         }
         "sessions" | "session.list" => {
+            // M1e：SessionStore 提供权威列表（创建顺序、失活/空判定）。
             let updated_at = now_ms();
             let items = {
-                let reg = registry.lock().unwrap();
-                let mut items = reg
+                let mut items = host
+                    .list()
                     .iter()
-                    .map(|(id, log)| {
+                    .map(|s| {
                         serde_json::json!({
-                            "sessionId": id,
-                            "updatedAt": updated_at,
+                            "sessionId": s.id().raw(),
+                            "updatedAt": s.events().last().map(|e| e.time.max(0) as u64).unwrap_or(updated_at),
                             "running": false,
-                            "blank": log.events().is_empty(),
+                            "blank": s.events().is_empty(),
                         })
                     })
                     .collect::<Vec<_>>();
@@ -754,65 +821,39 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, registry: &SessionRegist
             serde_json::json!({"ok": true, "value": {"items": items}})
         }
         "session.create" => {
-            // 多会话：mint 唯一 sessionId 并注册空 log（seed 序号避免冲突）。
-            let id = {
-                let mut reg = registry.lock().unwrap();
-                let n = reg.len();
-                let mut candidate = format!("s{}", n + 1);
-                while reg.contains_key(&candidate) {
-                    candidate.push('x');
-                }
-                reg.insert(candidate.clone(), dsh_core::SessionLog::new());
-                candidate
-            };
+            // M1e：SessionHost mint 唯一 sessionId 并创建空会话。
+            let id = host.create_new().unwrap_or_else(|_| "s1".to_string());
             serde_json::json!({"ok": true, "value": {"sessionId": id}})
         }
         "session.history" => {
-            // 多会话：按 payload.sessionId 取对应 log（缺省 default）。
+            // M1e：SessionStore 的历史（strict-envelope 事件直接 wire）。
             let sid = payload
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("default")
                 .to_string();
-            // 未知 session → 空历史（不 panic）。
-            let events = {
-                let reg = registry.lock().unwrap();
-                match reg.get(&sid) {
-                    Some(log) => log
-                        .events()
-                        .iter()
-                        .map(|e| {
-                            serde_json::json!({
-                                "event": {
-                                    "type": e.kind,
-                                    "seq": e.seq,
-                                    "time": now_ms(),
-                                    "data": e.payload_value(),
-                                },
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                    None => Vec::new(),
-                }
-            };
+            let events = host
+                .events(&sid)
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "event": serde_json::to_value(e).unwrap_or(Value::Null),
+                    })
+                })
+                .collect::<Vec<_>>();
             serde_json::json!({"ok": true, "value": {"events": events, "hasMore": false}})
         }
         "session.search" => {
             serde_json::json!({"ok": true, "value": {"items": [], "hasMore": false}})
         }
         "session.models" => {
+            // M1e：由 Boot.llm（dsh-core LlmService）注册表驱动；空注册表回退
+            // 内置 loop 目录组（echo/llm/tool——本仓真实可运行的 loop 组件）。
+            let (current, groups) = llm_catalog(boot);
             serde_json::json!({"ok": true, "value": {
-                "current": {"provider": "dsh", "model": "echo"},
+                "current": current,
                 "routable": true,
-                "groups": [{
-                    "id": "dsh",
-                    "name": "DeepSeek Harness",
-                    "models": [
-                        {"id": "echo", "name": "echo-loop"},
-                        {"id": "llm", "name": "llm-loop"},
-                        {"id": "tool", "name": "tool-loop"},
-                    ],
-                }],
+                "groups": groups,
                 "failures": [],
             }})
         }
@@ -826,36 +867,31 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, registry: &SessionRegist
         "session.rename" => {
             let title = payload.get("title").and_then(|v| v.as_str()).unwrap_or("session").to_string();
             let sid = payload.get("sessionId").and_then(|v| v.as_str()).unwrap_or("default");
-            let seq = registry
-                .lock()
-                .unwrap()
-                .get(sid)
-                .map(|l| l.events().len() as u64)
-                .unwrap_or(0);
+            let seq = host.seq_of(sid);
             serde_json::json!({"ok": true, "value": {"title": title, "seq": seq}})
         }
         "session.fork" => {
-            // fork：从当前 session 复制事件到新 session。
+            // M1e fork：从 live 源会话创建子会话（seed+边界标记均已 store 处理）。
             let src = payload.get("sessionId").and_then(|v| v.as_str()).unwrap_or("default");
-            let mut reg = registry.lock().unwrap();
-            let n = reg.len();
-            let mut id = format!("s{}", n + 1);
-            while reg.contains_key(&id) {
-                id.push('x');
+            let (id, ok) = match host.fork(src) {
+                Ok(id) => (id, true),
+                Err(e) => (e, false),
+            };
+            if ok {
+                serde_json::json!({"ok": true, "value": {"sessionId": id}})
+            } else {
+                // 源会话不存在 → 按 schema 失败（session-not-found）。
+                serde_json::json!({"ok": false, "error": {
+                    "code": "session-not-found",
+                    "message": format!("cannot fork unknown session \"{src}\""),
+                    "details": {"sessionId": src},
+                }})
             }
-            let mut child = dsh_core::SessionLog::new();
-            if let Some(parent) = reg.get(src) {
-                for e in parent.events() {
-                    let _ = child.append_with_op(&e.kind, e.payload.clone(), dsh_core::SurfaceOp::Append);
-                }
-            }
-            reg.insert(id.clone(), child);
-            serde_json::json!({"ok": true, "value": {"sessionId": id}})
         }
         "session.prompt" => {
             // 前端经 prompt 发消息：提取 content → 驱动 turn（回显 loop 语义）。
-            // 多会话：记下驱动前 boot.sessions 的已有点数，turn 产生的新事件按
-            // payload.sessionId 追加到对应 registry log（实现各自独立历史）。
+            // M1e：turn 产生的新事件经 SessionHost.adopt 回放进目标会话
+            // （SessionStore）→ on_event 持久化 + EventSink 下链。
             let sid = payload.get("sessionId").and_then(|v| v.as_str()).unwrap_or("default").to_string();
             let content = payload.get("content").cloned().unwrap_or(Value::Null);
             let before = boot.sessions.lock().unwrap().events().len();
@@ -868,12 +904,8 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, registry: &SessionRegist
                     .map(|e| (e.kind.clone(), e.payload.clone()))
                     .collect()
             };
-            {
-                let mut reg = registry.lock().unwrap();
-                let target = reg.entry(sid).or_default();
-                for (kind, payload) in new_events {
-                    let _ = target.append_with_op(&kind, payload, dsh_core::SurfaceOp::Append);
-                }
+            if !new_events.is_empty() {
+                let _ = host.adopt(&sid, &new_events);
             }
             serde_json::json!({"ok": true, "value": {"accepted": true}})
         }
@@ -1004,18 +1036,14 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, registry: &SessionRegist
             serde_json::json!({"ok": true, "value": {}})
         }
         "llm.providers" => {
-            serde_json::json!({"ok": true, "value": {"providers": []}})
+            // M1e：由 Boot.llm 注册表驱动（configurableProviderViewSchema）。
+            let providers = llm_providers(boot);
+            serde_json::json!({"ok": true, "value": {"providers": providers}})
         }
         "llm.models" => {
+            let (_, groups) = llm_catalog(boot);
             serde_json::json!({"ok": true, "value": {
-                "groups": [{
-                    "id": "dsh", "name": "DeepSeek Harness",
-                    "models": [
-                        {"id": "echo", "name": "echo-loop"},
-                        {"id": "llm", "name": "llm-loop"},
-                        {"id": "tool", "name": "tool-loop"},
-                    ],
-                }],
+                "groups": groups,
                 "failures": [],
             }})
         }
@@ -1130,6 +1158,7 @@ mod tests {
             ctx: cordis,
             loop_plugin: std::rc::Rc::new(std::cell::RefCell::new(plugin)),
             sessions,
+            llm: dsh_core::new_llm(),
             refresh: std::rc::Rc::new(|| Ok(())),
         }
     }
@@ -1237,13 +1266,11 @@ mod tests {
         assert!(item["blank"].is_boolean());
     }
 
-    /// 构造一个 seed `default` 的会话注册表（测试用）。
-    fn seeded_registry() -> SessionRegistry {
-        Arc::new(Mutex::new({
-            let mut m = std::collections::HashMap::new();
-            m.insert("default".to_string(), dsh_core::SessionLog::new());
-            m
-        }))
+    /// 构造一个 seed `default` 的 SessionHost（测试用；M1e 会话由 store 承载）。
+    fn seeded_host() -> Rc<SessionHost> {
+        let host = SessionHost::in_memory();
+        let _ = host.session("default");
+        host
     }
 
     /// 阶段2：session.history 返回对齐 sessionHistoryValueSchema 的形状
@@ -1251,36 +1278,54 @@ mod tests {
     #[test]
     fn rpc_session_history_shape() {
         let boot = boot_with_sessions();
-        let reg = seeded_registry();
-        // 预置 default 历史到注册表（多会话后 history 从 registry 读）。
-        {
-            let mut log = reg.lock().unwrap();
-            log.get_mut("default").unwrap().append(
-                "user/message",
-                serde_json::to_vec(&serde_json::json!({
-                    "id": "u1", "role": "user", "content": [{"type": "text", "text": "hi"}],
-                    "source": {"kind": "user"},
-                })).unwrap(),
-            );
-        }
+        let host = seeded_host();
+        // 预置 default 历史到 store（grant-append：user/message + assistant/message）。
+        host.adopt(
+            "default",
+            &[
+                (
+                    "user/message".into(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "id": "u1", "role": "user", "content": [{"type": "text", "text": "hi"}],
+                        "source": {"kind": "user"},
+                    })).unwrap(),
+                ),
+                (
+                    "assistant/message".into(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "turn": 1, "step": 1,
+                        "message": {
+                            "id": "a1", "role": "assistant",
+                            "content": [{"type": "text", "text": "hi"}],
+                            "source": {"kind": "model", "provider": "mock", "model": "mock"},
+                        },
+                    })).unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
         let body = serde_json::to_vec(&serde_json::json!({
             "type": "client-request", "rpcId": "r7", "method": "session.history", "payload": {}
         })).unwrap();
-        let (_, v) = handle_rpc_registry(&boot, "session.history", &body, &reg);
+        let (_, v) = handle_rpc_host(&boot, "session.history", &body, &host);
         assert_eq!(v["result"]["ok"], true);
         let val = &v["result"]["value"];
         assert_eq!(val["hasMore"], false);
         assert!(val["events"].is_array());
         assert_eq!(val["events"][0]["event"]["type"], "user/message");
         assert_eq!(val["events"][0]["event"]["data"]["id"], "u1");
+        // strict envelope：time 为真实 epoch ms（>0），seq 连续。
+        assert!(val["events"][0]["event"]["time"].as_u64().unwrap() > 0);
+        assert_eq!(val["events"][0]["event"]["seq"], 0);
+        assert_eq!(val["events"][1]["event"]["seq"], 1);
     }
 
-    /// 阶段3 多会话：session.create mint 新 id，session.list 含多会话，
-    /// session.prompt 把 turn 事件追加到目标 session 的独立 log。
+    /// 阶段3/4 多会话：session.create mint 新 id，session.list 含多会话，
+    /// session.prompt 把 turn 事件 adopt 进目标 session 的独立 store 历史。
     #[test]
     fn rpc_multi_session_create_list_prompt() {
         let boot = boot_with_sessions();
-        let reg = seeded_registry();
+        let host = seeded_host();
 
         // 创建两个新会话
         let mut ids = Vec::new();
@@ -1288,7 +1333,7 @@ mod tests {
             let body = serde_json::to_vec(&serde_json::json!({
                 "type": "client-request", "rpcId": "r", "method": "session.create", "payload": {}
             })).unwrap();
-            let (_, v) = handle_rpc_registry(&boot, "session.create", &body, &reg);
+            let (_, v) = handle_rpc_host(&boot, "session.create", &body, &host);
             let id = v["result"]["value"]["sessionId"].as_str().unwrap().to_string();
             assert!(!ids.contains(&id), "session ids unique");
             ids.push(id);
@@ -1299,33 +1344,37 @@ mod tests {
             let body = serde_json::to_vec(&serde_json::json!({
                 "type": "client-request", "rpcId": "r", "method": "session.list", "payload": {}
             })).unwrap();
-            let (_, v) = handle_rpc_registry(&boot, "session.list", &body, &reg);
+            let (_, v) = handle_rpc_host(&boot, "session.list", &body, &host);
             assert_eq!(v["result"]["value"]["items"].as_array().unwrap().len(), 3);
         }
-        // 对第一个新会话 prompt → 事件只进该会话 log
+        // 对第一个新会话 prompt → 事件只进该会话 store 历史
         {
             let sid = &ids[0];
             let body = serde_json::to_vec(&serde_json::json!({
                 "type": "client-request", "rpcId": "r", "method": "session.prompt",
                 "payload": {"sessionId": sid, "content": [{"type": "text", "text": "hi"}]},
             })).unwrap();
-            let (_, v) = handle_rpc_registry(&boot, "session.prompt", &body, &reg);
+            let (_, v) = handle_rpc_host(&boot, "session.prompt", &body, &host);
             assert_eq!(v["result"]["value"]["accepted"], true);
         }
-        // 目标会话历史有事件；另一新会话历史为空（独立）。
+        // 目标会话历史有事件；另一新会话历史为空（独立 store 会话）。
         {
             let body = serde_json::to_vec(&serde_json::json!({
                 "type": "client-request", "rpcId": "r", "method": "session.history",
                 "payload": {"sessionId": &ids[0]},
             })).unwrap();
-            let (_, v) = handle_rpc_registry(&boot, "session.history", &body, &reg);
-            assert!(!v["result"]["value"]["events"].as_array().unwrap().is_empty());
+            let (_, v) = handle_rpc_host(&boot, "session.history", &body, &host);
+            let evs = v["result"]["value"]["events"].as_array().unwrap();
+            assert!(!evs.is_empty());
+            // strict-envelope：assistant/message 带真实 time（epoch ms）。
+            let assistant = evs.iter().find(|e| e["event"]["type"] == "assistant/message").unwrap();
+            assert!(assistant["event"]["time"].as_u64().unwrap() > 0);
 
             let body2 = serde_json::to_vec(&serde_json::json!({
                 "type": "client-request", "rpcId": "r", "method": "session.history",
                 "payload": {"sessionId": &ids[1]},
             })).unwrap();
-            let (_, v2) = handle_rpc_registry(&boot, "session.history", &body2, &reg);
+            let (_, v2) = handle_rpc_host(&boot, "session.history", &body2, &host);
             assert!(v2["result"]["value"]["events"].as_array().unwrap().is_empty());
         }
     }
@@ -1470,6 +1519,61 @@ mod tests {
         assert!(!boot.sessions.lock().unwrap().events().is_empty());
     }
 
+    /// M1e E2E：prompt → 事件 adopt 进 store + 持久化落盘 → **重启**（新 host
+    /// 同根）→ 历史恢复；且下链日志被后续连接读取。
+    #[test]
+    fn web_e2e_prompt_persist_restart_restores() {
+        let boot = boot_with_sessions();
+        let root = std::env::temp_dir().join(format!("dsh-web-m1e-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let prompt = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "session.prompt",
+            "payload": {"content": [{"type": "text", "text": "persist me"}]},
+        })).unwrap();
+        let history_body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "session.history", "payload": {}
+        })).unwrap();
+
+        // 第一次启动：prompt → 事件进 store + 持久化。
+        {
+            let host = SessionHost::with_root(&root);
+            let (_, v) = handle_rpc_host(&boot, "session.prompt", &prompt, &host);
+            assert_eq!(v["result"]["value"]["accepted"], true);
+            let (_, v) = handle_rpc_host(&boot, "session.history", &history_body, &host);
+            let evs = v["result"]["value"]["events"].as_array().unwrap();
+            assert!(!evs.is_empty(), "prompt 事件已进 store");
+            assert!(host.seq_of("default") >= 6);
+            // 下链日志：prompt 的事件已进入 EventSink（新连接全部可读）。
+            assert!(host.sink_len() >= 6);
+            host.flush("default").unwrap();
+        }
+
+        // 「重启」：新 host 从同一持久化根恢复 → 历史在、可继续 prompt。
+        {
+            let host2 = SessionHost::with_root(&root);
+            assert!(host2.is_live("default"));
+            let (_, v) = handle_rpc_host(&boot, "session.history", &history_body, &host2);
+            let evs = v["result"]["value"]["events"].as_array().unwrap();
+            assert!(!evs.is_empty(), "重启后历史恢复");
+            // 继续一 turn：seq 连续（不重复）。
+            let before = host2.seq_of("default");
+            let (_, v) = handle_rpc_host(&boot, "session.prompt", &prompt, &host2);
+            assert_eq!(v["result"]["value"]["accepted"], true);
+            let after = host2.seq_of("default");
+            assert!(after > before, "重启后仍可追加");
+            // 下链新事件从旧游标后可见。
+            let (_, v) = handle_rpc_host(&boot, "session.history", &history_body, &host2);
+            assert_eq!(
+                v["result"]["value"]["events"].as_array().unwrap().len(),
+                after as usize
+            );
+            host2.flush("default").unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(&root).ok();
+    }
+
     /// 阶段4：trust fence 判定 Host 头是否 loopback（对齐前端 isLoopbackHostname）。
     #[test]
     fn host_is_loopback_classifies() {
@@ -1514,28 +1618,39 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// M71：`mux_session_event_frame` 构造对齐 muxFrameSchema 的
-    /// `session/event` 帧——`{type, sessionId, event:{type, seq, time, data}}`。
+    /// M71/M1e：`mux_session_event_frame` 构造对齐 muxFrameSchema 的
+    /// `session/event` 帧——`{type, sessionId, event:{type, seq, time, data}}`
+    /// （event 为 strict-envelope 序列化；time 为会话真实 epoch ms）。
     #[test]
     fn mux_session_event_frame_shape() {
-        let ev = dsh_core::SessionEvent {
-            seq: 3,
-            kind: "assistant/message".into(),
-            payload: serde_json::to_vec(&serde_json::json!({
+        use dsh_session::types::EventKind;
+        let ev = dsh_session::types::SessionEvent::new(
+            3,
+            1_700_000_000_123,
+            EventKind::from_str("assistant/message"),
+            serde_json::json!({
                 "turn": 1, "step": 1,
                 "message": {"id": "a1", "role": "assistant", "content": [], "source": {"kind": "model"}},
-            }))
-            .unwrap(),
-        };
-        let frame = mux_session_event_frame(&ev);
+            }),
+        );
+        let frame = mux_session_event_frame("default", &ev);
         assert_eq!(frame["type"], "server-request");
         assert_eq!(frame["method"], "session/event");
         assert_eq!(frame["payload"]["type"], "session/event");
         assert_eq!(frame["payload"]["sessionId"], "default");
         assert_eq!(frame["payload"]["event"]["type"], "assistant/message");
         assert_eq!(frame["payload"]["event"]["seq"], 3);
-        assert!(frame["payload"]["event"]["time"].as_u64().unwrap() > 0);
+        assert_eq!(frame["payload"]["event"]["time"], 1_700_000_000_123i64);
         assert_eq!(frame["payload"]["event"]["data"]["message"]["id"], "a1");
+        // 帧事件对象只有 strict-envelope 键（无额外字段泄漏；键序无关 JSON schema）。
+        let mut keys: Vec<&str> = frame["payload"]["event"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["data", "seq", "time", "type"]);
     }
 
     /// M71：`write_sse` 写出 `data: {json}` 帧；null → keepalive 注释行。

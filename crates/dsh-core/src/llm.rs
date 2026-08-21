@@ -25,6 +25,17 @@ pub struct LlmService {
     providers: std::collections::HashMap<String, Arc<LlmFn>>,
 }
 
+/// 一个已注册的模型提供者条目（web `llm.providers`/`llm.models` 的目录来源）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmProviderInfo {
+    /// 提供者 id（注册键）。
+    pub id: String,
+    /// 是否为默认适配器。
+    pub is_default: bool,
+    /// 已注册的模型 id（本 repo 适配器只用一个模型，模型 id = provider id）。
+    pub models: Vec<String>,
+}
+
 impl Default for LlmService {
     fn default() -> Self {
         Self::new()
@@ -87,6 +98,39 @@ impl LlmService {
             crate::llm_http::chat_completions(&base, api_key.as_deref(), &model, &messages, &tools)
         });
     }
+
+    /// 枚举已注册提供者（含 default 标记；M1e web `llm.providers` 驱动源）。
+    /// 提供者 id → 模型 id（本 repo 每 provider 注册一个模型，id 同 provider）。
+    pub fn provider_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.providers.keys().cloned().collect();
+        ids.sort();
+        if ids.is_empty() && self.default.is_some() {
+            ids.push("default".to_string());
+        }
+        ids
+    }
+
+    /// 提供者目录（`llm.providers`/`llm.models` 的权威来源）。
+    pub fn providers(&self) -> Vec<LlmProviderInfo> {
+        let mut out: Vec<LlmProviderInfo> = self
+            .providers
+            .keys()
+            .map(|id| LlmProviderInfo {
+                id: id.clone(),
+                is_default: false,
+                models: vec![id.clone()],
+            })
+            .collect();
+        if self.default.is_some() {
+            out.push(LlmProviderInfo {
+                id: "default".to_string(),
+                is_default: true,
+                models: vec!["default".to_string()],
+            });
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
 }
 
 /// 共享 LLM 服务句柄（作为 `ctx.llm` 服务值；Send+Sync）。
@@ -95,4 +139,54 @@ pub type LlmHandle = Arc<Mutex<LlmService>>;
 /// 构造共享 LLM 服务。
 pub fn new_llm() -> LlmHandle {
     Arc::new(Mutex::new(LlmService::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_ids_empty_default_present() {
+        let svc = LlmService::new();
+        assert_eq!(svc.provider_ids(), Vec::<String>::new());
+        assert!(svc.providers().is_empty());
+    }
+
+    #[test]
+    fn providers_reflect_registered() {
+        let mut svc = LlmService::new();
+        svc.register_provider("deepseek", |_, _| serde_json::json!({"content": ""}));
+        svc.register_provider("ollama", |_, _| serde_json::json!({"content": ""}));
+        assert_eq!(svc.provider_ids(), vec!["deepseek", "ollama"]);
+        let dir = svc.providers();
+        assert_eq!(dir.len(), 2);
+        assert_eq!(dir[0].id, "deepseek");
+        assert_eq!(dir[0].models, vec!["deepseek"]);
+        assert!(!dir[0].is_default);
+        assert_eq!(dir[1].id, "ollama");
+    }
+
+    #[test]
+    fn providers_default_marked() {
+        let mut svc = LlmService::new();
+        svc.set_default(|_, _| serde_json::json!({"content": ""}));
+        svc.register_provider("deepseek", |_, _| serde_json::json!({"content": ""}));
+        let dir = svc.providers();
+        assert_eq!(dir.len(), 2);
+        let default = dir.iter().find(|p| p.id == "default").expect("default in dir");
+        assert!(default.is_default);
+        let ds = dir.iter().find(|p| p.id == "deepseek").unwrap();
+        assert!(!ds.is_default);
+    }
+
+    #[test]
+    fn provider_ids_sorted() {
+        let mut svc = LlmService::new();
+        svc.register_provider("z", |_, _| serde_json::json!({}));
+        svc.register_provider("a", |_, _| serde_json::json!({}));
+        let ids = svc.provider_ids();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted);
+    }
 }

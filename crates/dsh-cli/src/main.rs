@@ -252,6 +252,7 @@ fn web_main(args: &[String]) {
     let mut port: u16 = 0;
     let mut overlays: Vec<PathBuf> = Vec::new();
     let mut wasm_base = PathBuf::from("wasm-plugins");
+    let mut session_dir: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -274,6 +275,10 @@ fn web_main(args: &[String]) {
             "--wasm-base" => {
                 i += 1;
                 wasm_base = PathBuf::from(&args[i]);
+            }
+            "--session-dir" => {
+                i += 1;
+                session_dir = Some(PathBuf::from(&args[i]));
             }
             other if other.starts_with("--") => {
                 eprintln!("dsh web: unknown arg {other}");
@@ -319,6 +324,7 @@ fn web_main(args: &[String]) {
         plugin_root,
         host: host.clone(),
         port,
+        session_dir,
     };
     match dsh_cli::web::serve(&boot, cfg) {
         Ok(server) => {

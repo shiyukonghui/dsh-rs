@@ -704,5 +704,129 @@ Rust 用 `std::fs::rename`（原子替换同卷）——两者崩溃语义等价
 非错误），调用方（`load_stored`/`read_artifact`）已按 committed 前缀处理；如需恢复
 torn 尾明文，届时再评估 FFI 或上游能力回滚点。不影响 D-018 的其他决策。
 
+---
+
+## D-020（M1e）：SessionHost 承载——WASM loop 仍写 SessionHandle，经 adopt 桥进入 dsh-session store + 持久化挂载
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M1e 需把 web.rs `session.*` 方法面升级为由 `dsh-session::SessionStore` +
+`dsh-llm` 驱动（M1-REQUIREMENTS §10），并把 Boot 的会话承载从 `SessionRegistry<
+Arc<Mutex<SessionLog>>>` 升级为 dsh-session store + 持久化挂载。已知摩擦：dsh-session
+`Session`/`SessionStore` 是单线程 `RefCell`（`!Send + !Sync`），而 web.rs 的 SSE/WS
+下链线程是 `std::thread` 轮询 `SessionHandle`（Send+Sync）；WASM loop 经 WIT
+`session::append(kind:String, payload:Vec<u8>)` 只写 `SessionLog`（无 time、free-string
+kind），且「不改 loop 语义」（风险 §9.2）。
+
+**关键事实（三项子代理 + 源码直读确认）**：
+- `SessionHandle = Arc<Mutex<SessionLog>>`（dsh-core/src/session.rs:460），loop 的
+  `session::append` 落在它上面（dsh-wasmrt/src/loop.rs:209）；前端要求
+  `event.{type,seq,time,data}` 且 `additionalProperties:false`（session.json:9-23），
+  而 `SessionLog.SessionEvent` 无 time → 必须换成带 time 的 dsh-session 事件。
+- dsh-session `SessionEvent` 已含 `{seq,time: i64(epoch ms),kind,data}`（types.rs:681），
+  serde camelCase（type/seq/time/data）——结构上正好贴前端 schema。
+- dsh-session `SessionStore` 是 `Rc` 持有、`create/enter/announce/fork` 需 `&Rc<Self>`，
+  持久化只在 `on_event`/`on_flush` 回调里（store.rs:73-90）；`PersistenceCoordinator`
+  （dsh-persistence）需 `create(header)` 先、`append(id, events)` 要求 seq 连续、`
+  set_live_turn` 守卫 live turn。
+- web.rs 的 `serve` 在单线程 `for request in server.incoming_requests()` 里同步分派
+  RPC（`dispatch_request`），只有 SSE/WS 下链单独起线程。
+
+**考虑的选项**：
+1. **SessionHost 桥（采用）**：`dsh-cli` 新增 `session_host.rs`——持有
+   `Rc<SessionStore>` + `Rc<PersistenceCoordinator>` + `EventSink`（
+   `Arc<Mutex<VecDeque<(SessionId, SessionEvent)>>>`，Send+Sync 供下链线程 drain）。
+   挂载：`store.on_event` → `coord.create/append`（持久化）+ `sink.push`（下链）；
+   `store.on_flush` → `coord.flush(id)`。loop 经 WIT 仍写 `SessionHandle`（原封不动），
+   `session.prompt` 在 `run_turn` 后把 SessionHandle 的新事件 **adopt** 进目标
+   `dsh-session::Session`：`(String kind, Vec<u8>)` → `EventKind::from_str` +
+   `Value` + `SurfaceIntent(append)`，`Session::append` 校验并触发 on_event → 持久化
+   + 下链。事件带 time、类型化，满足前端 schema 与读模型。
+2. **直接把 dsh-session store 作为 ctx "sessions" 服务**：loop 的 WIT append 需
+   `Arc<Mutex<...>>` 类型，与 Rc/RefCell store 不兼容，且 `Session::append` 需
+   SurfaceIntent/typed kind——loop 语义必改；否决。
+3. **web 流线程持 `Arc<Mutex<Session>>`（再次包锁）**：违背单线程核心纪律，也是
+   D-004/D-006 明确反对的；否决。
+
+**最终选择**：选项 1。`SessionHost`（dsh-cli 内）是唯一让单线程 core 与多线程下链共处
+的接缝：所有 `SessionStore`/coordinator 操作在 serve 单线程（RPC 线程）发生；
+`EventSink` 用 `Arc<Mutex>` 把只读事件帧交给下链线程。`session.prompt` = `run_turn`
+(loop 写 SessionHandle) → adopt 新事件入 Session（类型化 + time）→ 持久化 + 下链。
+`llm.providers`/`llm.models`/`session.models` 由 dsh-core `LlmService`（真实 host 缝，
+Arc<Mutex>+真实 HTTP，m17_http_llm.rs 已有本地 TCP mock 全套）驱动——dsh-llm
+`LlmRuntime` 的 `PayloadsResolver` HTTP+SSE 桥在本仓库尚不存在（子代理确认），用
+dsh-core 缝是「现状允许」的选择，后续 M1e 若需 LlmRuntime 丰富目录再评估。
+
+**选择理由**：保持「纯语义内核（dsh-session）+ 观察者表」同构（D-018 同）；loop 语义
+不改（§9.2 风险最小化）；事件一次 adopt 即同时进持久化与下链，无 double-write；
+跨线程只走 `Arc<Mutex<EventSink>>` 唯一下链通道。`EventKind::from_str` 是 total
+（未知 → `Unknown`），adopt 不会因词表扩展崩坏。
+
+**预期影响与回滚点**：`dsh-cli` 新增 `session_host.rs` + `Boot{ session_host: Rc<
+SessionHost> }`（`sessions` 仍保留——loop 写 + headless `--session-in/out` 兼容）；
+web.rs `session.list/create/history/prompt/fork/rename/models` 与 `llm.providers/
+models` 改由 SessionHost/dsh-core LlmService 驱动；SSE/WS 下链接 EventSink。
+`m1e_session_host.rs`/`m1e_web_rpc.rs` 测试 + 全 workspace test/clippy 零告警。
+回滚：撤 M1e 提交即可；不影响 M1a–M1d。E2E 冒烟（`dsh web` + 会话恢复）作为验收。
+
+---
+
+## D-021（M1e 落地）：SessionHost 实现定稿 + web.rs 方法面重接线 + llm.* 目录源
+**日期**：2025（本机时间）
+
+**触发的问题**：D-020 选定「SessionHost 桥」后，编码落地时暴露三个实现细节需要
+定稿：(a) 事件下链日志的读语义；(b) `session.*`/`llm.*` 方法面重接线后的形状收口；
+(c) llm 空注册表的目录回退。
+
+**关键事实（直读源码 + 参考 TS 实测）**：
+- 前端 `sessionEventSchema` = strict-envelope `{type, seq, time, data,
+  sourceEventSeqs?, surfaceOp?, ignorable?}`（`dsh-client-connection/lib`:5229）——
+  `dsh-session::SessionEvent` 的 serde 逐字段对其（types.rs:797），mux `session/event`
+  帧与该 history 条目共用该 schema。
+- 多连接下链若用「drain 型 VecDeque」会相互抢事件；改用 **append-only
+  `Vec<(String, SessionEvent)>` + 每连接自有游标**（`sink_since(from)`），
+  对应原 SSE/WS 的 `last_seq` 增量读语义。
+- `llm.providers`=`{providers:[configurableProviderViewSchema]}`；`llm.models`=
+  `{groups, failures}`；`session.models`=`{current, routable, groups, failures}`
+  （`dsh-host-apiproxy`/`dsh-client-connection` 实测）。
+
+**考虑的选项**：
+1. **下链=EventSink（append-only Vec + 游标）（采用）**：SSE/WS 线程各自
+   `cursor = sink_len()` 起增量读，`mux_session_event_frame(session_id, ev)` 直接
+   `serde_json::to_value(e)` 序列化 strict-envelope 事件（真实 time + 真实 sessionId）。
+2. 下链仍轮询 `boot.sessions`（SessionLog）：丢失 dsh-session 的类型化事件与真实
+   time；否决。
+3. llm 空注册表直接给 `groups:[]`/`providers:[]`：前端 `session.models` 的
+   `current.{provider,model}` 必须 `string().min(1)`，空目录会让 UI current 校验失败；
+   故保留内置 loop 目录组（`dsh` 组：echo/llm/tool——本仓真实可运行的 WASM loop
+   组件）作为**空注册表回退**，注册表非空时完全由 `LlmService::providers()` 驱动。
+
+**最终选择**：
+- `session_host.rs`：`EventSink = Arc<Mutex<Vec<(String, SessionEvent)>>>` +
+  `sink_len()`/`sink_since()`；store.on_event → coord.create/append（持久化）+
+  sink.push（下链）；on_flush → coord.flush。`restore_all()` 从持久化根恢复快照进
+  store（`from_restore` → enter + announce + coord cursor 回灌）。
+- `web.rs`：`serve` 构造 `Rc<SessionHost>`（有 `--session-dir` 则 `with_root`，否则
+  `in_memory`），seed `default`；`handle_rpc` → `handle_rpc_host(boot, m, body,
+  &host)`；session.list/create/history/fork/rename/prompt 全部由 SessionHost 驱动；
+  SSE/WS 下链接 EventSink（真实 sessionId + time）。
+- `llm.providers`/`llm.models`/`session.models` 由 `Boot.llm.providers()` 驱动，空
+  注册表回退内置 loop 目录组。
+- `Boot` 新增 `llm: LlmHandle`（boot() 从 cordis 取 `llm` 服务，fallback
+  `new_llm()`）；web.rs 测试 helper `boot_with_sessions()` 补该字段。
+
+**选择理由**：下链语义与前端 mux frame 逐字段一致（diff/TS 权威），多连接不抢数据；
+llm 目录在「有真实注册表」时完全注册表驱动（不再是硬编码 echo/llm/tool），空注册表
+回退保证 UI `current` 校验通过、演示流程不破。
+
+**预期影响与回滚点**：新增 `dsh-cli/src/session_host.rs`（11 测试）+ `web.rs`
+session.*/llm.* 方法面 + SSE/WS 下链（38 测试）+ `dsh-core/src/llm.rs`
+`LlmProviderInfo`/`provider_ids()`/`providers()`（4 测试）。cargo deps 新增
+dsh-session/dsh-persistence/dsh-brand（无 dsh-llm 直接依赖——dsh-session 已
+re-export）。web_main 新增 `--session-dir <dir>`。回滚：撤本提交即可；不影响
+M1a–M1d 与 headless `--session-in/out`（Boot.sessions 仍保留为 loop 写目标）。
+E2E 冒烟（`dsh web` + prompt + SSE + 重启恢复）已通过。
+
+
 
 
