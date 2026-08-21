@@ -1,0 +1,15 @@
+[package]
+name = "dsh-compaction"
+version = "0.1.0"
+edition = "2021"
+description = "长会话压缩：CompactionEngine 缝 + compact-basic 后端 + tool-result-pruner（M1c）"
+license = "MIT"
+
+[dependencies]
+dsh-session = { path = "../dsh-session" }
+dsh-llm = { path = "../dsh-llm" }
+dsh-brand = { path = "../dsh-brand" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]

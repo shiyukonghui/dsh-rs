@@ -583,3 +583,51 @@ serde_json）。回滚：撤 M1b 提交即可；不影响 M0/M1a。M1e 线程桥
 接线点；若桥延迟受阻，adapter 仍可用测试 thunk 全链验证。wire 字段名是兼容面，
 改动需连同黄金测试更新。
 
+---
+
+## D-017（M1c）：dsh-compaction——压缩引擎按 TS 参考四模块推进，摘要缝每调用注入
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M1c 需交付压缩能力（`compaction-basic`/`compaction`/`compaction-tool-result-pruner`/
+`checkpoint`），并与 M1a 的 session surface + M1b 的 LLM 缝集成。TS 侧原始源码在
+沙箱内只有 `node_modules` 编译产物（`@deepseek-ai/dsh-compaction-basic/lib/index.js`）可读，
+且已确认 `summarize` 是**每次调用经 dependencies 注入**（`dependencies.summarize(...)`），
+不是构造函数持有。Rust 核心是单线程 `Rc<RefCell>` 纪律（D-004/D-006），真实 LLM 摘要
+调用必须推迟到服务层（M1e 线程桥）。
+
+**考虑的选项**：
+1. **纯语义四模块 + `Rc<dyn Fn>` Summarizer 每调用注入（本次采用）**：`basic.rs`
+   （阈值/retained-tail/区域选择/压缩事务/一次性摘要框架 + token 估算/测量）、
+   `engine.rs`（CompactionEngine 缝 + tool-pairing 平衡）、`pruner.rs`（Unicode 码点
+   裁剪 + shadow-price）、`absorb.rs`（compaction/* wire 形状 + checkpoint user Replace）。
+   `Summarizer = Rc<dyn Fn(&SummarizationInput) -> Result<SummaryResult,String>>`，
+   `CompactionEngine` 三个方法（compactIfNeeded/compactNow/compactRegion）都带
+   `summarize: &Summarizer` 参数——编译期强制每次调用显式接线，与 TS 的注入面一致，
+   也便于测试用确定性替身。
+2. **构造函数持有摘要闭包**：引擎生命周期内绑定单一摘要器，违背 TS 每次调用注入面
+   且 M1e 服务层难以按 request 换摘要函数。
+3. **async summarize（返回 Future）**：引入异步运行时，违背核心单线程纪律。
+
+**最终选择**：选项 1。`BasicCompactionEngine` 实现 `CompactionEngine` trait，配置解析
+（ratio/retainedTail/maxTokens/compactionRetries/overflowRetries + 成对校验）+ 模型
+policy 覆盖 + `ModelInfoProvider`（默认 context window 65536）全部在核心内。压缩事务
+（`compact_surface_region`）线性化：先落 `compaction/start`（锁）→ prepare/summarize/
+稳定性检查/commit（`compaction/summary` + checkpoint user Replace）→ 成功/失败都落
+`compaction/end`。`CompactionError` 实现 `Display`（串化对齐 TS 错误文本）。
+
+**选择理由**：核心保持纯语义（可单测/可差分），唯一非确定性源（真实 LLM）隔离在
+M1e 服务层；`Rc<dyn Fn>` 可 clone、跨多次压缩事务复用。TS 的「未匹配
+`compaction/start` 阻挡并发压缩（busy 锁）」「无 open turn 时自动压缩拒绝」
+「summary 不小于 shadowed 内容时拒绝」等错误文本与实现逐字对齐（`index.js` 已核对）。
+
+**预期影响与回滚点**：新增 `crates/dsh-compaction`（依赖 dsh-session/dsh-llm/dsh-brand/
+serde/serde_json）；`dsh-brand` 增加 `CompactionId`（拥有者=dsh-compaction）；
+`dsh-llm::types::PluginMessageSource` 扩展 `extra: Map<String,Value>` 无损承载
+`{kind:'plugin', plugin:'compact', compactionId, sourceCommandId?}`（checkpoint source，
+已由 dsh-llm 单测覆盖 round-trip）。测试：`tests/{m1_compaction_tokens,config,toolpairing,
+pruner,region,engine,checkpoint}.rs` 共 77 项全绿；全 workspace `cargo test` + `clippy
+--all-targets` 零告警。回滚：撤 M1c 提交即可；不影响 M0/M1a/M1b。M1e 线程桥是摘要
+缝唯一接线点，若受阻引擎仍可用测试替身全链验证。
+
+

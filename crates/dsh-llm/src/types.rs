@@ -368,6 +368,18 @@ impl ContextForm {
             _ => return Some(Err("unknown plugin form")),
         })
     }
+
+    /// 该 form 在 source 对象中占用的自有键（round-trip 时从 extra 排除）。
+    fn own_keys(&self) -> &'static [&'static str] {
+        match self {
+            ContextForm::Instructions => &["form"],
+            ContextForm::Catalog => &["form"],
+            ContextForm::Snapshot { .. } => &["form", "sections"],
+            ContextForm::Notice { .. } => &["form", "summary"],
+            ContextForm::Relay => &["form"],
+            ContextForm::Recall => &["form"],
+        }
+    }
 }
 
 /// 一个 `snapshot` 形式上下文中按名贡献的一段（组装顺序）。
@@ -399,18 +411,48 @@ impl ToolMessageSource {
 }
 
 /// plugin 注入上下文来源（含可选的 ContextForm 声明）。
+///
+/// TS 侧 `plugin` source 是开放对象（`{kind:'plugin'; plugin:string} & ContextFormed`，
+/// `message.ts MessageSourceMap`）；插件可在 plugin/form 之外携带自有字段——如
+/// compaction 的 `compactCheckpointSource` 在 plugin 上多带 `compactionId`/
+/// `sourceCommandId`。`extra` 无损保留这些开放字段，保证日志 round-trip 字节一致。
 #[derive(Debug, Clone, PartialEq)]
 pub struct PluginMessageSource {
     pub plugin: String,
     pub form: Option<ContextForm>,
+    /// plugin/form 之外的开放 source 字段（如 checkpoint 的 compactionId）。
+    pub extra: Map<String, Value>,
 }
 
 impl PluginMessageSource {
+    pub fn new(plugin: impl Into<String>) -> Self {
+        PluginMessageSource {
+            plugin: plugin.into(),
+            form: None,
+            extra: Map::new(),
+        }
+    }
+
+    pub fn with_form(mut self, form: ContextForm) -> Self {
+        self.form = Some(form);
+        self
+    }
+
+    /// 设置一个开放附加字段（`compactionId`/`sourceCommandId` 等）。
+    pub fn with_extra(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(key.into(), value);
+        self
+    }
+
     pub fn plugin(&self) -> &str {
         &self.plugin
     }
     pub fn form(&self) -> Option<&ContextForm> {
         self.form.as_ref()
+    }
+    /// 读取一个开放附加字段。
+    pub fn extra(&self, key: &str) -> Option<&Value> {
+        self.extra.get(key)
     }
 }
 
@@ -469,6 +511,10 @@ impl serde::Serialize for MessageSource {
                         _ => unreachable!("context form serializes to object"),
                     }
                 }
+                // 开放 source 字段（compactionId/sourceCommandId 等）无损回流。
+                for (k, v) in &p.extra {
+                    obj[k] = v.clone();
+                }
                 obj
             }
             MessageSource::Model(m) => {
@@ -508,7 +554,22 @@ impl<'de> serde::Deserialize<'de> for MessageSource {
                     },
                     None => None,
                 };
-                Ok(MessageSource::Plugin(PluginMessageSource { plugin, form }))
+                // form 自身占用的键不属于 extra（避免 round-trip 双写）。剩余键
+                // （compactionId/sourceCommandId 等开放 source 字段）无损保留。
+                let mut form_keys: std::collections::HashSet<&str> = ["kind", "plugin", "form"].into_iter().collect();
+                if let Some(f) = &form {
+                    for k in f.own_keys() {
+                        form_keys.insert(k);
+                    }
+                }
+                let mut extra = Map::new();
+                for (k, v) in obj {
+                    if form_keys.contains(k.as_str()) {
+                        continue;
+                    }
+                    extra.insert(k.clone(), v.clone());
+                }
+                Ok(MessageSource::Plugin(PluginMessageSource { plugin, form, extra }))
             }
             "model" => Ok(MessageSource::Model(ModelMessageSource {
                 provider: req_str(obj, "provider").map_err(D::Error::custom)?,
@@ -1055,4 +1116,47 @@ mod metadata_tests {
         let back: LlmModelInfo = serde_json::from_value(v).unwrap();
         assert_eq!(back, info);
     }
+
+    #[test]
+    fn plugin_source_open_fields_roundtrip_losslessly() {
+        // TS checkpoint source：{kind:'plugin', plugin:'compact', compactionId, sourceCommandId?}
+        // （D-014：契约不绑定键序，差分统一规范序，故只做语义断言）
+        let src = MessageSource::Plugin(
+            PluginMessageSource::new("compact")
+                .with_extra("compactionId", serde_json::json!("cid-123")),
+        );
+        let json = serde_json::to_string(&src).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["kind"], serde_json::json!("plugin"));
+        assert_eq!(parsed["plugin"], serde_json::json!("compact"));
+        assert_eq!(parsed["compactionId"], serde_json::json!("cid-123"));
+        let back: MessageSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, src);
+        match &back {
+            MessageSource::Plugin(p) => {
+                assert_eq!(p.plugin(), "compact");
+                assert_eq!(p.extra("compactionId"), Some(&serde_json::json!("cid-123")));
+            }
+            other => panic!("expected plugin source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_source_form_fields_not_leaked_to_extra() {
+        let src = MessageSource::Plugin(
+            PluginMessageSource::new("demo").with_form(ContextForm::Notice {
+                summary: "hello".into(),
+            }),
+        );
+        let json = serde_json::to_string(&src).unwrap();
+        let back: MessageSource = serde_json::from_str(&json).unwrap();
+        match &back {
+            MessageSource::Plugin(p) => {
+                assert_eq!(p.form(), Some(&ContextForm::Notice { summary: "hello".into() }));
+                assert!(p.extra.is_empty(), "form summary must not double into extra");
+            }
+            other => panic!("expected plugin source, got {other:?}"),
+        }
+    }
 }
+

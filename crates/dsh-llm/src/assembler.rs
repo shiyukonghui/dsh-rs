@@ -248,10 +248,7 @@ impl BlockAssembler {
 
     /// 组装好的 assistant 消息（role=assistant，内容=blocks()）。
     pub fn message(&self, id: MessageId) -> Message {
-        let source = MessageSource::Plugin(PluginMessageSource {
-            plugin: "dsh-llm/assembler".to_string(),
-            form: None,
-        });
+        let source = MessageSource::Plugin(PluginMessageSource::new("dsh-llm/assembler"));
         Message {
             id,
             role: crate::types::Role::Assistant,

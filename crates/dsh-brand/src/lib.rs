@@ -16,7 +16,8 @@
 //!   （TS 定义于 `llm/llm/src/brand.ts`）；
 //! - `RpcId`：拥有者为 api 契约层（TS 定义于 `host/apiproxy/src/api/rpc.ts`）；
 //! - `WorkspaceId`：拥有者为 workspace 域；
-//! - `AttachmentIdType`：拥有者为 attachment 域。
+//! - `AttachmentIdType`：拥有者为 attachment 域；
+//! - `CompactionId`：拥有者为 dsh-compaction（TS 定义于 `compaction/compaction/src/brand.ts`）。
 //!   各拥有 crate 从本 crate newtype 后再以自己名字 re-export（保留"拥有者暴露 id"语义）。
 
 use serde::{Deserialize, Serialize};
@@ -110,6 +111,10 @@ define_brand! {
 define_brand! {
     /// 附件（attachment）标识。
     AttachmentIdType, "AttachmentIdType"
+}
+define_brand! {
+    /// 一次压缩事务的稳定标识（dsh-compaction 拥有者：compaction/start|summary|checkpoint|end 共享）。
+    CompactionId, "CompactionId"
 }
 
 #[cfg(test)]
