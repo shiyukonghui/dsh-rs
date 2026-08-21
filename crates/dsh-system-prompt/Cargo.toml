@@ -1,0 +1,14 @@
+[package]
+name = "dsh-system-prompt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dsh-llm = { path = "../dsh-llm" }
+dsh-scope = { path = "../dsh-scope" }
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"

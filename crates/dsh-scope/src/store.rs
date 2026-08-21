@@ -128,6 +128,16 @@ impl<V: 'static> NamedEntries<V> {
             cursor: 0,
         }
     }
+
+    /// live 迭代器（同 `values` 语义），但每步返回 `(key, value)` 对（对齐 TS
+    /// `Map.entries()` 的 live 迭代：消费方在迭代期间新注册的条目本轮可见）。
+    pub fn entries_live(&self) -> IterKeyedPair<String, V> {
+        IterKeyedPair {
+            data: self.data.clone(),
+            gen: self.data.borrow().gen,
+            cursor: 0,
+        }
+    }
 }
 
 /// 命名条目 live 迭代器（对齐 TS Map 迭代器）。
@@ -153,6 +163,36 @@ where
         let v = t.items[self.cursor].1.clone();
         self.cursor += 1;
         Some(v)
+    }
+}
+
+/// `entries_live` 的 `(key, value)` live 迭代器（对齐 TS `Map.entries`）。
+pub struct IterKeyedPair<K, V> {
+    data: Shared<K, V>,
+    gen: u64,
+    cursor: usize,
+}
+
+impl<K, V> Iterator for IterKeyedPair<K, V>
+where
+    K: Clone,
+    V: Clone,
+{
+    type Item = (K, V);
+    fn next(&mut self) -> Option<(K, V)> {
+        let t = self.data.borrow();
+        if t.gen != self.gen {
+            return None; // 已换新代 → 脱离
+        }
+        if self.cursor >= t.items.len() {
+            return None;
+        }
+        let pair = (
+            t.items[self.cursor].0.clone(),
+            t.items[self.cursor].1.clone(),
+        );
+        self.cursor += 1;
+        Some(pair)
     }
 }
 

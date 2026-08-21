@@ -1112,6 +1112,45 @@ dsh-tools 总测试 74，workspace 全绿（离线）+ clippy 零告警。环境
 
 ---
 
+## D-028（M2c）：dsh-system-prompt 组装/渲染/插值/伴生 invariant
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M2c 需交付 `system-prompt` 包（assemble/orderTools/渲染纯函数/
+严格 `{{var}}` 插值/水岭唤醒/complete 恢复/scoped 遮蔽/invariant）。依赖面含
+dsh-scope 的 `entries_live()`（变量 live 迭代——TS `Map.entries` 在 provider 求值期
+新注册可见）。
+
+**考虑的选项**：
+1. **完整收敛 + 窄化声明（本次采用）**：ScopedLayers 上实现 SystemPrompt；`variables`
+   用 `Vec<(String, Option<String>)>` 保序（own-property 语义 + 与 JS 一致的注册名
+   报错序）；水岭监听器在服务内 `Rc<RefCell<Vec<..>>>` 存储；invariant 校验可达类。
+2. 引入完整 Cordis 事件内核：超出单线程 Rc 纪律（D-004/D-006），且 M2f 再评估。
+
+**差异声明（Rust 面）**：
+- `AssembleContext.signal`（AbortSignal）未入 Rust 面——栈中无取消令牌对象；显式
+  组装的控制信号语义（不保留去控后续 turn）不变（记本条目）。
+- `variables` 保序 Vec 的对 → 无原型穿透、报错列表序 = 全局插入序 + 作用域链远→近
+  （对齐 JS Record own-property + Object.keys 序）。
+- 水岭监听器：`register_assemble_listener(scope, prepend, cb)`；prepend = 队列最前
+  （invariant 用全局+prepend 包外层）；采纳 = 监听器 tag ∈ assemble scope 的链
+  （对齐 `ScopeCarrier.adopts`）。短路径无监听器 = 恒等。
+- invariant 窄化：TS 校验「text 非 string」「变量值非 string|undefined」在 Rust 强
+  类型下不可能（waterfall listener 只能产出 `String`/`Option<String>`）——Rust 面
+  保留可达类别（空名/重名/变量名非法），消息逐字对齐 B.6 契约。
+- 本机 rustc 不接受 `format!("{expr}")` 内联表达式捕获（已用最小示例探针证实），
+  error 消息统一用位置参数渲染（对用户可见零差异）。
+- 环境：本回合继续离线（出网 TLS 仍被阻）；新增依赖零、全走已缓存路径。
+
+**预期影响与回滚点**：新增 `crates/dsh-system-prompt`（lib + invariant + 42 测试，
+`tests/m2c_system_prompt.rs` 全绿）；dsh-scope 增量 `entries_live()`（+1 测试，
+additive 不动既有 API）；workspace 98 二进制全绿 + clippy 零告警。回滚：撤提交。
+增量：M2d dsh-agent 的 `assembleContextFor`（`{ agent, scope: agent }`）与
+`installModelSelection` 在 `system-prompt/assemble` 水岭覆盖 `variables.provider/model`
+接到本 crate 的水岭注册 API。
+
+---
+
 ---
 
 ---

@@ -296,6 +296,17 @@ fn named_entries_starts_fresh_generation_after_drain() {
 }
 
 #[test]
+fn named_entries_entries_live_yields_key_value_pairs() {
+    let e = NamedEntries::new(|name| format!("dup: {name}"));
+    let _ = ins(&e, "a", 1);
+    let mut iter = e.entries_live();
+    assert_eq!(iter.next(), Some(("a".to_string(), 1)));
+    let _ = ins(&e, "b", 2); // 迭代期间新注册 → 本轮 live 可见
+    assert_eq!(iter.next(), Some(("b".to_string(), 2)));
+    assert_eq!(iter.next(), None);
+}
+
+#[test]
 fn anonymous_entries_own_equal_values_independently_with_live_iteration_and_idempotent_undo() {
     let e = AnonymousEntries::new();
     let value = "same";
