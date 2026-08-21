@@ -628,6 +628,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-scope"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "dsh-session"
 version = "0.1.0"
 dependencies = [

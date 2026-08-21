@@ -872,6 +872,49 @@ E2E 冒烟（`dsh web` + prompt + SSE + 重启恢复）已通过。
 
 **预期影响与回滚点**：本记录仅追加 DECISIONS.md，无代码改动。回滚：无。
 
+---
 
+## D-023（M2a）：dsh-scope 迁移设计——作用域原语以「身份句柄 + 迷你派发」适配 Cordis 缺口
 
+**日期**：2025（本机时间）
+
+**触发的问题**：M2 需迁 `packages/core/scope`（`@deepseek-ai/dsh-scope`）——TS 里是
+建立在 Cordis 之上的作用域注册原语（`createScope`/`scopeTarget`/`ScopedLayers`）。
+但 Rust dsh-core 的 Cordis 等价物（`Cordis`，D-004/D-006）**缺少** Scope 语义所依赖的
+两样东西：`ctx.extend` 的 Symbol 标签继承、与 `Context.filter`（以 thisArg 为 this 的
+对象过滤器）的派发路由。若直接改 dsh-core 内核，回归风险大，违背「核心单线程纪律
+不轻易改动」。
+
+**第一性原理拆解**：scope 的**可观察语义**只有三件（report §0）：打标签（后代可见）、
+读标签、由 `scopeTarget` carrier 做路由（无标签全局 / 带标签 `tag ∈ chain(key)`、
+事件沿链上行绝不下行）。这不是「权限边界」而只是「注册可见性」；其真相是**纯内存
+身份**（TS `ScopeKey = object`，引用相等，从不序列化）。
+
+**考虑的选项**：
+1. **身份句柄 + 迷你派发总线（本次采用）**：`ScopeKey(Rc<()>)`（指针身份 `Eq/Hash`）；
+   父链表 = 模块级 `thread_local`（对齐 TS 模块级 WeakMap）；`ScopeCarrier::adopts`
+   复刻逐调用方谓词；`ScopedContext` 迷你总线复刻「global 绕过 filter、带标签者
+   adopts」派发；`NamedEntries`/`AnonymousEntries`/`ScopedLayers` 按 store.spec 逐
+   条语义（live 迭代 + 代数、精确幂等 undo、聚合惰性创建/只回收空层、effect 时序与
+   `['notify','undo','notify']` 回滚）。不依赖、不改动 dsh-core。
+2. 扩 dsh-core Cordis（加 extend/filter/thisArg dispatch）：等价性最高，但侵入核心
+   且无实时消费者压力（第三方 JS 插件不会在 Rust 宿主运行——决策 Q2 宿主插件 =
+   Rust/WASM），风险收益比差。
+3. 只搬数据无路由：丢「全局/作用域可见性」这一核心语义，upper 层无法按 agent 收发事件。
+
+**最终选择**：选项 1。与 D-015（dsh-session 用最小观察者表代替 Cordis 总线）同构：
+scope 提供给 dsh-agent/dsh-agent-loop 一个**测试完备、语义逐条对齐**的作用域机制，
+消费方在 Rust 核心内用它做作用域事件派发。
+
+**差异声明（与 TS 逐字节对齐的边界）**：
+- `create_scope.dispose` = 同步幂等（Cordis 的异步 quiescence/inertia 反复排空在
+  单线程核心无对应物）；`raw_dispose` 仍暴露精确 disposer 身份。
+- `is_scope_carrier` 由类型系统保证（`ScopeCarrier` 即 carrier，无需 WeakMap 查询）；
+  base filter 用捕获 base 的闭包表达（TS 是 `base[cordis.filter]` 方法、`this=base`）。
+- `Scoped<T>` phantom brand 运行时擦除，不强加。
+- 事件载荷在迷你总线里用 `serde_json::Value`（消费方一致的通用形态）。
+
+**预期影响与回滚点**：新增 crate `dsh-scope`（零依赖纯语义）+ 23 项测试
+（`tests/m2_scope.rs`，移植 scope/store/invariant 三 spec 的 24 条可观察行为）。
+回滚：撤提交即移除，不影响既有 crate。增量：dsh-agent 等消费方在 M2d+ 接入。
 

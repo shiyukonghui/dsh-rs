@@ -8,6 +8,9 @@ members = [
   # M1 运行时（PLAN §5）：llm 适配器 + 压缩 + 持久化 + 读模型查询
   "crates/dsh-llm-deepseek", "crates/dsh-compaction",
   "crates/dsh-session-query",
+  # M2 运行时（PLAN §6）：agent 驱动链 —— 作用域原语 / 工具能力缝 / 系统提示 /
+  # agent 注册表 / agent loop / interaction 审批链
+  "crates/dsh-scope",
 ]
 
 [workspace.package]

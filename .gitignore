@@ -10,3 +10,6 @@ $t
 
 # 用户私有笔记（deepseek-harness 主题，不属于 dsh-rs）
 DSH-插件开发经验.md
+
+# 需求分析过程产物（子代理契约摘要等中间工件）
+/analysis

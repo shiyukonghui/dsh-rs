@@ -1,0 +1,12 @@
+[package]
+name = "dsh-scope"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "M2a: 作用域注册原语（ScopeKey/bindScopeParent/createScope/scopeTarget/ScopedLayers），镜像 TS @deepseek-ai/dsh-scope。"
+
+[dependencies]
+serde_json = "1"
+
+[dev-dependencies]
