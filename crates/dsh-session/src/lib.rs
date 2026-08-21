@@ -4,6 +4,7 @@
 //! M0 仅承载类型/纯函数（SessionEventMap/信封/surface/TurnEndReason/header 折叠/词表/
 //! 读取闸）；`Session`/`SessionStore`/`deriveMessages` 等运行时为 M1a 交付。
 
+pub mod chunk_rows;
 pub mod invariant;
 pub mod repair;
 pub mod request_header;

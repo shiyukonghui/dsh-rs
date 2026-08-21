@@ -1,17 +1,18 @@
 [package]
-name = "dsh-persistence"
+name = "dsh-session-query"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "M1d (dsh-persistence)：SessionPersistence seam + format/zstd/jsonl 原生后端 + coordinator + write-behind + import。"
+description = "M1d (dsh-session-query)：读模型投影（watermark readFrom）+ session-log-export（前端日志导出形状）。"
 
 [dependencies]
 dsh-brand = { path = "../dsh-brand" }
 dsh-session = { path = "../dsh-session" }
+dsh-persistence = { path = "../dsh-persistence" }
+dsh-llm = { path = "../dsh-llm" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-zstd = "0.13.3"
 
 [dev-dependencies]
 serde_json = "1"

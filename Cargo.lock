@@ -613,6 +613,7 @@ dependencies = [
  "dsh-session",
  "serde",
  "serde_json",
+ "zstd",
 ]
 
 [[package]]
@@ -629,6 +630,18 @@ version = "0.1.0"
 dependencies = [
  "dsh-brand",
  "dsh-llm",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dsh-session-query"
+version = "0.1.0"
+dependencies = [
+ "dsh-brand",
+ "dsh-llm",
+ "dsh-persistence",
+ "dsh-session",
  "serde",
  "serde_json",
 ]

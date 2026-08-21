@@ -630,4 +630,79 @@ pruner,region,engine,checkpoint}.rs` 共 77 项全绿；全 workspace `cargo tes
 --all-targets` 零告警。回滚：撤 M1c 提交即可；不影响 M0/M1a/M1b。M1e 线程桥是摘要
 缝唯一接线点，若受阻引擎仍可用测试替身全链验证。
 
+---
+
+## D-018（M1d）：dsh-persistence 按 TS 参考三模块推进——seam/coordinate/JSONL 后端；dsh-session-query 当期落地
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M1d 需交付会话持久化链（`dsh-persistence`：coordinator/write-behind/jsonl/
+import，`dsh-session-query`：projection/export）。TS 侧源码只在 `node_modules` 编译产物
+（`@deepseek-ai/dsh-session-persistence/lib/index.js`、`-jsonl/lib/index.js`、
+`dsh-session-query/lib/index.js`）可读，且为单线程、无 async 运行时、IO 推迟到服务层的
+Rust 纪律（D-004/D-006，`Rc<RefCell>`）。
+
+**考虑的选项**：
+1. **无状态 JSONL 文件后端 + coordinator 实现 seam（采用）**：`jsonl.rs` 只做纯 IO
+   （materialize/append/repair/list/read-raw），`coordinator.rs` 实现 `SessionPersistence`
+   seam（状态复用、首 append 物化、write-behind 批窗、prepare 缓存、live-turn 守卫、
+   crash 修复）。原子物化：temp 写 + fsync + rename 发布，失败回滚。可单测、可差分。
+2. **后端自持状态（有状态文件后端）**：最初直接把 `SessionPersistence` 实现在
+   `jsonl.rs` 上（无状态无法懒物化、append 即 NotFound）——被否：状态复用/守卫/WB 全部
+   重复，且 seam 语义无法复用，故重写为「后端 + coordinator」结构（记录本次修正）。
+3. **引入 tokio async**：违反 D-004/D-006 单线程核心纪律，且差分需 await 编排；否决。
+
+**最终选择**：选项 1。物理格式逐字对齐 TS：`logPath = root/<projectKey|_no-cwd>/<encodeSegment(id)>/session.jsonl(.zstd)`，
+header 行 + 每事件一行 + `\n`，packChunks 默认 true（MIN_RUN=3）打包，压缩默认 zstd——
+checksummed 拼接独立帧（magic 0xFD2FB528、checksum flag ON），header 是独立帧。
+`revision = dev:ino:size:mtimeNs:ctimeNs` 经 `:` join（Windows dev/ino=0 占位）。
+`SessionWriteBehind` 移植 TS `SessionWriteBehind`（barrier/批量失败原序回队首/automaticPaused/
+enqueue 唤醒自动写），`BatchSink::write` 单批同步返回。ProjectKey 用 TS `separatorRun`
+把连续分隔符坍缩为单个 `-`（`--C-work-proj--`），`encodeSegment` 仅 `~` 与非
+`[A-Za-z0-9._-]` 以 `~XXXX` 转义。`import.rs`（SessionImport）读取 TS 侧 zstd/plaintext
+artifact，经 `Session::from_restore` 语义校验后落 Rust JSONL，拒绝覆盖（幂等安全）。
+`dsh-session-query`（projection/export）也于本里程碑以独立 crate 完成。
+
+**选择理由**：保持核心纯语义（可单测/可差分），把唯一非确定性源（真实磁盘 IO）留在
+后端内部，与 dsh-session 的「纯语义内核 + 观察者表」同构。TS 常量/词汇在
+pretty-print/scan/坐标对齐单测覆盖（zstd 帧区间 `[0,33]/[33,56]/[56,118]`、torn 56、
+short 0 与 TS `scanZstdFrames` 逐字节一致；dsh-session-query 经子代理 65a8ab3b 交付并
+18/18 测试 + clippy 零告警）。
+
+**预期影响与回滚点**：新增 `crates/dsh-persistence`（依赖 dsh-brand/dsh-session/zstd
+0.13.3）与 `crates/dsh-session-query`（依赖 dsh-session/dsh-persistence/dsh-brand/
+dsh-llm）。M1d 测试：format 24 + zstd 7 + jsonl 集成 21 + import 5 + seam 8 = 65 项全绿；
+TS↔Rust 交叉验证双向通过（TS node:zlib 写 → Rust 读；Rust 写 → TS node:zlib 解码）；
+全 workspace `cargo test` + `clippy --all-targets` 零告警。回滚：撤 M1d 提交即可；
+不影响 M0/M1a/M1b/M1c。M1e 线程桥（io.rs）是真实磁盘 IO 与 LLM 唯一接线点，尚未实现。
+
+---
+
+## D-019（M1d）：torn 尾容差的 Rust 差异——zstd crate 缺 `ZSTD_e_flush` 流式解码，容忍性靠 committed 前缀兜底
+
+**日期**：2025（本机时间）
+
+**触发的问题**：TS `decompressZstdPrefix` 用 `ZSTD_e_flush` 可恢复残缺末帧的明文前
+缀；Rust `zstd` crate 的流式 `Decoder` 对截断帧直接报 "incomplete frame" 并输出零字节
+（探针 `probe-zstd` 已确认），因此 Rust 无法逐字复刻 TS 的「torn 尾恢复」。
+
+**考虑的选项**：
+1. **截断到 committed 前缀兜底（采用）**：`scan_zstd_frames` 逐字节对齐 TS（magic →
+   descriptor → block 循环 → checksum），`load_stored` 只把「最后一个完整帧的 end」作为
+   `truncate_offset`（crash 修复 truncate 到该处），帧内 EOF → `tornStart` 标记 torn。
+   `decompress_zstd_prefix` 对残缺帧返回空（可整帧解码则恢复）。容忍性靠「截断到
+   committed 前缀」获得，与 TS 的语义目标一致（不丢已提交事件）。
+2. **直接调用 libzstd C API 拿 `ZSTD_e_flush`**：需引入 unsafe FFI，违反纯 Rust
+   纪律且破坏单测/差分；否决。
+
+**最终选择**：选项 1。另记录：TS 用 `publishNewFileWin32`（`MoveFileExW` + 写透语义），
+Rust 用 `std::fs::rename`（原子替换同卷）——两者崩溃语义等价（要么旧文件、要么新文件）。
+
+**选择理由**：Rust `zstd` 是成熟、通用、广泛验证的库（D-017 依赖引入原则），不重复造
+轮子；`ZSTD_e_flush` 缺口对我们的场景（崩溃时最多丢一个未提交 batch）无正确性影响。
+**预期影响与回滚点**：`zstd.rs::decompress_zstd_prefix` 对残缺帧返回 `Ok(vec![])`（而
+非错误），调用方（`load_stored`/`read_artifact`）已按 committed 前缀处理；如需恢复
+torn 尾明文，届时再评估 FFI 或上游能力回滚点。不影响 D-018 的其他决策。
+
+
 

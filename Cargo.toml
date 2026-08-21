@@ -5,8 +5,9 @@ members = [
   "crates/dsh-diff", "crates/dsh-wasmrt", "crates/dsh-cli",
   # M0 契约基建（PLAN-rust-full-harness-migration.md §4）：数据面先行
   "crates/dsh-brand", "crates/dsh-llm", "crates/dsh-session", "crates/dsh-persistence", "crates/dsh-api",
-  # M1 运行时（PLAN §5）：llm 适配器 + 压缩
+  # M1 运行时（PLAN §5）：llm 适配器 + 压缩 + 持久化 + 读模型查询
   "crates/dsh-llm-deepseek", "crates/dsh-compaction",
+  "crates/dsh-session-query",
 ]
 
 [workspace.package]

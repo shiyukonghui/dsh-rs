@@ -245,6 +245,73 @@ impl Drop for SessionPreparation {
     }
 }
 
+/// 从后端读取的存储日志（含 torn 标记）。
+#[derive(Debug)]
+pub struct StoredLog {
+    /// 经校验的会话 header（来自 artifact 之首）。
+    pub meta: SessionHeader,
+    /// 连续逻辑事件日志（torn 尾已截断）。
+    pub events: Vec<SessionEvent>,
+    /// 存储 revision。
+    pub revision: SessionPersistenceRevision,
+    /// 是否存在 torn 尾（读取时已丢弃，coordinator 可截断修复）。
+    pub torn: bool,
+    /// 若 torn：物理截断友好偏移（字节；None 表示后端无法表达时由 coordinator
+    /// 以「重写 artifact」兜底——JSONL 后端始终给出 committed 前缀字节偏移）。
+    pub truncate_offset: Option<u64>,
+}
+
+/// 镜像 TS `PersistenceBackend` 的最小后端契约（M1d `PersistedBackends` 交替实现）。
+///
+/// coordinator 消费此契约实现公开 `SessionPersistence`；JSONL 后端实现本 trait。
+/// 与 `SessionPersistence` 的区别：本契约让 backend 拥有一个**无内存状态**的文件
+/// 视图（materialize/append/repair/list），协调层负责 buffer 与启动/关闭。
+pub trait PersistenceBackend {
+    /// 无读取/创建/flush 地解析该后端的独立本地 artifact。
+    fn locate(&self, meta: &SessionHeader) -> Option<SessionLocation>;
+
+    /// 该后端是否每会话暴露一个逐字原始 artifact。
+    fn supports_raw_artifacts(&self) -> bool;
+
+    /// 逐字读取后端写入的 artifact 文本（解码物理编码后）；无 artifact 返回 None。
+    fn read_raw(&self, id: &SessionId) -> Result<Option<SessionRawArtifact>, PersistenceError>;
+
+    /// 读取存储日志（异常格式/版本拒绝；torn 尾丢弃并标记）。
+    fn load_stored(&self, id: &SessionId) -> Result<Option<StoredLog>, PersistenceError>;
+
+    /// revision 轻读（存储动作不动日志）。
+    fn read_stored_revision(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<SessionPersistenceRevision>, PersistenceError>;
+
+    /// 追加批次（未物化时由 backend 自身处理——JSONL 实现允许由调用方先 materialize，
+    /// 但该契约约定 backend 追加必须覆盖「已物化」情形；coordinator 负责顺序）。
+    fn append_batch(
+        &self,
+        meta: &SessionHeader,
+        events: &[SessionEvent],
+    ) -> Result<(), PersistenceError>;
+
+    /// 首次物化：header + 首批次原子落盘（重复 materialize 拒绝）。
+    fn materialize_batch(
+        &self,
+        meta: &SessionHeader,
+        events: &[SessionEvent],
+    ) -> Result<(), PersistenceError>;
+
+    /// 提交修复：截断 torn 尾 + 追加 closing 事件（崩溃恢复后的持久化收尾）。
+    fn commit_repair(
+        &self,
+        id: &SessionId,
+        torn_offset: Option<u64>,
+        closers: &[SessionEvent],
+    ) -> Result<(), PersistenceError>;
+
+    /// 列出物化会话 + 廉价变更 token（不动日志）。
+    fn list_snapshots(&self) -> Result<Vec<SessionPersistenceSnapshot>, PersistenceError>;
+}
+
 /// 从 `fromSeq` 起的存储事件后缀（`readFrom` 的返回形状）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSuffix {
