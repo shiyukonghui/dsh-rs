@@ -11,6 +11,7 @@
 //!   `ToolArgsErrorData` 等轻量载体（宿主至今未引入统一 HarnessError 类型）。
 
 pub mod json_schema;
+pub mod py_types;
 pub mod runtime;
 pub mod schema;
 pub mod ts_types;
@@ -20,6 +21,7 @@ pub use json_schema::{
     assert_object_json_schema, assert_supported_json_schema, validate_json_schema_value,
     JsonSchemaError, JsonSchemaNode, JsonSchemaScalar, JsonSchemaType, ObjectJsonSchema,
 };
+pub use py_types::{json_schema_to_py, render_tools_sdk_py};
 pub use runtime::{
     ToolErrorInfo, ToolExecutionClass, ToolExecutionInput, ToolExecutionMode, ToolExecutionResult,
     ToolGuard, ToolRegistry, ToolRestriction, ToolView,

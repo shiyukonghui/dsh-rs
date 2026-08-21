@@ -1058,6 +1058,62 @@ M2b-3b = Python 味（含已知偏斜声明）。
 
 ---
 
+## D-027（M2b-3b）：Python SDK 代码生成 + 本机网络降级记录
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M2b-3a 完成 TS 味后，Python 味（`packages/core/tools/py-types.ts`）
+是 `tools:sdk` 区在 `runtime.language === 'python'` 下的模型面来源。其实现依赖模型
+无关的确定性算法（命名 TypedDict、类名分配、`Literal[...]`、list 深度上限、协议组装）
+加一层 JS/CPython 各自的 Unicode 表（`\p{XID_Start}`/`\p{XID_Continue}`、NFKC、
+`toUpperCase`、UTF-16 码元计数的 120 上限、`.split` 行为）。
+
+**环境事件**：为支撑 XID/NFKC 引入 `unicode-ident`+`unicode-normalization` 时，
+cargo fetch 遭遇 rsproxy 与 crates.io 双侧 `SEC_E_NO_CREDENTIALS` SSL 失败；curl/
+Invoke-WebRequest 同样 000（沙箱出网 TLS 被阻断）。自修：`unicode-ident 1.0.24` 与
+`unicode-normalization 0.1.25` 已在本地 registry 缓存，`cargo --offline` 全部解析与
+构建成功。记录：本环境出网暂不可用不影响后续（增量都走已缓存离线路径）；若需新依赖
+将显式通知用户协调网络。
+
+**考虑的选项**：
+1. **完整移植 + 声明偏斜（本次采用）**：用 `unicode-ident`/`unicode-normalization`
+   实现 `is_bare_identifier`/`camel_case`/class-name 上限，输出对 ASCII/通用 BMP
+   输入与 TS 逐字节一致；涉及不同 Unicode 表版本的边角显式记录为偏差（上游自身也把
+   case-mapping 暴露记为 deferral）。
+2. 只做 ASCII 近似：`路径` 等合法 Python 标识符会被降级到 subscript/`dict[str, Any]`，
+   在 `mode:'code'` 下丢掉字段名/必填/类型——信息损失违背第一性原理。
+3. 全部部署到 M5（code runtime 时代再调）：`sdkSection` 只有 code-mode 才消费，推迟
+   虽可，但 M2 的「tools 包完整交付」关口依赖纯语义可测性（本模块零集成即可锚定）。
+
+**最终选择**：选项 1。
+
+**差异声明（Rust 面）**：
+- `is_bare_identifier`/`camel_case` 的 XID/NFKC/case-map 表版本 = Rust 捆绑
+  `unicode-ident`（~Unicode 15.x）≠ Node 22（17.0）≠ CPython 3.9.6（13.0）。输出对
+  三套表交集内的名字逐字节一致；表版本差异仅命中近期赋码位/特定 case-map 边角，记入
+  本条目而非伪造对齐。
+- 类名上限 120 按 UTF-16 码元计（`encode_utf16`），跨界 astral 整体丢弃（复刻 JS
+  `slice(0,120)` + high-surrogate 回退的净效果）。
+- 数字展示：整数超安全范围精确十进制（serde_json u64/i64 精确，JS BigInt 双精度已
+  舍入——Rust 更精确）；`1.0` 写法 serde 保留小数点（JS 归一为 `1`）；指数形式
+  `e+21` vs `e21`。均极稀有且不影响可解析性。
+- 排序：`str cmp` ≤ JS UTF-16 lexicographic（同 D-026）；属性顺序 BTreeMap 字典序
+  (D-014) 不等同 JS 插入序（仅影响 Python 类字段排版）。
+- `describe` 折叠用 `split_whitespace`（≈ JS `\s+`）；lone surrogate 在合法 UTF-8
+  不存在，省略 `\uNNNN` 分支（`\xNN` 覆盖 C0/C1/DEL 全范围）。
+- `MAX_LIST_NESTING=180`、`MAX_CLASS_NAME_BASE=120`、`RESERVED` 34 词、`TYPING_ORDER`
+  全部照搬。
+
+**预期影响与回滚点**：新增 `py_types.rs` + `tests/m2b_tools_sdk_py.rs`（9 测试）；
+dsh-tools 总测试 74，workspace 全绿（离线）+ clippy 零告警。环境：新增依赖
+`unicode-ident`/`unicode-normalization`（已缓存，离线解析）。回滚：撤提交。
+增量：M2e 在 `sdkSection` 按 runtime 语言选 `render_tools_sdk`/`render_tools_sdk_py`
+（native → SDK 区为空串，`dsh-tools: no SDK renderer for <language>` 兜底）。
+
+---
+
+---
+
 ---
 
 

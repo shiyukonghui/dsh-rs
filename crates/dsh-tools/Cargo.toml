@@ -12,6 +12,10 @@ dsh-scope = { path = "../dsh-scope" }
 serde = { version = "1", features = ["derive"] }
 # D-014：serde_json 默认 BTreeMap 规范序（与 dsh-diff 一致），不用 preserve_order。
 serde_json = "1"
+# M2b-3b：Python SDK 生成的 Unicode 面——XID_Start/XID_Continue 表 + NFKC 归一化
+# （对齐 TS py-types.ts 的 isBareIdentifier/camelCase）。版本偏斜记 D-026/D-027。
+unicode-ident = "1"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 serde_json = "1"
