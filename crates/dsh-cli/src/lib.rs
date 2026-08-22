@@ -49,6 +49,11 @@ pub struct Boot {
     pub settings: Rc<std::cell::RefCell<dsh_settings::SettingsProvider>>,
     /// M3c：credentials 能力缝（env/file 分层 + set/unset + 文件）。
     pub credentials: Rc<std::cell::RefCell<dsh_credentials::CredentialProvider>>,
+    /// M4h：goal 服务（goal.* RPC 的真实状态机；`Rc<RefCell>` 跨请求共享）。
+    pub goal: Rc<std::cell::RefCell<dsh_goal::GoalService>>,
+    /// M4h：会话投影注册表（当前挂 `todos` unit；goal/plan/subagent/jobs 投影
+    /// 挂 dsh-session 事件流为 M4 后续接入，本子步仅注册 + 可选暴露）。
+    pub projections: Rc<std::cell::RefCell<dsh_session_query::projection::ProjectionRegistry>>,
 }
 
 /// M56：转储生效配置（对齐生产 `dsh --dump-config`）——读主配置 + overlays
@@ -220,6 +225,10 @@ pub fn boot(
         credentials: Rc::new(std::cell::RefCell::new(
             dsh_credentials::CredentialProvider::memory(),
         )),
+        goal: Rc::new(std::cell::RefCell::new(dsh_goal::GoalService::new(
+            dsh_goal::ServiceOptions::default(),
+        ))),
+        projections: crate::web::todo_projection_registry(),
     })
 }
 

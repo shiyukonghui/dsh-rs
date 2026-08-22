@@ -824,6 +824,261 @@ fn credentials_error_response(ref_name: &str, e: dsh_credentials::CredentialsErr
     })
 }
 
+// ---------------------------------------------------------------------------
+// M4h：goal / subagent web RPC —— 把 M4 纯域服务接到 handle_rpc_host。
+// ---------------------------------------------------------------------------
+
+/// M4h：装配会话投影注册表，注册 `todos` 投影单元（M4g 交付的 into_unit）。
+///
+/// ProjectionRegistry 是可选能力：注册失败（重复键等）静默容忍，不 panic（对齐
+/// `goal`/`plan` 等投影挂 dsh-session 事件流的 M4 后续接入——本子步只注册不强制暴露）。
+pub fn todo_projection_registry() -> Rc<std::cell::RefCell<dsh_session_query::projection::ProjectionRegistry>> {
+    let registry = Rc::new(std::cell::RefCell::new(
+        dsh_session_query::projection::ProjectionRegistry::new(),
+    ));
+    {
+        let mut reg = registry.borrow_mut();
+        let _ = reg.register(dsh_session_query::todo::todos_projection_unit().into_unit());
+    }
+    registry
+}
+
+/// M4h：bad-request（ref 缺失 / revision<=0 / sessionId 缺失等 wire 前置校验失败）。
+fn bad_request_response(message: impl Into<String>) -> Value {
+    serde_json::json!({
+        "ok": false, "error": {
+            "code": "bad-request",
+            "message": message.into(),
+        },
+    })
+}
+
+/// M4h：GoalServiceError → wire `{ok:false, error:{code, message}}`。
+/// code 逐字用 GoalServiceError::code()（GOAL_* 稳定码）。
+fn goal_error_response(e: &dsh_goal::GoalServiceError) -> Value {
+    serde_json::json!({
+        "ok": false, "error": {
+            "code": e.code(),
+            "message": e.to_string(),
+        },
+    })
+}
+
+/// M4h：从 payload 解析 goal ref（`{id, revision}`；revision<=0 视为缺失）。
+fn goal_ref_from_payload(payload: &Value) -> Option<dsh_goal::GoalRef> {
+    let r = payload.get("ref")?;
+    let id = r.get("id")?.as_str()?.to_string();
+    let revision = r.get("revision")?.as_u64()?;
+    if revision == 0 {
+        return None;
+    }
+    Some(dsh_goal::GoalRef::new(id, revision))
+}
+
+/// M4h：goal ref → wire `{ref: {id, revision}}`（响应 value）。
+fn goal_ref_wire(gr: &dsh_goal::GoalRef) -> Value {
+    serde_json::json!({"ref": {"id": gr.id.0, "revision": gr.revision}})
+}
+
+/// M4h：maxGoalRounds 解析（缺失 → None；显式值非法/0 → 0 哨兵让服务判
+/// GOAL_INVALID_MAX_ROUNDS）。
+fn goal_max_rounds(payload: &Value) -> Option<u64> {
+    payload.get("maxGoalRounds").map(|v| v.as_u64().unwrap_or(0))
+}
+
+/// M4h：goal RPC 家族（goal.create/edit/pause/resume/complete/clear）。
+fn goal_dispatch(boot: &Boot, method: &str, payload: &Value) -> Value {
+    // 全部 goal.* 请求带 sessionId（catch-all：缺失 → bad-request）。
+    let session_id = payload.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+    if session_id.is_empty() {
+        return bad_request_response(format!("{method} requires sessionId"));
+    }
+    let mut svc = boot.goal.borrow_mut();
+    match method {
+        "goal.create" => {
+            let objective = payload.get("objective").and_then(|v| v.as_str()).unwrap_or("");
+            match svc.create(objective, goal_max_rounds(payload)) {
+                Ok(gr) => serde_json::json!({"ok": true, "value": goal_ref_wire(&gr)}),
+                Err(e) => goal_error_response(&e),
+            }
+        }
+        "goal.edit" => {
+            let Some(gr) = goal_ref_from_payload(payload) else {
+                return bad_request_response("goal.edit requires ref {id, revision>0}");
+            };
+            let has_objective = payload.get("objective").and_then(|v| v.as_str()).is_some();
+            let has_max = payload.get("maxGoalRounds").is_some();
+            if !has_objective && !has_max {
+                return bad_request_response("goal.edit requires objective and/or maxGoalRounds");
+            }
+            let objective = payload.get("objective").and_then(|v| v.as_str());
+            match svc.edit(&gr, objective, goal_max_rounds(payload)) {
+                Ok(gr2) => serde_json::json!({"ok": true, "value": goal_ref_wire(&gr2)}),
+                Err(e) => goal_error_response(&e),
+            }
+        }
+        "goal.pause" | "goal.resume" | "goal.complete" => {
+            let Some(gr) = goal_ref_from_payload(payload) else {
+                return bad_request_response(format!("{method} requires ref {{id, revision>0}}"));
+            };
+            let result = match method {
+                "goal.pause" => svc.pause(&gr),
+                "goal.resume" => svc.resume(&gr),
+                _ => svc.complete(&gr),
+            };
+            match result {
+                Ok(gr2) => serde_json::json!({"ok": true, "value": goal_ref_wire(&gr2)}),
+                Err(e) => goal_error_response(&e),
+            }
+        }
+        "goal.clear" => {
+            // ref 缺失 → bad-request（revision<=0 亦视为缺失）。
+            let Some(gr) = goal_ref_from_payload(payload) else {
+                return bad_request_response("goal.clear requires ref {id, revision>0}");
+            };
+            // 幂等 no-op：无当前 goal（服务 Err(NotFound)）→ 仍 {cleared:true}（对齐 TS
+            // clear 无 current goal 语义）；服务成功 → cleared:true；其余错误透传。
+            match svc.clear(&gr) {
+                Ok(_) => serde_json::json!({"ok": true, "value": {"cleared": true}}),
+                Err(dsh_goal::GoalServiceError::NotFound) => {
+                    serde_json::json!({"ok": true, "value": {"cleared": true}})
+                }
+                Err(e) => goal_error_response(&e),
+            }
+        }
+        _ => bad_request_response("unknown goal method"),
+    }
+}
+
+/// M4h：subagent.list entry wire（camelCase：hasChildren/label/reason）。
+fn subagent_entry_wire(e: &dsh_subagent::ChildEntry) -> Value {
+    if e.kind == "diagnostic" {
+        return serde_json::json!({
+            "kind": "diagnostic",
+            "id": e.id,
+            "reason": e.reason.clone().unwrap_or_default(),
+        });
+    }
+    let mut v = serde_json::Map::new();
+    v.insert("kind".to_string(), serde_json::json!("child"));
+    v.insert("id".to_string(), serde_json::json!(e.id));
+    v.insert("mode".to_string(), serde_json::json!(e.mode));
+    v.insert("activity".to_string(), serde_json::json!(e.activity));
+    v.insert("hasChildren".to_string(), serde_json::json!(e.has_children));
+    // label：one-shot 可选 / continuable 必填（纯数据承载，wire 上看有无）。
+    if let Some(l) = &e.label {
+        v.insert("label".to_string(), serde_json::json!(l));
+    }
+    serde_json::Value::Object(v)
+}
+
+/// M4h：subagent RPC 家族（subagent.list/history/interrupt/prompt）。
+fn subagent_dispatch(boot: &Boot, method: &str, payload: &Value) -> Value {
+    match method {
+        "subagent.list" => {
+            // M4 无真实子代理运行时（无监控源）→ 空目录行（0 条 child/diagnostic）；
+            // 行构造走 catalog 纯函数（category_child/diagnostic_row 的宿主投影保持
+            // 同一 wire 形状——subagent_entry_wire），供真实目录源接入时复用。
+            let rows: Vec<dsh_subagent::ChildEntry> = Vec::new();
+            let entries: Vec<Value> = rows.iter().map(subagent_entry_wire).collect();
+            let _ = boot;
+            serde_json::json!({"ok": true, "value": {"entries": entries, "parentAvailable": true}})
+        }
+        "subagent.history" => {
+            // M4 无真实持久化子代理日志 → 诚实空实现（events 空、hasMore false）。
+            let _ = boot;
+            serde_json::json!({"ok": true, "value": {"events": [], "hasMore": false}})
+        }
+        "subagent.prompt" => {
+            let parent = payload.get("parentSessionId").and_then(|v| v.as_str()).unwrap_or("");
+            let child = payload.get("childSessionId").and_then(|v| v.as_str()).unwrap_or("");
+            let mode = payload.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+            let addr = dsh_subagent::PromptAddress {
+                parent_session_id: parent.to_string(),
+                child_session_id: child.to_string(),
+                mode: mode.to_string(),
+            };
+            // prompt 仅对 continuable child（mode 校验）。
+            if let Err(dsh_subagent::PromptError::NotContinuable) = dsh_subagent::prompt_gate(&addr) {
+                return bad_request_response(
+                    "subagent.prompt requires mode 'continuable'",
+                );
+            }
+            let _ = boot;
+            // M4 无真实投递 → 诚实合成 messageId（过 schema；未来接 agent-loop inbox）。
+            serde_json::json!({"ok": true, "value": {"messageId": format!("pmsg-{child}:1")}})
+        }
+        "subagent.interrupt" => {
+            let parent = payload.get("parentSessionId").and_then(|v| v.as_str()).unwrap_or("");
+            let child = payload.get("childSessionId").and_then(|v| v.as_str()).unwrap_or("");
+            let mode = payload.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+            let addr = dsh_subagent::InterruptAddress {
+                parent_session_id: parent.to_string(),
+                child_session_id: child.to_string(),
+                mode: mode.to_string(),
+            };
+            let accepted = dsh_subagent::interrupt_receipt(&addr);
+            let _ = boot;
+            serde_json::json!({"ok": true, "value": {"accepted": accepted}})
+        }
+        _ => bad_request_response("unknown subagent method"),
+    }
+}
+
+/// M4h：注册 M4 工具（当前：todo_write）到给定 ToolRegistry。
+///
+/// 说明：harness（Boot）当前没有持久 ToolRegistry 注入点（工具注册表只在 agent-loop
+/// 装配时按需创建）——本子步提供纯注册函数 + 单元测试证明可注册 + 参数校验走
+/// `dsh_session_query::todo::to_todo_list`；不强制挂 boot 链（差值记录于 D-043 同类）。
+pub fn register_m4_tools(registry: &dsh_tools::ToolRegistry) {
+    let def = dsh_tools::define_tool(dsh_tools::DefineToolOptions {
+        name: "todo_write".to_string(),
+        description: "写入/替换当前会话的待办列表（全表覆盖，单活动纪律受 allowParallel 约束）。".to_string(),
+        parameters: serde_json::json!({
+            "todos": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "content": {"type": "string", "required": true},
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "completed"],
+                        },
+                    },
+                },
+                "required": true,
+            },
+            "allowParallel": {"type": "boolean"},
+        }),
+        output_schema: serde_json::json!({ "type": "json" }),
+        render: Rc::new(|_, value| {
+            let text = format!("todos: {}", serde_json::to_string(value).unwrap_or_default());
+            vec![dsh_llm::ContentBlock::text(text)]
+        }),
+        execute: Rc::new(|args, _| {
+            let raw = args.get("todos").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let allow_parallel = args.get("allowParallel").and_then(|v| v.as_bool()).unwrap_or(false);
+            match dsh_session_query::todo::to_todo_list(&raw, allow_parallel) {
+                Ok(list) => serde_json::to_value(list)
+                    .map_err(|e| dsh_tools::ToolFailureData::new(e.to_string(), dsh_tools::CODE_INVALID_TOOL_OUTPUT, "Error")),
+                Err(e) => Err(dsh_tools::ToolFailureData::new(
+                    format!("todo list rejected: {e:?}"),
+                    dsh_tools::CODE_INVALID_ARGS,
+                    "TodoListError",
+                )),
+            }
+        }),
+        ..Default::default()
+    })
+    .expect("todo_write tool defines cleanly");
+    registry
+        .register_global(Rc::new(def))
+        .expect("register todo_write");
+}
+
+
 fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) -> Value {
     match method {
         "version" => serde_json::json!({"ok": true, "value": {"version": env!("CARGO_PKG_VERSION")}}),
@@ -1241,31 +1496,18 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
         "llm.discoverModels" => {
             serde_json::json!({"ok": true, "value": {"models": []}})
         }
-        "goal.create" | "goal.edit" | "goal.pause" | "goal.resume" | "goal.complete" => {
-            serde_json::json!({"ok": true, "value": {
-                "ref": {"id": "default", "revision": 1},
-            }})
+        "goal.create" | "goal.edit" | "goal.pause" | "goal.resume" | "goal.complete" | "goal.clear" => {
+            goal_dispatch(boot, method, payload)
         }
-        "goal.clear" => {
-            serde_json::json!({"ok": true, "value": {"cleared": true}})
-        }
-        "subagent.list" => {
-            serde_json::json!({"ok": true, "value": {"entries": [], "parentAvailable": true}})
-        }
-        "subagent.history" => {
-            serde_json::json!({"ok": true, "value": {"events": [], "hasMore": false}})
-        }
-        "subagent.interrupt" => {
-            serde_json::json!({"ok": true, "value": {"accepted": true}})
-        }
-        "subagent.prompt" => {
-            serde_json::json!({"ok": true, "value": {"messageId": "default"}})
+        "subagent.list" | "subagent.history" | "subagent.prompt" | "subagent.interrupt" => {
+            subagent_dispatch(boot, method, payload)
         }
         "commands/list" => {
             serde_json::json!({"ok": true, "value": [
                 {"name": "compact", "description": "压缩当前会话上下文"},
                 {"name": "plan", "description": "进入或离开计划模式", "input": {"hint": "[off|message]"}},
                 {"name": "goal", "description": "为长任务设置或查看目标", "input": {"hint": "<objective>"}},
+                {"name": "subagents", "description": "列出子代理目录", "input": {"hint": "[parentSessionId]"}},
             ]})
         }
         // cordis 插件清单 UI（dynamicCordisRunner remote）：host 侧无动态插件，
@@ -1373,6 +1615,10 @@ mod tests {
             credentials: std::rc::Rc::new(std::cell::RefCell::new(
                 dsh_credentials::CredentialProvider::memory(),
             )),
+            goal: std::rc::Rc::new(std::cell::RefCell::new(
+                dsh_goal::GoalService::new(dsh_goal::ServiceOptions::default()),
+            )),
+            projections: todo_projection_registry(),
         }
     }
 
@@ -1743,6 +1989,10 @@ mod tests {
     #[test]
     fn rpc_extended_method_surface_ok() {
         let boot = boot_with_sessions();
+        // 该方法面冒烟测试以「空 payload 可合法 ok」为主；M4h 后需 payload 的方法
+        // （goal.create 需 objective、subagent.interrupt 需 mode）用最小合法 payload
+        // 触发（对齐 M3a 对 host.createDirectory/openPath 的处理：真实语义覆盖移入
+        // 专用测试；此处保留方法面 ok 检查）。
         let cases: &[(&str, &str, &str)] = &[
             ("settings.describe", "writable", "bool"),
             ("credentials.describe", "credentials", "obj"),
@@ -1772,9 +2022,26 @@ mod tests {
             ("workspace.archiveSession", "workspace", "obj"),
             ("agentPreset.openDocument", "opened", "bool"),
         ];
+        // 方法 → 冒烟 payload（缺省空对象；需要入参的方法给最小合法 payload）。
+        fn surface_payload(m: &str) -> Value {
+            match m {
+                "goal.create" => serde_json::json!({
+                    "sessionId": "default", "objective": "surface goal",
+                }),
+                "goal.clear" => serde_json::json!({
+                    "sessionId": "default", "ref": {"id": "goal-1", "revision": 1},
+                }),
+                "subagent.interrupt" => serde_json::json!({
+                    "parentSessionId": "default",
+                    "childSessionId": "c-1",
+                    "mode": "continuable",
+                }),
+                _ => serde_json::json!({}),
+            }
+        }
         for (m, key, expect) in cases.iter().chain(cases2.iter()) {
             let body = serde_json::to_vec(&serde_json::json!({
-                "type": "client-request", "rpcId": "r", "method": m, "payload": {}
+                "type": "client-request", "rpcId": "r", "method": m, "payload": surface_payload(m)
             })).unwrap();
             let (status, v) = handle_rpc(&boot, m, &body);
             assert_eq!(status, 200, "{m} status");
@@ -2347,5 +2614,233 @@ mod tests {
         assert_eq!(res["result"]["value"]["credentials"]["MY_STORED"]["configured"], false);
         let res = call("credentials.unset", serde_json::json!({"ref": "MY_STORED"}));
         assert_eq!(res["result"]["ok"], true, "unset absent idempotent");
+    }
+
+    /// M4h：goal.create 由 GoalService 真实创建 → ref {id: goal-1, revision: 1}。
+    #[test]
+    fn rpc_goal_create_returns_real_ref() {
+        let boot = boot_with_sessions();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "goal.create",
+            "payload": {"sessionId": "default", "objective": "fix the flaky test"},
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "goal.create", &body);
+        assert_eq!(v["result"]["ok"], true, "goal.create ok");
+        let refv = &v["result"]["value"]["ref"];
+        assert_eq!(refv["id"], "goal-1", "first id is goal-1");
+        assert_eq!(refv["revision"], 1, "first revision is 1");
+        assert!(refv["revision"].as_u64().unwrap() > 0);
+    }
+
+    /// M4h：goal.create 缺 objective → GOAL_INVALID_OBJECTIVE（逐字对齐 GoalErrorCode）。
+    #[test]
+    fn rpc_goal_create_missing_objective_rejects() {
+        let boot = boot_with_sessions();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "goal.create",
+            "payload": {"sessionId": "default"},
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "goal.create", &body);
+        assert_eq!(v["result"]["ok"], false, "missing objective must reject");
+        assert_eq!(v["result"]["error"]["code"], "GOAL_INVALID_OBJECTIVE");
+    }
+
+    /// M4h：goal.create 缺 sessionId → bad-request（sessionId 必填校验）。
+    #[test]
+    fn rpc_goal_create_requires_session_id() {
+        let boot = boot_with_sessions();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "goal.create",
+            "payload": {"objective": "no session"},
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "goal.create", &body);
+        assert_eq!(v["result"]["ok"], false, "missing sessionId must reject");
+        assert_eq!(v["result"]["error"]["code"], "bad-request");
+    }
+
+    /// M4h：goal.create → goal.complete → goal.clear 全链路（complete 后 clear 幂等
+    /// cleared:true；clear 无当前目标时 NotFound → cleared:true）。
+    #[test]
+    fn rpc_goal_complete_then_clear() {
+        let boot = boot_with_sessions();
+        // create
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "goal.create",
+            "payload": {"sessionId": "default", "objective": "finish M4h"},
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "goal.create", &body);
+        let refv = v["result"]["value"]["ref"].clone();
+        // complete（消耗当前目标）
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "goal.complete",
+            "payload": {"sessionId": "default", "ref": refv},
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "goal.complete", &body);
+        assert_eq!(v["result"]["ok"], true, "goal.complete ok");
+        assert_eq!(v["result"]["value"]["ref"]["revision"], 2, "revision bumps to 2");
+        // clear（目标已 complete，服务仍持有 → 正常 clear）
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "goal.clear",
+            "payload": {"sessionId": "default", "ref": v["result"]["value"]["ref"].clone()},
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "goal.clear", &body);
+        assert_eq!(v["result"]["ok"], true, "goal.clear ok");
+        assert_eq!(v["result"]["value"]["cleared"], true);
+        // 再来一次 clear（ref 缺失 / 无当前目标）→ 幂等 cleared:true
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "goal.clear",
+            "payload": {"sessionId": "default", "ref": {"id": "goal-1", "revision": 99}},
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "goal.clear", &body);
+        assert_eq!(v["result"]["ok"], true, "clear no current goal idempotent");
+        assert_eq!(v["result"]["value"]["cleared"], true);
+        // 完全缺失 ref → bad-request（wire：ref 缺失或 revision<=0 → bad-request）。
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "goal.clear",
+            "payload": {"sessionId": "default"},
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "goal.clear", &body);
+        assert_eq!(v["result"]["ok"], false, "clear missing ref rejects");
+        assert_eq!(v["result"]["error"]["code"], "bad-request");
+    }
+
+    /// M4h：subagent.list 空目录 → entries=[], parentAvailable=true；subagent.history
+    /// → events=[], hasMore=false（诚实空实现）。
+    #[test]
+    fn rpc_subagent_list_empty_catalog() {
+        let boot = boot_with_sessions();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "subagent.list",
+            "payload": {"parentSessionId": "default"},
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "subagent.list", &body);
+        assert_eq!(v["result"]["ok"], true);
+        assert_eq!(v["result"]["value"]["entries"], serde_json::json!([]));
+        assert_eq!(v["result"]["value"]["parentAvailable"], true);
+        // history 诚实空
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "subagent.history",
+            "payload": {"parentSessionId": "default", "childSessionId": "c-1", "mode": "one-shot"},
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "subagent.history", &body);
+        assert_eq!(v["result"]["ok"], true);
+        assert_eq!(v["result"]["value"]["events"], serde_json::json!([]));
+        assert_eq!(v["result"]["value"]["hasMore"], false);
+    }
+
+    /// M4h：condergate 子代 —— subagent.prompt 仅 continuable；非 continuable → bad-request
+    /// （控制面 prompt_gate 的 wire 投影）。
+    #[test]
+    fn rpc_subagent_prompt_gates_mode() {
+        let boot = boot_with_sessions();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "subagent.prompt",
+            "payload": {"parentSessionId": "default", "childSessionId": "c-1", "mode": "one-shot"},
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "subagent.prompt", &body);
+        assert_eq!(v["result"]["ok"], false, "one-shot child cannot be prompted");
+        assert_eq!(v["result"]["error"]["code"], "bad-request");
+        // continuable → 诚实 messageId
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "subagent.prompt",
+            "payload": {"parentSessionId": "default", "childSessionId": "c-1", "mode": "continuable"},
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "subagent.prompt", &body);
+        assert_eq!(v["result"]["ok"], true);
+        assert!(v["result"]["value"]["messageId"].as_str().is_some());
+    }
+
+    /// M4h：commands/list 含 subagents 项（方法面扩展）。
+    #[test]
+    fn rpc_commands_list_includes_subagents() {
+        let boot = boot_with_sessions();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r10", "method": "commands/list", "payload": {}
+        })).unwrap();
+        let (_, v) = handle_rpc(&boot, "commands/list", &body);
+        assert_eq!(v["result"]["ok"], true);
+        let names: Vec<&str> = v["result"]["value"]
+            .as_array().unwrap()
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert!(names.contains(&"subagents"), "subagents command present: {names:?}");
+        assert!(names.contains(&"goal"));
+        assert!(names.contains(&"plan"));
+        assert!(names.contains(&"compact"));
+    }
+
+    /// M4h：Boot 挂载 todos 投影单元（ProjectionRegistry 注册成功）。
+    #[test]
+    fn boot_mounts_todos_projection() {
+        let boot = boot_with_sessions();
+        let reg = boot.projections.borrow();
+        let unit = reg.get("todos");
+        assert!(unit.is_some(), "todos projection unit registered");
+        assert_eq!(unit.unwrap().key(), "todos");
+        assert_eq!(unit.unwrap().state_version(), 2);
+    }
+
+    /// M4h：register_m4_tools 可注册 todo_write + 参数校验走 to_todo_list（执行兜底
+    /// 语义：空 todos → ToolArgsError/执行拒绝）。
+    #[test]
+    fn register_m4_tools_todo_write() {
+        use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
+        let registry = ToolRegistry::new(ToolExecutionMode::Native);
+        register_m4_tools(&registry);
+        // 注册成功 → 全局可见
+        assert!(registry.get("todo_write", None).is_some(), "todo_write registered+visible");
+        // 有效参数执行 OK（normalized todos 走 to_todo_list）。
+        let input = ToolExecutionInput::new(
+            "call-1",
+            "todo_write",
+            serde_json::json!({
+                "todos": [
+                    {"content": "write tests", "status": "in_progress"},
+                    {"content": "implement"},
+                ],
+            }),
+            Some("agent-1".to_string()),
+        );
+        let res = registry.execute(&input, None);
+        assert!(!res.is_error, "valid todos execute ok: {res:?}");
+        let val = res.value.unwrap();
+        let arr = val.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["content"], "write tests");
+        assert_eq!(arr[0]["status"], "in_progress");
+        // 空 content → 执行拒绝（to_todo_list EmptyContent）。
+        let input = ToolExecutionInput::new(
+            "call-2",
+            "todo_write",
+            serde_json::json!({"todos": [{"content": "  "}]}),
+            Some("agent-1".to_string()),
+        );
+        let res = registry.execute(&input, None);
+        assert!(res.is_error, "empty content rejected");
+        // 重复 content → 拒绝（DuplicateContent）。
+        let input = ToolExecutionInput::new(
+            "call-3",
+            "todo_write",
+            serde_json::json!({"todos": [
+                {"content": "dup", "status": "pending"},
+                {"content": "dup", "status": "completed"},
+            ]}),
+            Some("agent-1".to_string()),
+        );
+        let res = registry.execute(&input, None);
+        assert!(res.is_error, "duplicate content rejected");
+        // allowParallel=false 多个 in_progress → 拒绝（TooManyInProgress）。
+        let input = ToolExecutionInput::new(
+            "call-4",
+            "todo_write",
+            serde_json::json!({"todos": [
+                {"content": "a", "status": "in_progress"},
+                {"content": "b", "status": "in_progress"},
+            ]}),
+            Some("agent-1".to_string()),
+        );
+        let res = registry.execute(&input, None);
+        assert!(res.is_error, "two in_progress without allowParallel rejected");
     }
 }
