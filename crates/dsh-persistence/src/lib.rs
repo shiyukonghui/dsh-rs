@@ -6,6 +6,7 @@
 
 pub mod coordinator;
 pub mod format;
+pub mod fs_atomic;
 pub mod import;
 pub mod jsonl;
 pub mod seam;
@@ -14,6 +15,7 @@ pub mod zstd;
 
 pub use coordinator::*;
 pub use format::*;
+pub use fs_atomic::*;
 pub use import::*;
 pub use jsonl::*;
 pub use seam::*;

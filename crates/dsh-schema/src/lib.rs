@@ -315,7 +315,52 @@ impl Schema {
         let k = kind.to_string();
         Schema::with_meta(s, |m| m.badges.push((t, k)))
     }
-}
+
+    /// `role('secret')` 快捷：写保密槽位（settings redact 语义；角色名逐字对齐）。
+    pub fn secret(s: &SchemaRef) -> SchemaRef {
+        Schema::role(s, "secret")
+    }
+
+    /// meta 任意键（对齐 TS `Schema.prototype.extra(key, value)`——键直接落在
+    /// meta 顶层；重复键后者覆盖，`Null` 值等价删除）。
+    pub fn extra(s: &SchemaRef, key: &str, value: Value) -> SchemaRef {
+        Schema::with_meta(s, |m| {
+            let map = match m.extra.as_object_mut() {
+                Some(map) => map,
+                None => {
+                    m.extra = Value::Object(Default::default());
+                    match m.extra.as_object_mut() {
+                        Some(map) => map,
+                        // 上面刚赋值 Object，必 Some；兜底返回空对象。
+                        None => {
+                            m.extra = Value::Object(Default::default());
+                            m.extra.as_object_mut().unwrap()
+                        }
+                    }
+                }
+            };
+            if value.is_null() {
+                map.remove(key);
+            } else {
+                map.insert(key.to_string(), value);
+            }
+        })
+    }
+
+    /// S了一遍成为 wire JSON（对齐 Schemastery `Schema.prototype.toJSON`）。
+    ///
+    /// 输出 `{uid, refs}`：
+    /// - 每节点序列化为 `{type, meta, ...结构字段}`；`inner/list/dict/sKey`
+    ///   等嵌套 schema 引用以 **uid 数字** 占位（refs 键 = uid 字符串）；
+    /// - `callback`/`builder` 等函数在 wire 上不存在（JSON.stringify 跳过函数——
+    ///   对齐 TS：`preserve` 布尔仍输出，lazy 的 inner 只在已展开时输出）；
+    /// - uid 从 0 分配（前端 `new Schema({uid, refs})` 按 refs[uid] 重建，无所谓顺序）。
+    pub fn to_json(&self) -> Value {
+        let mut refs: serde_json::Map<String, Value> = serde_json::Map::new();
+        let mut next_uid = 0usize;
+        let root_uid = schema_to_json_node(self, &mut refs, &mut next_uid);
+        serde_json::json!({ "uid": root_uid, "refs": refs })
+    }}
 
 // ---- 校验 ----
 
@@ -946,4 +991,162 @@ pub fn schema_to_string(schema: &SchemaRef) -> String {
         }
     }
     fmt(schema, false)
+}
+
+/// 序列化一个 schema 节点为 wire JSON，并把整棵树写入 `refs`。返回分配的 uid。
+///
+/// 对齐 Schemastery `toJSON` 的 refs 表语义：节点自身不含 uid 字段，嵌套 schema
+/// 只以 uid 数字出现在结构字段（`dict`/`inner`/`list`/`sKey`）；`callback`/`builder`
+/// 等函数不出现；`lazy` 在被展开（LazyState.resolved 为 Some）时输出 inner。
+fn schema_to_json_node(
+    schema: &Schema,
+    refs: &mut serde_json::Map<String, Value>,
+    next_uid: &mut usize,
+) -> u64 {
+    let uid = *next_uid as u64;
+    *next_uid += 1;
+    let mut node = serde_json::Map::new();
+    // type 判别。
+    let type_name = match &schema.kind {
+        SchemaKind::Any => "any",
+        SchemaKind::Never => "never",
+        SchemaKind::Const(_) => "const",
+        SchemaKind::String => "string",
+        SchemaKind::Number => "number",
+        SchemaKind::Boolean => "boolean",
+        SchemaKind::Function => "function",
+        SchemaKind::Is(_) => "is",
+        SchemaKind::Bitset(_) => "bitset",
+        SchemaKind::Array(_) => "array",
+        SchemaKind::Dict { .. } => "dict",
+        SchemaKind::Tuple(_) => "tuple",
+        SchemaKind::Object(_) => "object",
+        SchemaKind::Union(_) => "union",
+        SchemaKind::Intersect(_) => "intersect",
+        SchemaKind::Transform { .. } => "transform",
+        SchemaKind::Lazy(_) => "lazy",
+        SchemaKind::Custom(name) => name.as_str(),
+    };
+    node.insert("type".to_string(), Value::String(type_name.to_string()));
+    // 结构字段（嵌套引用 → uid 数字）。`&Rc<Schema>` 经 deref 协变到 `&Schema`。
+    let mut child = |inner: &SchemaRef| schema_to_json_node(inner, refs, next_uid);
+    match &schema.kind {
+        SchemaKind::Const(v) => {
+            node.insert("value".to_string(), v.clone());
+        }
+        SchemaKind::Is(name) => {
+            node.insert("constructor".to_string(), Value::String(name.clone()));
+        }
+        SchemaKind::Bitset(bits) => {
+            let mut b = serde_json::Map::new();
+            for (k, v) in bits {
+                b.insert(k.clone(), Value::from(*v));
+            }
+            node.insert("bits".to_string(), Value::Object(b));
+        }
+        SchemaKind::Array(inner) => {
+            node.insert("inner".to_string(), Value::from(child(inner)));
+        }
+        SchemaKind::Dict { inner, s_key } => {
+            node.insert("inner".to_string(), Value::from(child(inner)));
+            node.insert("sKey".to_string(), Value::from(child(s_key)));
+        }
+        SchemaKind::Tuple(list) | SchemaKind::Union(list) | SchemaKind::Intersect(list) => {
+            let items: Vec<Value> = list.iter().map(child).map(Value::from).collect();
+            node.insert("list".to_string(), Value::Array(items));
+        }
+        SchemaKind::Object(dict) => {
+            let mut d = serde_json::Map::new();
+            let mut keys: Vec<&String> = dict.keys().collect();
+            keys.sort();
+            for key in keys {
+                d.insert(key.clone(), Value::from(child(&dict[key])));
+            }
+            node.insert("dict".to_string(), Value::Object(d));
+        }
+        SchemaKind::Transform { inner, preserve, .. } => {
+            node.insert("inner".to_string(), Value::from(child(inner)));
+            if *preserve {
+                node.insert("preserve".to_string(), Value::Bool(true));
+            }
+            // callback（函数）不序列化——对齐 JSON.stringify 跳过函数。
+        }
+        SchemaKind::Lazy(lazy) => {
+            if let Some(inner) = lazy.resolved.borrow().as_ref() {
+                node.insert("inner".to_string(), Value::from(child(inner)));
+            }
+        }
+        _ => {}
+    }
+    node.insert("meta".to_string(), meta_to_json(&schema.meta));
+    refs.insert(uid.to_string(), Value::Object(node));
+    uid
+}
+
+/// Meta → wire JSON（对齐 TS schema.meta 顶层键）。`extra` 的 object 键展开到
+/// meta 顶层（TS `extra(key, value)` 语义）；`Null` 键不输出；缺省值不输出。
+fn meta_to_json(meta: &Meta) -> Value {
+    let mut m = serde_json::Map::new();
+    if meta.required {
+        m.insert("required".to_string(), Value::Bool(true));
+    }
+    if meta.loose {
+        m.insert("loose".to_string(), Value::Bool(true));
+    }
+    if meta.hidden {
+        m.insert("hidden".to_string(), Value::Bool(true));
+    }
+    if meta.collapse {
+        m.insert("collapse".to_string(), Value::Bool(true));
+    }
+    if meta.disabled {
+        m.insert("disabled".to_string(), Value::Bool(true));
+    }
+    if let Some(v) = &meta.default {
+        m.insert("default".to_string(), v.clone());
+    }
+    if let Some((source, flags)) = &meta.pattern {
+        m.insert(
+            "pattern".to_string(),
+            serde_json::json!({ "source": source, "flags": flags }),
+        );
+    }
+    if let Some(v) = meta.min {
+        m.insert("min".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = meta.max {
+        m.insert("max".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = meta.step {
+        m.insert("step".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = &meta.role {
+        m.insert("role".to_string(), Value::String(v.clone()));
+    }
+    if let Some(v) = &meta.description {
+        m.insert("description".to_string(), Value::String(v.clone()));
+    }
+    if let Some(v) = &meta.comment {
+        m.insert("comment".to_string(), Value::String(v.clone()));
+    }
+    if let Some(v) = &meta.link {
+        m.insert("link".to_string(), Value::String(v.clone()));
+    }
+    if !meta.badges.is_empty() {
+        let badges: Vec<Value> = meta
+            .badges
+            .iter()
+            .map(|(text, kind)| serde_json::json!({ "text": text, "type": kind }))
+            .collect();
+        m.insert("badges".to_string(), Value::Array(badges));
+    }
+    // extra object 键展开到 meta 顶层（TS `meta[key]=value` 语义）。
+    if let Some(extra) = meta.extra.as_object() {
+        for (k, v) in extra {
+            if !v.is_null() {
+                m.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Value::Object(m)
 }

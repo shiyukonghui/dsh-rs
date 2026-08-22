@@ -12,6 +12,8 @@ members = [
   # agent 注册表 / agent loop / interaction 审批链
   "crates/dsh-scope", "crates/dsh-tools", "crates/dsh-system-prompt",
   "crates/dsh-agent", "crates/dsh-agent-loop",
+  # M3 宿主（PLAN §6）：settings/credentials 能力缝 + file 提供者（web gui 配置面）
+  "crates/dsh-settings", "crates/dsh-credentials",
 ]
 
 [workspace.package]

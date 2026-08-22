@@ -1593,4 +1593,53 @@ create_directory_real_fs 集成）；dsh-cli lib 53/53；clippy `-D warnings` �
 
 ---
 
+## D-039（M3b 落地）：dsh-schema::to_json + dsh-persistence::atomic_write + dsh-settings
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M3b 把 settings wire 面做成真实语义——describe/update/replace/mutate +
+redact + 文件持久化。依赖两段基建（D-037 决策的兑现）：dsh-schema 缺 `to_json`；
+dsh-persistence 的原子写是 jsonl 私有方法。
+
+**实现要点（对齐 TS 语义）**：
+1. **`dsh_schema::Schema::to_json`**：输出 `{uid, refs:{uid-str: node}}`；嵌套 schema 引用以
+   uid 数字占位；`callback`/`builder` 函数不上 wire（对齐 JSON.stringify 跳函数，preserve 布尔
+   保留）；lazy 只在 resolved 时输出 inner；uid 从 0 自增（前端 `new Schema({uid,refs})` 按
+   refs[uid] 重建，数字本身无关）。**M3 差异**：TS 的 `__schemastery_refs__` 全局共享态 + 同一
+   schema 实例只序列化一次（DAG 去重）未复刻——每次 `child()` 重新分配 uid → 共享 Rc 节点产生
+   两份拷贝（wire 冗余但语义相等）。settings registry 无语义循环，故递归有界。
+2. **`dsh_persistence::fs_atomic::atomic_write`**：从 jsonl `write_tmp_then_publish` 抽取的公共
+   小函数，差异是 **可覆盖既有文件**（settings 反复改写）；temp create_new + sync + rename，
+   失败清理 temp；带 `Other` 错误与父目录 mkdir。
+3. **`Schema::extra(key,value)` / `secret()` 组合子**：对齐 TS `Schema.prototype.extra`
+   （meta 顶层键）+ `role('secret')` 快捷，供 settings namespace schema 构造。
+4. **dsh-settings crate**：`SettingsProvider::{memory,file}`；register（不预插空 section →
+   user 层省略对 TS `section()` undefined）；describe 三层 redact + schema.to_json + revision；
+   update=merge / replace=wholesale / mutate=path ops（set 建中间对象、unset 递归删除、空路径
+   指根）；revision conflict → `SETTINGS_CONFLICT`（expected/actual）；commit 前 schema
+   resolve 校验拒绝；file 模式把 `{ns: section}` 全量 YAML 原子写（**M3 差异**：不做 TS 的
+   comment-preserving leaf-diff，非目标 D-037）。
+
+**redact 移植要点**：role 在 Schema.meta 而非 kind → 全程 `&SchemaRef` 走；object 属性即使
+值缺失也枚举 slot（`set:false`）但**不输出该键**（TS `undefined` 哨兵 → Rust `Option` 全链路
+`None`＝不呈现）；未声明到 schema 的额外键保留。dict/array 只在拥有该位置时枚举。
+
+**过程中的测试修正**：
+- `Map` 不实现 `Index<String>` → `refs[key.as_str()]`；索引返回 `&Value` 需 `&refs[...]`。
+- redact 首版以 `SchemaKind` 为递归载体漏掉 meta.role 判定 → 改 `&SchemaRef`；缺失键初版输出
+  `Null`（错）→ Option 全链路修平，与 TS undefined 语义一致。
+- `mutate_path_ops` 循环构造 Value 的借用问题 → 退用「wrong-typed patch → Invalid」断言
+  （serde_json::Value 无法表达真循环，M3b 该层本就无循环输入；真循环在 M3d wire 层 Zod 拒）。
+- `replace_wholesale_and_reset` 暴露 register 预插空 section 的 user 呈现错误 → 改为不预插。
+
+**验证**：dsh-schema to_json 11 测试 + persistence atomic_write 3 测试 + settings lib/集成
+11 测试全绿；dsh-schema/dsh-persistence/dsh-settings 三 crate 全量绿；clippy `-D warnings`
+零告警。
+
+**预期影响与回滚点**：新增 `crates/dsh-settings` + `dsh-schema::to_json`/`extra`/`secret` +
+`dsh-persistence::fs_atomic`。回滚撤相关提交即可；dsh-schema/persistence 改动为纯增量
+（新增 pub API + 模块，未改既有行为）。
+
+---
+
 
