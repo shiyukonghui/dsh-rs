@@ -1786,4 +1786,47 @@ pickDirectory & openDocument 诚实降级 / discoverModels 空。
 
 ---
 
+## D-044（M4 需求分析+M3 差异）：M4 长任务编排需求结论 + 双域语义分界
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M3 验收通过后进入 M4（长任务编排与子代理：goal + subagent + schedule +
+jobs + workflow + plan/todo + interaction/users）。按瀑布流先做需求分析，产出
+`M4-REQUIREMENTS.md`。关键难点：M4 范围大且混合「纯逻辑可单线程」与「硬依赖外部进程/JS
+引擎」两类子域，需要第一性原理划界，避免把不可避免的桩伪装成实现。
+
+**结论（需求结论，契约事实全部来自逐行阅读参考源码 + 两份子代理语义报告）**：
+- **web RPC 方法面只有 10 个**：`goal.*`（create/edit/pause/resume/complete/clear）6 +
+  `subagent.*`（list/history/prompt/interrupt）4（权威：rpc-map.ts）。**jobs/schedule/
+  workflow/todo 不在 web RPC 上**，以宿主服务/工具/事件/投影承载。
+- **可完整单线程落地（纯域 + 复用既定基础设施）**：goal（CAS 状态机 + 事件溯源，无外部
+  backend）、plan-mode（log 派生投影）、subagent in-process（spawn/fork 两 provider）、
+  jobs 注册表（状态机 + 授权 + 子代理 producer）、schedule（fold 重放 + followup 注入）、
+  todo（todo/write 事件 + 投影 + 工具）。
+- **必须保持诚实桩**：workflow JS 执行引擎（node:vm/worker 不可低成本复刻）、out-of-process
+  subagent provider（acp/claude-code/codex/dsh-sdk，真实 OS 进程属 M5）、jobs 的宿主
+  subprocess producer（bash/pwsh/terminal，M5）。
+- **最大既有资产（自底向上核实）**：`dsh-session::EventKind` 词表 + payload 变体**已预留
+  全部 M4 事件**（goal/change、plan/mode、subagent/descriptor、schedule/change、todo/write、
+  command/run、command/done、tool-workflow/*）；`dsh-session-query::ProjectionRegistry` 已
+  完整；`dsh-agent-loop::AgentLoopHost.followup/events/teardown` 已就绪；`dsh-tools::ToolRegistry`
+  已就绪；`dsh-persistence`（atomic_write + SessionPersistence）已就绪 → M4 工作量集中在域
+  逻辑 + RPC 接线 + 投影注册，几乎不新建基础设施。
+
+**决策展开**：
+- 新增 crate：`dsh-goal`（纯域 + round-driver 判定）、`dsh-plan`（轻投影 + exit 工具）、
+  `dsh-subagent`（provider/inproc/catalog/control）、`dsh-jobs`（注册表 + job 工具）、
+  `dsh-schedule`（fold/规则）、`dsh-workflow`（meta 校验 + 事件骨架）。
+- subagent cold resume 复用 JSONL 持久化（激活边界 = seedLength）；无持久化 →
+  `PERSISTENCE_UNAVAILABLE`。
+- goal/plan/subagent/jobs/todos 投影挂载到既有 ProjectionRegistry（M4h 装配）。
+- workflow 差异明确：只做 meta 校验/事件骨架/致命 code/result materialize 规则的诚实桩。
+- 非目标重申：不新增 web RPC 方法、不引入多线程、不破 D-004 单线程核心。
+
+**预期影响与回滚点**：M4 是独立里程碑；各子步独立 crate + 提交可回滚。M4a-M4i 八个子步
+按文档依赖序推进，每步绿 + DECISIONS + git。真浏览器 E2E 留 M4+（环境不可跑，延续
+D-022/D-036 handle_rpc_host 代偿）。
+
+---
+
 
