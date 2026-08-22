@@ -2071,4 +2071,55 @@ dsh-tools 完成；本子步交付其校验与投影数据面。workflow 桩仅�
 
 ---
 
+## D-052（M4h web.rs 接线）：10 RPC 实做 + todos 投影挂载 + M4 工具注册点
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M4 收口集成——把 M4a-M4g 纯域接到 `crates/dsh-cli/src/web.rs` 的
+`handle_rpc_host`，替换 goal.*/subagent.* 空桩，挂投影（todo），扩展 commands/list，
+注册 M4 工具。
+
+**结论**：
+- `Boot` 增字段：`goal: Rc<RefCell<GoalService>>`（GoalService::new(ServiceOptions::default)）
+  + `projections: Rc<RefCell<ProjectionRegistry>>`；boot() 组装时注册
+  `todos_projection_unit().into_unit()`（注册失败静默容忍，投影是可选能力）。dsh-cli
+  Cargo.toml 增 dsh-goal/dsh-subagent/dsh-session-query path 依赖。
+- **goal.\* 6 RPC**：全部经 boot.goal.borrow_mut() 真实状态机。create（objective 空 →
+  GOAL_INVALID_OBJECTIVE；maxGoalRounds 报 0 哨兵走 InvalidMaxRounds）/ edit（须 ref +
+  objective 或 maxGoalRounds 至少一，否则 bad-request；CAS 错 → GOAL_STALE_REVISION）/
+  pause/resume/complete（须 ref）→ 响应 `{ref:{id,revision(递增)}}`；错误统一
+  GoalServiceError::code()。clear 须 ref，**NotFound → 幂等 `{cleared:true}`**（对齐 TS
+  clear 无 current goal 的 no-op），其余错误透传。全部带 sessionId 必填校验。
+- **subagent.\* 4 RPC**：list 经 catalog 纯函数投影为空目录 `{entries:[], parentAvailable:
+  true}`（subagent_entry_wire 走 ChildEntry → camelCase hasChildren/label/reason；无真实
+  子代理运行时 → 诚实空 + wire 形状留好供真实源接入）；history 诚实空 `{events:[],hasMore:
+  false}`；prompt 走 control::prompt_gate（非 continuable → bad-request）+ 诚实合成
+  messageId；interrupt 走 interrupt_receipt → `{accepted:true}`。
+- **commands/list**：保留 compact/plan/goal + 新增 subagents 项。
+- **M4 工具注册点**：`pub fn register_m4_tools(&ToolRegistry)` 注册 todo_write（描述 +
+  执行经 to_todo_list 校验 Empty/Duplicate/TooManyInProgress → 拒）。**差异**：harness 无
+  持久 ToolRegistry 注入点（Boot 不持有）→ 不强制挂 boot 链，以独立注册函数 + 单测证明
+  可注册与校验路径（M4i/M5 若宿主开放 registry 再真挂）。jobs/schedule/workflow：M4e/f/g
+  已为纯域，不在 web RPC 方法表（D-044 已定），本子步不新增 RPC 分支。
+- **测试 9 个**：goal.create 真实 ref（id=goal-1, revision=1）、缺 objective 拒、缺
+  sessionId 拒、complete→clear 全链路（含 ref 缺失 → bad-request 分叉）、subagent.list
+  空目录、prompt 门（非 continuable 拒）、commands/list 含 subagents、Boot 挂载 todos
+  投影、register_m4_tools todo_write。原有 `rpc_extended_method_surface_ok` 冒烟用例改为
+  按方法给最小合法 payload（对齐 M3a 对 host.createDirectory 的处理——真实方法需要入参）。
+- 全仓验证（父会话复核）：143 组 test-result 全 ok（0 failed，1000+ 测试）+ 
+  `cargo clippy --workspace --all-targets -D warnings` exit 0 零告警。
+
+**差异记录**：
+- subagent.list/history 为诚实空实现（无真实子代理运行时），非伪装数据；wire 形状完备，
+  真实目录源（M5 in-process driver 或持久化日志）接入时只换 rows 源不换 wire。
+- clear 的 NotFound→cleared:true 是无当前 goal 时的幂等 no-op（对齐 TS），与
+  create/edit/pause 的 NotFound→GOAL_NOT_FOUND 错误语义分叉——这是刻意对齐参考的行为
+  （TS GoalService::clear 对无 current goal 返回 cleared:true），如实实现。
+
+**预期影响与回滚点**：Boot 字段新增、10 RPC 真实现、投影/工具注册——均由 M4a-M4g 纯域
+驱动，回滚撤 1ccd261 即可整体回退到 20497c6（M4g 桩后状态）。M4h 是 M4 全部编码的集成
+收口，M4i 将据 D-044 验收标准做 M4-ACCEPTANCE。
+
+---
+
 
