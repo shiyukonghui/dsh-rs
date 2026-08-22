@@ -1551,4 +1551,46 @@ guard 切片。回滚：撤相关提交即可，不影响既有 crate（dsh-sche
 
 ---
 
+## D-038（M3a 落地）：host 目录方法面（host_dir）真实 fs 实现
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M3a 把 web.rs 的 `host.listDirectory`/`host.createDirectory` 从空桩推成真实
+fs 实现，对齐 `@deepseek-ai/dsh-host-directory-picker-browse`。
+
+**实现要点（每个 = 一处参考对齐）**：
+1. **`fully_qualified` 平台敏感**：Windows 只收盘符限定（`C:\…`/`C:/…`）或完整 UNC
+   （`\\server\share…`，server 与 share 两级非空）；POSIX 用 `Path::is_absolute`。**红线**：
+   TS 的 win32 `isAbsolute('/a')` 为 true 但 browse 的 `fullyQualified` 正则拒之——Rust
+   侧显式实现等价判定（非 `/` 根相对误判）。
+2. **有界窗口**：`bounded_insert(window, cand, keep=max_entries+1)`——满窗且 name≥尾 O(1) 拒，
+   否则二分插入；驱逐 = truncated 证据。对齐 browse maxEntries=1000 默认。
+3. **symbolic link stat 探针**：dirent 命中目录直接放行；symlink `std::fs::metadata` 探针，
+   可进入（is_dir）才出 row，broken/循环静默跳。
+4. **hidden 前缀**：`name.starts_with('.')`（POSIX 习惯；Windows hidden 属性 dirent 不暴露，
+   差异记录）。
+5. **createDirectory**：父 fully-qualified 围栏 + 段名校验（空/`.`/`..`/含 `/\` 拒，文案逐字
+   `"…" is not a single path segment`）→ `std::fs::create_dir` 非递归；`AlreadyExists →
+   directory-exists`（`{path} already exists`）、其余 → `directory-create-failed`
+   （`cannot create {path}: {err}`）。
+6. **web.rs 接线**：listDirectory 错误 code 直透（directory-unreadable 等）；host.describe 补
+   `home`。pickDirectory 保持 `{path:null}`（无 native dialog 诚实降级）；openPath 记录并按
+   payload 校验（空 path → bad-request），openPath 真实 OS opener 留 M4（无桌面 opener）。
+
+**过程中的测试修正（平台假设错误，非行为缺陷）**：
+- `fully_qualified` 初始 POSIX 测试在 Windows 上误把 `/a/b` 当 absolute——测试改为 `cfg!(windows)`
+  分岐（Windows 语义 + POSIX 语义各自断言），对应 TS 平台的 fullyQualified。
+- `normalize_without_fs` 输出为 OS 原生分隔；测试期望改为 `cfg!(windows) ? "\\a\\c\\d" : "/a/c/d"`
+  （原先用 `Path::new("/a").join(...)` 在 Windows 产生混合分隔符怪癖）。
+- `host.createDirectory`/`host.openPath` 从「空 payload 恒 ok」的 extended-method-surface 测试
+  移除（做实后空 payload 是合法错误），由专用集成测试覆盖。
+
+**验证**：`host_dir` 12 测试 + web.rs 27 测试全绿（新增 list_directory_real_fs /
+create_directory_real_fs 集成）；dsh-cli lib 53/53；clippy `-D warnings` 零告警。
+
+**预期影响与回滚点**：新增 `crates/dsh-cli/src/host_dir.rs`（独立可测模块）+ web.rs 接线。
+回滚：撤提交仅影响 dsh-cli 方法面，其余 crate 零改动。
+
+---
+
 

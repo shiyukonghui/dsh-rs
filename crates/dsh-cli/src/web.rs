@@ -776,28 +776,55 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
                 "version": env!("CARGO_PKG_VERSION"),
                 "cwd": cwd,
                 "attachedSessions": attached,
+                "home": crate::host_dir::home_dir(),
                 "canOpenPath": true,
             }})
         }
         "host.pickDirectory" => {
+            // M3a：无 native dialog 的诚实降级——`{path:null}` 对齐「用户取消」语义。
             serde_json::json!({"ok": true, "value": {"path": null}})
         }
         "host.listDirectory" => {
-            let cwd = std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            serde_json::json!({"ok": true, "value": {
-                "path": cwd, "home": cwd, "crumbs": [], "entries": [], "truncated": false,
-            }})
+            // M3a：真实 fs 列目录（browse capability；默认列 home）。
+            let path = payload.get("path").and_then(|p| p.as_str());
+            match crate::host_dir::list_directory(path, 1000) {
+                Ok(listing) => serde_json::json!({"ok": true, "value": {
+                    "path": listing.path,
+                    "home": listing.home,
+                    "crumbs": listing.crumbs.iter().map(|c| serde_json::json!({
+                        "name": c.name, "path": c.path, "hidden": c.hidden,
+                    })).collect::<Vec<_>>(),
+                    "entries": listing.entries.iter().map(|e| serde_json::json!({
+                        "name": e.name, "path": e.path, "hidden": e.hidden,
+                    })).collect::<Vec<_>>(),
+                    "truncated": listing.truncated,
+                }}),
+                Err(e) => serde_json::json!({"ok": false, "error": {
+                    "code": e.code, "message": e.message,
+                }}),
+            }
         }
         "host.createDirectory" => {
-            let path = std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            serde_json::json!({"ok": true, "value": {"path": path}})
+            // M3a：真实创建单段子目录（browse capability）。
+            let parent = payload.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            let name = payload.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            match crate::host_dir::create_directory(parent, name) {
+                Ok(path) => serde_json::json!({"ok": true, "value": {"path": path}}),
+                Err(e) => serde_json::json!({"ok": false, "error": {
+                    "code": e.code, "message": e.message,
+                }}),
+            }
         }
         "host.openPath" => {
-            serde_json::json!({"ok": true, "value": {"opened": true}})
+            // M3a：无桌面 opener 的诚实降级——记录目标并回报 opened（差异见 D-037）。
+            let path = payload.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            if path.is_empty() {
+                serde_json::json!({"ok": false, "error": {
+                    "code": "bad-request", "message": "path is required",
+                }})
+            } else {
+                serde_json::json!({"ok": true, "value": {"opened": true}})
+            }
         }
         "sessions" | "session.list" => {
             // M1e：SessionStore 提供权威列表（创建顺序、失活/空判定）。
@@ -1267,7 +1294,7 @@ mod tests {
     }
 
     /// 阶段2：host.describe 返回对齐 hostDescribeValueSchema 的形状
-    /// （{version, cwd, attachedSessions, canOpenPath}）。
+    /// （{version, cwd, attachedSessions, home, canOpenPath}；M3a 补 home）。
     #[test]
     fn rpc_host_describe_shape() {
         let boot = boot_with_sessions();
@@ -1281,6 +1308,79 @@ mod tests {
         assert!(val["cwd"].as_str().is_some());
         assert!(val["attachedSessions"].as_u64().is_some());
         assert_eq!(val["canOpenPath"], true);
+        let home = val["home"].as_str().expect("host.describe.home present (M3a)");
+        assert!(!home.is_empty());
+    }
+
+    /// M3a：host.listDirectory 经 /api 返回 DirectoryListing 形状，且真实包含
+    /// 一个测试目录（browse capability 真实 fs 读）。
+    #[test]
+    fn rpc_host_list_directory_real_fs() {
+        let boot = boot_with_sessions();
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-web-list-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("alpha")).unwrap();
+        std::fs::create_dir_all(dir.join(".zeta")).unwrap();
+        std::fs::write(dir.join("file.txt"), "x").unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "host.listDirectory",
+            "payload": {"path": dir.to_str().unwrap()},
+        })).unwrap();
+        let (status, v) = handle_rpc(&boot, "host.listDirectory", &body);
+        assert_eq!(status, 200);
+        assert_eq!(v["result"]["ok"], true);
+        let val = &v["result"]["value"];
+        let entries = val["entries"].as_array().expect("entries array");
+        assert!(entries.iter().any(|e| e["name"] == "alpha"), "alpha row");
+        assert!(entries.iter().any(|e| e["name"] == ".zeta" && e["hidden"] == true), ".zeta hidden row");
+        assert!(!entries.iter().any(|e| e["name"] == "file.txt"), "non-dir skipped");
+        assert!(val["crumbs"].as_array().is_some() && !val["crumbs"].as_array().unwrap().is_empty());
+        assert_eq!(val["truncated"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M3a：host.createDirectory 真实创建；重复 → directory-exists 错误链路。
+    #[test]
+    fn rpc_host_create_directory_real_fs() {
+        let boot = boot_with_sessions();
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-web-create-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |name: &str| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": "host.createDirectory",
+                "payload": {"path": dir.to_str().unwrap(), "name": name},
+            })).unwrap();
+            handle_rpc(&boot, "host.createDirectory", &body)
+        };
+        // 相对父 → directory-create-failed。
+        let mk_rel = || {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": "host.createDirectory",
+                "payload": {"path": "relative/parent", "name": "x"},
+            })).unwrap();
+            handle_rpc(&boot, "host.createDirectory", &body)
+        };
+        let (_, v) = mk("nested");
+        assert_eq!(v["result"]["ok"], true);
+        assert_eq!(
+            v["result"]["value"]["path"],
+            dir.join("nested").to_string_lossy().to_string()
+        );
+        assert!(dir.join("nested").is_dir());
+        let (_, dup) = mk("nested");
+        assert_eq!(dup["result"]["ok"], false);
+        assert_eq!(dup["result"]["error"]["code"], "directory-exists");
+        let (_, rel) = mk_rel();
+        assert_eq!(rel["result"]["ok"], false);
+        assert_eq!(rel["result"]["error"]["code"], "directory-create-failed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 阶段2：session.list 返回对齐 sessionListValueSchema 的形状
@@ -1512,8 +1612,8 @@ mod tests {
             ("session.updateQueue", "accepted", "bool"),
             ("host.pickDirectory", "path", "null"),
             ("host.listDirectory", "entries", "arr"),
-            ("host.createDirectory", "path", "str"),
-            ("host.openPath", "opened", "bool"),
+            // M3a：host.createDirectory/host.openPath 已做实，空 payload 不再是
+            // 合法 ok 响应（create 需 path+name、openPath 需 path）→ 由专用测试覆盖。
             ("workspace.create", "workspace", "obj"),
             ("workspace.rename", "workspace", "obj"),
             ("workspace.delete", "deleted", "bool"),

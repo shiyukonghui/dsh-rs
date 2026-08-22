@@ -22,6 +22,9 @@ use dsh_wasmrt::{Capabilities, DshServicesPlugin, WasmLoopPlugin};
 /// `dsh web`——服务 DeepSeek Harness 前端 + `/api` RPC（M70）。
 pub mod web;
 
+/// M3a host 目录方法面（listDirectory/createDirectory 真实 fs 实现，可差分单测）。
+pub mod host_dir;
+
 /// M1e SessionHost：把 WASM loop 的 SessionLog 事件 adopt 进 dsh-session store，
 /// 并挂载持久化（dsh-persistence coordinator event 回调）。
 pub mod session_host;
