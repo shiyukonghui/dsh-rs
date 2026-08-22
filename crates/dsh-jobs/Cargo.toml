@@ -1,0 +1,12 @@
+[package]
+name = "dsh-jobs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Rust port of the dsh jobs capability seam (background job registry state machine, authorization fence, id allocation, lifecycle)."
+
+[dependencies]
+dsh-session = { path = "../dsh-session" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1961,4 +1961,35 @@ agent idle 时自动发起下一轮（goal-round-driver），对齐
 
 ---
 
+## D-049（M4e dsh-jobs）：任务注册表状态机 + 授权围栏 + first-wins 结算
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M4 第五子块 = jobs（后台任务注册表）。web RPC 上不暴露 jobs——以宿主
+`session/jobs` 帧 taskViewSchema 投影承载。本子步交付注册表纯语义（单线程拉式结算）。
+
+**结论**：
+- `registry.rs`：`JobRegistry` 状态机——`running` →（可选 `stopping`）→ 恰一终态
+  （completed|killed|failed）；id = `<kind>-N`（每 kind 独立计数器）；`start` 前置校验
+  （空 kind/label→EmptyKind/EmptyLabel、owner 活跃上限→OwnerQuota）→ producer() →
+  登记（startedAt）；`kill` running→停 + on_cancel + 置 stopping（terminated →
+  AlreadyFinished）；`settle` first-wins（终态已定即忽略后到，finishedAt 落）；`read`
+  幂等 final-output（从不消费）+ 承诺 reported；`get/list` 授权围栏（owner 只见自己 +
+  无主）；`view` 输出 JobView wire（id/kind/label/status/detail?/startedAt/finishedAt?，
+  绝无 owner/reported 泄漏）。
+- producer 是同步 `run() -> Hooks`（on_cancel + read_output），单线程模型不引入后台线程
+  （D-004）；结算由宿主在 settle 时机显式调用。
+- 测试 11 绿：id 分配、start 拒空、owner 配额、生命周期 kill→stopping→killed first-wins、
+  completed 直结、授权围栏、read 幂等、ops 错误、reported 抑制、view wire 形状、list 隔离。
+- clippy -D warnings 零告警（doc 列表项 + Default derive）。
+
+**差异记录**：子代理 producer（subagent job）在此只占 kind 命名空间；真实 in-process
+driver 投递由 M4h 提供。bash/pwsh/terminal producer 为 M5 subprocess。view 即 web
+`session/jobs` 帧的 taskViewSchema。
+
+**预期影响与回滚点**：纯内存单线程注册表，独立 crate。回滚撤提交即可；M4h 接宿主事件循环
+驱动 settle + session/jobs 帧。
+
+---
+
 
