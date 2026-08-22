@@ -1758,4 +1758,32 @@ chain 五态 / include-exclude / per-agent / reset / drop）；dsh-tools 全量�
 
 ---
 
+## D-043（M3f 收口）：M3 验收通过 + 差异归档（M3-ACCEPTANCE.md）
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M3 六子步（M3a host 目录 / M3b settings+基建 / M3c credentials / M3d web
+接线 / M3e guard）全部落地，进入 M3f 验收——按 M3-REQUIREMENTS §5 七条验收标准逐项核对，
+并生成阶段关卡工件（M3-ACCEPTANCE.md）。
+
+**结论**：7/7 验收标准全部满足。
+1. `cargo test --workspace` 全绿（0 failed）+ clippy `-D warnings` 零告警。
+2. host 目录真实 fs 测试（temp 目录/点文件/大目录/hidden/truncated/文案逐字）。
+3. settings 注册→describe(redact)→update(merge)→mutate(path-op)→replace(reset)→
+   revision conflict + 文件落盘重启恢复。
+4. credentials resolve/describe/set/unset + shadowed/空值/幂等 unset + `.credentials.yaml`
+   落盘恢复。
+5. web.rs 12 方法（settings 5 + credentials 3 + host 4）全部 handle_rpc_host 真实服务驱动。
+6. guard TOOL_TIMEOUT + gentle/detailed 消息逐字。
+7. 每子步 D-038…D-043 ↔ 提交 f7c698f/b61a1fa/3da232b/bd5e853/c81cf18 互查。
+
+**差异归档**（M3 内对 TS 语义的有意取舍，非缺陷）：无 OS watch / 无 YAML 注释保真
+leaf-diff / credentials 两层 / revision 不持久化 / guard 同步 wall-clock（无抢占）/
+pickDirectory & openDocument 诚实降级 / discoverModels 空。
+
+**预期影响与回滚点**：M3 是独立里程碑；M4 M2 规划内后续里程碑（agent-loop guard 完整
+接线、credentials records、settings 文件 provider 缺省路径、真浏览器 E2E）在遗留清单。
+
+---
+
 
