@@ -174,6 +174,41 @@
 
 ---
 
-*验收执行：父会话（0 号 agent）旗舰复核 + SA-1..SA-4 子块独立验收（子代理）均已返回；全仓
-回归 + clippy -D warnings 在本报告汇总。流水线：M4 编码（TDD）→ 本验收 → D-053 决策日志与
-git 提交，进入部署（M5）前置条件已齐。*
+## 附：运行复核记录（本轮实跑确认）
+
+> 以下数字在撰写本报告后的独立复查 round 中全部**重新实跑确认**（非仅引用历史日志），
+> 作为审查者可直接复现的最新证据快照。
+
+```text
+$ cargo test --offline --workspace
+  1130 passed / 0 failed          # 全仓（143 组 test-result 全 ok）
+
+$ cwd crates 级主验收套件（各套件独立实跑）
+  dsh-goal   --test m4_goal_round_driver : 9 passed
+  dsh-goal   --test m4_goal_change       : 6 passed
+  dsh-schedule --test m4_schedule_inject : 9 passed
+  dsh-tools  --test m4_tools             : 16 passed
+  dsh-jobs   --test m4_jobs_supplement   : 8 passed
+  dsh-session-query --test m4_units      : 7 passed
+
+$ cargo test --offline -p dsh-cli --lib
+  81 passed / 0 failed            # 含 fake-loop 端到端 3 项 + 工具 bind/注入 + 投影
+
+$ 验收引用的 8 个 web 测试名均已 --list 确认存在
+  goal_round_driver_drives_real_agent_round
+  todo_tool_with_host_lands_todo_write_and_projection_folds
+  register_m4_tools_with_job_registry_binds_really
+  register_m4_tools_with_schedule_host_injects_due
+  schedule_host_create_then_delete
+  rpc_subagent_prompt_drives_real_child_agent_round
+  rpc_subagent_prompt_gates_and_drives_fake_loop
+  register_all_m4_tools_unbound_fail_loud
+
+$ cargo clippy --offline --workspace --all-targets -- -D warnings
+  exit 0                           # 零告警
+```
+
+**复核结论**：M4-ACCEPTANCE 全部十项验收所依赖的证据均存在且可复现；git 工作树干净
+（HEAD=`3be790e`，D-053 补齐收口提交之上无未提交改动）。
+
+---
