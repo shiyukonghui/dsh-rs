@@ -551,11 +551,14 @@ dependencies = [
  "dsh-agent-loop",
  "dsh-brand",
  "dsh-core",
+ "dsh-credentials",
  "dsh-llm",
  "dsh-loader",
  "dsh-persistence",
+ "dsh-schema",
  "dsh-scope",
  "dsh-session",
+ "dsh-settings",
  "dsh-system-prompt",
  "dsh-tools",
  "dsh-wasmrt",
@@ -588,6 +591,17 @@ dependencies = [
  "native-tls",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "dsh-credentials"
+version = "0.1.0"
+dependencies = [
+ "dsh-persistence",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -687,6 +701,17 @@ dependencies = [
  "dsh-session",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "dsh-settings"
+version = "0.1.0"
+dependencies = [
+ "dsh-persistence",
+ "dsh-schema",
+ "serde",
+ "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
