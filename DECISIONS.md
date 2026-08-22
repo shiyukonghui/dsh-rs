@@ -1514,7 +1514,40 @@ core/tools + core/scope + interaction（permission/user-approval/commands）」�
 credentials/guard 宿主化 + 真实 provider + 浏览器 E2E）。M1 既有 WASM loop 路径零回归
 （agent_loop=None 分支不变）；web Rust loop 路由为可选叠加。
 
+---
 
+## D-037（M3 需求分析）：web.rs 空桩方法面做实 + settings/credentials 宿主化 + guard 最小切片
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M3 按 PLAN §6 = host/api 全方法面（directory-picker / frontend-static /
+plugin-inventory / webserver）+ settings/credentials/guard，把 web.rs 的 `host.*` 目录方法、
+`settings.*`、`credentials.*` 空桩全部做实并落 `$DSH_HOME` 持久化。需求经第一性原理 +
+双视角（参考源码逐行核对 wire schema / 服务缝 / 文件提供者）收敛，工件见
+`M3-REQUIREMENTS.md`。
+
+**考虑的选项 / 关键决策**：
+1. **schema 求值复用 dsh-schema（采用）**：settings 的 `resolve(defaults→base→user)` 直接包
+   M4 移植的 Schemastery `resolve()`；只在 `dsh-schema` 补 `to_json()`（`{uid, refs}` wire
+   形状）。不重写 schemastery。
+2. **文件格式 YAML 默认（采用）**：settings.yaml/`.credentials.yaml` 对齐 TS 默认；原子写复用
+   dsh-persistence 的 write_tmp_then_publish 形态（抽出 `atomic_write` 公共小函数）。
+3. **hot-reload 不引入 OS watch（采用）**：无 chokidar 等价跨平台依赖；写路径自一致 + 启动读，
+   外部编辑热更新留后续（差异记录：M3 不做 OS 级 watch）。
+4. **凭据分层 env→file 两层（采用）**：.env（project/user）解析留 M5 服务层；web gui 主要用
+   file 层，shadowed 拒绝语义保留。
+5. **guard 最小切片（采用）**：timeout wrapper（TOOL_TIMEOUT 逐字）+ repeat-reminder 阈值
+   pure 逻辑（[3,5,8] 逐字）；完整 agent-loop 接线依赖 M5 通道，留 seam。
+6. **浏览器 E2E 代偿（沿用 D-022/D-036）**：无浏览器/无 key/out 网络阻断 → handle_rpc_host
+   集成测试为 M3 阶段验收主通道；真浏览器收口顺延 M4+。
+
+**选择理由**：M3 的重点是把「前端可感知的方法面」从空桩推成真实语义——settings/credentials
+是纯数据语义（可单测、可差分），directory-picker 是纯 fs 函数 + 围栏（可测），guard 是事件
+语义不 new 状态机；全部不触碰核心并发模型。
+
+**预期影响与回滚点**：新增 `crates/dsh-settings`、`crates/dsh-credentials` 两 crate +
+`dsh-schema::to_json` + `dsh-persistence::atomic_write` 抽取 + web.rs host/目录方法做实 +
+guard 切片。回滚：撤相关提交即可，不影响既有 crate（dsh-schema/persistence 的修改是纯增量）。
 
 ---
 
