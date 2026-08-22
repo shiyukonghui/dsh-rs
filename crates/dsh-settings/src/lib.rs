@@ -146,6 +146,23 @@ impl SettingsProvider {
         self.describe_inner(ns, &reg)
     }
 
+    /// 列出所有已注册 namespace 的描述（注册顺序）。
+    pub fn describe_all(&mut self) -> Vec<NamespaceDescriptor> {
+        let regs = self
+            .registrations
+            .iter()
+            .map(|r| r.clone_reg())
+            .collect::<Vec<_>>();
+        regs.iter()
+            .filter_map(|r| self.describe_inner(&r.ns, r).ok())
+            .collect()
+    }
+
+    /// 是否绑定本地文档（file 模式）。
+    pub fn has_document(&self) -> bool {
+        self.document_path.is_some()
+    }
+
     pub fn update(
         &mut self,
         ns: &str,

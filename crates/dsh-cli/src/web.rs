@@ -761,6 +761,69 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// M3b：namespace 描述 → wire `SettingsNamespaceView`（对齐 settingsNamespaceViewSchema）。
+fn namespace_view(view: dsh_settings::NamespaceDescriptor) -> Value {
+    let mut v = serde_json::Map::new();
+    v.insert("ns".to_string(), serde_json::json!(view.ns));
+    let mut secrets = Vec::new();
+    for slot in &view.secrets {
+        secrets.push(serde_json::json!({"path": slot.path, "set": slot.set}));
+    }
+    let applies = match view.applies {
+        dsh_settings::Applies::Live => "live",
+        dsh_settings::Applies::Restart => "restart",
+    };
+    v.insert("schema".to_string(), view.schema);
+    v.insert("value".to_string(), view.value);
+    if let Some(base) = view.base {
+        v.insert("base".to_string(), base);
+    }
+    if let Some(user) = view.user {
+        v.insert("user".to_string(), user);
+    }
+    v.insert("applies".to_string(), serde_json::json!(applies));
+    v.insert("secrets".to_string(), serde_json::json!(secrets));
+    v.insert("revision".to_string(), serde_json::json!(view.revision));
+    serde_json::Value::Object(v)
+}
+
+/// M3b：settings 错误 → wire `settings-rejected` 或 `SETTINGS_CONFLICT`。
+fn settings_error_response(ns: &str, e: dsh_settings::SettingsError) -> Value {
+    match e {
+        dsh_settings::SettingsError::Conflict { expected, actual, .. } => serde_json::json!({
+            "ok": false, "error": {
+                "code": "SETTINGS_CONFLICT",
+                "message": format!(
+                    "settings namespace \"{ns}\" changed since it was read (expected revision {expected}, now {actual})"
+                ),
+            },
+        }),
+        dsh_settings::SettingsError::NotRegistered(name) => serde_json::json!({
+            "ok": false, "error": {
+                "code": "settings-rejected",
+                "message": format!("settings namespace \"{name}\" is not registered"),
+            },
+        }),
+        dsh_settings::SettingsError::Invalid { message } => serde_json::json!({
+            "ok": false, "error": {
+                "code": "settings-rejected",
+                "message": message,
+            },
+        }),
+    }
+}
+
+/// M3c：credentials 错误 → wire `credential-rejected`。
+fn credentials_error_response(ref_name: &str, e: dsh_credentials::CredentialsError) -> Value {
+    serde_json::json!({
+        "ok": false, "error": {
+            "code": "credential-rejected",
+            "message": e.to_string(),
+            "details": {"ref": ref_name},
+        },
+    })
+}
+
 fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) -> Value {
     match method {
         "version" => serde_json::json!({"ok": true, "value": {"version": env!("CARGO_PKG_VERSION")}}),
@@ -772,13 +835,23 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             let cwd = std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
-            serde_json::json!({"ok": true, "value": {
-                "version": env!("CARGO_PKG_VERSION"),
-                "cwd": cwd,
-                "attachedSessions": attached,
-                "home": crate::host_dir::home_dir(),
-                "canOpenPath": true,
-            }})
+            let (current, _) = llm_catalog(boot);
+            let provider = current.get("provider").and_then(|p| p.as_str());
+            let model = current.get("model").and_then(|m| m.as_str());
+            let mut value = serde_json::Map::new();
+            value.insert("version".to_string(), serde_json::json!(env!("CARGO_PKG_VERSION")));
+            value.insert("cwd".to_string(), serde_json::json!(cwd));
+            value.insert("attachedSessions".to_string(), serde_json::json!(attached));
+            value.insert("home".to_string(), serde_json::json!(crate::host_dir::home_dir()));
+            // provider/model 可选：缺省省略（对齐 host schema 可选性）。
+            if let Some(p) = provider {
+                value.insert("provider".to_string(), serde_json::json!(p));
+            }
+            if let Some(m) = model {
+                value.insert("model".to_string(), serde_json::json!(m));
+            }
+            value.insert("canOpenPath".to_string(), serde_json::json!(true));
+            serde_json::json!({"ok": true, "value": value})
         }
         "host.pickDirectory" => {
             // M3a：无 native dialog 的诚实降级——`{path:null}` 对齐「用户取消」语义。
@@ -1060,27 +1133,98 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             serde_json::json!({"ok": true, "value": {"opened": true}})
         }
         "settings.describe" => {
+            // M3b：真实 service 驱动——列出已注册 namespace（分层 resolve + redact）。
+            let mut sp = boot.settings.borrow_mut();
+            let namespaces: Vec<Value> = sp
+                .describe_all()
+                .into_iter()
+                .map(namespace_view)
+                .collect();
+            let writable = true;
+            let has_document = sp.has_document();
             serde_json::json!({"ok": true, "value": {
-                "writable": false,
-                "hasDocument": false,
-                "namespaces": [],
+                "writable": writable,
+                "hasDocument": has_document,
+                "namespaces": namespaces,
             }})
         }
         "settings.openDocument" => {
+            // M3b：无桌面 opener 的诚实降级——`{opened:true}`（差异见 D-037）。
             serde_json::json!({"ok": true, "value": {"opened": true}})
         }
         "settings.update" | "settings.replace" | "settings.mutate" => {
-            let ns = payload.get("ns").and_then(|v| v.as_str()).unwrap_or("default").to_string();
-            serde_json::json!({"ok": true, "value": {
-                "ns": ns, "schema": {}, "value": {}, "applies": "restart",
-                "secrets": [], "revision": 0,
-            }})
+            let ns = payload.get("ns").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let expected = payload.get("expectedRevision").and_then(|v| v.as_u64());
+            let mut sp = boot.settings.borrow_mut();
+            let result = match method {
+                "settings.update" => {
+                    let patch = payload.get("patch").cloned().unwrap_or(Value::Null);
+                    sp.update(&ns, &patch, expected)
+                }
+                "settings.replace" => {
+                    let section = payload.get("section").cloned().unwrap_or(Value::Null);
+                    sp.replace(&ns, &section, expected)
+                }
+                _ => {
+                    let ops = payload.get("ops").cloned().unwrap_or(Value::Null);
+                    sp.mutate(&ns, &ops, expected)
+                }
+            };
+            match result {
+                Ok(view) => serde_json::json!({"ok": true, "value": namespace_view(view)}),
+                Err(e) => settings_error_response(&ns, e),
+            }
         }
         "credentials.describe" => {
-            serde_json::json!({"ok": true, "value": {"credentials": {}}})
+            // M3c：真实 service 驱动——按 refs 批量描述（configured/source/writable）。
+            let creds = boot.credentials.borrow();
+            let refs = payload.get("refs").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let mut out = serde_json::Map::new();
+            for r in refs {
+                let Some(name) = r.as_str() else {
+                    return serde_json::json!({"ok": false, "error": {
+                        "code": "bad-request",
+                        "message": "refs must be strings",
+                    }});
+                };
+                if !dsh_credentials::is_credential_ref_name(name) {
+                    return serde_json::json!({"ok": false, "error": {
+                        "code": "bad-request",
+                        "message": format!("invalid credential ref \"{name}\""),
+                    }});
+                }
+                let view = creds.describe(name).unwrap_or(
+                    dsh_credentials::CredentialView { configured: false, source: None, writable: true }
+                );
+                let mut v = serde_json::Map::new();
+                v.insert("configured".to_string(), serde_json::json!(view.configured));
+                if let Some(src) = view.source {
+                    v.insert("source".to_string(), serde_json::json!(src));
+                }
+                v.insert("writable".to_string(), serde_json::json!(view.writable));
+                out.insert(name.to_string(), serde_json::Value::Object(v));
+            }
+            serde_json::json!({"ok": true, "value": {"credentials": out}})
         }
         "credentials.set" | "credentials.unset" => {
-            serde_json::json!({"ok": true, "value": {}})
+            let name = payload.get("ref").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if !dsh_credentials::is_credential_ref_name(&name) {
+                return serde_json::json!({"ok": false, "error": {
+                    "code": "bad-request",
+                    "message": format!("invalid credential ref \"{name}\""),
+                }});
+            }
+            let mut creds = boot.credentials.borrow_mut();
+            let result = if method == "credentials.set" {
+                let value = payload.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                creds.set(&name, value)
+            } else {
+                creds.unset(&name)
+            };
+            match result {
+                Ok(()) => serde_json::json!({"ok": true, "value": {}}),
+                Err(e) => credentials_error_response(&name, e),
+            }
         }
         "llm.providers" => {
             // M1e：由 Boot.llm 注册表驱动（configurableProviderViewSchema）。
@@ -1223,6 +1367,12 @@ mod tests {
             llm: dsh_core::new_llm(),
             refresh: std::rc::Rc::new(|| Ok(())),
             agent_loop: None,
+            settings: std::rc::Rc::new(std::cell::RefCell::new(
+                dsh_settings::SettingsProvider::memory(),
+            )),
+            credentials: std::rc::Rc::new(std::cell::RefCell::new(
+                dsh_credentials::CredentialProvider::memory(),
+            )),
         }
     }
 
@@ -2060,5 +2210,142 @@ mod tests {
         // 驱动回到 idle（agent 可按配置 id 取到）。
         use dsh_agent::AgentStatus;
         assert_eq!(host.agent("a1").unwrap().status(), AgentStatus::Idle);
+    }
+
+    /// M3b：settings 全方法面经 handle_rpc_host 真实服务驱动。
+    /// describe → update(merge) → mutate(path-op) → replace(reset) → conflict。
+    #[test]
+    fn rpc_settings_full_wire_real_driver() {
+        let boot = boot_with_sessions();
+        // 注册一个测试 namespace（真实 schema + secret）进共享 provider。
+        {
+            let mut sp = boot.settings.borrow_mut();
+            let mut dict = std::collections::HashMap::new();
+            dict.insert("mode".to_string(), dsh_schema::Schema::string());
+            dict.insert(
+                "token".to_string(),
+                dsh_schema::Schema::secret(&dsh_schema::Schema::string()),
+            );
+            sp.register("test-ns", &dsh_schema::Schema::object(dict), None, dsh_settings::Applies::Live);
+        }
+        let session_host = SessionHost::in_memory();
+        let call = |method: &str, payload: serde_json::Value| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": method, "payload": payload,
+            })).unwrap();
+            handle_rpc_host(&boot, method, &body, &session_host).1
+        };
+        // describe：value redact（token 缺席），secrets 枚举 set:false，revision 0。
+        let res = call("settings.describe", serde_json::json!({}));
+        assert_eq!(res["result"]["ok"], true);
+        let ns_list = res["result"]["value"]["namespaces"].as_array().unwrap();
+        let test_ns = ns_list.iter().find(|n| n["ns"] == "test-ns").expect("registered ns");
+        assert_eq!(test_ns["revision"], 0);
+        assert!(test_ns["value"].get("token").is_none(), "secret redacted from value");
+        let secrets = test_ns["secrets"].as_array().unwrap();
+        assert!(secrets.iter().any(|s| s["path"][0] == "token" && s["set"] == false));
+        // update(merge)：写入 mode；token 不动（secrets 仍 set:false）。
+        let res = call("settings.update", serde_json::json!({
+            "ns": "test-ns", "patch": {"mode": "fast"}, "expectedRevision": 0,
+        }));
+        assert_eq!(res["result"]["ok"], true);
+        assert_eq!(res["result"]["value"]["revision"], 1);
+        assert_eq!(res["result"]["value"]["value"]["mode"], "fast");
+        // mutate(path-op)：set 深路径 + unset。
+        let res = call("settings.mutate", serde_json::json!({
+            "ns": "test-ns", "ops": [{"op": "set", "path": ["extra", "k"], "value": 2}],
+            "expectedRevision": 1,
+        }));
+        assert_eq!(res["result"]["ok"], true);
+        assert_eq!(res["result"]["value"]["value"]["extra"]["k"], 2);
+        assert_eq!(res["result"]["value"]["revision"], 2);
+        let res = call("settings.mutate", serde_json::json!({
+            "ns": "test-ns", "ops": [{"op": "unset", "path": ["extra", "k"]}],
+            "expectedRevision": 2,
+        }));
+        assert_eq!(res["result"]["ok"], true);
+        assert!(res["result"]["value"]["value"]["extra"].get("k").is_none());
+        // replace(reset)：清空 user → value 回落 schema default/缺省。
+        let res = call("settings.replace", serde_json::json!({
+            "ns": "test-ns", "section": {}, "expectedRevision": 3,
+        }));
+        assert_eq!(res["result"]["ok"], true);
+        assert_eq!(res["result"]["value"]["value"]["mode"], Value::Null);
+        // conflict：带 stale revision 再写 → SETTINGS_CONFLICT。
+        let res = call("settings.update", serde_json::json!({
+            "ns": "test-ns", "patch": {"mode": "x"}, "expectedRevision": 0,
+        }));
+        assert_eq!(res["result"]["ok"], false);
+        assert_eq!(res["result"]["error"]["code"], "SETTINGS_CONFLICT");
+        // openDocument：诚实降级 opened:true。
+        let res = call("settings.openDocument", serde_json::json!({}));
+        assert_eq!(res["result"]["ok"], true);
+        assert_eq!(res["result"]["value"]["opened"], true);
+    }
+
+    /// M3c：credentials 全方法面经 handle_rpc_host 真实服务驱动。
+    /// describe（configured）→ set → resolve via describe source → unset（幂等）。
+    #[test]
+    fn rpc_credentials_full_wire_real_driver() {
+        let boot = boot_with_sessions();
+        // 注入一个 env 遮蔽 ref（验证 shadowed 拒绝走 wire）。
+        {
+            let mut env = std::collections::HashMap::new();
+            env.insert("SHADOWED_KEY".to_string(), "envv".to_string());
+            let cp = boot.credentials.clone();
+            let mut c = cp.borrow_mut();
+            *c = dsh_credentials::CredentialProvider::with_env(env);
+        }
+        let session_host = SessionHost::in_memory();
+        let call = |method: &str, payload: serde_json::Value| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": method, "payload": payload,
+            })).unwrap();
+            handle_rpc_host(&boot, method, &body, &session_host).1
+        };
+        // describe：未知 ref → unconfigured writable:true；env ref → configured writable:false。
+        let res = call("credentials.describe", serde_json::json!({
+            "refs": ["MY_STORED", "SHADOWED_KEY", "BAD-NAME"],
+        }));
+        assert_eq!(res["result"]["ok"], false, "invalid ref name -> bad-request");
+        assert_eq!(res["result"]["error"]["code"], "bad-request");
+        let res = call("credentials.describe", serde_json::json!({
+            "refs": ["MY_STORED", "SHADOWED_KEY"],
+        }));
+        assert_eq!(res["result"]["ok"], true);
+        let creds = &res["result"]["value"]["credentials"];
+        assert_eq!(creds["MY_STORED"]["configured"], false);
+        assert_eq!(creds["MY_STORED"]["writable"], true);
+        assert_eq!(creds["SHADOWED_KEY"]["configured"], true);
+        assert_eq!(creds["SHADOWED_KEY"]["source"], "env");
+        assert_eq!(creds["SHADOWED_KEY"]["writable"], false);
+        // set 到文件层（memory provider 的 document_path None → 内存持久化）。
+        let res = call("credentials.set", serde_json::json!({
+            "ref": "MY_STORED", "value": "abc123",
+        }));
+        assert_eq!(res["result"]["ok"], true);
+        let res = call("credentials.describe", serde_json::json!({"refs": ["MY_STORED"]}));
+        assert_eq!(res["result"]["value"]["credentials"]["MY_STORED"]["configured"], true);
+        assert_eq!(res["result"]["value"]["credentials"]["MY_STORED"]["source"], "file");
+        // env shadowed set → credential-rejected。
+        let res = call("credentials.set", serde_json::json!({
+            "ref": "SHADOWED_KEY", "value": "x",
+        }));
+        assert_eq!(res["result"]["ok"], false);
+        assert_eq!(res["result"]["error"]["code"], "credential-rejected");
+        assert_eq!(res["result"]["error"]["details"]["ref"], "SHADOWED_KEY");
+        // empty value set → credential-rejected（Empty）。
+        let res = call("credentials.set", serde_json::json!({
+            "ref": "MY_STORED", "value": "",
+        }));
+        assert_eq!(res["result"]["ok"], false);
+        assert_eq!(res["result"]["error"]["code"], "credential-rejected");
+        // unset → 配置消失；再 unset 幂等成功。
+        let res = call("credentials.unset", serde_json::json!({"ref": "MY_STORED"}));
+        assert_eq!(res["result"]["ok"], true);
+        let res = call("credentials.describe", serde_json::json!({"refs": ["MY_STORED"]}));
+        assert_eq!(res["result"]["value"]["credentials"]["MY_STORED"]["configured"], false);
+        let res = call("credentials.unset", serde_json::json!({"ref": "MY_STORED"}));
+        assert_eq!(res["result"]["ok"], true, "unset absent idempotent");
     }
 }

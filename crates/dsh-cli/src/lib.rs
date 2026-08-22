@@ -44,6 +44,11 @@ pub struct Boot {
     /// M2g：可选的 Rust AgentLoopHost（装配了真实 agent-loop 服务；Some 时
     /// `session.prompt`/`agent.run` 改驱 Rust loop，None 保留 M1 WASM loop 路径）。
     pub agent_loop: Option<Rc<dsh_agent_loop::AgentLoopHost>>,
+    /// M3b：settings 能力缝（namespace 注册 + describe/update/replace/mutate + 文件）。
+    /// `Rc<RefCell>`——web RPC 只持 `&Boot`，跨请求共享可变状态。
+    pub settings: Rc<std::cell::RefCell<dsh_settings::SettingsProvider>>,
+    /// M3c：credentials 能力缝（env/file 分层 + set/unset + 文件）。
+    pub credentials: Rc<std::cell::RefCell<dsh_credentials::CredentialProvider>>,
 }
 
 /// M56：转储生效配置（对齐生产 `dsh --dump-config`）——读主配置 + overlays
@@ -180,6 +185,30 @@ pub fn boot(
         Ok(())
     });
 
+    let settings = Rc::new(std::cell::RefCell::new(
+        dsh_settings::SettingsProvider::memory(),
+    ));
+    // M3d：注册 LLM 连接 namespace（对齐 TS `llm` 插件注册集）。schema 覆盖
+    // provider/model/baseURL/apiKey(secret)；用户写入即落到本地文档。
+    {
+        let mut sp = settings.borrow_mut();
+        let mut dict = std::collections::HashMap::new();
+        dict.insert(
+            "provider".to_string(),
+            dsh_schema::Schema::with_default(&dsh_schema::Schema::string(), serde_json::json!("dsh")),
+        );
+        dict.insert(
+            "model".to_string(),
+            dsh_schema::Schema::with_default(&dsh_schema::Schema::string(), serde_json::json!("echo")),
+        );
+        dict.insert("baseURL".to_string(), dsh_schema::Schema::string());
+        dict.insert(
+            "apiKey".to_string(),
+            dsh_schema::Schema::secret(&dsh_schema::Schema::string()),
+        );
+        sp.register("llm", &dsh_schema::Schema::object(dict), None, dsh_settings::Applies::Restart);
+    }
+
     Ok(Boot {
         ctx: cordis,
         loop_plugin: loop_cell,
@@ -187,6 +216,10 @@ pub fn boot(
         llm,
         refresh,
         agent_loop: None,
+        settings,
+        credentials: Rc::new(std::cell::RefCell::new(
+            dsh_credentials::CredentialProvider::memory(),
+        )),
     })
 }
 

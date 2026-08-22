@@ -1676,4 +1676,42 @@ serde_yaml）。回滚撤提交即可，其余 crate 零改动。
 
 ---
 
+## D-041（M3d 落地）：web.rs 接线——settings/credentials/host 全方法面真实服务驱动
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M3d 把 web.rs 的 `settings.*`（describe/update/replace/mutate/openDocument）、
+`credentials.*`（describe/set/unset）从空桩改为真实服务驱动，`host.describe` 补
+provider/model；完成 M3-ACCEPTANCE 标准 5 的 12 方法集成。
+
+**实现要点**：
+1. **Boot 承载可变态**：`Boot.settings: Rc<RefCell<dsh_settings::SettingsProvider>>`、
+   `Boot.credentials: Rc<RefCell<dsh_credentials::CredentialProvider>>`——web RPC 只持
+   `&Boot`，跨请求共享可变状态（对照 sessions/llm 的既有 handle 形态）。`boot()` 与
+   测试 `boot_with_sessions` 构造同步补字段。
+2. **boot() 注册默认 `llm` namespace**：provider/model（带默认）/baseURL/apiKey(secret)；
+   `applies: restart`。设置页有可渲染表单且写入落到本地文档（对齐 TS `llm` 插件注册集）。
+3. **dispatch 接线**：
+   - `settings.describe` → `describe_all()` + `namespace_view`（wire 按钮：schema 用
+     `schema.to_json()`、value/base/user redact、secrets `{path,set}`、revision、applies、
+     可选字段缺省省略）；`writable:true`、`hasDocument: document_path.is_some()`。
+   - `settings.update/replace/mutate` → 对应 provider 方法；错误映射
+     `SETTINGS_CONFLICT`（消息逐字 toJSON 文案）/ `settings-rejected`。
+   - `settings.openDocument` → `{opened:true}` 诚实降级（无桌面 opener，D-037 差异）。
+   - `credentials.describe` → 按 refs 批量（invalid ref → `bad-request`；unknown 合法 ref
+     → unconfigured+writable:true）；`credentials.set/unset` → provider + shadowed/empty
+     映射 `credential-rejected`（含 `details:{ref}`）。
+   - `host.describe` → provider/model 从 `llm_catalog(boot).0` 取，可选字段缺省省略。
+4. **缺失的 Provider 方法补上**：`SettingsProvider::describe_all()`（保序列出）/
+   `has_document()`。
+
+**验证**：web.rs 29 测试全绿（新增 `rpc_settings_full_wire_real_driver` 7 段断言 +
+`rpc_credentials_full_wire_real_driver` 8 段断言经 handle_rpc_host 真实驱动）；
+dsh-cli lib 55/55；clippy `-D warnings` 零告警。
+
+**预期影响与回滚点**：dsh-cli Cargo.toml 加 dsh-settings/dsh-credentials/dsh-schema 依赖；
+lib.rs web.rs 接线。回滚撤提交即可；既有方法面（session/workspace/llm 等）零改动。
+
+---
+
 
