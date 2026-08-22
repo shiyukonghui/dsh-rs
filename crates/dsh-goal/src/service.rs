@@ -323,6 +323,35 @@ impl GoalService {
         self.opts.max_consecutive_blocked_rounds
     }
 
+    /// 当前 phase（无目标 → None；driver 判定用）。
+    pub fn phase(&self) -> Option<GoalPhase> {
+        self.state.as_ref().and_then(|s| s.goal.as_ref()).map(|g| g.phase)
+    }
+
+    /// 当前已准入轮次（driver 判定用）。
+    pub fn rounds_started(&self) -> u64 {
+        self.state.as_ref().map(|s| s.rounds_started).unwrap_or(0)
+    }
+
+    /// 当前激活（driver 判定用）。
+    pub fn activation(&self) -> GoalActivation {
+        self.state.as_ref().map(|s| s.activation).unwrap_or(GoalActivation::Disarmed)
+    }
+
+    /// 当前 maxGoalRounds（driver 判定用）。
+    pub fn max_goal_rounds(&self) -> u64 {
+        self.state
+            .as_ref()
+            .and_then(|s| s.goal.as_ref())
+            .map(|g| g.max_goal_rounds)
+            .unwrap_or(0)
+    }
+
+    /// 当前目标 objective（driver 提示渲染用）。
+    pub fn objective(&self) -> Option<&str> {
+        self.state.as_ref().and_then(|s| s.goal.as_ref()).map(|g| g.objective.as_str())
+    }
+
     fn state_mut(&mut self) -> Result<&mut State, GoalServiceError> {
         self.state.as_mut().ok_or(GoalServiceError::NotFound)
     }

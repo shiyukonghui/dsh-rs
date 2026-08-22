@@ -1866,4 +1866,34 @@ D-022/D-036 handle_rpc_host 代偿）。
 
 ---
 
+## D-046（M4b goal-round-driver）：自动续跑判定 + 一轮提示驱动
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M4a 纯域完成后，goal 需要「自动续跑」能力 —— active+armed+未超 cap+
+agent idle 时自动发起下一轮（goal-round-driver），对齐
+`packages/goal/goal-round-driver/src/index.ts`。
+
+**结论**：
+- `dsh-goal/src/round_driver.rs`：`StatusPort` trait 抽象宿主（`status_idle`/
+  `has_pending_inbox`/`followup`），driver 不持有 agent-loop → dsh-goal 保持纯域零
+  agent-loop 依赖，宿主在 M4h web.rs 装配实现。
+- `round_driver_outcome(&service,&id,&port)` 只读判定：phase==active ∧ armed ∧
+  roundsStarted<max ∧ idle ∧ 无竞争 inbox → `Continue`；`drive_once` 判定 + 准入本轮
+  （admit_round(next)）+ 渲染 `<goal_round>…Round: N/M…` 提示 + followup 投递。
+- service 补访问子：`phase()/rounds_started()/activation()/max_goal_rounds()/objective()`
+  （driver 判定与提示渲染用）；`get(id)` 作 id 一致性校验。
+- 测试 9 绿：续跑/不续跑（disarmed/pending inbox/running/非 active/到 cap）、提示渲染
+  （Round: 3/3 逐字）、resume 后保持 armed。总计 dsh-goal 36 测试绿 + clippy 零。
+- 超 cap 的自动 `block {code:"round-limit"}` 语义由 caller（agent-loop 轮次收尾）判定，
+  driver 层面先以「到 cap 不续跑」表达（M4h 的 status 事件收到 cap 后由宿主调 block）。
+
+**差异记录**：driver 是「每轮结束调用一次」的拉式驱动（宿主事件循环驱动），不是 TS 的
+独立 round-loop 进程——单线程 D-004 下以拉式判定对齐，无后台线程。
+
+**预期影响与回滚点**：driver 是纯函数 + trait seam，回滚撤提交即可。M4h 将与 agent-loop
+的 AgentLoopHost 装配（status + inbox + followup 实配）。
+
+---
+
 

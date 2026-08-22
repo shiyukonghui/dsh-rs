@@ -4,9 +4,11 @@
 //! 权威参考：`deepseek-harness/packages/goal/goal/src/{types,domain,fold,runtime}.ts`。
 
 pub mod fold;
+pub mod round_driver;
 pub mod service;
 pub mod types;
 
 pub use fold::{fold_goal_events, FoldedGoal};
+pub use round_driver::{drive_once, render_round_prompt, round_driver_outcome, RoundOutcome, StatusPort};
 pub use service::{GoalService, GoalServiceError, ServiceOptions};
 pub use types::*;
