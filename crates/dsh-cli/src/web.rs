@@ -889,11 +889,31 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             }
         }
         "session.prompt" => {
-            // 前端经 prompt 发消息：提取 content → 驱动 turn（回显 loop 语义）。
-            // M1e：turn 产生的新事件经 SessionHost.adopt 回放进目标会话
-            // （SessionStore）→ on_event 持久化 + EventSink 下链。
+            // 前端经 prompt 发消息：提取 content → 驱动 turn。
+            // M2g：boot 装配了 Rust AgentLoopHost 时改驱真实 agent-loop（事件直接
+            // 落共享 store；前端历史/下链同一事实源）；否则 M1 WASM loop 路径
+            // （run_turn 的 SessionLog 新事件 adopt 进目标会话）。
             let sid = payload.get("sessionId").and_then(|v| v.as_str()).unwrap_or("default").to_string();
             let content = payload.get("content").cloned().unwrap_or(Value::Null);
+            if boot.agent_loop.is_some() {
+                // 取首个 text 块为 prompt 文本（M1 回显 loop 的输入形状）。
+                let text = content
+                    .as_array()
+                    .and_then(|blocks| {
+                        blocks.iter().find_map(|b| {
+                            (b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                                .then(|| b.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string())
+                        })
+                    })
+                    .unwrap_or_default();
+                return match crate::run_rust_loop(boot, &sid, &text) {
+                    Ok(()) => serde_json::json!({"ok": true, "value": {"accepted": true}}),
+                    Err(e) => serde_json::json!({"ok": false, "error": {
+                        "code": "internal",
+                        "message": e.to_string(),
+                    }}),
+                };
+            }
             let before = boot.sessions.lock().unwrap().events().len();
             let _ = crate::run_turn(boot, &serde_json::json!({"content": content}));
             let new_events: Vec<(String, Vec<u8>)> = {
@@ -1086,6 +1106,21 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             serde_json::json!({"ok": true, "value": null})
         }
         "agent-loop" | "agent.turn" | "agent.run" => {
+            if boot.agent_loop.is_some() {
+                // M2g：调度到 Rust AgentLoopHost（默认会话映射；事件落共享 store）。
+                let text = payload
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                return match crate::run_rust_loop(boot, "default", &text) {
+                    Ok(()) => serde_json::json!({"ok": true, "value": {"accepted": true}}),
+                    Err(e) => serde_json::json!({"ok": false, "error": {
+                        "code": "internal",
+                        "message": e.to_string(),
+                    }}),
+                };
+            }
             let input = serde_json::json!({"content": payload.get("content").cloned().unwrap_or(Value::Null)});
             match crate::run_turn(boot, &input) {
                 Ok(result) => serde_json::json!({"ok": true, "value": result}),
@@ -1160,6 +1195,7 @@ mod tests {
             sessions,
             llm: dsh_core::new_llm(),
             refresh: std::rc::Rc::new(|| Ok(())),
+            agent_loop: None,
         }
     }
 
@@ -1808,5 +1844,121 @@ mod tests {
         assert!(text.contains("client.js?rev="), "entry has bundle url");
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&pr).ok();
+    }
+
+    /// M2g：session.prompt 在装配了 Rust AgentLoopHost 时改驱真实 agent-loop，
+    /// 事件直接落共享 SessionHost store（前端历史读模型 + EventSink 下链同一事实源）。
+    #[test]
+    fn rpc_prompt_routes_to_rust_agent_loop_shared_store() {
+        use std::cell::{Cell, RefCell};
+        use std::collections::VecDeque;
+        use std::rc::Rc;
+
+        // Mock adapter：一段文本回答（模拟模型应答；Rust loop 真实驱动）。
+        let script = Rc::new(RefCell::new(VecDeque::from_iter([vec![
+            dsh_llm::StreamChunk::BlockStart {
+                index: 0,
+                block_type: "text".parse().unwrap(),
+            },
+            dsh_llm::StreamChunk::TextDelta { index: 0, text: "hello from rust loop".into() },
+            dsh_llm::StreamChunk::BlockEnd {
+                index: 0,
+                block: dsh_llm::ContentBlock::text("hello from rust loop"),
+            },
+            dsh_llm::StreamChunk::Finish {
+                reason: dsh_llm::FinishReason::Stop,
+                replay_state: None,
+            },
+        ]])));
+        let calls = Rc::new(Cell::new(0u32));
+        struct Adapter {
+            script: Rc<RefCell<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
+            calls: Rc<Cell<u32>>,
+        }
+        impl dsh_llm::LlmAdapter for Adapter {
+            fn stream(
+                &self,
+                _options: dsh_llm::GenerateOptions,
+            ) -> Box<dyn Iterator<Item = dsh_llm::StreamChunk>> {
+                self.calls.set(self.calls.get() + 1);
+                let next = self
+                    .script
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or_default();
+                Box::new(next.into_iter())
+            }
+        }
+        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Rc::new(Adapter { script, calls }))
+            .unwrap();
+
+        let tools = Rc::new(dsh_tools::ToolRegistry::new(
+            dsh_tools::ToolExecutionMode::Native,
+        ));
+        // 配置 agent：provider mock → 映射到注册的 mock adapter；sessionId = default。
+        use dsh_agent_loop::{AgentLoopConfig, AgentLoopHost, ConfiguredAgent};
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let config = AgentLoopConfig {
+            max_parallel_tool_calls: None,
+            agents: vec![ConfiguredAgent {
+                id: "a1".into(),
+                provider: Some("mock".into()),
+                model: Some("mock-model".into()),
+                session_id: Some("default".into()),
+                max_tokens: None,
+                cwd: None,
+                resume_session_id: None,
+            }],
+        };
+        let host = AgentLoopHost::with_store(
+            config,
+            llm,
+            tools,
+            session_host.store.clone(),
+        )
+        .unwrap();
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(host.clone());
+
+        // session.prompt → sessionId default（Rust loop 路径，不经过 WASM adopt）。
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r1", "method": "session.prompt",
+            "payload": {"sessionId": "default", "content": [{"type": "text", "text": "hi from ui"}]},
+        })).unwrap();
+        let (_, v) = handle_rpc_host(&boot, "session.prompt", &body, &session_host);
+        assert_eq!(v["result"]["value"]["accepted"], true);
+
+        // 事件直接落在共享 store：user/message + assistant/message + turn/end。
+        let evs = session_host.events("default");
+        assert!(
+            evs.iter().any(|e| e.kind.as_str() == "assistant/message"),
+            "Rust loop assistant/message in shared store"
+        );
+        assert!(
+            evs.iter().any(|e| e.kind.as_str() == "user/message"),
+            "user/message written by the loop"
+        );
+        let assistant = evs
+            .iter()
+            .find(|e| e.kind.as_str() == "assistant/message")
+            .unwrap();
+        assert_eq!(
+            assistant.data["message"]["content"][0]["text"],
+            "hello from rust loop"
+        );
+        // EventSink 下链触发（前端实时帧来源）。
+        assert!(session_host.sink_len() >= 4, "downlink fired: {}", session_host.sink_len());
+        // session.history 读模型可回读（前端视角）。
+        let body2 = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r2", "method": "session.history",
+            "payload": {"sessionId": "default"},
+        })).unwrap();
+        let (_, h) = handle_rpc_host(&boot, "session.history", &body2, &session_host);
+        assert!(h["result"]["value"]["events"].as_array().unwrap().len() == evs.len());
+        // 驱动回到 idle（agent 可按配置 id 取到）。
+        use dsh_agent::AgentStatus;
+        assert_eq!(host.agent("a1").unwrap().status(), AgentStatus::Idle);
     }
 }

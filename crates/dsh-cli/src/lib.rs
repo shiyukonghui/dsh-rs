@@ -38,6 +38,9 @@ pub struct Boot {
     /// HMR refresh 回调：重读主配置 + overlays → 重新挂载（watch 模式用；
     /// 对应 Cordis Include 插件的 `internal/update → refresh` 路径）。
     pub refresh: Rc<dyn Fn() -> Result<(), CordisError>>,
+    /// M2g：可选的 Rust AgentLoopHost（装配了真实 agent-loop 服务；Some 时
+    /// `session.prompt`/`agent.run` 改驱 Rust loop，None 保留 M1 WASM loop 路径）。
+    pub agent_loop: Option<Rc<dsh_agent_loop::AgentLoopHost>>,
 }
 
 /// M56：转储生效配置（对齐生产 `dsh --dump-config`）——读主配置 + overlays
@@ -180,6 +183,7 @@ pub fn boot(
         sessions,
         llm,
         refresh,
+        agent_loop: None,
     })
 }
 
@@ -269,6 +273,40 @@ fn load_component(wasm_base: &Path, spec: &str) -> Result<Vec<u8>, CordisError> 
 pub fn run_turn(boot: &Boot, input: &Value) -> Result<Value, CordisError> {
     let plugin = boot.loop_plugin.borrow().clone();
     plugin.run_turn(&boot.ctx, input)
+}
+
+/// M2g：把一条 user 文本驱动进 Rust AgentLoopHost 的配置 agent。
+/// - 目标 agent：配置项中 `sessionId == session_id` 或默认 `agent-{id} == session_id` 者；
+/// - agent 懒装配（ensure_agent 幂等）；事件直接写 AgentLoopHost 持有的共享 store
+///   （web 侧与 SessionHost 同店 → 前端读模型/下链/持久化同一事实源）；
+/// - 无 host 或无可路由 agent → Err（fail loud）。
+pub fn run_rust_loop(boot: &Boot, session_id: &str, content: &str) -> Result<(), CordisError> {
+    let host = boot.agent_loop.as_ref().ok_or_else(|| {
+        CordisError::Internal("no Rust AgentLoopHost assembled in this boot".into())
+    })?;
+    let configured = host
+        .config
+        .agents
+        .iter()
+        .find(|a| {
+            a.session_id.as_deref() == Some(session_id)
+                || a.resume_session_id.as_deref() == Some(session_id)
+                || format!("agent-{}", a.id) == session_id
+        })
+        .cloned()
+        .ok_or_else(|| {
+            CordisError::Internal(format!(
+                "no configured agent maps to session \"{session_id}\""
+            ))
+        })?;
+    host.ensure_agent(&configured)
+        .map_err(|e| CordisError::Internal(format!("agent-loop host: {e}")))?;
+    let message = dsh_llm::Message::user(
+        dsh_llm::MessageId::from_raw(format!("prompt-{session_id}")),
+        vec![dsh_llm::ContentBlock::text(content)],
+    );
+    host.followup(&configured.id, message)
+        .map_err(|e| CordisError::Internal(format!("agent-loop host: {e}")))
 }
 
 /// headless 单发任务的结果（对齐 DSH `dsh --profile headless "job"`：

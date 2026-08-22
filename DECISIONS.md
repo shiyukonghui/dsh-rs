@@ -1428,6 +1428,93 @@ tests/m2f_interaction.rs`（2，真实闭环：ask 无通道 → tool/result 逐
 allowed-once → 工具体执行）。workspace 112 套件全绿 + clippy 零告警。回滚：撤销本提交。
 增量：M2g 把 host boot 装进 web.rs + E2E 冒烟；approval 通道宿主化（M3）。
 
+## D-035（M2g）：AgentLoopHost 宿主装配 + web.rs 路由 Rust loop
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M2 收口需要把已建的 agent 能力缝（dsh-agent / dsh-agent-loop /
+dsh-system-prompt / dsh-tools / dsh-scope）组装成**宿主服务**：按组合配置
+（`AgentLoop.Config` 形态）装配 agent、暴露设置与配置身份（`CONFIGURED_AGENT_IDENTITIES_KEY`）、
+负责生命周期 teardown，并把 Rust loop 接进 `dsh web`（`session.prompt`/`agent.run`）。
+
+**考虑的选项**：
+1. **宿主装配模块放 dsh-agent-loop（本次采用）**：`AgentLoopHost` 自拥 bus/registry/
+   store/llm/tools/prompt，`with_store` 可注入外部 SessionStore（web 共享同一事实源）。
+   agent 懒装配（`ensure_agent` 幂等）。
+2. 在 dsh-cli 里手写装配：承载在 web crate 但无独立测试面，且 composer 语义（配置校验）
+   被埋进 web；否决——配置形态/校验/teardown 属于 agent-loop 服务契约，需 crate 内测试。
+3. 独立 `dsh-interaction` crate：M2f 已判定 approval 通道类型留在 dsh-tools；M2g 同样
+   不新建（宿主装配是 agent-loop 的服务职责），否决。
+
+**决策与语义**：
+- **配置形态**：`AgentLoopConfig{ maxParallelToolCalls?, agents[] }`（serde，对齐
+  `AgentLoop.Config` 逐字段）；`ConfiguredAgent { id, sessionId?, provider?, model?,
+  maxTokens?, cwd?, resumeSessionId? }`。`validate()` 复用 settings.rs
+  `resolve_max_parallel_tool_calls`（逐字 `maxParallelToolCalls must be a positive
+  integer`）+ `validate_configured_agents`（逐字 `agents "a" and "b" use duplicate exact
+  session identity "s"` / `agent "a": sessionId and resumeSessionId are mutually
+  exclusive`）。
+- **身份 key**：`CONFIGURED_AGENT_IDENTITIES_KEY`（`configuredAgentIdentities`）经
+  `configured_identities()` 暴露（id + 精确 sessionId launcher 身份）。
+- **装配**：`ensure_agent`（幂等）——会话 mint（已在 store → 复用现有 live 会话，续接/
+  挂载既有历史）→ `Agent` → `create_loop_agent`（真实 service 装配）。
+- **生命周期**：`teardown()` 执行宿主登记的 disposer + 清空装配表；registry/store/llm/
+  tools 为宿主 Rc，随宿主 drop 释放。
+- **web 集成**：`Boot.agent_loop: Option<Rc<AgentLoopHost>>`（`boot()` 默认 None——M1
+  WASM loop 路径不变）。`session.prompt`/`agent.run` 在 Some 时改驱 `run_rust_loop`
+  （按 `sessionId==session_id` 或默认 `agent-{id}==session_id` 匹配配置 agent），事件直接
+  落共享 store（前端读模型 + EventSink 下链 + 持久化同一事实源）。
+- **agent 懒装配差值**：TS 在 plugin apply 期热切创建配置 agent；Rust 懒装配（首用建）。
+  语义等价（首用即建、幂等），声明差值（无「启动期空跑预热」）。
+
+**sync/环境差值声明**：
+- **`resumeSessionId` 恢复未做**：持久化 host（dsh-persistence SessionHost）在 M3 宿主化
+  时接续；M2g 仅复用 store 既有 live 会话（续接同进程历史）。
+- **浏览器 E2E 不可跑**：本环境无浏览器/无 `DEEPSEEK_API_KEY`/out 网络阻断；dump-dom 验收
+  以 `handle_rpc_host` 集成测试替代（session.prompt → Rust loop → 共享 store 事件 +
+  session.history 读模型 + EventSink 下链断言全部真实执行），真实浏览器阶段验收留 M3
+  （web.rs 全方法面 + 宿主持久化）。
+
+**预期影响与回滚点**：新增 `crates/dsh-agent-loop/src/host.rs` + `tests/m2g_host.rs`（9）；
+dsh-cli 增加 dsh-agent/agent-loop/llm/tools/system-prompt/scope 依赖 + `Boot.agent_loop`
++ `run_rust_loop` + web.rs 两分支路由 + 集成测试
+`rpc_prompt_routes_to_rust_agent_loop_shared_store`。workspace 113 套件全绿 + clippy
+零告警。回滚：撤销本提交（M1 WASM 路径不受影响——agent_loop=None 分支不变）。
+
+## D-036（M2 验收收口）：里程碑验收清单
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M2 里程碑按 PLAN §6「core/agent + core/agent-loop + core/system-prompt +
+core/tools + core/scope + interaction（permission/user-approval/commands）」收口；按
+§7.1 差分核心语义包 + §7.2 集成 + §7.3 E2E 三道闸验收。逐项核对：
+
+**验收清单（每条 + 证据）**：
+1. **capability spine 迁移**：dsh-agent（M2d-1/D-029、M2d-2/D-030：AgentBus/Registry/
+   initiator/dispatch/invariant/Inbox）、dsh-agent-loop（M2e-1/D-031 请求重建、M2e-2/D-032
+   驱动状态机、M2e-3/D-033 调度+投影+服务装配）、dsh-system-prompt（M2c/D-028）、
+   dsh-tools（M2b/D-025..027，注册表+pre/post 语义+SDK codegen）、dsh-scope（M2a）——
+   均带 TDD 单测。**证据**：提交 91a8bda / 3b1f253 / f8823ae / 9b54c27 / 0fcec03 /
+   42b5823 / 7d0004b。
+2. **interaction（approval）**：M2f/D-034——`PreToolDecision`/`ApprovalProvider` 接入
+   tool pre 阶段，四种逐字审批结果 + 无通道/无 agent 退化 + 真实闭环验证（工具体
+   执行/不执行）。**证据**：`m2f_approval.rs`（12）+ `m2f_interaction.rs`（2），提交 100fb4d。
+3. **宿主装配 + web 收口**：M2g/D-035——`AgentLoopHost`（设置/身份/teardown）+ web.rs
+   `session.prompt`/`agent.run` 路由 Rust loop + 共享 store 集成测试。**证据**：`m2g_host.rs`（9）
+   + `rpc_prompt_routes_to_rust_agent_loop_shared_store`，本提交。
+4. **workspace 全绿 + clippy 零警告**：110→113 套件全绿；clippy `--workspace --all-targets
+   -- -D warnings` 零告警。
+5. **差分/契约**：D-028/D-031/D-032/D-033/D-034 内逐字 wire 形状（模型文本/拒绝原因/
+   事件 payload/sourceEventSeqs）均经测试锚定（TDD 红绿绿）；核心语义包差分基建沿用
+   M1 doctest + integration 快照。
+6. **E2E**：本环境无浏览器/无 key/out 网络阻断 → 以 handle_rpc_host 集成测试代偿（D-035
+   声明）；真实浏览器 `--dump-dom` 阶段验收 + 前端逐帧断言正式收口于 M3（web.rs 全方法面）。
+
+**验收结论**：M2 能力缝与宿主装配按计划完成，可进入 M3（host/api 全方法面 + settings/
+credentials/guard 宿主化 + 真实 provider + 浏览器 E2E）。M1 既有 WASM loop 路径零回归
+（agent_loop=None 分支不变）；web Rust loop 路由为可选叠加。
+
+
 
 ---
 

@@ -547,11 +547,17 @@ name = "dsh-cli"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "dsh-agent",
+ "dsh-agent-loop",
  "dsh-brand",
  "dsh-core",
+ "dsh-llm",
  "dsh-loader",
  "dsh-persistence",
+ "dsh-scope",
  "dsh-session",
+ "dsh-system-prompt",
+ "dsh-tools",
  "dsh-wasmrt",
  "serde",
  "serde_json",
