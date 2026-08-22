@@ -9,6 +9,7 @@
 //! deferred（D-044/D-050：评价后引入），不伪装支持。
 
 mod domain;
+mod inject;
 
 pub use domain::{
     allocate_id_from_seen, canonicalize_time_zone, create_after_record, create_at_record_from_offset,
@@ -16,6 +17,7 @@ pub use domain::{
     resolve_every_occurrence, schedule_view, EveryOccurrence, FoldedSchedules, InputCode, LogError,
     ScheduleInputError, ScheduleRecordData, ScheduleViewData, SCHEDULE_CHANGE_VERSION,
 };
+pub use inject::{dispatch_schedule_change, due_records, framing_text};
 
 /// `schedule/change` 事件投递标记。
 pub const SCHEDULE_CHANGE_EVENT: &str = "schedule/change";

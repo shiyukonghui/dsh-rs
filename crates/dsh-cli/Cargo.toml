@@ -30,6 +30,9 @@ dsh-schema = { path = "../dsh-schema" }
 dsh-goal = { path = "../dsh-goal" }
 dsh-subagent = { path = "../dsh-subagent" }
 dsh-session-query = { path = "../dsh-session-query" }
+# M4h 补实：jobs/schedule 宿主服务 seam（工具 bind + 帧 + 到期注入）
+dsh-jobs = { path = "../dsh-jobs" }
+dsh-schedule = { path = "../dsh-schedule" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

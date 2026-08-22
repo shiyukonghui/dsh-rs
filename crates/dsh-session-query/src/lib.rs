@@ -7,9 +7,11 @@
 //! - 日志导出：`deepseek-harness/packages/session/session-log-export/` + host 侧导出形状。
 
 pub mod export;
+pub mod m4_units;
 pub mod projection;
 pub mod todo;
 
 pub use export::*;
+pub use m4_units::*;
 pub use projection::*;
 pub use todo::*;

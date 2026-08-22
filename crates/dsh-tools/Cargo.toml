@@ -9,6 +9,10 @@ description = "M2b: 工具能力缝（schema DSL→JSON Schema / 子集断言 / 
 [dependencies]
 dsh-llm = { path = "../dsh-llm" }
 dsh-scope = { path = "../dsh-scope" }
+# M4h：todo_write 下沉用 dsh-session-query::todo（to_todo_list/todo_counts）；workflow
+# 参数级 meta 校验用 dsh-workflow::validate_meta。两者不依赖 dsh-tools（无环）。
+dsh-session-query = { path = "../dsh-session-query" }
+dsh-workflow = { path = "../dsh-workflow" }
 serde = { version = "1", features = ["derive"] }
 # D-014：serde_json 默认 BTreeMap 规范序（与 dsh-diff 一致），不用 preserve_order。
 serde_json = "1"

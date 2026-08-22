@@ -22,7 +22,7 @@ pub struct ToolRestriction {
 
 /// 校验后的子代理描述符（durable payload）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "mode", rename_all = "kebab-case")]
+#[serde(tag = "mode", rename_all = "kebab-case", rename_all_fields = "camelCase")]
 pub enum Descriptor {
     #[serde(rename = "one-shot")]
     OneShot {

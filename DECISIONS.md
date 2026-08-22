@@ -2074,7 +2074,6 @@ dsh-tools 完成；本子步交付其校验与投影数据面。workflow 桩仅�
 ## D-052（M4h web.rs 接线）：10 RPC 实做 + todos 投影挂载 + M4 工具注册点
 
 **日期**：2025（本机时间）
-
 **触发的问题**：M4 收口集成——把 M4a-M4g 纯域接到 `crates/dsh-cli/src/web.rs` 的
 `handle_rpc_host`，替换 goal.*/subagent.* 空桩，挂投影（todo），扩展 commands/list，
 注册 M4 工具。
@@ -2119,6 +2118,62 @@ dsh-tools 完成；本子步交付其校验与投影数据面。workflow 桩仅�
 **预期影响与回滚点**：Boot 字段新增、10 RPC 真实现、投影/工具注册——均由 M4a-M4g 纯域
 驱动，回滚撤 1ccd261 即可整体回退到 20497c6（M4g 桩后状态）。M4h 是 M4 全部编码的集成
 收口，M4i 将据 D-044 验收标准做 M4-ACCEPTANCE。
+
+---
+
+## D-053（M4i 补齐收口）：子代理真实驱动 + 宿主工具 bind + todo 事件 + round-driver 实配
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M4i 验收复核发现 M4h 的多处「诚实空/桩」实为**欠实**（非环境受限）：subagent
+list/history/prompt 为空实现、M4 工具仅注册 todo_write、round-driver 未接真实 agent-loop、
+todo 工具不落事件。经与用户确认（裁决 B：「全部补齐再做验收，含 fake-loop 驱动链路」），
+回编码阶段逐项补实，禁止以环境受限收口、禁止文过饰非。
+
+**结论**：
+- **补4 subagent 真实 in-process 驱动**（`crates/dsh-cli/src/subagent_runtime.rs` 新建）：
+  子代理 = store 里真实 `Session`（header `origin=Subagent` + `parentSession` +
+  `delegationDepth`）；身份 = `subagent/descriptor` 事件经 dsh-subagent fold。`spawn_child`
+  mint `sa-N` id / resolve_child_depth / store.create 带 meta / append descriptor（data=
+  snapshot_descriptor）；`fork_child` seed=源 events + seed_length meta；`list_children`
+  只读枚举折叠 category_child/diagnostic_row（不激活 Agent）；`history` 严格 `e.seq<beforeSeq`
+  分页 + has_more；`prompt` 经 `AgentLoopHost.ensure_agent`（`sa-agent-<child>`，provider/
+  model 从描述符析出）+ followup 驱动一轮（同步单线程；fake-loop = mock LlmAdapter 装配
+  真实 Rust loop），messageId=`pmsg-{child}:{seq+1}`，无 agent_loop → Internal fail loud；
+  `interrupt` fire-and-return 收据。gates：one-shot → bad-request。
+- **Descriptor 序列化修复**（`dsh-subagent/src/descriptor.rs`）：`#[serde(rename_all_fields =
+  "camelCase")]`——snapshot→to_value 产 camelCase（agentProvider/agentModel），与
+  fold_descriptor_from_events 期望一致；此前 snake_case 致 round-trip 失败（既有 fold 测试
+  用手写 camelCase JSON 未暴露此缺口）。subagent 投影 view 直接返回 identity。
+- **补5 M4 工具全注册 + 宿主 bind**（web.rs）：`M4HostServices{jobs,schedule,todo}` +
+  `dsh_cli_host` 内嵌模块（`ScheduleHost`：以会话 `schedule/change` 事件为权威，fold/
+  create/list/delete/dispatch_due）+ `register_m4_tools_with_host`（注册 todo_write +
+  job_output/list/kill + schedule_create/list/delete + exit_plan_mode + workflow，共 9 工具；
+  有 host 则 bind 到真实 JobRegistry/ScheduleHost，无 host 保持 `NOT_BOUND` fail loud）。
+  job_output 输出 `{text,job}`、job_kill 输出 `{outcome,job}`（对齐 SA-4 schema 精确键）。
+  schedule create 事件 `{version,operation:"create",schedule:<record>}`（decode 强制精确键
+  集合：after={id,kind,prompt,afterSeconds,scheduledAt}、at 无秒数键、every 用 everySeconds）；
+  `dispatch_due` 到期注入 → dispatch 事件（one-shot 无 acceptedAt / every 带规范 acceptedAt）
+  + framing 文本；schedule 工具输出 schema `{"type":"json"}`、workflow 恒桩。
+- **补6 todo 事件落会话**：`TodoWriteHost`（SessionHost + agent→session 登记）——todo_write
+  校验/规范化后把整表落为 `todo/write` 事件到属主会话；`todos` 投影据此折叠；无宿主时保持
+  SA-4 自包含定义（校验-only，不伪称已持久化）；无 agent 调用者 → 拒绝。
+- **补7 round-driver 实配**：`GoalRoundPort`（web.rs）把 `Rc<ReactLoopAgent>` 实配到
+  `dsh_goal::round_driver::StatusPort`（status_idle / has_pending_inbox / followup）；armed
+  目标 + 空闲 + 空 inbox + 未超 cap → `drive_once` admit 本轮 + followup 驱动真实 Rust 轮次，
+  到 cap 后不再续跑。
+- **测试**：补4 subagent_runtime 7 绿 + web.rs fake-loop 端到端；补5 注册/bind/schedule 注入
+  测试；补6 todo 事件 + 投影折叠测试；补7 fake-loop round-driver 端到端（两轮 + cap）。
+  dsh-cli `--lib` 81 绿；全仓 1130 测试 0 失败；`cargo clippy --workspace --all-targets -- -D
+  warnings` exit 0 零告警。
+
+**差异记录**：schedule 到期注入在本仓同步单线程下由宿主显式调用 `dispatch_due`
+（frame/轮次钩子），非真实定时器——事件与 fold 语义一致，定时推进属 M5 宿主调度。
+workflow 恒桩 / out-of-process provider / IANA 全时区仍为 M5+（D-044 非目标不扩散）。
+
+**预期影响与回滚点**：本提交为 M4i 补齐收口，之后 M4-ACCEPTANCE 验收。回滚撤本提交即回
+M4h 桩后状态；subagent_runtime.rs / dsh_cli_host / M4HostServices 均为本提交新增，撤提交
+即整体移除。改动 → 提交 → 本条目互查（提交信息引用 D-053）。
 
 ---
 

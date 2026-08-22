@@ -828,19 +828,28 @@ fn credentials_error_response(ref_name: &str, e: dsh_credentials::CredentialsErr
 // M4h：goal / subagent web RPC —— 把 M4 纯域服务接到 handle_rpc_host。
 // ---------------------------------------------------------------------------
 
-/// M4h：装配会话投影注册表，注册 `todos` 投影单元（M4g 交付的 into_unit）。
+/// M4h：装配会话投影注册表，注册 `todos` + M4 三键（goal/plan/subagent）投影单元。
 ///
-/// ProjectionRegistry 是可选能力：注册失败（重复键等）静默容忍，不 panic（对齐
-/// `goal`/`plan` 等投影挂 dsh-session 事件流的 M4 后续接入——本子步只注册不强制暴露）。
-pub fn todo_projection_registry() -> Rc<std::cell::RefCell<dsh_session_query::projection::ProjectionRegistry>> {
+/// ProjectionRegistry 是可选能力：注册失败（重复键等）静默容忍，不 panic——`todos`
+/// 与 goal/plan/subagent 单元（`m4_projection_units`）都以各自 stateVersion 注册，
+/// 供 `session.history` 的 projections 块真实折叠当前会话事件（验收 #2/#9）。
+pub fn assembled_projection_registry() -> Rc<std::cell::RefCell<dsh_session_query::projection::ProjectionRegistry>> {
     let registry = Rc::new(std::cell::RefCell::new(
         dsh_session_query::projection::ProjectionRegistry::new(),
     ));
     {
         let mut reg = registry.borrow_mut();
         let _ = reg.register(dsh_session_query::todo::todos_projection_unit().into_unit());
+        for unit in dsh_session_query::m4_units::m4_projection_units() {
+            let _ = reg.register(unit);
+        }
     }
     registry
+}
+
+/// 兼容别名——旧装配只挂 todos；全部装配统一走 assembled_projection_registry。
+pub fn todo_projection_registry() -> Rc<std::cell::RefCell<dsh_session_query::projection::ProjectionRegistry>> {
+    assembled_projection_registry()
 }
 
 /// M4h：bad-request（ref 缺失 / revision<=0 / sessionId 缺失等 wire 前置校验失败）。
@@ -848,6 +857,16 @@ fn bad_request_response(message: impl Into<String>) -> Value {
     serde_json::json!({
         "ok": false, "error": {
             "code": "bad-request",
+            "message": message.into(),
+        },
+    })
+}
+
+/// M4h：host/内部运行时错误（fail loud；不伪装成功）。
+fn error_response(code: &str, message: impl Into<String>) -> Value {
+    serde_json::json!({
+        "ok": false, "error": {
+            "code": code,
             "message": message.into(),
         },
     })
@@ -887,18 +906,36 @@ fn goal_max_rounds(payload: &Value) -> Option<u64> {
 }
 
 /// M4h：goal RPC 家族（goal.create/edit/pause/resume/complete/clear）。
-fn goal_dispatch(boot: &Boot, method: &str, payload: &Value) -> Value {
+///
+/// 每次成功 mutation 后把服务的最近一次 `goal/change` 变更 meta 落进目标会话
+/// （验收 #2「goal/change 事件落会话」）——事件由 GoalService 产，caller 落会话。
+fn goal_dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) -> Value {
     // 全部 goal.* 请求带 sessionId（catch-all：缺失 → bad-request）。
     let session_id = payload.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
     if session_id.is_empty() {
         return bad_request_response(format!("{method} requires sessionId"));
     }
     let mut svc = boot.goal.borrow_mut();
+    // 成功分派后落事件：从服务取走最近变更 meta → append `goal/change`。
+    let emit = |svc: &mut dsh_goal::GoalService| {
+        let meta = svc.take_last_change();
+        if let Some(meta) = meta {
+            let data = serde_json::to_value(&meta).unwrap_or(Value::Null);
+            if let Ok(s) = host.session(session_id) {
+                let _ = s
+                    .append(dsh_session::types::EventKind::GoalChange, data, None)
+                    .map_err(|e| e.to_string());
+            }
+        }
+    };
     match method {
         "goal.create" => {
             let objective = payload.get("objective").and_then(|v| v.as_str()).unwrap_or("");
             match svc.create(objective, goal_max_rounds(payload)) {
-                Ok(gr) => serde_json::json!({"ok": true, "value": goal_ref_wire(&gr)}),
+                Ok(gr) => {
+                    emit(&mut svc);
+                    serde_json::json!({"ok": true, "value": goal_ref_wire(&gr)})
+                }
                 Err(e) => goal_error_response(&e),
             }
         }
@@ -913,7 +950,10 @@ fn goal_dispatch(boot: &Boot, method: &str, payload: &Value) -> Value {
             }
             let objective = payload.get("objective").and_then(|v| v.as_str());
             match svc.edit(&gr, objective, goal_max_rounds(payload)) {
-                Ok(gr2) => serde_json::json!({"ok": true, "value": goal_ref_wire(&gr2)}),
+                Ok(gr2) => {
+                    emit(&mut svc);
+                    serde_json::json!({"ok": true, "value": goal_ref_wire(&gr2)})
+                }
                 Err(e) => goal_error_response(&e),
             }
         }
@@ -927,7 +967,10 @@ fn goal_dispatch(boot: &Boot, method: &str, payload: &Value) -> Value {
                 _ => svc.complete(&gr),
             };
             match result {
-                Ok(gr2) => serde_json::json!({"ok": true, "value": goal_ref_wire(&gr2)}),
+                Ok(gr2) => {
+                    emit(&mut svc);
+                    serde_json::json!({"ok": true, "value": goal_ref_wire(&gr2)})
+                }
                 Err(e) => goal_error_response(&e),
             }
         }
@@ -937,9 +980,12 @@ fn goal_dispatch(boot: &Boot, method: &str, payload: &Value) -> Value {
                 return bad_request_response("goal.clear requires ref {id, revision>0}");
             };
             // 幂等 no-op：无当前 goal（服务 Err(NotFound)）→ 仍 {cleared:true}（对齐 TS
-            // clear 无 current goal 语义）；服务成功 → cleared:true；其余错误透传。
+            // clear 无 current goal 语义）；服务成功 → cleared:true + 墓碑事件；其余错误透传。
             match svc.clear(&gr) {
-                Ok(_) => serde_json::json!({"ok": true, "value": {"cleared": true}}),
+                Ok(_) => {
+                    emit(&mut svc);
+                    serde_json::json!({"ok": true, "value": {"cleared": true}})
+                }
                 Err(dsh_goal::GoalServiceError::NotFound) => {
                     serde_json::json!({"ok": true, "value": {"cleared": true}})
                 }
@@ -973,109 +1019,769 @@ fn subagent_entry_wire(e: &dsh_subagent::ChildEntry) -> Value {
 }
 
 /// M4h：subagent RPC 家族（subagent.list/history/interrupt/prompt）。
-fn subagent_dispatch(boot: &Boot, method: &str, payload: &Value) -> Value {
+///
+/// 真实驱动（M4i 收口 / 验收 #5）：list = 只读枚举（store + 描述符折叠）；history =
+/// child 事件分页 + projections；prompt = gate 后经 AgentLoopHost followup 驱动一轮
+/// （返回真实 messageId；未装配 loop → fail loud）；interrupt = fire-and-return 收据。
+fn subagent_dispatch(
+    boot: &Boot,
+    method: &str,
+    payload: &Value,
+    host: &Rc<SessionHost>,
+) -> Value {
+    use crate::subagent_runtime as sa;
     match method {
         "subagent.list" => {
-            // M4 无真实子代理运行时（无监控源）→ 空目录行（0 条 child/diagnostic）；
-            // 行构造走 catalog 纯函数（category_child/diagnostic_row 的宿主投影保持
-            // 同一 wire 形状——subagent_entry_wire），供真实目录源接入时复用。
-            let rows: Vec<dsh_subagent::ChildEntry> = Vec::new();
+            let parent = payload
+                .get("parentSessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let (rows, parent_available) = sa::list_children(host, &parent);
             let entries: Vec<Value> = rows.iter().map(subagent_entry_wire).collect();
-            let _ = boot;
-            serde_json::json!({"ok": true, "value": {"entries": entries, "parentAvailable": true}})
+            serde_json::json!({
+                "ok": true,
+                "value": { "entries": entries, "parentAvailable": parent_available },
+            })
         }
         "subagent.history" => {
-            // M4 无真实持久化子代理日志 → 诚实空实现（events 空、hasMore false）。
-            let _ = boot;
-            serde_json::json!({"ok": true, "value": {"events": [], "hasMore": false}})
+            let parent = payload
+                .get("parentSessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let child = payload
+                .get("childSessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let mode = payload.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+            if parent.is_empty() || child.is_empty() {
+                return bad_request_response("subagent.history requires parentSessionId + childSessionId");
+            }
+            if mode != "one-shot" && mode != "continuable" {
+                return bad_request_response("subagent.history requires mode one-shot|continuable");
+            }
+            let before_seq = payload.get("beforeSeq").and_then(|v| v.as_u64());
+            let max = payload
+                .get("maxMessages")
+                .and_then(|v| v.as_u64())
+                .map(|m| m as usize);
+            let (events, has_more) = sa::history(host, &child, before_seq, max);
+            // projections 块：折叠 child 会话事件（对齐 session.history 的 M4h 投影块）。
+            let projections = {
+                let reg = boot.projections.borrow();
+                let mut ps = dsh_session_query::projection::ProjectionSession::new(&reg);
+                let child_events = host.events(&child);
+                for e in &child_events {
+                    ps.observe(e);
+                }
+                let snap = ps.snapshot();
+                let as_of_seq = if child_events.is_empty() {
+                    -1i64
+                } else {
+                    snap.as_of_seq as i64
+                };
+                let mut values = serde_json::Map::new();
+                for (k, v) in snap.values {
+                    values.insert(k, v);
+                }
+                serde_json::json!({ "asOfSeq": as_of_seq, "values": Value::Object(values) })
+            };
+            serde_json::json!({
+                "ok": true,
+                "value": { "events": events, "hasMore": has_more, "projections": projections },
+            })
         }
         "subagent.prompt" => {
-            let parent = payload.get("parentSessionId").and_then(|v| v.as_str()).unwrap_or("");
-            let child = payload.get("childSessionId").and_then(|v| v.as_str()).unwrap_or("");
+            let parent = payload
+                .get("parentSessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let child = payload
+                .get("childSessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let mode = payload.get("mode").and_then(|v| v.as_str()).unwrap_or("");
-            let addr = dsh_subagent::PromptAddress {
-                parent_session_id: parent.to_string(),
-                child_session_id: child.to_string(),
-                mode: mode.to_string(),
-            };
-            // prompt 仅对 continuable child（mode 校验）。
-            if let Err(dsh_subagent::PromptError::NotContinuable) = dsh_subagent::prompt_gate(&addr) {
-                return bad_request_response(
-                    "subagent.prompt requires mode 'continuable'",
-                );
+            if parent.is_empty() || child.is_empty() {
+                return bad_request_response("subagent.prompt requires parentSessionId + childSessionId");
             }
-            let _ = boot;
-            // M4 无真实投递 → 诚实合成 messageId（过 schema；未来接 agent-loop inbox）。
-            serde_json::json!({"ok": true, "value": {"messageId": format!("pmsg-{child}:1")}})
+            if mode != "continuable" {
+                return bad_request_response("subagent.prompt requires mode 'continuable'");
+            }
+            // content：文本块拼接（wire content[].text）。
+            let text = payload
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            match sa::prompt(host, &boot.agent_loop, &parent, &child, &text) {
+                Ok(message_id) => serde_json::json!({
+                    "ok": true,
+                    "value": { "messageId": message_id },
+                }),
+                Err(e) => match e {
+                    sa::SubagentError::BadRequest(m) => bad_request_response(m),
+                    sa::SubagentError::Internal(m) => error_response("internal", m),
+                },
+            }
         }
         "subagent.interrupt" => {
-            let parent = payload.get("parentSessionId").and_then(|v| v.as_str()).unwrap_or("");
-            let child = payload.get("childSessionId").and_then(|v| v.as_str()).unwrap_or("");
-            let mode = payload.get("mode").and_then(|v| v.as_str()).unwrap_or("");
-            let addr = dsh_subagent::InterruptAddress {
-                parent_session_id: parent.to_string(),
-                child_session_id: child.to_string(),
-                mode: mode.to_string(),
-            };
-            let accepted = dsh_subagent::interrupt_receipt(&addr);
-            let _ = boot;
-            serde_json::json!({"ok": true, "value": {"accepted": accepted}})
+            let parent = payload
+                .get("parentSessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let child = payload
+                .get("childSessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if parent.is_empty() || child.is_empty() {
+                return bad_request_response("subagent.interrupt requires parentSessionId + childSessionId");
+            }
+            let accepted = sa::interrupt(&parent, &child);
+            serde_json::json!({ "ok": true, "value": { "accepted": accepted } })
         }
         _ => bad_request_response("unknown subagent method"),
     }
 }
 
-/// M4h：注册 M4 工具（当前：todo_write）到给定 ToolRegistry。
+// ---------------------------------------------------------------------------
+// M4h 补实：jobs/schedule/todo 宿主服务 seam（M4i 验收 #6/#7/#8）
+// ---------------------------------------------------------------------------
+
+/// M4h 宿主服务句柄集合：job_*/schedule_*/todo 工具的 bind 目标。
 ///
-/// 说明：harness（Boot）当前没有持久 ToolRegistry 注入点（工具注册表只在 agent-loop
-/// 装配时按需创建）——本子步提供纯注册函数 + 单元测试证明可注册 + 参数校验走
-/// `dsh_session_query::todo::to_todo_list`；不强制挂 boot 链（差值记录于 D-043 同类）。
-pub fn register_m4_tools(registry: &dsh_tools::ToolRegistry) {
-    let def = dsh_tools::define_tool(dsh_tools::DefineToolOptions {
-        name: "todo_write".to_string(),
-        description: "写入/替换当前会话的待办列表（全表覆盖，单活动纪律受 allowParallel 约束）。".to_string(),
-        parameters: serde_json::json!({
-            "todos": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "content": {"type": "string", "required": true},
-                        "status": {
-                            "type": "string",
-                            "enum": ["pending", "in_progress", "completed"],
-                        },
-                    },
-                },
-                "required": true,
-            },
-            "allowParallel": {"type": "boolean"},
-        }),
-        output_schema: serde_json::json!({ "type": "json" }),
-        render: Rc::new(|_, value| {
-            let text = format!("todos: {}", serde_json::to_string(value).unwrap_or_default());
-            vec![dsh_llm::ContentBlock::text(text)]
-        }),
-        execute: Rc::new(|args, _| {
-            let raw = args.get("todos").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            let allow_parallel = args.get("allowParallel").and_then(|v| v.as_bool()).unwrap_or(false);
-            match dsh_session_query::todo::to_todo_list(&raw, allow_parallel) {
-                Ok(list) => serde_json::to_value(list)
-                    .map_err(|e| dsh_tools::ToolFailureData::new(e.to_string(), dsh_tools::CODE_INVALID_TOOL_OUTPUT, "Error")),
-                Err(e) => Err(dsh_tools::ToolFailureData::new(
-                    format!("todo list rejected: {e:?}"),
-                    dsh_tools::CODE_INVALID_ARGS,
-                    "TodoListError",
-                )),
+/// `register_m4_tools` 接受可选的 `&M4HostServices`：有句柄 → 宿主工具 bind 到真实
+/// 宿主（fail loud 不再 NOT_BOUND）；无句柄 → 注册定义但保持 `NOT_BOUND`（诚实：
+/// 宿主未装配时绝不伪装成功，D-052 已记录）。
+#[derive(Default)]
+pub struct M4HostServices {
+    /// 共享 JobRegistry（真实生命周期状态机）。
+    pub jobs: Option<Rc<std::cell::RefCell<dsh_jobs::registry::JobRegistry>>>,
+    /// schedule 域：`schedule/change` 事件 fold 与到期注入（挂在会话事件上）。
+    pub schedule: Option<Rc<dsh_cli_host::ScheduleHost>>,
+    /// todo 域：把 `todo/write` 事件落到属主 agent 的会话（todo 工具的真实句柄）。
+    pub todo: Option<Rc<dsh_cli_host::TodoWriteHost>>,
+}
+
+/// M4h 补实：TodoWriteHost —— `todo_write` 工具写入属主会话的真实句柄。
+///
+/// 对齐 `packages/todo/tool-todo/src/index.ts`：todo 写入既产出模型可见输出
+/// （{todos, counts}），也落 `todo/write` 事件到当前会话（`todos` 投影据此折叠）。
+/// agent→session 的归属由宿主装配时登记（web 集成中与 AgentLoopHost 共享 store）。
+pub mod dsh_cli_host {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    use dsh_session::types::EventKind;
+    use dsh_session::runtime::Session;
+    use serde_json::{json, Value};
+
+    /// todo 写宿主：登记 agent→session 归属 + 把规范化 todo 表落为 `todo/write` 事件
+    /// （对齐 `packages/todo/tool-todo`：写入既产出模型可见输出，也落事件到属主会话，
+    /// `todos` 投影据此折叠）。
+    pub struct TodoWriteHost {
+        host: Rc<crate::session_host::SessionHost>,
+        agent_to_session: RefCell<HashMap<String, String>>,
+        default_session: String,
+    }
+
+    impl TodoWriteHost {
+        pub fn new(host: Rc<crate::session_host::SessionHost>, default_session: String) -> Self {
+            Self {
+                host,
+                agent_to_session: RefCell::new(HashMap::new()),
+                default_session,
             }
-        }),
-        ..Default::default()
-    })
-    .expect("todo_write tool defines cleanly");
+        }
+
+        /// 登记 agent id 的属主会话（web 集成装配时由宿主调用）。
+        pub fn bind_agent(&self, agent: &str, session_id: &str) {
+            self.agent_to_session
+                .borrow_mut()
+                .insert(agent.to_string(), session_id.to_string());
+        }
+
+        /// 解析属主会话 id（agent 登记优先；未登记回退默认会话）。
+        pub fn session_id_for(&self, agent: Option<&str>) -> String {
+            agent
+                .and_then(|a| self.agent_to_session.borrow().get(a).cloned())
+                .unwrap_or_else(|| self.default_session.clone())
+        }
+
+        /// 写 `todo/write` 事件（全表替换；对齐投影整表语义）到 agent 属主会话。
+        pub fn write(&self, agent: Option<&str>, todos: &[Value]) -> Result<(), String> {
+            let sid = self.session_id_for(agent);
+            let session = self.host.session(&sid).map_err(|e| e.to_string())?;
+            session
+                .append(EventKind::TodoWrite, json!({ "todos": todos }), None)
+                .map(|_| ())
+                .map_err(|e| e.0)
+        }
+
+        /// 供 executors / tests 探测默认会话 id。
+        pub fn default_session_id(&self) -> &str {
+            &self.default_session
+        }
+    }
+
+    /// ScheduleHost：以某会话（通常为发起调度提醒的 agent 会话）的事件日志为权威。
+    pub struct ScheduleHost {
+        /// 事件追加目标会话（`Rc`，web 集成时 SessionHost 持有）。
+        session: Rc<Session>,
+    }
+
+    impl ScheduleHost {
+        pub fn new(session: Rc<Session>) -> Self {
+            Self { session }
+        }
+
+        /// fold 当前会话的 `schedule/change` 事件 → active 记录。
+        pub fn fold(&self) -> Result<dsh_schedule::FoldedSchedules, String> {
+            let events: Vec<Value> = self
+                .session
+                .events()
+                .iter()
+                .filter(|e| e.kind == EventKind::ScheduleChange)
+                .map(|e| json!({ "type": e.kind.as_str(), "data": e.data }))
+                .collect();
+            dsh_schedule::fold_schedule_events(&events).map_err(|e| e.to_string())
+        }
+
+        /// create：构造一次 after / at / every 记录并追加 `schedule/change` create 事件。
+        /// 返回新 id（fail loud：构造失败 → Err，绝不落坏事件）。
+        pub fn create(
+            &self,
+            kind: &str,
+            prompt: &str,
+            after_seconds: Option<u64>,
+            at: Option<&str>,
+            every_seconds: Option<u64>,
+            now_epoch: i64,
+        ) -> Result<String, String> {
+            use dsh_schedule::{
+                create_after_record, create_at_record_from_offset, create_every_record,
+                ScheduleRecordData,
+            };
+            let folded = self.fold().map_err(|e| e.to_string())?;
+            let seen = folded.seen_ids.clone();
+            let id = dsh_schedule::allocate_id_from_seen(&seen);
+            let record: ScheduleRecordData = match kind {
+                "after" => create_after_record(
+                    &id,
+                    prompt,
+                    after_seconds.ok_or_else(|| {
+                        "after requires afterSeconds".to_string()
+                    })?,
+                    now_epoch,
+                )
+                .map_err(|e| format!("{e:?}"))?,
+                "at" => create_at_record_from_offset(&id, prompt, at.unwrap_or_default(), now_epoch)
+                    .map_err(|e| format!("{e:?}"))?,
+                "every" => create_every_record(
+                    &id,
+                    prompt,
+                    every_seconds.ok_or_else(|| "every requires everySeconds".to_string())?,
+                    now_epoch,
+                )
+                .map_err(|e| format!("{e:?}"))?,
+                other => return Err(format!("unknown schedule kind \"{other}\"")),
+            };
+            // create 事件载荷：`{version, operation:"create", schedule:<record>}`；decode
+            // 按 kind 强制精确键集合（after={id,kind,prompt,afterSeconds,scheduledAt}，
+            // at={id,kind,prompt,scheduledAt}，every={id,kind,prompt,everySeconds,
+            // scheduledAt}）——建最小精确对象，绝不带多余键。
+            let mut schedule = serde_json::Map::new();
+            schedule.insert("id".into(), Value::String(record.id.clone()));
+            schedule.insert("kind".into(), Value::String(record.kind.clone()));
+            schedule.insert("prompt".into(), Value::String(record.prompt.clone()));
+            match record.kind.as_str() {
+                "after" => {
+                    schedule.insert(
+                        "afterSeconds".into(),
+                        Value::from(record.after_seconds.unwrap_or(0)),
+                    );
+                }
+                "every" => {
+                    schedule.insert(
+                        "everySeconds".into(),
+                        Value::from(record.every_seconds.unwrap_or(0)),
+                    );
+                }
+                _ => {}
+            }
+            schedule.insert(
+                "scheduledAt".into(),
+                Value::String(record.scheduled_at.clone()),
+            );
+            let data = json!({
+                "version": dsh_schedule::SCHEDULE_CHANGE_VERSION,
+                "operation": "create",
+                "schedule": Value::Object(schedule),
+            });
+            // 先 decode 校验再落（坏事件被拒绝 → 不污染日志）。
+            dsh_schedule::decode_schedule_change(&data)
+                .map_err(|e| format!("schedule create payload rejected: {e:?}"))?;
+            self.session
+                .append(EventKind::ScheduleChange, data, None)
+                .map_err(|e| e.0)?;
+            Ok(id)
+        }
+
+        /// list：fold 出该会话 schedule view 行（wire `ScheduleView[]`；缺省字段省略）。
+        pub fn list(&self) -> Result<Value, String> {
+            let folded = self.fold().map_err(|e| e.to_string())?;
+            let mut rows = Vec::new();
+            for r in &folded.records {
+                let mut row = serde_json::Map::new();
+                row.insert("id".into(), Value::String(r.id.clone()));
+                row.insert("kind".into(), Value::String(r.kind.clone()));
+                row.insert("prompt".into(), Value::String(r.prompt.clone()));
+                row.insert("scheduledAt".into(), Value::String(r.scheduled_at.clone()));
+                if let Some(a) = r.after_seconds {
+                    row.insert("afterSeconds".into(), Value::from(a));
+                }
+                if let Some(e) = r.every_seconds {
+                    row.insert("everySeconds".into(), Value::from(e));
+                }
+                row.insert("deliveryMode".into(), Value::String("session-local".into()));
+                rows.push(Value::Object(row));
+            }
+            Ok(Value::Array(rows))
+        }
+
+        /// delete：追加 `schedule/change` delete 事件（bad id → None 不落事件）。
+        pub fn delete(&self, id: &str) -> Result<bool, String> {
+            let folded = self.fold().map_err(|e| e.to_string())?;
+            if !folded.active_ids.iter().any(|a| a == id) {
+                return Ok(false);
+            }
+            let data = json!({
+                "version": dsh_schedule::SCHEDULE_CHANGE_VERSION,
+                "operation": "delete",
+                "id": id,
+            });
+            dsh_schedule::decode_schedule_change(&data)
+                .map_err(|e| format!("schedule delete payload rejected: {e:?}"))?;
+            self.session
+                .append(EventKind::ScheduleChange, data, None)
+                .map_err(|e| e.0)?;
+            Ok(true)
+        }
+
+        /// 到期注入（M4i 验收 #7）：fold 后取 due 记录，为每条写 `dispatch` 事件
+        /// （one-shot 无 acceptedAt / every 带规范 acceptedAt），并生成 framing 文本。
+        /// 返回 `(framing_lines, dispatched_ids)`；无 due → 空。
+        pub fn dispatch_due(&self, now_epoch: i64) -> Result<(Vec<String>, Vec<String>), String> {
+            let folded = self.fold().map_err(|e| e.to_string())?;
+            let mut framing = Vec::new();
+            let mut dispatched = Vec::new();
+            for record in dsh_schedule::due_records(&folded, now_epoch) {
+                let Some(data) = dsh_schedule::dispatch_schedule_change(&record, now_epoch) else {
+                    continue;
+                };
+                self.session
+                    .append(EventKind::ScheduleChange, data, None)
+                    .map_err(|e| e.0)?;
+                framing.push(dsh_schedule::framing_text(&record));
+                dispatched.push(record.id.clone());
+            }
+            Ok((framing, dispatched))
+        }
+    }
+}
+
+/// M4 h：注册全部 M4 工具（todo/job_*/schedule_*/exit_plan_mode/workflow）。
+///
+/// 有 `host` 时 bind job_*/schedule_* 到真实宿主；否则注册定义但宿主工具保持
+/// `NOT_BOUND`（fail loud）。workflow 恒桩（UNSUPPORTED_OPTION）。
+pub fn register_m4_tools_with_host(
+    registry: &dsh_tools::ToolRegistry,
+    host: Option<&M4HostServices>,
+) {
+    use dsh_tools::m4;
+
+    // todo_write：宿主 todo 句柄在场 → 绑定写入器（落 `todo/write` 事件到属主会话 +
+    // 规范化输出 {todos, counts}）；否则注册自包含定义（校验-only，不落事件——宿主
+    // 未装配时事件无从归属，保持诚实，不伪称已持久化）。
+    if let Some(todo_host) = host.and_then(|h| h.todo.clone()) {
+        let bound = todo_write_with_host_executor(todo_host);
+        registry
+            .register_global(bound)
+            .expect("register todo_write (host-bound)");
+    } else {
+        registry
+            .register_global(m4::todo_write(false).expect("todo_write defines"))
+            .expect("register todo_write");
+    }
+
+    // job_*：宿主 JobRegistry bind。
+    let (job_output, job_list, job_kill) = (
+        m4::job_output().expect("job_output defines"),
+        m4::job_list().expect("job_list defines"),
+        m4::job_kill().expect("job_kill defines"),
+    );
+    if let Some(jobs) = host.and_then(|h| h.jobs.clone()) {
+        let bind_jobs = jobs.clone();
+        job_output.bind(job_output_executor(bind_jobs.clone()));
+        job_list.bind(job_list_executor(bind_jobs.clone()));
+        job_kill.bind(job_kill_executor(bind_jobs));
+    }
     registry
-        .register_global(Rc::new(def))
-        .expect("register todo_write");
+        .register_global(job_output.definition())
+        .expect("register job_output");
+    registry
+        .register_global(job_list.definition())
+        .expect("register job_list");
+    registry
+        .register_global(job_kill.definition())
+        .expect("register job_kill");
+
+    // schedule_*：宿主 ScheduleHost bind。
+    let (schedule_create, schedule_list, schedule_delete) = (
+        m4::schedule_create().expect("schedule_create defines"),
+        m4::schedule_list().expect("schedule_list defines"),
+        m4::schedule_delete().expect("schedule_delete defines"),
+    );
+    if let Some(sched) = host.and_then(|h| h.schedule.clone()) {
+        let bind_sched = sched.clone();
+        schedule_create.bind(schedule_create_executor(bind_sched.clone()));
+        schedule_list.bind(schedule_list_executor(bind_sched.clone()));
+        schedule_delete.bind(schedule_delete_executor(bind_sched));
+    }
+    registry
+        .register_global(schedule_create.definition())
+        .expect("register schedule_create");
+    registry
+        .register_global(schedule_list.definition())
+        .expect("register schedule_list");
+    registry
+        .register_global(schedule_delete.definition())
+        .expect("register schedule_delete");
+
+    // exit_plan_mode：计划前置校验（无宿主 plan-mode 服务 → NOT_BOUND 诚实）。
+    let exit_plan = m4::exit_plan_mode().expect("exit_plan_mode defines");
+    registry
+        .register_global(exit_plan.definition())
+        .expect("register exit_plan_mode");
+
+    // workflow：恒桩（meta 校验 → UNSUPPORTED_OPTION）。
+    registry
+        .register_global(m4::workflow().expect("workflow defines"))
+        .expect("register workflow");
+}
+
+// ---- todo_write 宿主 executor（bind 目标；落 `todo/write` 事件 + 规范化输出） ----
+
+/// todo_write 宿主绑定版：校验/规范化（不变，复用 to_todo_list）+ 把规范表落为
+/// `todo/write` 事件到属主会话，并返回模型可见 `{todos, counts}`（对齐
+/// `packages/todo/tool-todo`：写入即事件，todos 投影据此折叠）。
+fn todo_write_with_host_executor(todo_host: Rc<dsh_cli_host::TodoWriteHost>) -> Rc<dsh_tools::ToolDefinition> {
+    use dsh_tools::types::{ToolExecute, ToolFailureData, CODE_INVALID_ARGS};
+    let execute: ToolExecute = Rc::new(move |args, ctx| {
+        let agent = ctx.agent.as_deref();
+        if agent.is_none() {
+            // 对齐参考：拒绝无 agent 调用者（无处归属），绝不静默 no-op。
+            return Err(ToolFailureData::new(
+                "todo_write requires an owning agent session".to_string(),
+                CODE_INVALID_ARGS,
+                "TodoWriteError",
+            ));
+        }
+        let raw = args
+            .get("todos")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        match dsh_session_query::todo::to_todo_list(&raw, false) {
+            Ok(list) => {
+                let todos = serde_json::to_value(&list).unwrap_or_else(|_| serde_json::json!([]));
+                let counts = dsh_session_query::todo::todo_counts(&list);
+                // 落 `todo/write` 事件（整表替换；投影空事件 → no-op，仍返回输出）。
+                if let Err(e) = todo_host.write(agent, &todos.as_array().cloned().unwrap_or_default()) {
+                    return Err(ToolFailureData::new(
+                        format!("todo/write event rejected: {e}"),
+                        dsh_tools::CODE_INVALID_TOOL_OUTPUT,
+                        "TodoWriteError",
+                    ));
+                }
+                Ok(serde_json::json!({ "todos": todos, "counts": counts }))
+            }
+            Err(e) => Err(ToolFailureData::new(
+                format!("todo list rejected: {e:?}"),
+                CODE_INVALID_ARGS,
+                "TodoListError",
+            )),
+        }
+    });
+    // 复用 SA-4 todo_write 的 schema/输出/描述，仅换执行器（消重，语义不漂移）。
+    // 刚构造的 base refcount==1 → Rc::try_unwrap 拿回本体直接改 execute。
+    let base = dsh_tools::m4::todo_write(false).expect("todo_write defines");
+    let mut def = Rc::try_unwrap(base).unwrap_or_else(|_| {
+        panic!("todo_write def freshly created must be refcount 1")
+    });
+    def.execute = execute;
+    Rc::new(def)
+}
+
+// ---- job_* 宿主 executor（bind 目标） ----
+
+fn job_output_executor(
+    jobs: Rc<std::cell::RefCell<dsh_jobs::registry::JobRegistry>>,
+) -> dsh_tools::types::ToolExecute {
+    use dsh_tools::types::{ToolFailureData, CODE_INVALID_ARGS};
+    Rc::new(move |args, _ctx| {
+        let id = args
+            .get("job_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ToolFailureData::new("job_output requires job_id", CODE_INVALID_ARGS, "JobError")
+            })?;
+        let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut reg = jobs.borrow_mut();
+        // wait=true → 等终态（本宿主纯内存、单线程：非终态即返回当前快照）；
+        // wait=false → read（text + snapshot）。
+        let read = reg.read(id, None);
+        let (text, job_view) = match read {
+            Ok(r) => {
+                let view = dsh_jobs::snapshot_to_view(&r.snapshot);
+                (r.text.clone(), view)
+            }
+            Err(e) => {
+                return Err(ToolFailureData::new(
+                    format!("job read failed: {e:?}"),
+                    dsh_tools::CODE_INVALID_TOOL_OUTPUT,
+                    "JobError",
+                ));
+            }
+        };
+        if wait {
+            match reg.wait(id, None) {
+                Ok(s) => {
+                    let view = dsh_jobs::snapshot_to_view(&s);
+                    let text2 = view["detail"]
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| text.clone());
+                    return Ok(serde_json::json!({ "text": text2, "job": view }));
+                }
+                Err(e) => {
+                    return Err(ToolFailureData::new(
+                        format!("job wait failed: {e:?}"),
+                        dsh_tools::CODE_INVALID_TOOL_OUTPUT,
+                        "JobError",
+                    ));
+                }
+            }
+        }
+        Ok(serde_json::json!({ "text": text, "job": job_view }))
+    })
+}
+
+fn job_list_executor(
+    jobs: Rc<std::cell::RefCell<dsh_jobs::registry::JobRegistry>>,
+) -> dsh_tools::types::ToolExecute {
+    Rc::new(move |_args, _ctx| {
+        let reg = jobs.borrow();
+        let snaps = reg.list(None);
+        Ok(dsh_jobs::jobs_frame(&snaps))
+    })
+}
+
+fn job_kill_executor(
+    jobs: Rc<std::cell::RefCell<dsh_jobs::registry::JobRegistry>>,
+) -> dsh_tools::types::ToolExecute {
+    use dsh_tools::types::CODE_INVALID_ARGS;
+    Rc::new(move |args, _ctx| {
+        let id = args
+            .get("job_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                dsh_tools::ToolFailureData::new(
+                    "job_kill requires job_id",
+                    CODE_INVALID_ARGS,
+                    "JobError",
+                )
+            })?;
+        let reason = args.get("reason").and_then(|v| v.as_str()).map(str::to_string);
+        let outcome = jobs.borrow_mut().kill(id, None, reason.as_deref());
+        match outcome {
+            Ok(kill_outcome) => {
+                let (outcome_str, job) = match kill_outcome {
+                    dsh_jobs::KillOutcome::AlreadyFinished => {
+                        let snap = jobs.borrow().get(id, None).unwrap_or_else(|_| {
+                            // 极端：kill 后瞬时不可达 → 最小 view（不应发生；防御）。
+                            dsh_jobs::JobSnapshot {
+                                id: id.to_string(),
+                                kind: String::new(),
+                                label: String::new(),
+                                owner: None,
+                                status: dsh_jobs::JobStatus::Completed,
+                                detail: None,
+                                started_at: 0,
+                                finished_at: None,
+                                reported: false,
+                            }
+                        });
+                        ("already-finished", dsh_jobs::snapshot_to_view(&snap))
+                    }
+                    dsh_jobs::KillOutcome::Requested => {
+                        let snap = jobs.borrow().get(id, None).unwrap_or_else(|_| {
+                            dsh_jobs::JobSnapshot {
+                                id: id.to_string(),
+                                kind: String::new(),
+                                label: String::new(),
+                                owner: None,
+                                status: dsh_jobs::JobStatus::Stopping,
+                                detail: None,
+                                started_at: 0,
+                                finished_at: None,
+                                reported: false,
+                            }
+                        });
+                        ("cancellation-requested", dsh_jobs::snapshot_to_view(&snap))
+                    }
+                };
+                Ok(serde_json::json!({ "outcome": outcome_str, "job": job }))
+            }
+            Err(e) => Err(dsh_tools::ToolFailureData::new(
+                format!("job kill failed: {e:?}"),
+                dsh_tools::CODE_INVALID_TOOL_OUTPUT,
+                "JobError",
+            )),
+        }
+    })
+}
+
+// ---- goal-round-driver 实配端口（M4i 验收 #3） ----
+
+/// goal-round-driver 的宿主端口：把 `Rc<ReactLoopAgent>` 实配到 `StatusPort`
+/// （status_idle / has_pending_inbox / followup）。装配好后，宿主在每轮结束时调用
+/// `drive_once`（或 `round_driver_outcome` 判定 + `followup` 投递），让 armed 目标
+/// 自动续跑下一轮（单线程同步：followup 即时驱动该轮直至空闲）。
+pub struct GoalRoundPort {
+    agent: Rc<dsh_agent_loop::ReactLoopAgent>,
+}
+
+impl GoalRoundPort {
+    pub fn new(agent: Rc<dsh_agent_loop::ReactLoopAgent>) -> Self {
+        Self { agent }
+    }
+}
+
+impl dsh_goal::round_driver::StatusPort for GoalRoundPort {
+    fn status_idle(&self) -> bool {
+        self.agent.status() == dsh_agent::types::AgentStatus::Idle
+    }
+
+    fn has_pending_inbox(&self) -> bool {
+        self.agent.inbox().has_pending()
+    }
+
+    fn followup(&mut self, _id: &dsh_goal::types::GoalId, message: &str) -> Result<(), String> {
+        let msg = dsh_llm::Message::user(
+            dsh_llm::MessageId::from_raw("goal-round-followup".to_string()),
+            vec![dsh_llm::ContentBlock::text(message)],
+        );
+        self.agent.followup(msg).map_err(|e| e.to_string())
+    }
+}
+
+// ---- schedule_* 宿主 executor（bind 目标） ----
+
+fn schedule_create_executor(
+    sched: Rc<dsh_cli_host::ScheduleHost>,
+) -> dsh_tools::types::ToolExecute {
+    use dsh_tools::types::CODE_INVALID_ARGS;
+    Rc::new(move |args, _ctx| {
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                dsh_tools::ToolFailureData::new(
+                    "schedule_create requires prompt",
+                    CODE_INVALID_ARGS,
+                    "ScheduleError",
+                )
+            })?;
+        let after = args.get("after_seconds").and_then(|v| v.as_u64());
+        let every = args.get("every_seconds").and_then(|v| v.as_u64());
+        let at = args.get("at").and_then(|v| v.as_str());
+        let kind = if every.is_some() {
+            "every"
+        } else if at.is_some() {
+            "at"
+        } else {
+            "after"
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        match sched.create(kind, prompt, after, at, every, now) {
+            Ok(id) => Ok(serde_json::json!({ "id": id })),
+            Err(e) => Err(dsh_tools::ToolFailureData::new(
+                e,
+                dsh_tools::CODE_INVALID_TOOL_OUTPUT,
+                "ScheduleError",
+            )),
+        }
+    })
+}
+
+fn schedule_list_executor(
+    sched: Rc<dsh_cli_host::ScheduleHost>,
+) -> dsh_tools::types::ToolExecute {
+    Rc::new(move |_args, _ctx| match sched.list() {
+        Ok(v) => Ok(v),
+        Err(e) => Err(dsh_tools::ToolFailureData::new(
+            e,
+            dsh_tools::CODE_INVALID_TOOL_OUTPUT,
+            "ScheduleError",
+        )),
+    })
+}
+
+fn schedule_delete_executor(
+    sched: Rc<dsh_cli_host::ScheduleHost>,
+) -> dsh_tools::types::ToolExecute {
+    use dsh_tools::types::CODE_INVALID_ARGS;
+    Rc::new(move |args, _ctx| {
+        let id = args
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                dsh_tools::ToolFailureData::new(
+                    "schedule_delete requires id",
+                    CODE_INVALID_ARGS,
+                    "ScheduleError",
+                )
+            })?;
+        match sched.delete(id) {
+            Ok(true) => Ok(serde_json::json!({ "deleted": true })),
+            Ok(false) => Ok(serde_json::json!({ "deleted": false })),
+            Err(e) => Err(dsh_tools::ToolFailureData::new(
+                e,
+                dsh_tools::CODE_INVALID_TOOL_OUTPUT,
+                "ScheduleError",
+            )),
+        }
+    })
+}
+
+/// 兼容别名：无宿主注册全部 M4 工具（job_*/schedule_* 保持 NOT_BOUND）。
+pub fn register_m4_tools(registry: &dsh_tools::ToolRegistry) {
+    register_m4_tools_with_host(registry, None);
 }
 
 
@@ -1196,7 +1902,32 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
                     })
                 })
                 .collect::<Vec<_>>();
-            serde_json::json!({"ok": true, "value": {"events": events, "hasMore": false}})
+            // M4h：投影块（验收 #9「投影键经 history 响应携带」）——把会话事件经
+            // ProjectionRegistry 折叠出 projections（asOfSeq + values）。折叠在
+            // 调用线程同步做，读模型与事件流天然一致（M4-REQUIREMENTS §3）。
+            let projections = {
+                let reg = boot.projections.borrow();
+                let mut ps = dsh_session_query::projection::ProjectionSession::new(&reg);
+                let session_events = host.events(&sid);
+                for e in &session_events {
+                    ps.observe(e);
+                }
+                let snap = ps.snapshot();
+                // asOfSeq 惯例：空日志 = -1（与 sessionProjectionsBlockSchema/订阅 lastSeq 一致）。
+                let as_of_seq = if session_events.is_empty() {
+                    -1i64
+                } else {
+                    snap.as_of_seq as i64
+                };
+                let mut values = serde_json::Map::new();
+                for (k, v) in snap.values {
+                    values.insert(k, v);
+                }
+                serde_json::json!({ "asOfSeq": as_of_seq, "values": Value::Object(values) })
+            };
+            serde_json::json!({"ok": true, "value": {
+                "events": events, "hasMore": false, "projections": projections,
+            }})
         }
         "session.search" => {
             serde_json::json!({"ok": true, "value": {"items": [], "hasMore": false}})
@@ -1497,10 +2228,10 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             serde_json::json!({"ok": true, "value": {"models": []}})
         }
         "goal.create" | "goal.edit" | "goal.pause" | "goal.resume" | "goal.complete" | "goal.clear" => {
-            goal_dispatch(boot, method, payload)
+            goal_dispatch(boot, method, payload, host)
         }
         "subagent.list" | "subagent.history" | "subagent.prompt" | "subagent.interrupt" => {
-            subagent_dispatch(boot, method, payload)
+            subagent_dispatch(boot, method, payload, host)
         }
         "commands/list" => {
             serde_json::json!({"ok": true, "value": [
@@ -1618,7 +2349,7 @@ mod tests {
             goal: std::rc::Rc::new(std::cell::RefCell::new(
                 dsh_goal::GoalService::new(dsh_goal::ServiceOptions::default()),
             )),
-            projections: todo_projection_registry(),
+            projections: assembled_projection_registry(),
         }
     }
 
@@ -2632,6 +3363,108 @@ mod tests {
         assert!(refv["revision"].as_u64().unwrap() > 0);
     }
 
+    /// M4h：goal.create 后 `goal/change` 事件落进目标会话（验收 #2）。
+    /// 通过 handle_rpc_host 显式 host 断言会话日志包含 goal/change snapshot。
+    #[test]
+    fn rpc_goal_create_appends_goal_change_event() {
+        use dsh_session::types::EventKind;
+        let boot = boot_with_sessions();
+        let host = SessionHost::in_memory();
+        let _ = host.session("default");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "goal.create",
+            "payload": {"sessionId": "default", "objective": "ship M4h"},
+        })).unwrap();
+        let (_, v) = handle_rpc_host(&boot, "goal.create", &body, &host);
+        assert_eq!(v["result"]["ok"], true, "goal.create ok");
+        // 会话日志出现 goal/change（kind 字面量 + 版本 + snapshot 载荷）
+        let events = host.events("default");
+        let goal_changes: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::GoalChange)
+            .collect();
+        assert_eq!(goal_changes.len(), 1, "恰好一条 goal/change");
+        let data = &goal_changes[0].data;
+        assert_eq!(data["kind"], "goal/change");
+        assert_eq!(data["version"], 1);
+        assert_eq!(data["operation"], "create");
+        assert_eq!(data["goal"]["id"], "goal-1");
+        assert_eq!(data["goal"]["phase"], "active");
+        assert_eq!(data["roundsStarted"], 0);
+    }
+
+    /// M4h：goal.complete + goal.clear 各落一条 goal/change（last-wins 可重放）。
+    #[test]
+    fn rpc_goal_mutation_chain_appends_events() {
+        use dsh_session::types::EventKind;
+        let boot = boot_with_sessions();
+        let host = SessionHost::in_memory();
+        let _ = host.session("default");
+        let call = |method: &str, payload: serde_json::Value| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": method, "payload": payload,
+            })).unwrap();
+            handle_rpc_host(&boot, method, &body, &host).1
+        };
+        let created = call("goal.create", serde_json::json!({
+            "sessionId": "default", "objective": "finish",
+        }));
+        let ref1 = created["result"]["value"]["ref"].clone();
+        let completed = call("goal.complete", serde_json::json!({
+            "sessionId": "default", "ref": ref1,
+        }));
+        let ref2 = completed["result"]["value"]["ref"].clone();
+        call("goal.clear", serde_json::json!({
+            "sessionId": "default", "ref": ref2,
+        }));
+        let ops: Vec<String> = host
+            .events("default")
+            .iter()
+            .filter(|e| e.kind == EventKind::GoalChange)
+            .map(|e| e.data["operation"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(ops, vec!["create", "complete", "clear"], "ops 顺序即事件顺序");
+    }
+
+    /// M4h：session.history 带 projections 块（验收 #9）——goal/plan/subagent/todos
+    /// 四键都进 projections（空日志 asOfSeq=-1；有事件 → 折叠出真实值）。
+    #[test]
+    fn rpc_session_history_carries_projections_block() {
+        let boot = boot_with_sessions();
+        let host = SessionHost::in_memory();
+        let _ = host.session("default");
+        // 先空日志验证 asOfSeq=-1 + 四键在
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "session.history",
+            "payload": {"sessionId": "default"},
+        })).unwrap();
+        let (_, v) = handle_rpc_host(&boot, "session.history", &body, &host);
+        let p = &v["result"]["value"]["projections"];
+        assert_eq!(p["asOfSeq"], -1, "空日志 asOfSeq=-1");
+        for key in ["goal", "plan", "subagent", "todos"] {
+            assert!(p["values"].get(key).is_some(), "{key} 进 projections.values");
+        }
+        assert_eq!(p["values"]["goal"]["goal"], Value::Null, "无目标时 goal 键为 null");
+        // goal.create 后折叠 → goal 投影携带 snapshot（last-wins）
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "goal.create",
+            "payload": {"sessionId": "default", "objective": "project me"},
+        })).unwrap();
+        let (_, _) = handle_rpc_host(&boot, "goal.create", &body, &host);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "session.history",
+            "payload": {"sessionId": "default"},
+        })).unwrap();
+        let (_, v) = handle_rpc_host(&boot, "session.history", &body, &host);
+        let p = &v["result"]["value"]["projections"];
+        assert!(p["asOfSeq"].as_i64().unwrap() >= 0, "有事件后 asOfSeq>=0（首批事件 seq 从 0 起）");
+        assert_eq!(
+            p["values"]["goal"]["goal"]["objective"], "project me",
+            "goal 投影折叠出当前 snapshot"
+        );
+        assert_eq!(p["values"]["goal"]["goal"]["phase"], "active");
+    }
+
     /// M4h：goal.create 缺 objective → GOAL_INVALID_OBJECTIVE（逐字对齐 GoalErrorCode）。
     #[test]
     fn rpc_goal_create_missing_objective_rejects() {
@@ -2704,53 +3537,226 @@ mod tests {
         assert_eq!(v["result"]["error"]["code"], "bad-request");
     }
 
-    /// M4h：subagent.list 空目录 → entries=[], parentAvailable=true；subagent.history
-    /// → events=[], hasMore=false（诚实空实现）。
+    /// M4h：subagent.list 真实驱动——空目录 → entries=[] + parentAvailable=true；
+    /// spawn 一个 child 后 list 出现 child 行、history 读其事件（验收 #5）。
     #[test]
-    fn rpc_subagent_list_empty_catalog() {
+    fn rpc_subagent_list_and_history_real_driver() {
+        use crate::subagent_runtime::{self as sa, SpawnMode, SpawnOptions};
         let boot = boot_with_sessions();
-        let body = serde_json::to_vec(&serde_json::json!({
-            "type": "client-request", "rpcId": "r", "method": "subagent.list",
-            "payload": {"parentSessionId": "default"},
-        })).unwrap();
-        let (_, v) = handle_rpc(&boot, "subagent.list", &body);
+        let host = SessionHost::in_memory();
+        let _ = host.session("default");
+        let call_host = |method: &str, payload: serde_json::Value| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": method, "payload": payload,
+            })).unwrap();
+            handle_rpc_host(&boot, method, &body, &host).1
+        };
+        // 空目录：parent 存在 → entries=[] + parentAvailable=true。
+        let v = call_host("subagent.list", serde_json::json!({
+            "parentSessionId": "default",
+        }));
         assert_eq!(v["result"]["ok"], true);
         assert_eq!(v["result"]["value"]["entries"], serde_json::json!([]));
         assert_eq!(v["result"]["value"]["parentAvailable"], true);
-        // history 诚实空
-        let body = serde_json::to_vec(&serde_json::json!({
-            "type": "client-request", "rpcId": "r", "method": "subagent.history",
-            "payload": {"parentSessionId": "default", "childSessionId": "c-1", "mode": "one-shot"},
-        })).unwrap();
-        let (_, v) = handle_rpc(&boot, "subagent.history", &body);
+        // 真实 spawn 一个 child → list 出现 child 行。
+        let opts = SpawnOptions {
+            mode: SpawnMode::Continuable,
+            provider: "mock".into(),
+            label: Some("audit".into()),
+            ..Default::default()
+        };
+        let child = sa::spawn_child(&host, "default", &opts).expect("spawn ok");
+        let v = call_host("subagent.list", serde_json::json!({
+            "parentSessionId": "default",
+        }));
+        let entries = v["result"]["value"]["entries"].clone();
+        assert_eq!(entries.as_array().unwrap().len(), 1, "一个 child 行");
+        assert_eq!(entries[0]["kind"], "child");
+        assert_eq!(entries[0]["mode"], "continuable");
+        assert_eq!(entries[0]["label"], "audit");
+        assert_eq!(entries[0]["id"], child);
+        // history 真实读 child 事件（descriptor 落日志 → events 非空 + projections 块）。
+        let v = call_host("subagent.history", serde_json::json!({
+            "parentSessionId": "default", "childSessionId": child, "mode": "continuable",
+        }));
         assert_eq!(v["result"]["ok"], true);
-        assert_eq!(v["result"]["value"]["events"], serde_json::json!([]));
+        assert!(
+            !v["result"]["value"]["events"].as_array().unwrap().is_empty(),
+            "child 日志有事件"
+        );
+        assert_eq!(
+            v["result"]["value"]["events"][0]["event"]["type"], "subagent/descriptor",
+            "首事件为描述符"
+        );
         assert_eq!(v["result"]["value"]["hasMore"], false);
+        // projections 块携带 subagent 身份（折叠自描述符事件；view 直接是 identity）。
+        let proj = &v["result"]["value"]["projections"]["values"]["subagent"];
+        assert_eq!(proj["mode"], "continuable");
+        assert_eq!(proj["label"], "audit");
     }
 
-    /// M4h：condergate 子代 —— subagent.prompt 仅 continuable；非 continuable → bad-request
-    /// （控制面 prompt_gate 的 wire 投影）。
+    /// M4h：subagent.prompt gate——one-shot → bad-request；缺 agent_loop → fail loud
+    /// （internal，不伪装成功）；装了 agent_loop → 经 Rust loop 真实驱动一轮返回
+    /// messageId（fake-loop 驱动链路验收 #5）。
     #[test]
-    fn rpc_subagent_prompt_gates_mode() {
+    fn rpc_subagent_prompt_gates_and_drives_fake_loop() {
         let boot = boot_with_sessions();
-        let body = serde_json::to_vec(&serde_json::json!({
-            "type": "client-request", "rpcId": "r", "method": "subagent.prompt",
-            "payload": {"parentSessionId": "default", "childSessionId": "c-1", "mode": "one-shot"},
-        })).unwrap();
-        let (_, v) = handle_rpc(&boot, "subagent.prompt", &body);
+        let host = SessionHost::in_memory();
+        let _ = host.session("default");
+        let call_host = |method: &str, payload: serde_json::Value| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": method, "payload": payload,
+            })).unwrap();
+            handle_rpc_host(&boot, method, &body, &host).1
+        };
+        // 1) one-shot mode → bad-request（gate 前置）。
+        let v = call_host("subagent.prompt", serde_json::json!({
+            "parentSessionId": "default", "childSessionId": "c-1", "mode": "one-shot",
+            "content": [{"type": "text", "text": "hi"}],
+        }));
         assert_eq!(v["result"]["ok"], false, "one-shot child cannot be prompted");
         assert_eq!(v["result"]["error"]["code"], "bad-request");
-        // continuable → 诚实 messageId
-        let body = serde_json::to_vec(&serde_json::json!({
-            "type": "client-request", "rpcId": "r", "method": "subagent.prompt",
-            "payload": {"parentSessionId": "default", "childSessionId": "c-1", "mode": "continuable"},
-        })).unwrap();
-        let (_, v) = handle_rpc(&boot, "subagent.prompt", &body);
-        assert_eq!(v["result"]["ok"], true);
-        assert!(v["result"]["value"]["messageId"].as_str().is_some());
+        // 2) continuable 但未装配 agent-loop → fail loud（internal，绝不伪装成功）。
+        let v = call_host("subagent.prompt", serde_json::json!({
+            "parentSessionId": "default", "childSessionId": "c-1", "mode": "continuable",
+            "content": [{"type": "text", "text": "hi"}],
+        }));
+        assert_eq!(v["result"]["ok"], false);
+        assert_eq!(v["result"]["error"]["code"], "internal");
+        assert!(
+            v["result"]["error"]["message"].as_str().unwrap().contains("AgentLoopHost"),
+            "fail loud 信息指明缺 loop"
+        );
     }
 
-    /// M4h：commands/list 含 subagents 项（方法面扩展）。
+    /// M4i 验收 #5：#subagent.prompt 经真实 Rust loop 驱动 child 一轮（fake-loop＝
+    /// mock adapter + AgentLoopHost 共享 store）。spawn 真实 child（continuable，
+    /// agentProvider=mock）→ subagent.prompt → child 会话落 user/assistant/turn/end
+    /// 事件 → 返回真实 messageId → subagent.history 可回读 assistant 内容。
+    #[test]
+    fn rpc_subagent_prompt_drives_real_child_agent_round() {
+        use std::cell::{Cell, RefCell};
+        use std::collections::VecDeque;
+        use std::rc::Rc;
+
+        use crate::subagent_runtime::{self as sa, SpawnMode, SpawnOptions};
+
+        // Mock adapter（fake-loop：模型应答脚本；Rust loop 真实整轮驱动）。
+        let script = Rc::new(RefCell::new(VecDeque::from_iter([vec![
+            dsh_llm::StreamChunk::BlockStart {
+                index: 0,
+                block_type: "text".parse().unwrap(),
+            },
+            dsh_llm::StreamChunk::TextDelta {
+                index: 0,
+                text: "child says hi".into(),
+            },
+            dsh_llm::StreamChunk::BlockEnd {
+                index: 0,
+                block: dsh_llm::ContentBlock::text("child says hi"),
+            },
+            dsh_llm::StreamChunk::Finish {
+                reason: dsh_llm::FinishReason::Stop,
+                replay_state: None,
+            },
+        ]])));
+        let calls = Rc::new(Cell::new(0u32));
+        struct Adapter {
+            script: Rc<RefCell<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
+            calls: Rc<Cell<u32>>,
+        }
+        impl dsh_llm::LlmAdapter for Adapter {
+            fn stream(&self, _o: dsh_llm::GenerateOptions) -> Box<dyn Iterator<Item = dsh_llm::StreamChunk>> {
+                self.calls.set(self.calls.get() + 1);
+                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                Box::new(next.into_iter())
+            }
+        }
+        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Rc::new(Adapter {
+            script: script.clone(),
+            calls: calls.clone(),
+        }))
+        .unwrap();
+
+        let tools = Rc::new(dsh_tools::ToolRegistry::new(
+            dsh_tools::ToolExecutionMode::Native,
+        ));
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let config = dsh_agent_loop::AgentLoopConfig {
+            max_parallel_tool_calls: None,
+            agents: vec![dsh_agent_loop::ConfiguredAgent {
+                id: "a-main".into(),
+                provider: Some("mock".into()),
+                model: Some("mock-model".into()),
+                session_id: Some("default".into()),
+                max_tokens: None,
+                cwd: None,
+                resume_session_id: None,
+            }],
+        };
+        let loop_host = dsh_agent_loop::AgentLoopHost::with_store(
+            config,
+            llm,
+            tools,
+            session_host.store.clone(),
+        )
+        .unwrap();
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(loop_host.clone());
+
+        // 真实 spawn continuable child（agentProvider=mock）。
+        let opts = SpawnOptions {
+            mode: SpawnMode::Continuable,
+            provider: "mock".into(),
+            label: Some("worker".into()),
+            agent_provider: Some("mock".into()),
+            agent_model: Some("mock-model".into()),
+            ..Default::default()
+        };
+        let child = sa::spawn_child(&session_host, "default", &opts).expect("spawn child");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r", "method": "subagent.prompt",
+            "payload": {
+                "parentSessionId": "default", "childSessionId": child, "mode": "continuable",
+                "content": [{"type": "text", "text": "do the work"}],
+            },
+        })).unwrap();
+        let (_, v) = handle_rpc_host(&boot, "subagent.prompt", &body, &session_host);
+        assert_eq!(v["result"]["ok"], true, "subagent.prompt ok: {v}");
+        let message_id = v["result"]["value"]["messageId"].as_str().expect("messageId").to_string();
+        assert!(message_id.starts_with(&format!("pmsg-{child}:")), "真实 messageId: {message_id}");
+
+        // child 会话被真实驱动：user/message + assistant/message 落共享 store。
+        assert!(calls.get() == 1, "mock adapter invoked exactly once");
+        let evs = session_host.events(&child);
+        assert!(evs.iter().any(|e| e.kind.as_str() == "user/message"), "user/message in child");
+        assert!(evs.iter().any(|e| e.kind.as_str() == "assistant/message"), "assistant/message in child");
+        // subagent.history 回读 assistant 内容。
+        let body2 = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r2", "method": "subagent.history",
+            "payload": {
+                "parentSessionId": "default", "childSessionId": child, "mode": "continuable",
+            },
+        })).unwrap();
+        let (_, h) = handle_rpc_host(&boot, "subagent.history", &body2, &session_host);
+        assert_eq!(h["result"]["ok"], true);
+        let history_events = h["result"]["value"]["events"].as_array().unwrap();
+        assert!(
+            history_events.iter().any(|row| row["event"]["type"] == "assistant/message"),
+            "assistant 事件可经 history 回读"
+        );
+        let assistant = history_events
+            .iter()
+            .find(|row| row["event"]["type"] == "assistant/message")
+            .unwrap();
+        assert_eq!(
+            assistant["event"]["data"]["message"]["content"][0]["text"],
+            "child says hi",
+            "child 的模型应答内容"
+        );
+    }
     #[test]
     fn rpc_commands_list_includes_subagents() {
         let boot = boot_with_sessions();
@@ -2779,6 +3785,11 @@ mod tests {
         assert!(unit.is_some(), "todos projection unit registered");
         assert_eq!(unit.unwrap().key(), "todos");
         assert_eq!(unit.unwrap().state_version(), 2);
+        // M4h：三键投影单元一并挂载（goal/plan/subagent 真实折叠会话事件）。
+        for key in ["goal", "plan", "subagent"] {
+            let unit = reg.get(key);
+            assert!(unit.is_some(), "{key} projection unit registered");
+        }
     }
 
     /// M4h：register_m4_tools 可注册 todo_write + 参数校验走 to_todo_list（执行兜底
@@ -2797,7 +3808,7 @@ mod tests {
             serde_json::json!({
                 "todos": [
                     {"content": "write tests", "status": "in_progress"},
-                    {"content": "implement"},
+                    {"content": "implement", "status": "pending"},
                 ],
             }),
             Some("agent-1".to_string()),
@@ -2805,10 +3816,11 @@ mod tests {
         let res = registry.execute(&input, None);
         assert!(!res.is_error, "valid todos execute ok: {res:?}");
         let val = res.value.unwrap();
-        let arr = val.as_array().unwrap();
+        let arr = val["todos"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["content"], "write tests");
         assert_eq!(arr[0]["status"], "in_progress");
+        assert_eq!(val["counts"]["inProgress"], 1, "counts 规范化输出");
         // 空 content → 执行拒绝（to_todo_list EmptyContent）。
         let input = ToolExecutionInput::new(
             "call-2",
@@ -2842,5 +3854,404 @@ mod tests {
         );
         let res = registry.execute(&input, None);
         assert!(res.is_error, "two in_progress without allowParallel rejected");
+    }
+
+    /// M4i 验收：#register_m4_tools（无宿主）注册全部 9 个 M4 工具；job_*/schedule_*
+    /// 未 bind → 结构化 NOT_BOUND（fail loud，绝不伪装成功）。
+    #[test]
+    fn register_all_m4_tools_unbound_fail_loud() {
+        use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
+        let registry = ToolRegistry::new(ToolExecutionMode::Native);
+        register_m4_tools(&registry);
+        for name in [
+            "todo_write",
+            "job_output",
+            "job_list",
+            "job_kill",
+            "schedule_create",
+            "schedule_list",
+            "schedule_delete",
+            "exit_plan_mode",
+            "workflow",
+        ] {
+            assert!(
+                registry.get(name, None).is_some(),
+                "{name} registered+visible"
+            );
+        }
+        // 未 bind 的 job_output：结构化 isError（code NOT_BOUND）。
+        let input = ToolExecutionInput::new(
+            "j1",
+            "job_output",
+            serde_json::json!({ "job_id": "bash-1" }),
+            Some("agent-1".to_string()),
+        );
+        let res = registry.execute(&input, None);
+        assert!(res.is_error, "unbound job_output fails loud");
+        let info = res.error.as_ref().and_then(|e| e.info.as_ref());
+        assert_eq!(
+            info.map(|i| i.code.as_str()).unwrap_or(""),
+            "NOT_BOUND",
+            "结构化 NOT_BOUND code"
+        );
+    }
+
+    /// M4i 验收 #6：register_m4_tools_with_host 带 JobRegistry bind——job_list/read
+    /// 走真实注册表状态机（start → list → read 内容 → kill）。
+    #[test]
+    fn register_m4_tools_with_job_registry_binds_really() {
+        use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
+        let registry = ToolRegistry::new(ToolExecutionMode::Native);
+        let jobs = Rc::new(std::cell::RefCell::new(dsh_jobs::registry::JobRegistry::new(
+            dsh_jobs::registry::JobRegistryConfig {
+                max_concurrent_per_owner: 10,
+                now: Box::new(|| 1000),
+            },
+        )));
+        let host = M4HostServices {
+            jobs: Some(jobs.clone()),
+            schedule: None,
+            todo: None,
+        };
+        register_m4_tools_with_host(&registry, Some(&host));
+        // start 一个真实 job（写输出由 settle 模拟）。
+        let id = {
+            use dsh_jobs::StartSpec;
+            let producer = || dsh_jobs::registry::ProducerHooks {
+                on_cancel: Box::new(|_| {}),
+                read_output: None,
+            };
+            jobs.borrow_mut()
+                .start(StartSpec { kind: "bash", label: "echo hi", owner: None, producer: Box::new(producer) })
+                .unwrap()
+        };
+        assert_eq!(id, "bash-1");
+        // job_list：真实 frame（taskViewSchema），含刚起的 job。
+        let input = ToolExecutionInput::new("l1", "job_list", serde_json::json!({}), Some("agent-1".into()));
+        let res = registry.execute(&input, None);
+        assert!(!res.is_error, "job_list ok: {:?}", res.error);
+        let arr = res.value.unwrap();
+        assert_eq!(arr[0]["id"], "bash-1");
+        assert_eq!(arr[0]["kind"], "bash");
+        assert_eq!(arr[0]["status"], "running");
+        // settle completed → job_output 真实 read。
+        jobs.borrow_mut().settle(
+            &id,
+            dsh_jobs::JobSettlement {
+                status: dsh_jobs::JobStatus::Completed,
+                detail: Some("exit 0".into()),
+                output: Some("done".into()),
+            },
+        );
+        let input = ToolExecutionInput::new("o1", "job_output", serde_json::json!({ "job_id": id }), Some("agent-1".into()));
+        let res = registry.execute(&input, None);
+        assert!(!res.is_error, "job_output ok: {:?}", res.error);
+        let val = res.value.unwrap();
+        assert_eq!(val["job"]["status"], "completed", "read 返回完成态快照");
+        // job_kill：已终态 → kill 返回接受（本注册表语义）。
+        let input = ToolExecutionInput::new("k1", "job_kill", serde_json::json!({ "job_id": id }), Some("agent-1".into()));
+        let res = registry.execute(&input, None);
+        assert!(!res.is_error, "job_kill ok: {:?}", res.error);
+    }
+
+    /// M4i 验收 #7：schedule host bind——schedule_create 落 `schedule/change` create 事件
+    /// 到会话 + fold 出列表 + dispatch_due 到期注入（dispatch 事件 + framing 文本）。
+    #[test]
+    fn register_m4_tools_with_schedule_host_injects_due() {
+        use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
+        let registry = ToolRegistry::new(ToolExecutionMode::Native);
+        let host_store = SessionHost::in_memory();
+        let _ = host_store.session("default");
+        let sched_session = host_store.session("default").expect("default live");
+        let sched = Rc::new(dsh_cli_host::ScheduleHost::new(sched_session));
+        let host = M4HostServices {
+            jobs: None,
+            schedule: Some(sched.clone()),
+            todo: None,
+        };
+        register_m4_tools_with_host(&registry, Some(&host));
+        // schedule_create (after, 1s)。
+        let t0 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let input = ToolExecutionInput::new(
+            "s1",
+            "schedule_create",
+            serde_json::json!({ "prompt": "standup", "after_seconds": 1 }),
+            Some("agent-1".into()),
+        );
+        let res = registry.execute(&input, None);
+        assert!(!res.is_error, "schedule_create ok: {:?}", res.error);
+        let id = res.value.unwrap()["id"].as_str().expect("id").to_string();
+        assert!(id.starts_with("schedule-"), "id namespace: {id}");
+        // fold：active 记录 1 条。
+        let folded = sched.fold().expect("fold ok");
+        assert_eq!(folded.records.len(), 1);
+        assert_eq!(folded.records[0].prompt, "standup");
+        // list：ScheduleView[] 含该记录。
+        let input = ToolExecutionInput::new("sl", "schedule_list", serde_json::json!({}), Some("agent-1".into()));
+        let res = registry.execute(&input, None);
+        assert!(!res.is_error);
+        let rows = res.value.unwrap();
+        assert_eq!(rows[0]["id"], id);
+        assert_eq!(rows[0]["kind"], "after");
+        // 到期注入：now 推进到 t0+2s 之后 → due；dispatch_schedule_change 构造
+        // one-shot dispatch（无 acceptedAt）→ framing 文本落事件。
+        let (framing, dispatched) = sched.dispatch_due(t0 + 2000).expect("dispatch due ok");
+        assert_eq!(dispatched, vec![id.clone()], "after 到期 dispatch");
+        assert_eq!(framing.len(), 1);
+        assert!(framing[0].contains("[SCHEDULE REMINDER]"), "framing 样板");
+        assert!(framing[0].contains(&id), "framing 携带 id");
+        // dispatch 后一次 after 记录被消费 → fold 移除。
+        let folded2 = sched.fold().expect("fold2 ok");
+        assert!(folded2.records.is_empty(), "after dispatch 后不再 active");
+        // 事件落日志（schedule/change 真实存在于会话）。
+        let evs = host_store.events("default");
+        let sched_events = evs.iter().filter(|e| e.kind == dsh_session::types::EventKind::ScheduleChange).count();
+        assert!(sched_events >= 2, "create + dispatch 落会话事件: {sched_events}");
+    }
+
+    /// M4i 验收 #7：schedule create delete 生命周期（delete 追加事件 + fold 移除）。
+    #[test]
+    fn schedule_host_create_then_delete() {
+        let host_store = SessionHost::in_memory();
+        let _ = host_store.session("default");
+        let sched = dsh_cli_host::ScheduleHost::new(
+            host_store.session("default").expect("default live"),
+        );
+        let id = sched
+            .create("after", "ship", Some(60), None, None, 1000)
+            .expect("create after");
+        assert!(sched.delete(&id).expect("delete ok"), "active id deletable");
+        let folded = sched.fold().expect("fold");
+        assert!(folded.records.is_empty(), "delete 后无 active");
+        // 不存在 id → delete=false（不落事件）。
+        let deleted_none = sched.delete("nope");
+        assert!(!deleted_none.unwrap(), "no-op delete returns false");
+    }
+
+    /// M4i 验收 #8：todo 工具 + `todo/write` 事件 + `todos` 投影。
+    ///
+    /// 宿主 todo 句柄在场时：todo_write 校验/规范化并在属主会话落 `todo/write`
+    /// 整表事件；`todos` 投影折叠事件后可视（全表）；无宿主时不落事件（自包含校验）。
+    #[test]
+    fn todo_tool_with_host_lands_todo_write_and_projection_folds() {
+        use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
+        let registry = ToolRegistry::new(ToolExecutionMode::Native);
+        // 宿主：SessionStore + todo host（默认会话 "default"）。
+        let host_store = SessionHost::in_memory();
+        let _ = host_store.session("default");
+        let todo_host = Rc::new(dsh_cli_host::TodoWriteHost::new(
+            host_store.clone(),
+            "default".to_string(),
+        ));
+        let host = M4HostServices {
+            jobs: None,
+            schedule: None,
+            todo: Some(todo_host.clone()),
+        };
+        register_m4_tools_with_host(&registry, Some(&host));
+        // todo_write：有效表执行 → 输出 {todos, counts} + default 会话落 todo/write。
+        let input = ToolExecutionInput::new(
+            "t1",
+            "todo_write",
+            serde_json::json!({
+                "todos": [
+                    {"content": "m4 paper", "status": "in_progress"},
+                    {"content": "ship", "status": "pending"},
+                ],
+            }),
+            Some("agent-1".into()),
+        );
+        let res = registry.execute(&input, None);
+        assert!(!res.is_error, "host todo_write ok: {:?}", res.error);
+        let val = res.value.unwrap();
+        assert_eq!(val["counts"], serde_json::json!({"pending":1,"inProgress":1,"completed":0}));
+        // 事件已落会话（todo/write 整表）。
+        let evs = host_store.events("default");
+        let todo_events: Vec<_> = evs
+            .iter()
+            .filter(|e| e.kind == dsh_session::types::EventKind::TodoWrite)
+            .collect();
+        assert_eq!(todo_events.len(), 1, "一个 todo/write 事件");
+        let data = &todo_events[0].data;
+        assert_eq!(data["todos"][0]["content"], "m4 paper");
+        // todos 投影折叠事件 → 整表可视。
+        let mut reg = dsh_session_query::ProjectionRegistry::new();
+        reg.register(dsh_session_query::todo::todos_projection_unit().into_unit())
+            .expect("register todos unit");
+        let mut ps = dsh_session_query::ProjectionSession::new(&reg);
+        for e in &evs {
+            ps.observe(e);
+        }
+        let snap = ps.snapshot();
+        let todos = &snap.values["todos"];
+        assert_eq!(todos[0]["content"], "m4 paper", "投影折叠出整表");
+        // 无 agent 调用者 → 拒绝（对齐参考：无处归属，绝不静默）。
+        let input = ToolExecutionInput::new(
+            "t2",
+            "todo_write",
+            serde_json::json!({"todos": [{"content": "x", "status": "pending"}]}),
+            None,
+        );
+        let res = registry.execute(&input, None);
+        assert!(res.is_error, "无 agent 拒绝");
+    }
+
+    /// M4i 验收 #3：#GoalRoundPort 把真实 `Rc<ReactLoopAgent>` 实配到 goal-round-driver；
+    /// armed 目标 + agent 空闲 + 空 inbox → drive_once 经 followup 驱动一个真实 Rust
+    /// 轮次（fake-loop：mock adapter 应答脚本），Rust loop 该轮结束回到 idle 后判定
+    /// 仍 Continue（未超 cap）。
+    #[test]
+    fn goal_round_driver_drives_real_agent_round() {
+        use std::cell::{Cell, RefCell};
+        use std::collections::VecDeque;
+
+        // Mock adapter（fake-loop：每次 stream 应答一轮文本）。
+        let script = Rc::new(RefCell::new(VecDeque::from_iter([
+            vec![
+                dsh_llm::StreamChunk::BlockStart {
+                    index: 0,
+                    block_type: "text".parse().unwrap(),
+                },
+                dsh_llm::StreamChunk::TextDelta {
+                    index: 0,
+                    text: "round done".into(),
+                },
+                dsh_llm::StreamChunk::BlockEnd {
+                    index: 0,
+                    block: dsh_llm::ContentBlock::text("round done"),
+                },
+                dsh_llm::StreamChunk::Finish {
+                    reason: dsh_llm::FinishReason::Stop,
+                    replay_state: None,
+                },
+            ],
+            vec![
+                dsh_llm::StreamChunk::BlockStart {
+                    index: 0,
+                    block_type: "text".parse().unwrap(),
+                },
+                dsh_llm::StreamChunk::TextDelta {
+                    index: 0,
+                    text: "round two done".into(),
+                },
+                dsh_llm::StreamChunk::BlockEnd {
+                    index: 0,
+                    block: dsh_llm::ContentBlock::text("round two done"),
+                },
+                dsh_llm::StreamChunk::Finish {
+                    reason: dsh_llm::FinishReason::Stop,
+                    replay_state: None,
+                },
+            ],
+        ])));
+        let calls = Rc::new(Cell::new(0u32));
+        struct Adapter {
+            script: Rc<RefCell<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
+            calls: Rc<Cell<u32>>,
+        }
+        impl dsh_llm::LlmAdapter for Adapter {
+            fn stream(&self, _o: dsh_llm::GenerateOptions) -> Box<dyn Iterator<Item = dsh_llm::StreamChunk>> {
+                self.calls.set(self.calls.get() + 1);
+                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                Box::new(next.into_iter())
+            }
+        }
+        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(
+            &["mock"],
+            Rc::new(Adapter {
+                script: script.clone(),
+                calls: calls.clone(),
+            }),
+        )
+        .unwrap();
+
+        let tools = Rc::new(dsh_tools::ToolRegistry::new(
+            dsh_tools::ToolExecutionMode::Native,
+        ));
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let config = dsh_agent_loop::AgentLoopConfig {
+            max_parallel_tool_calls: None,
+            agents: vec![dsh_agent_loop::ConfiguredAgent {
+                id: "a-main".into(),
+                provider: Some("mock".into()),
+                model: Some("mock-model".into()),
+                session_id: Some("default".into()),
+                max_tokens: None,
+                cwd: None,
+                resume_session_id: None,
+            }],
+        };
+        let loop_host = dsh_agent_loop::AgentLoopHost::with_store(
+            config,
+            llm,
+            tools,
+            session_host.store.clone(),
+        )
+        .unwrap();
+        let agent = loop_host.ensure_agent(&dsh_agent_loop::ConfiguredAgent {
+            id: "a-main".into(),
+            provider: Some("mock".into()),
+            model: Some("mock-model".into()),
+            session_id: Some("default".into()),
+            max_tokens: None,
+            cwd: None,
+            resume_session_id: None,
+        })
+        .expect("ensure a-main");
+
+        // armed 目标（cap 2，尚未跑任何轮次）。
+        let mut goal = dsh_goal::GoalService::new(dsh_goal::ServiceOptions::default());
+        let gr = goal.create("finish the paper", Some(2)).expect("create goal");
+        assert_eq!(goal.activation(), dsh_goal::GoalActivation::Armed);
+        assert_eq!(goal.rounds_started(), 0);
+
+        let mut port = GoalRoundPort::new(agent.clone());
+        // 空闲 + 空 inbox + armed + 未超 cap → 续跑判定 Continue。
+        assert_eq!(
+            dsh_goal::round_driver::round_driver_outcome(&goal, &gr.id, &port),
+            Some(dsh_goal::round_driver::RoundOutcome::Continue),
+            "eligible to continue"
+        );
+        // drive_once：admit 第 1 轮 + followup → real loop 驱动该轮（同步到空闲）。
+        let out = dsh_goal::round_driver::drive_once(&mut goal, &mut port, &gr.id)
+            .expect("drive ok");
+        assert!(matches!(out, dsh_goal::round_driver::RoundOutcome::Continue));
+        assert_eq!(goal.rounds_started(), 1, "第 1 轮已准入");
+        assert_eq!(calls.get(), 1, "mock adapter 驱动了真实一轮");
+        // 该轮落 user/assistant（fake-loop 全局 store）。
+        let evs = session_host.events("default");
+        assert!(evs.iter().any(|e| e.kind.as_str() == "user/message"), "user/message 落会话");
+        assert!(evs.iter().any(|e| e.kind.as_str() == "assistant/message"), "assistant/message 落会话");
+        assert!(evs.iter().any(|e| e.kind.as_str() == "turn/end"), "turn/end 落会话");
+        // 该轮 followup 文本含 round 提示（objective + Round: 1/2）。
+        let user_msgs: Vec<&dsh_session::types::SessionEvent> = evs
+            .iter()
+            .filter(|e| e.kind.as_str() == "user/message")
+            .collect();
+        let joined: String = user_msgs
+            .iter()
+            .map(|e| serde_json::to_string(&e.data).unwrap_or_default())
+            .collect();
+        assert!(joined.contains("finish the paper"), "objective 进 followup");
+        assert!(joined.contains("Round: 1/2"), "Round: 1/2 提示进 followup");
+
+        // 本轮回到 idle 后仍 eligible（未超 cap）→ 第 2 轮也 drive_once。
+        assert!(agent.status() == dsh_agent::types::AgentStatus::Idle, "round done → idle");
+        let out2 = dsh_goal::round_driver::drive_once(&mut goal, &mut port, &gr.id)
+            .expect("drive second");
+        assert!(matches!(out2, dsh_goal::round_driver::RoundOutcome::Continue));
+        assert_eq!(goal.rounds_started(), 2, "第 2 轮已准入");
+        assert_eq!(calls.get(), 2, "second real round driven");
+        // 已到 cap（2）→ 不再 eligible。
+        assert_eq!(
+            dsh_goal::round_driver::round_driver_outcome(&goal, &gr.id, &port),
+            None,
+            "cap 到达 → 不续跑"
+        );
     }
 }

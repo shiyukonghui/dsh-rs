@@ -8,7 +8,8 @@
 //! session-start/fork 的 disarmed 由 caller 触发 `disarm()`。
 
 use crate::types::{
-    GoalActivation, GoalBlockReason, GoalId, GoalPhase, GoalRef, GoalSnapshot, GoalView,
+    GoalActivation, GoalBlockReason, GoalChangeMeta, GoalClearChangeMeta, GoalId, GoalOperation,
+    GoalPhase, GoalRef, GoalSnapshot, GoalSnapshotChangeMeta, GoalView, GOAL_CHANGE_VERSION,
 };
 use std::collections::HashSet;
 
@@ -82,6 +83,22 @@ struct State {
     activation: GoalActivation,
 }
 
+impl State {
+    /// 以当前折叠态构造 snapshot 变体 meta（goal 存在时）。
+    fn snapshot_meta(&self, operation: GoalOperation) -> Option<GoalChangeMeta> {
+        let goal = self.goal.as_ref()?;
+        Some(GoalChangeMeta::Snapshot(GoalSnapshotChangeMeta {
+            kind: "goal/change".into(),
+            version: GOAL_CHANGE_VERSION,
+            operation,
+            goal: goal.clone(),
+            rounds_started: self.rounds_started,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }))
+    }
+}
+
 /// 目标服务（进程内单目标语义；跨会话多目标由 caller 各自实例或 key）。
 ///
 /// 说明：TS GoalService 是 per-agent 单目标（每个会话有且仅有一个当前 goal）。
@@ -92,6 +109,8 @@ pub struct GoalService {
     state: Option<State>,
     seen_goal_ids: HashSet<String>,
     next_id: u64,
+    /// 最近一次非只读操作产生的 `goal/change` meta（caller 取走并落会话；取走即清空）。
+    last_change: Option<GoalChangeMeta>,
 }
 
 impl GoalService {
@@ -101,7 +120,13 @@ impl GoalService {
             state: None,
             seen_goal_ids: HashSet::new(),
             next_id: 1,
+            last_change: None,
         }
+    }
+
+    /// 取走最近一次变更 meta（落会话用）；无未取走的变更 → None。
+    pub fn take_last_change(&mut self) -> Option<GoalChangeMeta> {
+        self.last_change.take()
     }
 
     fn mint_id(&mut self) -> GoalId {
@@ -144,6 +169,9 @@ impl GoalService {
             updated_at: now,
             activation: GoalActivation::Armed,
         });
+        self.last_change = self.state.as_ref().and_then(|s| {
+            s.snapshot_meta(GoalOperation::Create)
+        });
         Ok(GoalRef { id, revision: 1 })
     }
 
@@ -157,72 +185,99 @@ impl GoalService {
         if objective.is_none() && max_goal_rounds.is_none() {
             return Err(GoalServiceError::InvalidEdit);
         }
-        let s = self.state_mut()?;
-        let goal = s.goal.as_mut().ok_or(GoalServiceError::NotFound)?;
-        if goal.revision != refr.revision {
-            return Err(GoalServiceError::StaleRevision);
-        }
-        if let Some(o) = objective {
-            if o.trim().is_empty() {
-                return Err(GoalServiceError::InvalidObjective);
+        let (id, revision) = {
+            let s = self.state_mut()?;
+            let goal = s.goal.as_mut().ok_or(GoalServiceError::NotFound)?;
+            if goal.revision != refr.revision {
+                return Err(GoalServiceError::StaleRevision);
             }
-            goal.objective = o.trim().to_string();
-        }
-        if let Some(m) = max_goal_rounds {
-            if m == 0 {
-                return Err(GoalServiceError::InvalidMaxRounds);
+            if let Some(o) = objective {
+                if o.trim().is_empty() {
+                    return Err(GoalServiceError::InvalidObjective);
+                }
+                goal.objective = o.trim().to_string();
             }
-            goal.max_goal_rounds = m;
-        }
-        goal.revision += 1;
-        s.updated_at = now_millis();
-        Ok(GoalRef { id: goal.id.clone(), revision: goal.revision })
+            if let Some(m) = max_goal_rounds {
+                if m == 0 {
+                    return Err(GoalServiceError::InvalidMaxRounds);
+                }
+                goal.max_goal_rounds = m;
+            }
+            goal.revision += 1;
+            s.updated_at = now_millis();
+            (goal.id.clone(), goal.revision)
+        };
+        self.last_change = self.state.as_ref().and_then(|s| {
+            s.snapshot_meta(GoalOperation::Edit)
+        });
+        Ok(GoalRef { id, revision })
     }
 
     /// pause：active → paused + disarmed。
     pub fn pause(&mut self, refr: &GoalRef) -> Result<GoalRef, GoalServiceError> {
-        let s = self.state_mut()?;
-        let goal = s.goal.as_mut().ok_or(GoalServiceError::NotFound)?;
-        cas_ref(goal, refr)?;
-        if goal.phase != GoalPhase::Active {
-            return Err(GoalServiceError::InvalidTransition);
-        }
-        goal.phase = GoalPhase::Paused;
-        goal.revision += 1;
-        s.updated_at = now_millis();
-        s.activation = GoalActivation::Disarmed;
-        Ok(GoalRef { id: goal.id.clone(), revision: goal.revision })
+        let (id, revision) = {
+            let s = self.state_mut()?;
+            let goal = s.goal.as_mut().ok_or(GoalServiceError::NotFound)?;
+            cas_ref(goal, refr)?;
+            if goal.phase != GoalPhase::Active {
+                return Err(GoalServiceError::InvalidTransition);
+            }
+            goal.phase = GoalPhase::Paused;
+            goal.revision += 1;
+            s.updated_at = now_millis();
+            s.activation = GoalActivation::Disarmed;
+            (goal.id.clone(), goal.revision)
+        };
+        self.last_change = self
+            .state
+            .as_ref()
+            .and_then(|s| s.snapshot_meta(GoalOperation::Pause));
+        Ok(GoalRef { id, revision })
     }
 
     /// resume：{active,paused,blocked} → active + armed（CAS；active 且去 armed 时仍可 resume）。
     pub fn resume(&mut self, refr: &GoalRef) -> Result<GoalRef, GoalServiceError> {
-        let s = self.state_mut()?;
-        let goal = s.goal.as_mut().ok_or(GoalServiceError::NotFound)?;
-        cas_ref(goal, refr)?;
-        // 仅 active/paused/blocked 可 resume；complete 拒。
-        if goal.phase == GoalPhase::Complete {
-            return Err(GoalServiceError::InvalidTransition);
-        }
-        goal.phase = GoalPhase::Active;
-        goal.revision += 1;
-        s.updated_at = now_millis();
-        s.activation = GoalActivation::Armed;
-        Ok(GoalRef { id: goal.id.clone(), revision: goal.revision })
+        let (id, revision) = {
+            let s = self.state_mut()?;
+            let goal = s.goal.as_mut().ok_or(GoalServiceError::NotFound)?;
+            cas_ref(goal, refr)?;
+            // 仅 active/paused/blocked 可 resume；complete 拒。
+            if goal.phase == GoalPhase::Complete {
+                return Err(GoalServiceError::InvalidTransition);
+            }
+            goal.phase = GoalPhase::Active;
+            goal.revision += 1;
+            s.updated_at = now_millis();
+            s.activation = GoalActivation::Armed;
+            (goal.id.clone(), goal.revision)
+        };
+        self.last_change = self
+            .state
+            .as_ref()
+            .and_then(|s| s.snapshot_meta(GoalOperation::Resume));
+        Ok(GoalRef { id, revision })
     }
 
     /// complete：{active,paused,blocked} → complete + disarmed。
     pub fn complete(&mut self, refr: &GoalRef) -> Result<GoalRef, GoalServiceError> {
-        let s = self.state_mut()?;
-        let goal = s.goal.as_mut().ok_or(GoalServiceError::NotFound)?;
-        cas_ref(goal, refr)?;
-        if goal.phase == GoalPhase::Complete {
-            return Err(GoalServiceError::InvalidTransition);
-        }
-        goal.phase = GoalPhase::Complete;
-        goal.revision += 1;
-        s.updated_at = now_millis();
-        s.activation = GoalActivation::Disarmed;
-        Ok(GoalRef { id: goal.id.clone(), revision: goal.revision })
+        let (id, revision) = {
+            let s = self.state_mut()?;
+            let goal = s.goal.as_mut().ok_or(GoalServiceError::NotFound)?;
+            cas_ref(goal, refr)?;
+            if goal.phase == GoalPhase::Complete {
+                return Err(GoalServiceError::InvalidTransition);
+            }
+            goal.phase = GoalPhase::Complete;
+            goal.revision += 1;
+            s.updated_at = now_millis();
+            s.activation = GoalActivation::Disarmed;
+            (goal.id.clone(), goal.revision)
+        };
+        self.last_change = self
+            .state
+            .as_ref()
+            .and_then(|s| s.snapshot_meta(GoalOperation::Complete));
+        Ok(GoalRef { id, revision })
     }
 
     /// block：active → blocked + blockedReason + disarmed（host-only，无远程方法）。
@@ -237,21 +292,28 @@ impl GoalService {
         {
             return Err(GoalServiceError::InvalidBlockReason);
         }
-        let s = self.state_mut()?;
-        let goal = s.goal.as_mut().ok_or(GoalServiceError::NotFound)?;
-        cas_ref(goal, refr)?;
-        if goal.phase != GoalPhase::Active {
-            return Err(GoalServiceError::InvalidTransition);
-        }
-        goal.phase = GoalPhase::Blocked;
-        goal.blocked_reason = Some(GoalBlockReason {
-            code: reason.code,
-            message: reason.message.trim().to_string(),
-        });
-        goal.revision += 1;
-        s.updated_at = now_millis();
-        s.activation = GoalActivation::Disarmed;
-        Ok(GoalRef { id: goal.id.clone(), revision: goal.revision })
+        let (id, revision) = {
+            let s = self.state_mut()?;
+            let goal = s.goal.as_mut().ok_or(GoalServiceError::NotFound)?;
+            cas_ref(goal, refr)?;
+            if goal.phase != GoalPhase::Active {
+                return Err(GoalServiceError::InvalidTransition);
+            }
+            goal.phase = GoalPhase::Blocked;
+            goal.blocked_reason = Some(GoalBlockReason {
+                code: reason.code,
+                message: reason.message.trim().to_string(),
+            });
+            goal.revision += 1;
+            s.updated_at = now_millis();
+            s.activation = GoalActivation::Disarmed;
+            (goal.id.clone(), goal.revision)
+        };
+        self.last_change = self
+            .state
+            .as_ref()
+            .and_then(|s| s.snapshot_meta(GoalOperation::Block));
+        Ok(GoalRef { id, revision })
     }
 
     /// clear：任意 phase → 墓碑（rev+1），goal 降为无。
@@ -264,9 +326,17 @@ impl GoalService {
         goal.revision += 1;
         let id = goal.id.clone();
         let rev = goal.revision;
-        s.updated_at = now_millis();
+        let cleared_at = now_millis();
+        s.updated_at = cleared_at;
         s.goal = None;
         s.activation = GoalActivation::Disarmed;
+        self.last_change = Some(GoalChangeMeta::Clear(GoalClearChangeMeta {
+            kind: "goal/change".into(),
+            version: GOAL_CHANGE_VERSION,
+            operation: GoalOperation::Clear,
+            cleared: GoalRef { id: id.clone(), revision: rev },
+            cleared_at,
+        }));
         Ok(GoalRef { id, revision: rev })
     }
 

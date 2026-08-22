@@ -29,6 +29,10 @@ pub mod host_dir;
 /// 并挂载持久化（dsh-persistence coordinator event 回调）。
 pub mod session_host;
 
+/// M4h 补实：subagent 真实进程内驱动（in-process spawn/fork + 只读 list/history +
+/// prompt 经 AgentLoopHost 驱动 + interrupt 收据）。
+pub mod subagent_runtime;
+
 /// 启动结果：运行时上下文 + loop 插件句柄（供驱动）。
 pub struct Boot {
     pub ctx: Cordis,
@@ -228,7 +232,7 @@ pub fn boot(
         goal: Rc::new(std::cell::RefCell::new(dsh_goal::GoalService::new(
             dsh_goal::ServiceOptions::default(),
         ))),
-        projections: crate::web::todo_projection_registry(),
+        projections: crate::web::assembled_projection_registry(),
     })
 }
 

@@ -9,5 +9,5 @@ pub mod types;
 
 pub use registry::{
     JobRead, JobRegistry, JobRegistryConfig, JobSnapshot, JobStartError, JobStatus, JobSettlement,
-    JobOpsError, KillOutcome, ProducerHooks, StartSpec,
+    JobOpsError, KillOutcome, ProducerHooks, StartSpec, jobs_frame, snapshot_to_view,
 };

@@ -89,6 +89,9 @@ pub enum JobStartError {
     EmptyKind,
     EmptyLabel,
     OwnerQuota,
+    /// producer `run()` 抛错——什么都不登记、id 不消费（对齐 TS「a throwing starter
+    /// leaves nothing registered」）。携带 panic 文本用于诊断。
+    ProducerPanic(String),
 }
 
 /// 单条 job 记录。
@@ -153,6 +156,8 @@ impl JobRegistry {
     }
 
     /// start：preflight（kind/label 非空、owner 活跃上限）→ producer() → 登记。
+    /// producer `run()` 抛错（Rust panic）→ 回滚：不登记、id 计数器退回（对齐 TS
+    /// 「a throwing starter leaves nothing registered」）。
     pub fn start(&mut self, spec: StartSpec<'_>) -> Result<String, JobStartError> {
         if spec.kind.is_empty() {
             return Err(JobStartError::EmptyKind);
@@ -170,9 +175,12 @@ impl JobRegistry {
                 return Err(JobStartError::OwnerQuota);
             }
         }
+        // producer 先跑再分配 id：抛错时 id 从未发出（不消费计数器 → 下次仍 kind-N
+        // 同号），也无记录残留。
+        let producer = spec.producer;
+        let hooks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(producer))
+            .map_err(|payload| JobStartError::ProducerPanic(panic_message(&payload)))?;
         let id = self.next_id(spec.kind);
-        let mut producer = spec.producer;
-        let hooks = producer();
         let now = (self.config.now)();
         self.jobs.insert(
             id.clone(),
@@ -277,6 +285,22 @@ impl JobRegistry {
         Ok(JobRead { text, snapshot })
     }
 
+    /// wait：等 job 到达终态。单线程显式 settle 模型下实现为即时检查（无后台线程、
+    /// 无阻塞——诚实降级，见 D-004）：
+    /// - 已终态（completed|killed|failed）→ 返回该 snapshot 且置 `reported`（对齐 TS
+    ///   `wait`：报告终态即抑制重复完成通知）；
+    /// - 仍 running/stopping → 返回当前 snapshot，`reported` 不动（TS `wait` 在等待
+    ///   timeout 时同样返回 snapshot，而非抛错——这里即「瞬时 timeout」语义）。
+    /// - 未知/越权 → JobOpsError（与 get/read 同围栏）。
+    pub fn wait(&mut self, id: &str, caller: Option<&str>) -> Result<JobSnapshot, JobOpsError> {
+        self.authorize(id, caller)?;
+        let rec = self.jobs.get_mut(id).expect("authorized");
+        if rec.status.is_terminal() {
+            rec.reported = true;
+        }
+        Ok(self.snapshot_of(id))
+    }
+
     /// list：owner 只见自己的 + 无主；无 owner 参数 → 全部无主。
     pub fn list(&self, caller: Option<&str>) -> Vec<JobSnapshot> {
         let mut out: Vec<JobSnapshot> = self
@@ -296,20 +320,7 @@ impl JobRegistry {
     /// JobView wire 形状（taskViewSchema）：{id,kind,label,status,detail?,startedAt,finishedAt?}。
     pub fn view(&self, id: &str, caller: Option<&str>) -> Result<serde_json::Value, JobOpsError> {
         self.authorize(id, caller)?;
-        let rec = self.jobs.get(id).expect("authorized");
-        let mut obj = serde_json::Map::new();
-        obj.insert("id".into(), serde_json::Value::String(id.to_string()));
-        obj.insert("kind".into(), serde_json::Value::String(rec.kind.clone()));
-        obj.insert("label".into(), serde_json::Value::String(rec.label.clone()));
-        obj.insert("status".into(), serde_json::Value::String(rec.status.as_str().to_string()));
-        if let Some(d) = &rec.detail {
-            obj.insert("detail".into(), serde_json::Value::String(d.clone()));
-        }
-        obj.insert("startedAt".into(), serde_json::Value::from(rec.started_at));
-        if let Some(f) = rec.finished_at {
-            obj.insert("finishedAt".into(), serde_json::Value::from(f));
-        }
-        Ok(serde_json::Value::Object(obj))
+        Ok(snapshot_to_view(&self.snapshot_of(id)))
     }
 }
 
@@ -323,4 +334,41 @@ pub struct JobRead {
 fn now_millis() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+/// 提取 panic 载荷的人类可读文本（&str / String / 兜底 marker）。
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "producer panicked during start".to_string()
+    }
+}
+
+/// 投影单个 snapshot 到 wire JobView（taskViewSchema）：`{id,kind,label,status,
+/// detail?,startedAt,finishedAt?}`。刻意丢弃 `owner/reported/outputLimitBytes`
+/// （内部字段，对齐 `api/jobs.ts` JobView 三字段缺席说明）。
+pub fn snapshot_to_view(snap: &JobSnapshot) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("id".into(), serde_json::Value::String(snap.id.clone()));
+    obj.insert("kind".into(), serde_json::Value::String(snap.kind.clone()));
+    obj.insert("label".into(), serde_json::Value::String(snap.label.clone()));
+    obj.insert("status".into(), serde_json::Value::String(snap.status.as_str().to_string()));
+    if let Some(d) = &snap.detail {
+        obj.insert("detail".into(), serde_json::Value::String(d.clone()));
+    }
+    obj.insert("startedAt".into(), serde_json::Value::from(snap.started_at));
+    if let Some(f) = snap.finished_at {
+        obj.insert("finishedAt".into(), serde_json::Value::from(f));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// `session/jobs` 帧的 `jobs` 数组渲染（taskViewSchema[]）。纯构造函数：
+/// 给定某 owner 可见的 snapshots 列表 → wire 数组；空集返回 `[]`（前端缺失键 ≡ 空集，
+/// 无结束哨兵）。内部字段（owner/reported/outputLimitBytes）绝不上线。
+pub fn jobs_frame(snapshots: &[JobSnapshot]) -> serde_json::Value {
+    serde_json::Value::Array(snapshots.iter().map(snapshot_to_view).collect())
 }

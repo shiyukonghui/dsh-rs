@@ -553,9 +553,11 @@ dependencies = [
  "dsh-core",
  "dsh-credentials",
  "dsh-goal",
+ "dsh-jobs",
  "dsh-llm",
  "dsh-loader",
  "dsh-persistence",
+ "dsh-schedule",
  "dsh-schema",
  "dsh-scope",
  "dsh-session",
@@ -735,9 +737,12 @@ name = "dsh-session-query"
 version = "0.1.0"
 dependencies = [
  "dsh-brand",
+ "dsh-goal",
  "dsh-llm",
  "dsh-persistence",
+ "dsh-plan",
  "dsh-session",
+ "dsh-subagent",
  "serde",
  "serde_json",
 ]
@@ -778,6 +783,8 @@ version = "0.1.0"
 dependencies = [
  "dsh-llm",
  "dsh-scope",
+ "dsh-session-query",
+ "dsh-workflow",
  "serde",
  "serde_json",
  "unicode-ident",

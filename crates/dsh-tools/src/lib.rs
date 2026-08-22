@@ -12,6 +12,7 @@
 
 pub mod guard;
 pub mod json_schema;
+pub mod m4;
 pub mod py_types;
 pub mod runtime;
 pub mod schema;
@@ -22,6 +23,10 @@ pub use guard::{
     canonicalize, detailed_reminder, preview_arguments, tool_timeout_message,
     tool_timeout_result, timeout_exceeded, validate_thresholds, wildcard_matches, GENTLE_REMINDER,
     DEFAULT_THRESHOLDS, Reminder, RepeatTracker, TOOL_TIMEOUT,
+};
+pub use m4::{
+    exit_plan_mode, job_kill, job_list, job_output, schedule_create, schedule_delete, schedule_list,
+    todo_write, workflow, M4Tool, CODE_NOT_BOUND,
 };
 pub use json_schema::{
     assert_object_json_schema, assert_supported_json_schema, validate_json_schema_value,

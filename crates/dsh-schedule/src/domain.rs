@@ -167,7 +167,7 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 }
 
 /// 把规范 UTC instant 解析为 epoch 毫秒。
-fn utc_instant_to_epoch(s: &str) -> Option<i64> {
+pub(crate) fn utc_instant_to_epoch(s: &str) -> Option<i64> {
     if !is_utc_instant(s) {
         return None;
     }
@@ -468,7 +468,7 @@ fn future_instant(epoch: i64, now: i64) -> Result<String, ScheduleInputError> {
 }
 
 /// epoch 毫秒 → 规范 UTC instant（四位数年）。
-fn epoch_to_utc_instant(epoch: i64) -> Option<String> {
+pub(crate) fn epoch_to_utc_instant(epoch: i64) -> Option<String> {
     let days = epoch.div_euclid(86_400_000);
     let secs_of_day = epoch.rem_euclid(86_400_000) / 1_000;
     let millis = epoch.rem_euclid(1_000);
