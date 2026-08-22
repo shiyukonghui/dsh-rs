@@ -1992,4 +1992,46 @@ driver 投递由 M4h 提供。bash/pwsh/terminal producer 为 M5 subprocess。vi
 
 ---
 
+## D-050（M4f dsh-schedule）：schedule/change 域 + 创建规则 + every 锚定 + 时区范围决策
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M4 第六子块 = schedule（计划提醒）。web RPC 不暴露 schedule——以工具 +
+`schedule/change` 事件承载。本子步实现 durable 域纯语义（对齐
+`deepseek-harness/packages/schedule/schedule/src/domain.ts`）。
+
+**结论**：
+- `domain.rs`：
+  - 协议 `SCHEDULE_CHANGE_VERSION=1`；`MIN_EVERY_INTERVAL_SECONDS=300`（对齐 TS）。
+  - 错误联合：`LogError`（durable 损坏，码 corrupt_schedule_log）+ `ScheduleInputError`
+    `InputCode` 六码（InvalidPrompt/InvalidRule/InvalidTimeZone/NotFuture/
+    TimeOutOfRange/FrequencyTooHigh）。
+  - `decode_schedule_change`：create/delete/dispatch（±acceptedAt）精确键集合 + 版本校验 +
+    规范 UTC instant（自研 `is_utc_instant`：四位数年、真实日历日、字段范围）。
+  - `decode_record`：after/at/every 精确键 + prompt 已 trim 非空 + afterSeconds>0 safe +
+    everySeconds>=300。
+  - `fold_schedule_events`（+ `_seeded` fork 分界 seedLength）：create id 不重用、delete/
+    dispatch 非活跃拒、one-shot dispatch 拒 acceptedAt、every dispatch 必须 acceptedAt 且
+    锚定推进 scheduledAt（耗尽则移除）。`allocate_id_from_seen` 前扫不重 id（对齐 TS 从
+    size+1 起）。
+  - 创建：`create_after_record`（prompt trim/after>0/strict future）、
+    `create_at_record_from_offset`（显式 ±HH:MM 或 Z → UTC，含 1-3 位小数秒）、
+    `create_every_record`（>=300）。
+  - `resolve_every_occurrence`（锚定对齐：acceptedAt 前最新 occurrence + 首个未来目标）+
+    `schedule_view`（据真实 now 判 overdue/scheduled，deliveryMode=session-local）。
+- **时区范围决策（D-044 预设的「eval then introduce」触发）**：IANA 本地时区
+  `time_zone`（如 Asia/Shanghai）——离线 cargo 缓存有 index 元数据但无 chrono-tz crate
+  本体（仅 iana-time-zone 0.1.65 存在且属系统探测库，不携带 tzdb 数据），`--offline`
+  无法引入；评估后决定：M4 范围 `time_zone` 仅接受 `UTC`/`GMT` 与数值偏移，IANA local-at
+  按 `invalid_time_zone` 报错并记入 README Known Limitations（defer 到可联网引入
+  chrono-tz 或 jiff-tzdb 之时）。不因环境限制伪装支持，亦不降级架构（错误码留足 wire）。
+- 测试 16 绿：decode/fold 全路径、seed 分界、create 全错误码、偏移→UTC、every 锚定、
+  view、id 分配。clippy -D warnings 零告警（doc 列表项 + 冗余 cast + range contains）。
+
+**预期影响与回滚点**：纯 durable 域 + 独立 crate；M4h 接到 schedule 工具/事件投影。回滚
+撤提交即可。IANA 时区是显式 deferred 而非遗漏——一旦引入 chrono-tz 只需补
+`canonicalize_time_zone`/local-at 解析并重跑测试。
+
+---
+
 

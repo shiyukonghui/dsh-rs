@@ -1,0 +1,12 @@
+[package]
+name = "dsh-schedule"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Rust port of the dsh schedule capability seam (persistent timed reminders: after/at/every records, change-event fold replay, dispatch progression)."
+
+[dependencies]
+dsh-session = { path = "../dsh-session" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
