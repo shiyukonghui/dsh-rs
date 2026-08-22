@@ -1926,4 +1926,39 @@ agent idle 时自动发起下一轮（goal-round-driver），对齐
 
 ---
 
+## D-048（M4d dsh-subagent 纯语义）：描述符 + 深度 + provider 边界 + 目录 + 控制基础
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M4 第四子块 = subagent（in-process spawn/fork 进程内子代理 + 目录/描述符/
+深度/控制）。M4d 交付纯语义层（不接 agent-loop），对齐
+`packages/subagent/subagent/src/{descriptor,depth,list-children,projection}.ts` +
+各 provider capability 表。
+
+**结论**：
+- `descriptor.rs`：`SUBAGENT_DESCRIPTOR_VERSION=2`；`snapshot_descriptor`（one-shot 可选
+  label / continuable 必填 label + 可选 agentProvider/agentModel/persona/toolFilter，
+  前置校验）；`fold_descriptor_from_events`（首条 descriptor 权威、版本不符 → None、
+  当前版本未知字段/类型错 → fail loud、toolFilter 必须 allow 和/或 deny）。
+- `depth.rs`：`resolve_child_depth`（=max(header,runtime)+1，header 单调下限）+ 
+  `resolve_child_depth_bounded`（attempted>max → `DepthError::Overflow{attempted,max}`）+
+  `validate_max_depth`。
+- `provider.rs`：capability 表——spawn/fork 全 true（outputSchema/depthLimit/toolFilter/
+  persona；fork inheritsParentContext=true、spawn=false）；acp/claude-code/codex/dsh-sdk →
+  `NO_START_CAPABILITIES` 全 false（out-of-process 边界，M5）。
+- `catalog.rs`：`category_child`（child one-shot/continuable + activity + hasChildren）+
+  `diagnostic_row`（corrupt/unsupported/unavailable）。
+- `control.rs`：`prompt_gate`（仅 continuable 可 prompt）+ `interrupt_receipt`（fire-and-
+  return 恒 accepted，absent 目标 no-op 也 accepted）。
+- 测试 13 绿：descriptor snapshot/fold 全路径、深度递增/越界、provider 两边界、目录分类、
+  diagnostic。clippy -D warnings 零告警（doc 列表项 lint 修正）。
+
+**差异记录**：真实 child Agent 创建/投递（in-process driver + followup + persist resume）
+由 M4h 接 dsh-agent-loop 实配；本子步是纯判别与数据面。out-of-process provider 保持
+能力登记 + 明确不可用（非伪装成功）。
+
+**预期影响与回滚点**：纯数据面 + 独立 crate。回滚撤提交即可；M4h 在其上装配活子代理驱动。
+
+---
+
 
