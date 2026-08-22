@@ -732,7 +732,7 @@ impl ReactLoopAgent {
                 .session
                 .derive_messages()
                 .map_err(|e| Halt::Failed(unknown_failure(e.0)))?;
-            let built = build_request(
+            let mut built = build_request(
                 &self.agent.session,
                 &self.agent.options,
                 self.request_header_logged.get(),
@@ -752,7 +752,12 @@ impl ReactLoopAgent {
             }
             let mut assembler = BlockAssembler::new();
             let mut chunk_seqs: Vec<u64> = Vec::new();
-            let chunks = match (self.deps.stream)(&request) {
+            // `preparedCall?.stream(request) ?? llm.stream(request)`：prepared 派发优先。
+            let stream_result = match built.prepared_call.as_mut().and_then(|p| p.stream.take()) {
+                Some(mut ps) => ps(request.clone()).map(|it| it.collect()),
+                None => (self.deps.stream)(&request),
+            };
+            let chunks = match stream_result {
                 Ok(chunks) => chunks,
                 Err(e) => {
                     if let Some(c) = self.abort_reason() {

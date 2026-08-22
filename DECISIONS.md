@@ -1330,6 +1330,59 @@ dsh-agent 增 3 处小刀。833→846 全绿 + clippy 零告警。回滚：撤�
 增量：M2e-3 把 tool_exec/stream/project_context 换成真实 scheduler/MockAdapter/
 RuntimeContextProjection，`preparedCall.stream` 选择归一，request-error 补 retryPolicy。
 
+## D-033（M2e-3）：tool-calls 调度 + RuntimeContextProjection + AgentLoop 服务装配
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M2e-3 把 M2e-2 留下的三个 mock 依赖换成真实接线：tool 调度
+（`executeToolCalls`）、runtime-context 投影、AgentLoop 服务装配（`preparedCall.stream ??
+llm.stream` 归一 + invariant 守卫 + MockAdapter 闭环验证）。要求：模型顺序提交、并行/独占
+分类、`tool/call`+`tool/result` 事件与 `sourceEventSeqs`、`parseArguments`、skipped 合成、
+`concluded` 来自 `concludesTurn`、retained 三态/CLEARED/清理全部有测试锚定，且保持 driver
+（M2e-2）接口不变。
+
+**考虑的选项**：
+1. **sync 顺序调度（本次采用）**：按模型顺序循环 `run_group`；独占=单 call 屏障，并行=滚动
+   池（顺序执行天然有序）。对齐 TS 的「结果与上下文按模型顺序提交」「已启动提交、未启动
+   排水或跳过」。
+2. 引入 `ToolExecutionMode` 真并发线程池：dsh-tools 自身的执行管线也是 sync（execute 闭包
+   return 值，无 await），引入并发塞收益为零、破坏「日志即事实（事件顺序=提交顺序）」，
+   否决。
+
+**差值声明（sync 语义，逐项核对后，D-032 继续）**：
+- **无并发 inFlight 池**：`run_group` 顺序执行整个并行组；「并行调用可同时运行」退化但
+  **分类决定（屏障）语义保留**：组内 idx>0 起重新读 `execution_mode`，转 exclusive → 新
+  屏障（移交下一轮）；事件/上下文模型顺序不变。
+- **Abort 排水不可达**：调度器 ToolSignal 每次全新、driver 无中流抢占（sync 流已物化），
+  `aborted_before_dispatch` 检测与 skipped 合成保留 API 但正常路径不可达（同 D-032）。
+- **`concluded` 来源**：dsh-tools `ToolExecutionResult` 新增 `concludes_turn: bool`；执行期
+  `ToolRunContext::conclude_turn()`（对偶 TS `exec.concludeTurn()`）在成功路径归一化时读取。
+  失败/取消结果恒 false（TS 同款：failure never concludesTurn）。
+- **tool/result.meta 未接**：Rust runtime 无 meta 字段（TS 有 meta 透传）；D-033 声明为
+  差值，M?f 或暴露 meta 时补。`additional_contexts` 已接入（scheduler 收集为 next-step
+  Messages）——真实 runtime 目前恒空（工具尚无额外上下文产出器），契约已测。
+- **RuntimeContextProjection 无事件订阅**：TS 构造时扫描历史 + 跟随事件；Rust 每 `project`
+  前 `reconcile` 从当前日志**权威重派生** retained（后向找最后一个 owned 且仍在 surface 的
+  user/message；owned 但不在 surface → 无 retained；无 owned → never）。日志即事实源，
+  THEOREM 保证与跟随等价；surface-replacement 撤销快照由 reconcile 自然体现。
+- **`prepareCall.stream ?? llm.stream`** 归一：driver step 先取 `built.prepared_call.stream`
+  （`LlmRuntime::prepare_call` 捕获注册表派发），回退 `deps.stream`；二者都在 service 处挂
+  invariant 守卫（`check_loop_request`）。
+- **invariant 守卫位置**：prepared 流包装 + `deps.stream` fallback 两路都守卫；逐字 fail
+  message 不变（invariant.rs 已实现），守卫失败 → LlmError(code UNKNOWN)。
+- **MockAdapter**（`tests/m2e3_service.rs`，对齐 TS mock-adapter.ts）：脚本驱动 LlmAdapter，
+  `stream` 出队列 `Vec<StreamChunk>`；耗尽 → Finish Error（`SCRIPT_EXHAUSTED`）。
+
+**dsh-tools 变更**：`ToolExecutionResult.concludes_turn`（4 处字面量 + 结构体）；
+`ToolRunContext.concludes_turn`（pub(crate) Cell）+ `conclude_turn()`/`concludes_turn()`；
+lib 重新导出 `TOOL_ABORTED_BEFORE_DISPATCH` 等 code 常量。
+
+**预期影响与回滚点**：新增 `crates/dsh-agent-loop/src/tool_calls.rs` /
+`runtime_context.rs` / `service.rs`；driver step 微改（`prepared_call.stream.take()` 优先）；
+新增测试 `m2e3_scheduler`（7）/ `m2e3_projection`（7）/ `m2e3_service`（3，含真实工具闭环）。
+workspace 全绿 + clippy `-D warnings` 零告警。回滚：撤销本提交（保留 D-032 驱动）。
+增量：M2f 把 approval/guard 接 tool pre 阶段；M2g 把 AgentLoop 服务装进 host boot。
+
 ---
 
 

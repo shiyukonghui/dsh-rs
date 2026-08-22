@@ -35,5 +35,7 @@ pub use types::{
     ToolArn, ToolCallView, ToolDefinition, ToolExecution, ToolExecutionError,
     ToolExecutionSnapshot, ToolExecute, ToolFailureData, ToolFinalize, ToolIsConcurrencySafe,
     ToolOutputDefinition, ToolPresentCall, ToolPresentResult, ToolPresentationMeta, ToolRender,
-    ToolResult, ToolResultView, ToolRunContext, ToolSignal,
+    ToolResult, ToolResultView, ToolRunContext, ToolSignal, CODE_INVALID_ARGS,
+    CODE_INVALID_TOOL_OUTPUT, CODE_UNKNOWN_TOOL, RUN_CODE_NAME, TOOL_ABORTED,
+    TOOL_ABORTED_BEFORE_DISPATCH,
 };

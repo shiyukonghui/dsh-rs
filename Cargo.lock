@@ -520,6 +520,7 @@ dependencies = [
  "dsh-scope",
  "dsh-session",
  "dsh-system-prompt",
+ "dsh-tools",
  "serde",
  "serde_json",
 ]

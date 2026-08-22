@@ -182,6 +182,8 @@ pub struct ToolExecutionResult {
     pub is_error: bool,
     pub error: Option<ToolErrorInfo>,
     pub additional_contexts: Vec<Value>,
+    /// `concludesTurn` 标记：携带者在其步骤结束时关停 turn（M2e-3 调度读取）。
+    pub concludes_turn: bool,
 }
 
 /// 视图结果：可见工具（保插入序）+ 限制前全名集 + 可限制名（全局层名）。
@@ -576,6 +578,7 @@ impl ToolRegistry {
                 name: input.name.clone(),
                 agent: input.agent.clone(),
                 signal: input.signal.clone(),
+                concludes_turn: std::cell::Cell::new(false),
             },
             args: input.arguments.clone(),
         };
@@ -625,6 +628,7 @@ impl ToolRegistry {
             name: name.clone(),
             agent: exec.call.agent.clone(),
             signal: exec.call.signal.clone(),
+            concludes_turn: std::cell::Cell::new(false),
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             (def.execute)(&exec.args, &call_ctx)
@@ -679,6 +683,7 @@ impl ToolRegistry {
             is_error: false,
             error: None,
             additional_contexts: Vec::new(),
+            concludes_turn: call_ctx.concludes_turn(),
         }
     }
 
@@ -712,6 +717,7 @@ impl ToolRegistry {
             is_error: true,
             error: Some(info),
             additional_contexts: Vec::new(),
+            concludes_turn: false,
         }
     }
 
@@ -745,10 +751,11 @@ impl ToolRegistry {
                 info: Some(info),
             }),
             additional_contexts: Vec::new(),
+            concludes_turn: false,
         }
     }
 
-    /// post 阻断结果（guard 拒绝 reason）。
+    /// 阻断结果（guard 拒绝 reason）。
     fn post_blocked_result(&self, exec: &ToolExecution, reason: &str) -> ToolExecutionResult {
         ToolExecutionResult {
             execution: exec.clone(),
@@ -761,6 +768,7 @@ impl ToolRegistry {
                 info: None,
             }),
             additional_contexts: Vec::new(),
+            concludes_turn: false,
         }
     }
 }

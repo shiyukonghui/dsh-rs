@@ -111,6 +111,8 @@ pub struct ToolRunContext {
     /// 发起/归因 agent（InitiatorScope 标签；无则 None）。
     pub agent: Option<String>,
     pub signal: ToolSignal,
+    /// `concludesTurn` 标记（对偶 TS `exec.concludeTurn()`，interior-mutable）。
+    pub(crate) concludes_turn: std::cell::Cell<bool>,
 }
 
 impl ToolRunContext {
@@ -126,7 +128,18 @@ impl ToolRunContext {
             name: name.into(),
             agent,
             signal: ToolSignal::new(),
+            concludes_turn: std::cell::Cell::new(false),
         }
+    }
+
+    /// 用 `concludesTurn` 标记该执行在其 step 结束时关停 turn。
+    pub fn conclude_turn(&self) {
+        self.concludes_turn.set(true);
+    }
+
+    /// 该执行是否携带 `concludesTurn`。
+    pub fn concludes_turn(&self) -> bool {
+        self.concludes_turn.get()
     }
 }
 
