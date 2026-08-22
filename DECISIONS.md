@@ -1642,4 +1642,38 @@ dsh-persistence 的原子写是 jsonl 私有方法。
 
 ---
 
+## D-040（M3c 落地）：dsh-credentials 能力缝（env→file 两层，refs only）
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M3c 把 credentials wire 面做成真实语义——describe/resolve/set/unset 分层
+（进程 env 只读 wins > 本地文件 provider-managed 可写）+ 文件持久化。records half
+（grant/api-key）留 M5。
+
+**实现要点（对齐 credentials-local，D-037 决策 4 兑现）**：
+1. **REF 语法**：`/^[A-Za-z_][A-Za-z0-9_]*$/`；`is_credential_ref_name` 非语法名读作
+   「未配置」而非抛错（对齐 seam）。
+2. **分层**：`inherited(env) > 文件 refs`；resolve 每次调用读 current（M3 无 OS watch——
+   写路径自一致 + 启动读，与 settings 同纪律 D-039）。
+3. **writable 规则**：仅继承 env 不可写（`{configured:true, source:'env', writable:false}`）；
+   文件层 writable:true；未配置 `{configured:false, writable:true, source 缺席}`。
+4. **空值 seam-wide 规则**：空串 = 未配置（resolve 跳过、describe unconfigured）；set 空值
+   拒绝（`Empty`）。
+5. **shadowed 拒绝**：env 设了某 ref → set/unset 都 `Shadowed`（写会看起来成功而 resolve
+   仍返回遮蔽值）；unset absent 是幂等成功。
+6. **文件布局**：`version: 1` + `refs: {REF: value}`；未知顶层键/非 mapping/错类型/空值/
+   非语法 ref 全拒绝（boot-invalid）；空文档（或 comment-only）无需 version 即空 store。
+   `try_file`（严格，损坏 fail loud）vs `file`（便捷式宽松）双构造。
+7. **持久化**：复用 `dsh-persistence::fs_atomic::atomic_write`（D-039）；YAML 渲染
+   `refs:` 下双空格缩进，值为引号字符串。
+
+**验证**：dsh-credentials 8 测试全绿（grammar / env readonly / unconfigured / 文件
+set-resolve-unset roundtrip / 空值拒绝 / 损坏文件 fail loud / versioned 布局 / describe 批量）；
+clippy `-D warnings` 零告警。
+
+**预期影响与回滚点**：新增 `crates/dsh-credentials`（依赖 dsh-persistence + regex +
+serde_yaml）。回滚撤提交即可，其余 crate 零改动。
+
+---
+
 
