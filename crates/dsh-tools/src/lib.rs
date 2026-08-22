@@ -10,6 +10,7 @@
 //! - 错误语义对齐 `HarnessError(message, code)`：本 crate 提供 `SchemaErrorData`/
 //!   `ToolArgsErrorData` 等轻量载体（宿主至今未引入统一 HarnessError 类型）。
 
+pub mod guard;
 pub mod json_schema;
 pub mod py_types;
 pub mod runtime;
@@ -17,6 +18,11 @@ pub mod schema;
 pub mod ts_types;
 pub mod types;
 
+pub use guard::{
+    canonicalize, detailed_reminder, preview_arguments, tool_timeout_message,
+    tool_timeout_result, timeout_exceeded, validate_thresholds, wildcard_matches, GENTLE_REMINDER,
+    DEFAULT_THRESHOLDS, Reminder, RepeatTracker, TOOL_TIMEOUT,
+};
 pub use json_schema::{
     assert_object_json_schema, assert_supported_json_schema, validate_json_schema_value,
     JsonSchemaError, JsonSchemaNode, JsonSchemaScalar, JsonSchemaType, ObjectJsonSchema,

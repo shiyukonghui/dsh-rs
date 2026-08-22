@@ -1714,4 +1714,48 @@ lib.rs web.rs 接线。回滚撤提交即可；既有方法面（session/workspa
 
 ---
 
+## D-042（M3e 落地）：guard 切片——timeout-policy + repeat-tool-reminder seam
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M3e 把 `guard` 能力（M3-REQUIREMENTS 标准 6）做成可交付切片：TOOL_TIMEOUT
+结构化替换结果逐字 + repeat-tool-reminder 阈值检测（默认 `[3,5,8]`）gentle/detailed 消息逐字。
+完整 agent-loop 接线（依赖 fs/shell M5 通道）留 M5——M3 交付纯 seam + 最小 executor 路径。
+
+**实现要点（对齐 TS** `packages/guard/{timeout-policy,repeat-tool-reminder}` **）**：
+1. **dsh-tools `guard` 模块**（新增 `src/guard.rs`，纯逻辑，无新依赖——wildcard 用迭代
+   实现避免 regex 依赖）：
+   - `TOOL_TIMEOUT='TOOL_TIMEOUT'`；`tool_timeout_message(ms)` = `tool call timed out after
+     {ms}ms` 逐字；`tool_timeout_result(exec, ms)` → `{content:[text:'Error: {message}'],
+     isError, error:{message, info:{name:'ToolTimeoutError', code:'TOOL_TIMEOUT'}}}`。
+   - `timeout_exceeded(declared, elapsed)`：有正有限预算且 `elapsed >= budget` 才超时
+     （`None`/非正/非有限 → 永不超时，对齐 TS `timeoutMs undefined → delegate`）。
+   - repeat-reminder：`canonicalize`（深键排序后 stringify，对齐 sortJsonValue）；`wildcard`
+     （`*` 通配、其余含 `.` 逐字、锚定全串）；`validate_thresholds`（非空/整数>=2/无重复/
+     升序，fail-loud）；`preview_arguments`（`{}… (+N more chars)`，只截展示文本，链 key
+     恒用完整 canonical）；`GENTLE_REMINDER` 与 `detailed_reminder` 逐字。
+   - `RepeatTracker` 状态机：`observe(agent, name, args)` 推进链（key=`[{name},{canonical}]`，
+     命中阈值返回 `Reminder{text,count,summary}`，gentle@thresholds[0]、其余 detailed）；
+     无 agent / 未 tracked → 不计数不重置；`reset`（用户插话）、`drop_agent`（dispose）。
+2. **最小 executor 路径**（`runtime::execute_inner`）：工具声明 `timeoutMs` 时以 wall-clock
+   量 body 耗时，返回后 `elapsed >= 预算` → 以 `tool_timeout_result` 替换工具自身结果。
+   **差异记录**：TS 用 `deadline + AbortSignal` 抢占（异步管线）；Rust 核心同步（D-004）无法
+   并发抢占，故后置度量 = 诚实降级——工具体已执行完但结果被结构化替换（模型面语义一致：
+   同一 `Error:` 文本 + 独有 code 防嵌套外层误读）。真正可抢占接线留 M4/M5 executor。
+
+**过程中的测试修正**：`wildcard` 初版尾段/首段切分逻辑有误（`*probe`/尾段判定）→ 改为
+「首段前缀 + 中段顺序 find + 尾段后缀」标准 glob 三段式；`preview_arguments` 算术先用
+字节长、改字符数；`tracker_default_threshold_escalation` 等 3 个测试把「非阈值计数
+（4/3）」误写成 `.expectSome` → 改 `.is_none()` 断言（勿把 None 当 Some）。
+
+**验证**：dsh-tools `tests/m3_guard.rs` 22 测试全绿（消息逐字 / executor 替换 / 保留快
+结果 / 未预算委托 / canonical / wildcard / thresholds / preview / gentle+detailed /
+chain 五态 / include-exclude / per-agent / reset / drop）；dsh-tools 全量回归
+（m2b/m2f 等）绿；clippy `-D warnings` 零告警。
+
+**预期影响与回滚点**：新增 `crates/dsh-tools/src/guard.rs` + runtime.rs execute_inner
+加 8 行 wall-clock 判定。回滚：撤提交即还原 runtime；guard 模块独立可测。
+
+---
+
 

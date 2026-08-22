@@ -708,9 +708,16 @@ impl ToolRegistry {
             signal: exec.call.signal.clone(),
             concludes_turn: std::cell::Cell::new(false),
         };
+        // M3e（timeout-policy 最小 executor 路径）：声明了 timeoutMs 的工具按
+        // wall-clock 判定（同步执行无可抢占信号——对齐 TS `deadline`+`exec.signal`
+        // 的诚实降级，见 DECISIONS）。body 返回后若 elapsed >= 预算 → 用 TOOL_TIMEOUT
+        // 结构化结果替换工具自身结果（独有 code 防嵌套外层误读）。
+        use std::time::Instant;
+        let started = Instant::now();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             (def.execute)(&exec.args, &call_ctx)
         }));
+        let elapsed_ms = started.elapsed().as_millis() as u64;
         let body = match outcome {
             Ok(Ok(value)) => value,
             Ok(Err(failure)) => return self.tool_error_result(exec, failure),
@@ -725,6 +732,10 @@ impl ToolRegistry {
                 );
             }
         };
+        // 超时替换（自己的 timer 胜出 → 无论工具返回什么都换掉；对齐 TS）。
+        if crate::guard::timeout_exceeded(def.timeout_ms, elapsed_ms) {
+            return crate::guard::tool_timeout_result(exec, def.timeout_ms.unwrap() as u64);
+        }
 
         // 取消于 body 后 → ABORTED
         if exec.call.signal.aborted() {
