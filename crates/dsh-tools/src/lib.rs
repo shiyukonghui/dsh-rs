@@ -24,7 +24,8 @@ pub use json_schema::{
 pub use py_types::{json_schema_to_py, render_tools_sdk_py};
 pub use runtime::{
     ToolErrorInfo, ToolExecutionClass, ToolExecutionInput, ToolExecutionMode, ToolExecutionResult,
-    ToolGuard, ToolRegistry, ToolRestriction, ToolView,
+    ToolGuard, ToolRegistry, ToolRestriction, ToolView, ApprovalOutcome, ApprovalProvider,
+    PreToolDecision, ToolPreDecision,
 };
 pub use schema::{
     define_tool, parameter_schema_spec_to_json_schema, validate_args, value_schema_spec_to_json_schema,

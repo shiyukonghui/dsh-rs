@@ -1383,6 +1383,52 @@ lib 重新导出 `TOOL_ABORTED_BEFORE_DISPATCH` 等 code 常量。
 workspace 全绿 + clippy `-D warnings` 零告警。回滚：撤销本提交（保留 D-032 驱动）。
 增量：M2f 把 approval/guard 接 tool pre 阶段；M2g 把 AgentLoop 服务装进 host boot。
 
+## D-034（M2f）：tool pre 阶段审批（approval）接线
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M2f 把 M2b/M2e 留下的 approval 接线点补上——`tools/pre-execute`
+（allow/deny/ask）与 `serviceAsk`（审批通道把 ask 解析为放行/拒绝）。TS 侧验收标准：
+ask 无通道 → 逐字拒绝 `tool "<name>" requires approval (not yet supported)`；无 agent →
+`...has no agent to route it through`；`allowed-once` → 放行（guards 仍挡）；rejected /
+cancelled / unavailable → 三种逐字拒绝；deny 物化为 `Error: <reason>` 的 error 结果。
+
+**考虑的选项**：
+1. **同步决策钩子 + 全局 ApprovalProvider（本次采用）**：`add_pre_decision`（waterfall 到
+   allow：None = delegate；首个非 None 即最终决策）表达 pre-execute；`ApprovalProvider`
+   = `Fn(&ToolExecution, Option<&str>) -> ApprovalOutcome` 同步决策者，注册在 registry 根
+   （TS `ctx.get('approval')` 的全局语义）。
+2. 事件总线 waterfall（Cordis 完整 pre-execute chain）：同步 rust 无异步 listener 生态，
+   单个 hook 序列已覆盖「先决策后执行」语义；full waterfall 留宿主总线基建（M3），否决。
+3. 独立 `dsh-interaction` crate：仅一个类型别名/决策者函数，无宿主消费者（M3 才装），
+   违反「Require a current owner and need」，否决——通道类型先进 dsh-tools，宿主装
+   approval service 时（M3）再决定是否外提。
+
+**差值声明（sync 语义，逐项核对后）**：
+- **approval 请求是同步决策而非异步等待**：TS `approval.request()` 是异步心跳（起 UI 往返、
+  等待用户）；Rust 以同步回调表达（宿主把 UI 往返放在 loop 之外，返回一次性 outcome）。
+  唯一受影响的是「pending 等待期」——同步 loop 不可能悬空一个 step，declare divergence。
+- **approvalCancelled→aborted-before-dispatch 不可达**：该分支需要 ask 决议后 caller 已
+  取消；同步 loop 无中流抢占（流已物化、无并发 dispatcher），Cancelled 态恒以逐字拒绝
+  `approval for tool "<name>" was cancelled` 物化错误结果。
+- **ask 的 reason 语义**：TS `ask.reason ?? not-yet-supported`——有 reason 时无通道拒绝用
+  reason 原文；代码逐字对齐。
+- **模式：pre-decision 先于 guards**（对齐 prepareExecution：pre-execute waterfall → deny →
+  guardReason）→ 再 body。deny（任意来源）走 `post_blocked_result`：`Error: <reason>` +
+  isError=true + error{message, info:None}（TS `materializeFinalResult` error.info 缺省；
+  scheduler 因此不写 error 块——D-033 的 append_tool_result 只透传 `e.info`）。
+
+**dsh-tools 变更**：`PreToolDecision` / `ApprovalOutcome` / `ToolPreDecision` /
+`ApprovalProvider` 类型；`ToolLayer.pre_decisions`（effect 可拆卸）；registry
+`add_pre_decision` / `set_approval_provider`（返回前值便于组合）/ `approval_provider`；
+`execute_inner` pre-phase 重写；lib 重新导出新类型。
+
+**预期影响与回滚点**：新增 `dsh-tools/tests/m2f_approval.rs`（12）+ `dsh-agent-loop/
+tests/m2f_interaction.rs`（2，真实闭环：ask 无通道 → tool/result 逐字拒绝且工具体不执行；
+allowed-once → 工具体执行）。workspace 112 套件全绿 + clippy 零告警。回滚：撤销本提交。
+增量：M2g 把 host boot 装进 web.rs + E2E 冒烟；approval 通道宿主化（M3）。
+
+
 ---
 
 

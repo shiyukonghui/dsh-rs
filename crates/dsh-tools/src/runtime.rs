@@ -10,11 +10,11 @@
 //! - `execute`：resolve → guards → body → output 校验（`ToolOutputError`）→ render →
 //!   finalize → 取消合成（`ABORTED`/`ABORTED_BEFORE_DISPATCH`）。
 //!
-//! 差异声明（D-024/D-028，见 DECISIONS.md）：TS 的 Cordis waterfall 阶段
-//! （`tools/pre-execute`/`tools/post-execute`）与 approval 接线属事件总线基础设施，
-//! 留待 M2e（agent-loop 接入）与 M2f（user-approval）驱动；本轮以同步 guards 表达
-//! pre 决策、无 approval。Code Mode 传输（run_code）依赖 dsh-code-runtime（M5），
-//! 本轮注入占位；`execute` 对 collapsed 名给出精确路由错误。
+//! 差异声明（D-024/D-028/D-034，见 DECISIONS.md）：TS 的 Cordis waterfall 阶段
+//! （`tools/pre-execute`/`tools/post-execute`）在同步侧以 pre-decision 钩子表达 pre 阶段、
+//! 审批通道以同步决策者注入（M2f 已接）；post-execute 仍留宿主（M3）。Code Mode 传输
+//! （run_code）依赖 dsh-code-runtime（M5），本轮注入占位；`execute` 对 collapsed 名给出
+//! 精确路由错误。
 
 use crate::json_schema::validate_json_schema_value;
 use crate::types::*;
@@ -61,8 +61,33 @@ pub enum ToolExecutionClass {
 /// 一个 effect 返回的拆除器。
 pub type ToolDisposer = Rc<dyn Fn()>;
 
-/// guard 谓词：`(name, args)` → 拒绝理由（None = 放行）。
+/// guard 谓词：`(name, args)` → 拒绝理由（None = 放行）。单调拒绝（无 allow 结果）。
 pub type ToolGuard = Rc<dyn Fn(&str, &Value) -> Option<String>>;
+
+/// pre-dispatch 决策（对齐 TS `PreToolDecision`）：`allow` 放行、`deny` 物化错误、
+/// `ask` 仅在审批通道返回 `allowed-once` 后才放行、否则按原因拒绝。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreToolDecision {
+    Allow,
+    Deny { reason: String },
+    Ask { reason: Option<String> },
+}
+
+/// 审批通道的一次性结果（对齐 TS `ApprovalOutcome` 四态）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    /// 本次放行一次（工具仍受 guards 约束）。
+    AllowedOnce,
+    Rejected,
+    Cancelled,
+    Unavailable,
+}
+
+/// pre-execute 等价钩子：返回 None = 放行（delegate 到 allow）；首个非 None 即最终决策。
+pub type ToolPreDecision = Rc<dyn Fn(&ToolExecution) -> Option<PreToolDecision>>;
+
+/// 审批决策者（同步；宿主以回调把「ask」解析为 allow/deny——UI 往返在 loop 之外，M3）。
+pub type ApprovalProvider = Rc<dyn Fn(&ToolExecution, Option<&str>) -> ApprovalOutcome>;
 
 /// 限制谓词（allow/deny ReadonlySet；`admits` 语义对齐 TS）。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -104,6 +129,7 @@ pub struct ToolLayer {
     mode: Rc<RefCell<Option<ToolExecutionMode>>>,
     restrictions: Rc<RefCell<Vec<ToolRestriction>>>,
     guards: Rc<RefCell<Vec<ToolGuard>>>,
+    pre_decisions: Rc<RefCell<Vec<ToolPreDecision>>>,
 }
 
 impl ToolLayer {
@@ -113,6 +139,7 @@ impl ToolLayer {
             mode: Rc::new(RefCell::new(None)),
             restrictions: Rc::new(RefCell::new(Vec::new())),
             guards: Rc::new(RefCell::new(Vec::new())),
+            pre_decisions: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -204,6 +231,8 @@ pub struct ToolRegistry {
     layers: ScopedLayers<ToolLayer>,
     default_mode: ToolExecutionMode,
     on_change: Rc<dyn Fn()>,
+    /// 审批决策者（全局，M2f；TS `ctx.get('approval')` 等价——缺省 = 无通道，ask 即拒绝）。
+    approval: Rc<RefCell<Option<ApprovalProvider>>>,
 }
 
 impl ToolRegistry {
@@ -218,6 +247,7 @@ impl ToolRegistry {
             layers: ScopedLayers::new(|_| ToolLayer::new(), move || change()),
             default_mode,
             on_change,
+            approval: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -530,6 +560,45 @@ impl ToolRegistry {
         Ok(disposer)
     }
 
+    /// 追加一个 pre-execute 等价决策钩子（对齐 `tools/pre-execute` waterfall）。
+    /// `None` = 放行（delegate 到 allow）；首个非 None 即最终决策。
+    pub fn add_pre_decision(
+        &self,
+        pre: ToolPreDecision,
+        scope: Option<&ScopeKey>,
+    ) -> Result<ToolDisposer, String> {
+        let disposer = self.layers.effect(
+            scope,
+            move |layer| {
+                let pre_decisions = layer.pre_decisions.clone();
+                let mut buf = pre_decisions.borrow_mut();
+                buf.push(pre.clone());
+                let idx = buf.len() - 1;
+                drop(buf);
+                Rc::new(move || {
+                    let mut buf = pre_decisions.borrow_mut();
+                    if idx < buf.len() {
+                        buf.remove(idx);
+                    }
+                })
+            },
+            "tools.preDecision()",
+            false,
+        );
+        Ok(disposer)
+    }
+
+    /// 设置审批决策者（`None` 清除通道——ask 退化为「not yet supported」拒绝）。
+    /// 返回被替换的前值（便于宿主回滚组合）。
+    pub fn set_approval_provider(&self, provider: Option<ApprovalProvider>) -> Option<ApprovalProvider> {
+        std::mem::replace(&mut *self.approval.borrow_mut(), provider)
+    }
+
+    /// 当前审批决策者。
+    pub fn approval_provider(&self) -> Option<ApprovalProvider> {
+        self.approval.borrow().clone()
+    }
+
     // -----------------------------------------------------------------------
     // executionMode / execute
     // -----------------------------------------------------------------------
@@ -616,7 +685,16 @@ impl ToolRegistry {
             return self.aborted_before_dispatch_result(exec);
         }
 
-        // guards（同步 pre 决策；approval 在 M2f 接入此处之前）
+        // pre-phase（对齐 prepareExecution）：pre-execute 决策（waterfall 到 allow）→
+        // ask 经审批通道解析 → deny 物化为错误结果 → guards（单调拒绝）→ dispatch。
+        let decided = match self.first_pre_decision(exec, scope) {
+            PreToolDecision::Allow => None,
+            PreToolDecision::Deny { reason } => Some(reason),
+            PreToolDecision::Ask { reason } => self.resolve_approval(exec, reason),
+        };
+        if let Some(reason) = decided {
+            return self.post_blocked_result(exec, &reason);
+        }
         if let Some(reason) = self.guard_reason(&name, &exec.args, scope) {
             return self.post_blocked_result(exec, &reason);
         }
@@ -698,6 +776,50 @@ impl ToolRegistry {
             }
         }
         None
+    }
+
+    /// 首个非 None 的 pre-execute 决策（waterfall 到 allow：None = delegate）。
+    fn first_pre_decision(&self, exec: &ToolExecution, scope: Option<&ScopeKey>) -> PreToolDecision {
+        let chain = self.layers.chain_layers(scope);
+        for layer in std::iter::once(self.layers.global()).chain(chain.iter().map(|l| l.as_ref())) {
+            for pre in layer.pre_decisions.borrow().iter() {
+                if let Some(decision) = pre(exec) {
+                    return decision;
+                }
+            }
+        }
+        PreToolDecision::Allow
+    }
+
+    /// 解析 `ask` → allow/deny（对齐 `serviceAsk` 的逐字拒绝原因）。sync 差值：
+    /// `approvalCancelled` 驱动的 aborted-before-dispatch 分支无中流抢占不可达（D-034）；
+    /// 取消态仍以其逐字拒绝原因物化错误结果。
+    fn resolve_approval(
+        &self,
+        exec: &ToolExecution,
+        ask_reason: Option<String>,
+    ) -> Option<String> {
+        let name = exec.call.name.clone();
+        let Some(provider) = self.approval_provider() else {
+            return Some(ask_reason.unwrap_or_else(|| {
+                format!("tool \"{name}\" requires approval (not yet supported)")
+            }));
+        };
+        if exec.call.agent.is_none() {
+            return Some(format!(
+                "tool \"{name}\" requires approval, but the call has no agent to route it through"
+            ));
+        }
+        match provider(exec, ask_reason.as_deref()) {
+            ApprovalOutcome::AllowedOnce => None,
+            ApprovalOutcome::Rejected => Some(format!("the user rejected tool \"{name}\"")),
+            ApprovalOutcome::Cancelled => {
+                Some(format!("approval for tool \"{name}\" was cancelled"))
+            }
+            ApprovalOutcome::Unavailable => Some(format!(
+                "tool \"{name}\" requires approval, but no approval channel is available"
+            )),
+        }
     }
 
     // -----------------------------------------------------------------------
