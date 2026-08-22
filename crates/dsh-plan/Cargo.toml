@@ -1,0 +1,12 @@
+[package]
+name = "dsh-plan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Rust port of the dsh plan-mode capability seam (plan/mode event fold + active/pending projection + exit_plan_mode gate)."
+
+[dependencies]
+dsh-session = { path = "../dsh-session" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

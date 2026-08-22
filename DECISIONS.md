@@ -1896,4 +1896,34 @@ agent idle 时自动发起下一轮（goal-round-driver），对齐
 
 ---
 
+## D-047（M4c dsh-plan）：plan/mode 折叠 + plan 投影 + exit_plan_mode 前置
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M4 第三个子块 = plan-mode（计划模式，`/plan <msg>` 进入 / `/plan off`
+离开，`plan/mode` 事件 + `plan` 投影 active/pending，`exit_plan_mode` 工具）。对齐
+`packages/plan/plan-mode/src/index.ts`。
+
+**结论**：
+- `fold.rs`：`fold_plan_mode`（最后 `plan/mode` 胜出；无事件 → inactive）+ 前缀折叠 +
+  `has_open_turn`（turn/start…turn/end 配对）。
+- `projection.rs`：PlanUnitState（active/wanted/running）+ `plan_unit_apply`（command/run
+  name=='plan'→running 记录 wanted=args.trim()!="off"；配对 command/done 仅 success 且
+  wanted≠active 落 wanted；plan/mode→active 落定 + wanted 清；args 缺省不动）+ 视图
+  `{active, pending: (running?.wanted ?? wanted) !== null && !== active}`。纯事件重放 →
+  投影可从日志恢复（无 live mirror）。
+- `exit.rs`：`exit_plan_mode_check(events, plan, review_channel)`——非 plan mode →
+  `NotInPlanMode`；plan 不带 `# 标题`（`^#\s+\S`）→ `NeedsHeading`；无评审通道 →
+  `NoReviewChannel`；全过 → `Ok`。宿主 M4h 装配 user-questions 通道后才发评审。
+- 测试 12 绿：折叠 last-wins/前缀、open-turn、投影单元全路径（run/done success|error/
+  commit/pending）、exit 前置四态。
+- clippy -D warnings 零告警（prefix 用 `.take(end)` 消循环计数器；test bool 断言规范化）。
+
+**差异记录**：user-questions 评审通道（ask_user_question）是本仓 Rust 侧缺失面——M4c
+只做前置校验，真实评审交互由 M4h 决定是否提供最小内存通道或按文档报错（README 明确）。
+
+**预期影响与回滚点**：纯日志派生 + 投影 unit（M4h 挂 ProjectionRegistry）。回滚撤提交即可。
+
+---
+
 
