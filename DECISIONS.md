@@ -2034,4 +2034,41 @@ driver 投递由 M4h 提供。bash/pwsh/terminal producer 为 M5 subprocess。vi
 
 ---
 
+## D-051（M4g todo + dsh-workflow 桩）：todos 投影 unit + todo 工具校验 + workflow meta/桩
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M4 第七子块 = todo（`todo/write` 事件 + `todos` 投影 + todo 工具）+
+workflow（meta 校验 + 事件骨架 + 致命 code 分类 + 诚实执行桩）。
+
+**结论**：
+- todo 承载（需求行 210/254 的「dsh-session-query 投影 unit + dsh-tools 工具」拆解）：
+  在 `dsh-session-query` 新增 `todo.rs`——`to_todo_list`（trim 非空唯一 content；
+  allowParallelInProgress=false 时至多一个 in_progress → TooManyInProgress；空/重复 →
+  EmptyContent/DuplicateContent）、`todos_projection_unit()`（init=null，apply:
+  todo/write → 整表 / turn/start → null / 其余保持，view=state；stateVersion=2 对齐 TS）
+  + `into_unit()` 供 M4h 注册进 ProjectionRegistry、`todo_counts`（pending/inProgress/
+  completed）。利用既有 `dsh_session::TodoItem/TodoStatus/TodoWrite EventKind`。
+- dsh-workflow（补「上一步留下的桩」）：
+  - `error.rs`：`WorkflowErrorCode` 11 码全列（SCRIPT_PARSE…CANCELLED，wire 对齐 TS
+    大写下划线）+ `WorkflowError`（默认 fatal=true）+ `violations` 字段（META_INVALID 逐条）。
+  - `meta.rs`：`validate_meta` 逐 violation 列出（meta 未知键 / name/description 非空 /
+    whenToUse 可选 / phases 数组每项只认 title/detail/provider/model 且 title 非空），
+    code=META_INVALID，成功返回规范化副本（不别名调用方对象）。
+  - `event.rs`：WorkflowRunInfo / WorkflowAgentInfo（seq 1-based）/ AgentEndInfo wire 构造。
+  - `stub.rs`：`run_stub` 恒 Err（UNSUPPORTED_OPTION，isError）——JS 执行引擎 M4 不落地，
+    诚实桩不伪装成功（D-044/需求行 166）。
+- 测试 12 绿（session-query 6 + workflow 6）：todo 规范化/重复/并行纪律/投影折叠/view/
+  counts；meta 合法+全 violation/META_INVALID、错误码路由、事件 payload、桩 isError。
+  clippy -D warnings 零告警。
+
+**差异记录**：todo 工具注册本身（`todo_write` 工具 + 描述文案/输出 render）留 M4h 在
+dsh-tools 完成；本子步交付其校验与投影数据面。workflow 桩仅覆盖 meta/事件/isError——
+`parallel/pipeline` 组合器与 worker 协议均为 M5（真实 JS 引擎）。
+
+**预期影响与回滚点**：纯数据面 + 独立模块/crate。回滚撤提交即可；M4h 注册 todo 工具并
+挂 `todos` 投影 unit 进 Boot。
+
+---
+
 
