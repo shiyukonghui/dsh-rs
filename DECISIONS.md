@@ -1829,4 +1829,41 @@ D-022/D-036 handle_rpc_host 代偿）。
 
 ---
 
+## D-045（M4a dsh-goal 纯域）：CAS 状态机 + 事件溯源 fold + 投影基础
+
+**日期**：2025（本机时间）
+
+**触发的问题**：M4 进入编码，首块 M4a = goal 纯域（无驱动依赖）。目标：CAS 状态机 +
+严格回放 fold + 投影基础，逐字对齐 `packages/goal/goal/src/{types,domain,fold,runtime}.ts`
+并复用 `dsh-session` 已预留的 `goal/change` 事件 / serde_json 宽载荷。
+
+**结论**：
+- 新增 crate `dsh-goal`（只依赖 dsh-session + serde + serde_json）。
+- `types.rs`：GoalId/GoalRef/GoalPhase/GoalActivation(armed|disarmed)/GoalBlockReason/
+  GoalSnapshot/GoalProjection/GoalOperation/GoalChangeMeta（snapshot|clear 墓碑）——wire
+  字段 camelCase（`maxGoalRounds`/`roundsStarted`/`createdAt`/`updatedAt`/`clearedAt`）serde
+  rename 对齐 TS；`GoalView` 含派生 rounds_started/created_at/updated_at/activation。
+- `fold.rs`：`decode_goal_change`（非 goal 事件 → None；malformed → fail loud）+ 严格
+  apply（revision 精确 +1、跨目标 create 必须 rev1、id 不重用【clear 墓碑后同 id recreate
+  拒】、blocked 须带 blockedReason、非 complete 前 goal 的 create 拒、updatedAt/roundsStarted
+  守恒）+ `fold_goal_events_strict`（fail loud）+ 宽容 `fold_goal_events`。
+- `service.rs`：进程内 GoalService（单当前目标语义）——create（前 goal 须 absent 或
+  complete、默认 256 轮）/edit/pause/resume/complete/block（host-only + lower-kebab code
+  校验）/clear + `admit_round`（round 1..maxGoalRounds，递增 roundsStarted）+ `disarm`。
+  错误码 9 个逐字（GOAL_AGENT_NOT_LIVE/GOAL_NOT_FOUND/GOAL_ALREADY_EXISTS/
+  GOAL_STALE_REVISION/GOAL_INVALID_OBJECTIVE/GOAL_INVALID_MAX_ROUNDS/
+  GOAL_INVALID_BLOCK_REASON/GOAL_INVALID_EDIT/GOAL_INVALID_TRANSITION）。CAS 前置以自由
+  函数 `cas_ref` 剥离（避免 borrow checker 冲突）。
+- 测试 27 绿（fold 10 + service 17）：生命周期/边界/错误码逐字 + 严格 fold 不变量。
+- clippy -D warnings 零告警（fold bool 逻辑收敛为 is_none_or/is_some_and 组合）。
+
+**差异记录**：GoalActivation 只在服务进程内（不持久化）；service 是进程内单目标镜像，
+跨会话多目标由 caller 按会话实例化（web.rs M4h 装配）。clear 后用新 id create 允许、
+同 id 复用拒。
+
+**预期影响与回滚点**：纯域不接 agent-loop（驱动在 M4b）。回滚：撤提交即还原；service
+已不依赖 dsh-session 事件落盘（caller 自己落 `goal/change`）。
+
+---
+
 

@@ -623,6 +623,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-goal"
+version = "0.1.0"
+dependencies = [
+ "dsh-session",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dsh-jobs"
+version = "0.1.0"
+dependencies = [
+ "dsh-session",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dsh-llm"
 version = "0.1.0"
 dependencies = [
@@ -664,6 +682,24 @@ dependencies = [
  "serde",
  "serde_json",
  "zstd",
+]
+
+[[package]]
+name = "dsh-plan"
+version = "0.1.0"
+dependencies = [
+ "dsh-session",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dsh-schedule"
+version = "0.1.0"
+dependencies = [
+ "dsh-session",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -715,6 +751,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-subagent"
+version = "0.1.0"
+dependencies = [
+ "dsh-persistence",
+ "dsh-session",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dsh-system-prompt"
 version = "0.1.0"
 dependencies = [
@@ -745,6 +791,14 @@ dependencies = [
  "tokio",
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "dsh-workflow"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

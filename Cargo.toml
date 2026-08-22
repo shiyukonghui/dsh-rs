@@ -14,6 +14,9 @@ members = [
   "crates/dsh-agent", "crates/dsh-agent-loop",
   # M3 宿主（PLAN §6）：settings/credentials 能力缝 + file 提供者（web gui 配置面）
   "crates/dsh-settings", "crates/dsh-credentials",
+  # M4 长任务编排（PLAN §6）：goal/plan/subagent/jobs/schedule/workflow
+  "crates/dsh-goal", "crates/dsh-plan", "crates/dsh-subagent",
+  "crates/dsh-jobs", "crates/dsh-schedule", "crates/dsh-workflow",
 ]
 
 [workspace.package]
