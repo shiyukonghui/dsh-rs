@@ -676,6 +676,7 @@ dependencies = [
 name = "dsh-fs"
 version = "0.1.0"
 dependencies = [
+ "dsh-sandbox",
  "dsh-session",
  "dsh-tools",
  "globset",

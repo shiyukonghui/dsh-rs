@@ -12,3 +12,7 @@ pub use types::{
     FsEditOutcome, FsEditRequest, FsError, FsErrorCode, FsReadText, FsTarget, FsTargetKey,
     FsVersion, FsWriteIntent, FsWriteOutcome, ReadTextOptions, ResolveOptions,
 };
+
+/// 进程内沙箱围栏（写路径守卫）。
+pub mod sandbox;
+pub use sandbox::{checked_target, SandboxPolicy};
