@@ -2286,4 +2286,30 @@ sandbox / fs / shell / terminal / code-runtime 六缝逐字契约 + 各自 TDD �
 
 ---
 
+## D-058（M5 编码·dsh-subprocess）：有界收集必须 drain-to-EOF；溢出即落盘则内存 tail 清空
+
+**日期**：2026（M5 round 11）
+
+**触发问题**：`tests/spill.rs` 红测（5000 行 echo 溢出 200B）暴露真 bug——初版 `drain_pipe`
+在字节数达 `max_bytes` 时 `break` 停止读管道，导致管道满后子进程写阻塞/写失败
+（stderr 反复 `The process tried to write to a nonexistent pipe`，退出码 1）。
+
+**考虑的选项**：
+1. **始终 drain 到 EOF（本次采用）**：收集器不断读管道直至 EOF；内存只保留尾部 ≤ max_bytes；
+   发生溢出且有 spill → 完整流写盘、内存 tail **清空**（`readFrom(0)` 经 spill 路径恢复）；
+   无 spill → 内存回绕只留最后 max_bytes 诊断 tail。
+2. 初版「到预算即停读」：错误——管道是背压通道，停读必然连累子进程。
+3. 溢出后继续读但全量保留内存：违背有界内存纪律（max_bytes 即上限）。
+
+**最终选择**：选项 1。为「从不阻塞子进程」的不可违反不变量，即使 spill 未配置也必须读尽
+管道；溢出丢弃受 `max_bytes` 约束。
+
+**选择理由**：OS 管道是固定容量背压通道——任何「到阈值就停读」的收集器都会使子进程写侧
+阻塞或崩溃（本测试实证 exit 1）；参考 TS collect 语义即「完整流恢复 or 有界 tail」二选一。
+
+**预期影响与回滚点**：`drain_pipe` 重写；`tests/spill.rs` 锁定溢出落盘 + 内存 cap + 子
+进程正常退出；回滚 = 撤 057af4f 恢复初版。改动 → 提交 → 本条目互查（提交信息引用 D-058）。
+
+---
+
 
