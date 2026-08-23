@@ -19,6 +19,7 @@ dsh-agent-loop = { path = "../dsh-agent-loop" }
 dsh-session = { path = "../dsh-session" }
 dsh-persistence = { path = "../dsh-persistence" }
 dsh-llm = { path = "../dsh-llm" }
+dsh-llm-deepseek = { path = "../dsh-llm-deepseek" }
 dsh-tools = { path = "../dsh-tools" }
 dsh-system-prompt = { path = "../dsh-system-prompt" }
 dsh-scope = { path = "../dsh-scope" }

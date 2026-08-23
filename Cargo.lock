@@ -591,6 +591,7 @@ dependencies = [
  "dsh-goal",
  "dsh-jobs",
  "dsh-llm",
+ "dsh-llm-deepseek",
  "dsh-loader",
  "dsh-persistence",
  "dsh-sandbox",

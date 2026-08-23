@@ -306,3 +306,137 @@ fn error_value(msg: &str) -> Value {
         "content": "",
     })
 }
+
+// ---------------------------------------------------------------------------
+// M6 step5a（D-080）：流式 chat/completions 传输——POST 已序列化（含 `"stream": true`）
+// 的请求体，返回原始响应体字节；SSE 解码属 dsh-llm-deepseek（`sse::parse_sse`，不重复
+// 造 parser）。复用 tcp_exchange/build_request/parse_base；非 2xx → 带 status 的结构化错误。
+// ---------------------------------------------------------------------------
+
+/// 流式请求的产物：HTTP 状态码 + 原始响应体字节（SSE 文本；由调用方解析）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamBody {
+    pub status: u16,
+    pub bytes: Vec<u8>,
+}
+
+/// 流式请求的失败：携带状态码（0 = 连接/IO/形状错误）与详情。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamHttpError {
+    pub status: u16,
+    pub detail: String,
+}
+
+impl std::fmt::Display for StreamHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let st = if self.status == 0 { "network/io".to_string() } else { format!("HTTP {}", self.status) };
+        write!(f, "{st}: {}", self.detail)
+    }
+}
+
+/// POST 流式 chat/completions：`body` 须为已序列化的请求 JSON（含 `"stream": true`）。
+/// `base` 形如 `http://host:port[/prefix]`；`api_key` 可选（Bearer 认证）。
+pub fn chat_completions_stream(
+    base: &str,
+    api_key: Option<&str>,
+    body: &str,
+) -> Result<StreamBody, StreamHttpError> {
+    let (scheme, host, port, path) = match parse_base(base) {
+        Some(v) => v,
+        None => return Err(StreamHttpError { status: 0, detail: "invalid base url".into() }),
+    };
+    let request = build_request(&path, api_key, body);
+    let response = match tcp_exchange(&scheme, &host, port, &request) {
+        Ok(r) => r,
+        Err(e) => return Err(StreamHttpError { status: 0, detail: e }),
+    };
+    let (status, bytes) = match split_response(&response) {
+        Some(v) => v,
+        None => return Err(StreamHttpError { status: 0, detail: "malformed HTTP response".into() }),
+    };
+    if !(200..300).contains(&status) {
+        let detail = String::from_utf8_lossy(&bytes);
+        return Err(StreamHttpError { status, detail: detail.into_owned() });
+    }
+    Ok(StreamBody { status, bytes })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// 本地一次性 SSE 服务端：捕获请求文本 → 写指定状态行 + 响应体 → 关闭。
+    fn serve_once(status_line: &str, response_body: &[u8]) -> (u16, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = response_body.to_vec();
+        let status = status_line.to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            // 读请求：先读到头部结束（CRLFCRLF），再带 200ms 超时读剩余 body。
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(_) => break,
+                }
+            }
+            sock.set_read_timeout(Some(std::time::Duration::from_millis(200))).ok();
+            loop {
+                match sock.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(_) => break,
+                }
+            }
+            let mut out = format!(
+                "{status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            out.push_str(&String::from_utf8_lossy(&body));
+            sock.write_all(out.as_bytes()).unwrap();
+            sock.flush().unwrap();
+            let _ = sock;
+            String::from_utf8_lossy(&buf).to_string()
+        });
+        (port, handle)
+    }
+
+    /// M6i 验收 #6 支撑：POST 流式请求到本地端点 → 返回 (200, 原始 SSE 字节)。
+    #[test]
+    fn chat_completions_stream_posts_and_returns_raw_bytes() {
+        let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let (port, handle) = serve_once("HTTP/1.1 200 OK", sse);
+        let base = format!("http://127.0.0.1:{port}");
+        let body_json = r#"{"model":"m","messages":[],"stream":true}"#;
+        let res = chat_completions_stream(&base, Some("K"), body_json).expect("stream ok");
+        assert_eq!(res.status, 200);
+        assert_eq!(res.bytes, sse.to_vec(), "raw SSE body preserved (SSE decode owned by deepseek crate)");
+        let req_text = handle.join().unwrap();
+        assert!(req_text.contains("Authorization: Bearer K"), "Bearer header sent");
+        assert!(req_text.contains("\"stream\":true") || req_text.contains("stream\":true"), "stream request body passed through");
+    }
+
+    /// 非 2xx → 结构化错误（带 status + detail）。
+    #[test]
+    fn chat_completions_stream_non_2xx_is_structured_error() {
+        let (port, _) = serve_once("HTTP/1.1 401 Unauthorized", b"{\"error\":\"bad key\"}");
+        let base = format!("http://127.0.0.1:{port}");
+        let err = chat_completions_stream(&base, Some("bad"), r#"{"stream":true}"#)
+            .expect_err("401 must error");
+        assert_eq!(err.status, 401);
+        assert!(err.detail.contains("bad key"), "detail: {}", err.detail);
+        assert!(err.to_string().starts_with("HTTP 401"));
+    }
+
+    /// 无效 base → 状态 0 错误。
+    #[test]
+    fn chat_completions_stream_invalid_base() {
+        let err = chat_completions_stream("not-a-url", None, "{}").expect_err("must error");
+        assert_eq!(err.status, 0);
+    }
+}

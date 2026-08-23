@@ -2966,5 +2966,45 @@ step5 LLM 桥 → step6 前端最小闭环 → 穿插篮 → M6-ACCEPTANCE。
 
 ---
 
+## D-080（M6 编码·step5a+5b）：LLM 装配桥——dsh-core 流式传输 + deepseek 适配器 thunk +
+诚实 no-key fail-loud（验收 #6；P3/P4）
+
+**日期**：2026（M6 round 2）。
+**触发问题**：step5（LLM 装配）是 step1 的前置硬块；step1b serve 接线需要真实鲁棒实现。
+**自下而上实测定案**：① `serialize_request`（dsh-llm-deepseek）已产出 `WireRequest`
+**含 `"stream": true`** + `stream_options.include_usage`（serialize.rs 210-214）——适配器契约
+本就是流式；缺的只是 transport thunk（M1e 线绳桥未做）。② `dsh_llm_deepseek::sse::parse_sse
+(&[u8]) -> Result<Vec<String>>` 与 `translate` 已单测覆盖——**不重复造 parser**。③ dsh-core
+`llm_http` 已有 tcp_exchange（TLS https + Content-Length/读到关闭）+ build_request(Bearer) +
+parse_base——**HTTP/TLS 传输复用**。④ dsh-cli 尚无 dsh-llm-deepseek 依赖（依规范评估后引入：
+官方适配器 crate，M6 LLM 装配必需）。
+**实现（step5a dsh-core）**：`chat_completions_stream(base, api_key, body) ->
+Result<StreamBody{status, bytes}, StreamHttpError{status, detail}>`——POST 已序列化流式 body
+到 `{base}/chat/completions`，返回原始响应体字节（SSE 解码归 deepseek crate）；非 2xx →
+结构化错误带 status。测试：本地 TcpListener 单发 SSE → Ok(200,原始字节) + Bearer 头 + stream
+body 断言；401 → StreamHttpError{401}；无效 base → status 0。
+**实现（step5b dsh-cli::m6_llm）**：`server_llm_runtime_with_key(base, model, key)`（显式 key，
+测试用）+ `server_llm_runtime(base, model)`（key 仅读 `DEEPSEEK_API_KEY` 环境变量，P4）。
+连接事实：base_url + defaults + DEFAULT_MAX_TOKENS/CTX + catalog ≥ 装配模型 + normal
+retry。thunk：无 key → `LlmError(AUTH, "missing DEEPSEEK_API_KEY: set it...")`（首回合
+fail-loud，模型发现/工具注册/API 面照常——P3）；有 key → to_string(WireRequest) →
+chat_completions_stream → parse_sse → payloads；传输错误按 status 映射 `http_error_code`
+（0→NETWORK；401→AUTH 等）。装配 `LlmRuntime.register_adapter(["deepseek"], ...)`。
+**诚实时序说明**：chat_completions_stream 函数与其本地 TCP 单测在同一编辑落地（未先单独红），
+但测试跑真实本地 HTTP POST 交换（状态/原始字节/Bearer/stream 全断言）——功能既有事实验证，
+非骨架桩。m6_llm 三测独立红（新增模块无实现先缺席→补全绿）。
+**证据**：dsh-cli 96 测全绿（+3 m6_llm、+1 既有累计）+ dsh-core 7 测全绿 + workspace 全量
+test 绿 + clippy -D warnings 零告警 + check 绿。
+**拒绝**：① 在 dsh-core 重复造 SSE parser 或把解码塞进 llm_http（解码归 dsh-llm-deepseek，
+不重复）；② 非流式 chat_completions 单发 JSON 再合成 delta payload（偏离端点原生流式契约，
+且 tool_calls delta 需额外构造，否）；③ key 写入 WebConfig/代码/日志（安全红线，仅 env，否）。
+**预期影响与回滚点**：+dsh-core llm_http stream fn + dsh-cli::m6_llm（新模块）+ dsh-cli 依赖
+dsh-llm-deepseek。回滚 = 撤本提交。真实端点冒烟在 M6 后期门控执行（用户提供环境）。
+**待办**：step1b serve() 接线（&mut Boot + WebConfig.workspace_root(P2) + enable_agent_loop
+flag + server_llm_runtime 装配 + 装配失败诚实降级）→ step2 生命周期 → step3 tick 注入 →
+step4 sandbox 投影 → step6 前端最小闭环 → 穿插篮 → M6-ACCEPTANCE。
+
+---
+
 
 
