@@ -2725,5 +2725,40 @@ step8 M5-ACCEPTANCE。
 
 ---
 
+## D-073（M5 编码·step7f）：run_code 传输真实执行（验收 #6）——注册表
+`set_run_code_executor` 覆盖钩子（dsh-tools，替换 Code Mode 注入占位桩）+ web_m5
+run_code executor（真实 python 子进程 `PythonCodeRuntime::run` → 规范化值/渲染）；python
+可用门控 e2e（return 表达式 lossless 跨界 / print→logs / dict→json）
+
+**日期**：2026（M5 round 23/24）。
+**触发问题**：验收 #6 要求 run_code 工具桥接线**真实执行**（替换 `placeholder_run_code`）；
+当前注册表 view 注死占位桩（D-024 记录「Code Mode 传输依赖 dsh-code-runtime(M5) 本轮注入
+占位」），python 后端已备（D-065/066/067）。
+**考虑的选项**：1. **注册表加 `set_run_code_executor(exec) -> Option<ToolExecute>` 覆盖钩子（采用）**：
+view 步骤 4 在非 native 注入 run_code 时，用宿主 executor 构造 `run_code_def`（同名/schema/
+渲染单源 `render_run_code_value`：失败错误 → logs+value → 空 "completed with no output"），
+缺省仍占位桩（诚实早错）；**保留名守卫不变**（register_global 仍无条件拒 run_code——传输只能
+经本钩子覆盖，杜绝功能遮蔽回归）。2. 放开 run_code 可被 register_global 注册（破坏「presentation
+transport 保留名」承诺，弃）。3. web_m5 直接 register run_code 全局（原 D-068 已验证被注册表拒，
+弃）。
+**execute 语义**：`parse_run_code_args`（code/description 必填）→ `CodeRunRequest{program,
+bindings:vec![], signal:None}` → `PythonCodeRuntime::run`（真实 python 子进程，fd3-class
+stdin/stdout JSON-lines 协议，D-066/067）→ 规范化值 `{language, value?, logs[], error?}`
+（lossless 跨界 + print→log 帧回注）→ 模型可见渲染由 run_code_def 单源。**嵌套工具派发
+（bindings 注入 tools.*）本轮为空**——程序调 tools.* 得「未注入」诚实错误；嵌套执行/传播
+留宿主端下一步（不伪造）。
+**诚实限制（D 记录）**：无 runtime → 占位桩保留（"requires a code runtime"）；run_code 仅在
+Code-mode view 可见（Native 不受影响）；嵌套 tools 派发未接（诚实空命名空间）。
+**预期影响与回滚点**：dsh-tools（runtime.rs：字段 + setter + view 覆盖分支 + run_code_def/
+render_run_code_value + 测试 run_code_executor_override_replaces_placeholder）+ dsh-cli
+（web_m5.rs：M5HostServices.code + register hook + run_code_executor_with/canonical + web.rs
+e2e register_m5_run_code_transport_executes_python：缺 description → INVALID_ARGS / return 42
+lossless / print→logs+None / dict→json）；dsh-tools 103+ 测试、dsh-cli 89 测试全绿 + workspace
+clippy 零告警 + check 绿。回滚 = 撤本提交。
+**待办**：SAND/mode 会话事件投影、read_image 解码绑定、M5HostServices 生产装配工厂、
+step8 M5-ACCEPTANCE。
+
+---
+
 
 

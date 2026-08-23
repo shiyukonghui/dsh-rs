@@ -4382,7 +4382,7 @@ mod tests {
                 Box::new(|_cfg| Box::new(M5FakeBackend::default())),
             )
             .expect("register fake backend");
-        let host = M5HostServices { terminal: Some(term), fs: None, shell: None, bash_jobs: None };
+        let host = M5HostServices { terminal: Some(term), fs: None, shell: None, bash_jobs: None, code: None };
         register_m5_tools_with_host(&registry, Some(&host));
 
         // open
@@ -4516,7 +4516,7 @@ mod tests {
         let fsh = Rc::new(web_m5::FsHost::new(root.clone()));
         register_m5_tools_with_host(
             &registry,
-            Some(&M5HostServices { terminal: None, fs: Some(fsh), shell: None, bash_jobs: None }),
+            Some(&M5HostServices { terminal: None, fs: Some(fsh), shell: None, bash_jobs: None, code: None }),
         );
 
         let exec = |call_id: &str, name: &str, args: serde_json::Value| {
@@ -4684,7 +4684,7 @@ mod tests {
         let shost = Rc::new(web_m5::ShellHost::new(root.clone()).expect("shell host"));
         register_m5_tools_with_host(
             &registry,
-            Some(&M5HostServices { terminal: None, fs: None, shell: Some(shost), bash_jobs: None }),
+            Some(&M5HostServices { terminal: None, fs: None, shell: Some(shost), bash_jobs: None, code: None }),
         );
 
         let exec = |call_id: &str, args: serde_json::Value| {
@@ -4786,6 +4786,7 @@ mod tests {
                 fs: None,
                 shell: Some(shost),
                 bash_jobs: Some(bridge.clone()),
+                code: None,
             }),
         );
 
@@ -4927,6 +4928,7 @@ mod tests {
                 fs: None,
                 shell: Some(shost),
                 bash_jobs: Some(bridge.clone()),
+                code: None,
             }),
         );
 
@@ -4975,5 +4977,76 @@ mod tests {
 
         // 清理
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M5i 接线 #8（验收 #6）：run_code 传输**真实执行**——Code-mode registry + python 后端
+    /// 宿主覆盖注入传输（替换占位桩）；python 可用门控（真实子进程）。schema 校验、
+    /// 完成值 lossless 跨界、print→logs、dict→json。
+    #[test]
+    fn register_m5_run_code_transport_executes_python() {
+        use dsh_code_runtime::{python_available, PythonCodeRuntime, PythonConfig};
+        use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
+        if !python_available() {
+            eprintln!("python unavailable; skipping run_code transport test");
+            return;
+        }
+        let registry = ToolRegistry::new(ToolExecutionMode::Code);
+        let cr = Rc::new(PythonCodeRuntime::new(PythonConfig::default()));
+        register_m5_tools_with_host(
+            &registry,
+            Some(&M5HostServices {
+                terminal: None,
+                fs: None,
+                shell: None,
+                bash_jobs: None,
+                code: Some(cr),
+            }),
+        );
+
+        let exec = |call_id: &str, args: serde_json::Value| {
+            registry.execute(
+                &ToolExecutionInput::new(call_id, "run_code", args, Some("agent-1".into())),
+                None,
+            )
+        };
+
+        // schema 硬校验：code 缺失 → INVALID_ARGS（不触发运行时）。
+        let res = exec("rc0", serde_json::json!({ "description": "x" }));
+        assert!(res.is_error, "missing code rejected");
+
+        // 真实 python：return 表达式 → 完成值 42（lossless 跨界）。
+        let res = exec(
+            "rc1",
+            serde_json::json!({ "code": "return 1 + 41", "description": "add" }),
+        );
+        assert!(!res.is_error, "run_code executes: {:?}", res.error);
+        let v = res.value.unwrap();
+        assert_eq!(v["language"], "python");
+        assert_eq!(v["value"], 42);
+        assert!(v["error"].is_null());
+
+        // print → logs；return None → 无完成值（null）。
+        let res = exec(
+            "rc2",
+            serde_json::json!({ "code": "print(\"hello-log\")\nreturn None", "description": "log" }),
+        );
+        assert!(!res.is_error, "log run ok: {:?}", res.error);
+        let v = res.value.unwrap();
+        let logs = v["logs"].as_array().unwrap();
+        assert!(
+            logs.iter().any(|l| l.as_str().is_some_and(|s| s.contains("hello-log"))),
+            "logs captured: {logs:?}"
+        );
+        assert!(v["value"].is_null());
+
+        // dict → lossless JSON 对象跨界。
+        let res = exec(
+            "rc3",
+            serde_json::json!({ "code": "return {'ok': True, 'n': 7}", "description": "dict" }),
+        );
+        assert!(!res.is_error, "dict run ok: {:?}", res.error);
+        let v = res.value.unwrap();
+        assert_eq!(v["value"]["ok"], true);
+        assert_eq!(v["value"]["n"], 7);
     }
 }

@@ -233,6 +233,8 @@ pub struct ToolRegistry {
     on_change: Rc<dyn Fn()>,
     /// 审批决策者（全局，M2f；TS `ctx.get('approval')` 等价——缺省 = 无通道，ask 即拒绝）。
     approval: Rc<RefCell<Option<ApprovalProvider>>>,
+    /// Code Mode run_code 注入传输的 execute 覆盖（M5 真实执行；缺省 = 占位桩，D-073）。
+    run_code_executor: Rc<RefCell<Option<ToolExecute>>>,
 }
 
 impl ToolRegistry {
@@ -248,6 +250,7 @@ impl ToolRegistry {
             default_mode,
             on_change,
             approval: Rc::new(RefCell::new(None)),
+            run_code_executor: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -318,6 +321,12 @@ impl ToolRegistry {
         self.register(def, None)
     }
 
+    /// 覆盖 Code Mode run_code 注入传输的 execute（M5 真实执行；D-073）。命名/schema
+    /// 注入与保留名守卫不变；返回先前覆盖（None = 之前是占位桩）。全局幂等设置。
+    pub fn set_run_code_executor(&self, executor: ToolExecute) -> Option<ToolExecute> {
+        self.run_code_executor.borrow_mut().replace(executor)
+    }
+
     // -----------------------------------------------------------------------
     // 视图解析
     // -----------------------------------------------------------------------
@@ -367,10 +376,15 @@ impl ToolRegistry {
                 put(&mut visible, &name, def);
             }
         }
-        // 4. 非 native 呈现注入 run_code 传输（占位实现；Code Mode 属 M5）
+        // 4. 非 native 呈现注入 run_code 传输（占位实现；Code Mode 属 M5）。宿主可
+        //    `set_run_code_executor` 覆盖 execute 为真实执行（D-073）。
         if self.mode_for(scope) != ToolExecutionMode::Native {
             known.insert(RUN_CODE_NAME.to_string());
-            put(&mut visible, RUN_CODE_NAME, Rc::new(placeholder_run_code()));
+            let def = match self.run_code_executor.borrow().as_ref() {
+                Some(exec) => run_code_def(exec.clone()),
+                None => placeholder_run_code(),
+            };
+            put(&mut visible, RUN_CODE_NAME, Rc::new(def));
         }
 
         let restrictable_names = self
@@ -983,5 +997,65 @@ fn placeholder_run_code() -> ToolDefinition {
         is_concurrency_safe: None,
         present_call: None,
         present_result: None,
+    }
+}
+
+/// 覆盖版 run_code 定义：宿主 executor 替换占位传输（M5 真实执行）。命名/schema 注入
+/// 与保留名守卫不变（register_global 仍拒 run_code）；渲染依 execute 规范化值
+/// （{value?, logs?, error?}）产出模型可见文本。
+fn run_code_def(exec: ToolExecute) -> ToolDefinition {
+    ToolDefinition {
+        name: RUN_CODE_NAME.to_string(),
+        description: "run code in a sandbox".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "code": { "type": "string", "required": true, "description": "Program body to run (async body with top-level await/return)." },
+                "description": { "type": "string", "required": true, "description": "One-line description of what the program does." }
+            },
+            "additionalProperties": false,
+        }),
+        output: ToolOutputDefinition {
+            schema: crate::json_schema::JsonSchemaNode::default(),
+            render: Rc::new(|_, v| vec![ContentBlock::text(render_run_code_value(v))]),
+            presentation_meta: None,
+        },
+        timeout_ms: None,
+        execute: exec,
+        finalize_content: None,
+        is_concurrency_safe: None,
+        present_call: None,
+        present_result: None,
+    }
+}
+
+/// run_code 覆盖值的模型可见渲染：优先失败错误，否则 logs 接 value（字符串原样，否则
+/// JSON 紧凑），空则 "completed with no output"。
+fn render_run_code_value(v: &Value) -> String {
+    if let Some(e) = v.get("error") {
+        let kind = e["kind"].as_str().unwrap_or("?");
+        let message = e["message"].as_str().unwrap_or("?");
+        return format!("[run_code error: {kind}] {message}");
+    }
+    let logs: Vec<&str> = v["logs"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    let mut out = logs.join("\n");
+    if let Some(val) = v.get("value") {
+        if !val.is_null() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            match val {
+                Value::String(s) => out.push_str(s),
+                other => out.push_str(&other.to_string()),
+            }
+        }
+    }
+    if out.is_empty() {
+        "(run_code completed with no output)".to_string()
+    } else {
+        out
     }
 }

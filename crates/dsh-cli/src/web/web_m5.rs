@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
+use dsh_code_runtime::run_code::parse_run_code_args;
+use dsh_code_runtime::{CodeRunFailure, CodeRunRequest, CodeRunResult, CodeRuntime, PythonCodeRuntime};
 use dsh_fs::grep::{
     format_grep_output, retain_grep_matches, GrepMatch, RetainedMatches, GREP_MAX_LINE_BYTES,
     GREP_MAX_MATCHES,
@@ -331,6 +333,8 @@ pub struct M5HostServices {
     pub shell: Option<Rc<ShellHost>>,
     /// bash 后台 jobs producer 桥（bash run_in_background 的真实句柄；缺省 → 诚实拒绝）。
     pub bash_jobs: Option<Rc<BashJobsBridge>>,
+    /// code runtime（run_code 传输的真实 execute 覆盖；缺省 → 注册表占位桩诚实报错）。
+    pub code: Option<Rc<PythonCodeRuntime>>,
 }
 
 /// 注册全部 M5 工具（M5-DESIGN §8 工具集）到一个 registry。
@@ -411,6 +415,51 @@ pub fn register_m5_tools_with_host(
             .register_global(tool.definition())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
     }
+
+    // ---- run_code 传输（验收 #6）：code runtime 在场 → 覆盖注册表 Code Mode 注入传输
+    // 的 execute（真实 python 执行；D-073）。无 runtime → 占位桩保留（诚实报错）。
+    if let Some(cr) = host.and_then(|h| h.code.clone()) {
+        registry.set_run_code_executor(run_code_executor_with(cr));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// run_code 传输 executor（验收 #6）：真实 python 后端；渲染词表由 dsh-tools registry
+// run_code_def 单源（render_run_code_value 依规范化 value 产出可见文本）。
+// ---------------------------------------------------------------------------
+
+/// run_code executor：parse（code/description 必填）→ `PythonCodeRuntime::run` →
+/// 规范化值 `{language, value?, logs[], error?}`。嵌套工具派发（bindings）本轮为空——
+/// 诚实空命名空间（程序调 tools.* 得未注入错误），D-073 记录渐进。
+fn run_code_executor_with(runtime: Rc<PythonCodeRuntime>) -> ToolExecute {
+    Rc::new(move |args, _ctx| {
+        let (code, _description) =
+            parse_run_code_args(args).map_err(|m| invalid_args("run_code", m))?;
+        let request = CodeRunRequest {
+            program: &code,
+            bindings: Vec::new(),
+            signal: None,
+        };
+        let result = runtime.run(&request);
+        Ok(run_code_canonical(&result))
+    })
+}
+
+fn run_code_canonical(result: &CodeRunResult) -> Value {
+    json!({
+        "language": "python",
+        "value": result.value,
+        "logs": result.logs,
+        "error": result.error.as_ref().map(code_failure_json),
+    })
+}
+
+fn code_failure_json(e: &CodeRunFailure) -> Value {
+    json!({
+        "kind": e.kind.as_str(),
+        "message": e.message,
+        "detail": e.detail,
+    })
 }
 
 // ---------------------------------------------------------------------------

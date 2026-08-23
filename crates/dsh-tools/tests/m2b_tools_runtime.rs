@@ -328,6 +328,35 @@ fn code_mode_injects_run_code_and_collapses_others() {
     assert!(err2.message.contains("code runtime"), "{}", err2.message);
 }
 
+/// M5i 验收 #6：宿主接上真实 code runtime 后，`set_run_code_executor` 覆盖 Code Mode 的
+/// run_code 注入传输——命名/schema 注入不变，execute 从「占位报错」切换为真实执行。保留名
+/// 守卫不变（register_global 仍拒 run_code）。
+#[test]
+fn run_code_executor_override_replaces_placeholder() {
+    let r = registry();
+    let agent = ScopeKey::new();
+    r.register_global(Rc::new(echo_def("echo"))).unwrap();
+    r.present_as(ToolExecutionMode::Code, &agent).unwrap();
+
+    // 缺省占位：可见但执行报「code runtime」缺失。
+    let names: Vec<String> = r.known_names(Some(&agent)).into_iter().collect();
+    assert!(names.contains(&"run_code".to_string()));
+    let out = r.execute(&input("run_code", json!({ "code": "1" })), Some(&agent));
+    assert!(out.is_error, "placeholder errors before override");
+    assert!(out.error.unwrap().message.contains("code runtime"));
+
+    // 宿主接好真实执行 → 覆盖注入传输的 execute（命名/schema 注入不变）。
+    r.set_run_code_executor(Rc::new(|args, _| Ok(json!({ "ran": args["code"] }))));
+    let out = r.execute(&input("run_code", json!({ "code": "print(1)" })), Some(&agent));
+    assert!(!out.is_error, "override executes: {:?}", out.error);
+    assert_eq!(out.value.unwrap()["ran"], "print(1)");
+
+    // 保留名注册/遮蔽守卫不变：register_global 仍无条件拒 run_code。
+    let shadow = echo_def("run_code");
+    let err = r.register_global(Rc::new(shadow)).err().expect("rejected");
+    assert!(err.contains("reserved"), "guard intact: {err}");
+}
+
 // ---------------------------------------------------------------------------
 // executionMode
 // ---------------------------------------------------------------------------
