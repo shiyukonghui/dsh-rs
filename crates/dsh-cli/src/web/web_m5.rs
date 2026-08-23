@@ -260,6 +260,22 @@ impl BashJobsBridge {
     pub fn read(&self, id: &str, caller: Option<&str>) -> Result<JobRead, dsh_jobs::JobOpsError> {
         self.registry.borrow_mut().read(id, caller)
     }
+
+    /// M6 step2（D-082）：关停全部后台 bash job——kill 进程树 + 合作泵结算（Killed）。
+    /// 幂等：无存活进程/已结算 → no-op。宿主生命周期清理（`M5Host::shutdown`）调用，
+    /// 保证 serve 退出时不遗留孤儿进程（验收 #3）。
+    pub fn kill_all(&self) {
+        let ids: Vec<String> = self.processes.borrow().keys().cloned().collect();
+        let procs: Vec<Rc<ShellProcess>> = ids
+            .iter()
+            .filter_map(|id| self.processes.borrow().get(id).cloned())
+            .collect();
+        for p in procs {
+            p.kill();
+        }
+        // settle：kill 后 `pump()` 的 done() 等在进程退出（collector join）再 settle Killed。
+        self.pump();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +387,20 @@ impl M5Host {
     /// 便捷注册：全工具 + 全部在场句柄 bind 进目标 registry。
     pub fn register(&self, registry: &dsh_tools::ToolRegistry) {
         register_m5_tools_with_host(registry, Some(&self.services));
+    }
+
+    /// M6 step2（D-082）：幂等关停（宿主生命周期清理，验收 #3）——
+    /// ① kill 全部后台 bash 树（kill_all → 合作泵 settle Killed，remove 进程表）；
+    /// ② 终端会话全部 dispose（PTY worker 随之回落）。幂等：重复调用 no-op。
+    /// 装配方以 disposer 注册（`AgentLoopHost.add_disposer`），宿主 teardown 时执行；
+    /// M5g tick 由 serve 自驱节拍（step3）持有，不在本宿主内。
+    pub fn shutdown(&self) {
+        if let Some(b) = &self.services.bash_jobs {
+            b.kill_all();
+        }
+        if let Some(t) = &self.services.terminal {
+            t.borrow_mut().dispose();
+        }
     }
 }
 

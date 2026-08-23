@@ -3035,5 +3035,37 @@ serve → step4 sandbox 投影 → step6 前端最小闭环 → 穿插篮 → M6
 
 ---
 
+## D-082（M6 编码·step2）：宿主生命周期清理——`BashJobsBridge::kill_all` + `M5Host::
+shutdown` + 装配 disposer（验收 #3：bash bg / terminal 无孤儿）
+
+**日期**：2026（M6 round 3）。
+**触发问题**：step1b serve 闭环已接线；需保证宿主 teardown 时不遗留后台 bash 进程/终端
+会话（验收 #3「宿主生命周期清理」）。
+**自下而上实测定案**：① `BashJobsBridge` 持有 `processes: HashMap<String, Rc<ShellProcess>>`
++ `pump()`（done→settle Killed/Completed→remove）；`ShellProcess::kill()`（树杀）已被
+on_cancel 使用——kill_all = 遍历 kill + pump settle。② `TerminalSessionService::dispose()`
+（dsh-terminal）已实现（清空 sessions）——直接调用。③ `AgentLoopHost.add_disposer(Rc<dyn
+Fn()>)` + 显式 `teardown()`（非 Drop）——需由装配方接线：`assemble_server_loop` 把 `m5` 移入
+disposer closure。④ 生产 M5Host::assemble **尚未注册真实 PTY backend**（属后续里程碑）；
+测试用 FakeBackend 确定性验证 dispose。
+**实现**：`BashJobsBridge::kill_all(&self)`（幂等：kill 树 + pump settle）。
+`M5Host::shutdown(&self)`（幂等：bash_jobs.kill_all + terminal.dispose）。`assemble_server_loop`
+在 with_store 后 `host.add_disposer(Rc::new(move || m5.shutdown()))`。
+**红测（验收 #3）**：真实组装 M5Host（temp root）→ bash `run_in_background` 实起
+`sleep 2 && echo DONE > marker`（Running、marker 未写）→ terminal_open(FakeBackend, type
+bash) 会话存在 → `shutdown()` → 断言：① bash job settle **Killed**（registry read）；
+② **真无孤儿**：等 ≥2.5s marker 仍不出现（进程被树杀而非跑完写 marker）；③ terminal list
+**空**（dispose 生效）。bash 缺失 → 诚实 eprintln 跳过。
+**诚实边界**：真实 PTY backend 注册属后续里程碑（本步 dispose 语义由 FakeBackend 确定性
+验证；生产 PTY 会话真实孤儿解除随 backend 装配落地）。
+**证据**：dsh-cli 98 测全绿 + workspace clippy `-D warnings` 零告警 + check 绿；rustfmt
+仅 web_m5.rs（--edition 2021）。回滚 = 撤本提交。
+**待办**：step3 tick 注入 serve（主循环 recv_timeout 自驱节拍 → 主线程 `m5g_tick_once`；
+基准：M5gTick 服务线程不进 serve——DIV-2）→ step4 sandbox 投影 → step6 前端最小闭环 →
+穿插篮 → M6-ACCEPTANCE。
+
+---
+---
+
 
 

@@ -1874,7 +1874,11 @@ pub fn assemble_server_loop(
             resume_session_id: None,
         }],
     };
-    dsh_agent_loop::AgentLoopHost::with_store(config, llm, tools, session_store)
+    let host = dsh_agent_loop::AgentLoopHost::with_store(config, llm, tools, session_store)?;
+    // M6 step2（D-082）：宿主生命周期清理——`host.teardown()` 时执行 M5 关停
+    // （bash bg 树 kill + settle Killed；terminal dispose），无孤儿进程。
+    host.add_disposer(Rc::new(move || m5.shutdown()));
+    Ok(host)
 }
 
 /// 系统当前毫秒时间（`JobRegistry` now；i64 契约对齐 dsh-jobs）。
@@ -5523,6 +5527,109 @@ mod tests {
                 eprintln!("assemble_server_runtime deferred (expect NoBash/assemble): {e}");
             }
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M6i 验收 #3：宿主生命周期清理——`M5Host::shutdown()` 杀后台 bash 树（kill_all →
+    /// settle Killed）且**真无孤儿**（marker 未写 == 进程被杀而非跑完）；终端会话 dispose。
+    /// bash 不可用 → 诚实记录跳过（与 M5 assemble bash 门控一致）。
+    #[test]
+    fn m5_shutdown_kills_background_bash_no_orphan() {
+        use dsh_jobs::JobStatus;
+        use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
+        let root = std::env::temp_dir().join(format!("dsh-m6-shutdown-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let mut m5 = match web_m5::M5Host::assemble(root.clone()) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("m5 assemble deferred (bash/pty unavailable?): {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+        };
+        // 终端：注册 FakeBackend（生产 PTY backend 装配属后续里程碑；此处确定性验证
+        // dispose 清空会话表）。bash 保持真实桥（孤儿杀验证）。
+        let term = Rc::new(std::cell::RefCell::new(dsh_terminal::TerminalSessionService::new()));
+        term.borrow_mut()
+            .register_backend(
+                dsh_terminal::BackendDefinition {
+                    id: "bash".into(),
+                    kind: dsh_terminal::TerminalBackendKind::Bash,
+                    label: "fake bash".into(),
+                },
+                Box::new(|_cfg| Box::new(M5FakeBackend::default())),
+            )
+            .expect("register fake backend");
+        m5.services.terminal = Some(term);
+        let registry = ToolRegistry::new(ToolExecutionMode::Native);
+        m5.register(&registry);
+        let agent = Some("agent-1".to_string());
+
+        // 后台 bash：sleep 2 && 写 marker。shutdown 前：running、marker 未写。
+        let marker = root.join("done.txt");
+        let cmd = format!(
+            "sleep 2 && echo DONE > {}",
+            marker.display().to_string().replace('\\', "/")
+        );
+        let res = registry.execute(
+            &ToolExecutionInput::new(
+                "c1",
+                "bash",
+                serde_json::json!({
+                    "command": cmd,
+                    "description": "m6 shutdown lifecycle test",
+                    "run_in_background": true
+                }),
+                agent.clone(),
+            ),
+            None,
+        );
+        assert!(!res.is_error, "bash bg start: {:?}", res.error);
+        let job_id = res.value.unwrap()["jobId"].as_str().unwrap().to_string();
+        assert!(!marker.exists(), "marker must not exist yet (process still running)");
+        let bridge = m5.services.bash_jobs.clone().unwrap();
+        assert_eq!(
+            bridge.read(&job_id, agent.as_deref()).unwrap().snapshot.status,
+            JobStatus::Running,
+            "bg job running before shutdown"
+        );
+
+        // 终端会话：open（FakeBackend 确定可用）→ 会话存在。
+        let tres = registry.execute(
+            &ToolExecutionInput::new(
+                "c2",
+                "terminal_open",
+                serde_json::json!({ "type": "bash", "name": "work" }),
+                agent.clone(),
+            ),
+            None,
+        );
+        assert!(!tres.is_error, "terminal_open: {:?}", tres.error);
+        let terminal_svc = m5.services.terminal.clone().unwrap();
+        assert_eq!(terminal_svc.borrow().list().len(), 1, "one terminal session before shutdown");
+
+        // 生命周期关停。
+        m5.shutdown();
+
+        // bash bg：kill_all → 合作泵已 settle → Killed。
+        assert_eq!(
+            bridge.read(&job_id, agent.as_deref()).unwrap().snapshot.status,
+            JobStatus::Killed,
+            "bg job settled Killed by shutdown"
+        );
+        // 真无孤儿：等 ≥ 2.5s，marker 仍不出现 == 进程被树杀而非跑完写 marker。
+        std::thread::sleep(std::time::Duration::from_millis(2600));
+        assert!(!marker.exists(), "background process truly killed (no orphan)");
+
+        // 终端会话全部 dispose（list 空）。
+        assert!(
+            terminal_svc.borrow().list().is_empty(),
+            "terminal sessions disposed on shutdown"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
