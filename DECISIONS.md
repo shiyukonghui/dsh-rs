@@ -2411,5 +2411,28 @@ aborted/sandbox_policy 是 D-054 已标注的延后面，不提前造类型。
 
 ---
 
+## D-062（M5 编码·tool-bash 纯面）：camelCase `timeoutMs` schema + 标记词汇逐字；binding 留 step7
+
+**日期**：2026（M5 round 13）。
+**触发问题**：step4 最后一块——模型面 `bash` 工具：参数 schema（camelCase `timeoutMs` /
+`run_in_background` / 可选 escalate 两字段）+ execute 校验（command/description 非空 →
+`invalid command/description: …`；timeoutMs 正有限 → `invalid timeoutMs: expected a positive
+number, got …`；escalation 两字段同现） + 模型面标记词汇。参考 `tool-bash/src/{index,render}.ts`
+已逐字比对。
+**考虑的选项**：1. **纯函数面落地（本次采用）**——`bash_tool_parameters`（schema DSL）/
+`parse_bash_args`（校验）/`render_bash_result`/`render_bash_process_read`（标记词汇），
+binding（define_tool / 宿主接线 / 后台 JobRegistry）留 step7 web.rs，与 dsh-fs 的 tool-fs
+纯面先例一致。2. 现在就接 ToolRegistry.execute：引入 dsh-tools runtime 循环尚早，且后台
+需 jobs 宿主，属 step7 验收面。
+**最终选择**：选项 1。
+**选择理由**：schema/校验/渲染都是纯函数、可独立 TDD 锁定逐字契约；执行与注册是对宿主
+环境的组合，放到所有 seam 就位后的 step7 一次性接线，避免半接状态。
+**预期影响与回滚点**：`src/tool_bash.rs` + `tests/tool_bash.rs`（19 用例，含 schema 逐字
+快照、校验文案、标记顺序 denial→hint→exit、`[stderr]` 段、`(no output)`、截断 spill、
+SIGTERM 优先于退出码）；dsh-shell 合计 32 测试全绿 + clippy 零告警。DIV（P4）：`timeoutMs`
+camelCase 与既有 m4 snake `timeout_ms` 分叉（M5-DESIGN §5.3 已裁定）。回滚 = 撤本提交。
+
+---
+
 
 
