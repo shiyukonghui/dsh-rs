@@ -2434,5 +2434,33 @@ camelCase 与既有 m4 snake `timeout_ms` 分叉（M5-DESIGN §5.3 已裁定）�
 
 ---
 
+## D-063（M5 编码·dsh-terminal 注册表核心）：按 owner 隔离会话 + DUPLICATE_BACKEND=类型重复注册；PTY 后端/6 工具留后续
+
+**日期**：2026（M5 round 13 末）。
+**触发问题**：step5 第一块——终端会话注册表：Branded 会话 id、owner=精确 Agent 授权、
+每会话单 active send、可分类错误码。M5-DESIGN §6.1 列出的 `DuplicateBackend`/`DuplicateName`
+较为简略，初次实现把 DuplicateBackend 误解为「同名后端只能开一个会话」，导致两位 owner
+无法各自开会话（红测暴露）。
+**考虑的选项**：1. **逐字参考 `terminal/src/index.ts`（本次采用）**——`registerBackend`
+重复类型 → `DUPLICATE_BACKEND`；会话**按 owner 隔离**（不同 owner 可各用同名后端各开
+会话；同 owner 内 `name` 唯一 → `DUPLICATE_NAME`，覆盖已发布 + 在途保留）；spawn 失败
+→ close 残留回滚；`SERVICE_DISPOSING`/`OWNER_NOT_LIVE` 在发布前判定；`NO_SESSION`/
+`FOREIGN_SESSION` 统一 `expectOwned`。2. 维持「后端全局单会话」：违反 owner 隔离语义，
+参考源码也证实是误读。
+**最终选择**：选项 1。`TerminalSessionService.open(owner, backend_id, name, cfg)`；提供者
+注册 = 类型表（`BackendProvider: Fn(TerminalConfig) -> Box<dyn TerminalBackend>`）；
+**同步 send**（后端 `send()` 内完成等待与 wait_reason 判定后返回，注册表只守卫 `busy`
+标志，SEND_ACTIVE 保留为 API 契约，单线程服务员不可并发重入）。
+**选择理由**：owner 隔离与按 owner 命名是参考的行为契约（多 agent 并发的核心保证）；
+崩溃回滚与本 suite 的「绝不半发布」纪律一致；同步 send 是本项目单线程服务员模型的
+直接映射（异步主动操作由 jobs 层在 step7 包）。
+**预期影响与回滚点**：`src/types.rs`（词汇）+ `src/registry.rs`（服务 + `TerminalBackend`
+trait + `BackendDefinition`/`OwnerLiveness`）+ `tests/registry.rs`（12 用例：全生命周期、
+ForeignSession、OwnerNotLive、NoBackend、DuplicateBackend、DuplicateName、回滚、dispose、
+list）；clippy 零告警。真实 bash-pty 后端（portable-pty）与 6 工具（terminal_*）下一轮
+继续（本箱 bash 不可用 → 集成门控）。回滚 = 撤本提交。
+
+---
+
 
 
