@@ -5091,6 +5091,52 @@ mod tests {
         assert!(ws.contains("dsh-policy-seg"), "{ws}");
     }
 
+    /// M5i（验收 #3）：approved > session > default 完整解析优先级。
+    #[test]
+    fn resolve_sandbox_mode_precedence_approved_session_default() {
+        use dsh_sandbox::SandboxMode;
+        use serde_json::json;
+        use web_m5::{resolve_sandbox_mode, EffectiveSandbox};
+
+        // 无 approved + 无会话 → 默认 read-only。
+        assert_eq!(
+            resolve_sandbox_mode(None, &[]),
+            EffectiveSandbox {
+                mode: SandboxMode::ReadOnly,
+                source: "default"
+            }
+        );
+
+        // 无 approved + 会话最后一跳（workspace-write）→ 会话档。
+        let events = vec![json!({ "type": "sandbox/mode", "data": { "mode": "workspace-write" } })];
+        assert_eq!(
+            resolve_sandbox_mode(None, &events),
+            EffectiveSandbox {
+                mode: SandboxMode::WorkspaceWrite,
+                source: "session"
+            }
+        );
+
+        // approved（审批缝显式，delegation）覆盖会话（含更宽的 danger 会话也被覆盖）。
+        let events = vec![json!({ "type": "sandbox/mode", "data": { "mode": "danger-full-access" } })];
+        assert_eq!(
+            resolve_sandbox_mode(Some(SandboxMode::WorkspaceWrite), &events),
+            EffectiveSandbox {
+                mode: SandboxMode::WorkspaceWrite,
+                source: "approved"
+            }
+        );
+
+        // approved 且无会话事件 → 直接 approved。
+        assert_eq!(
+            resolve_sandbox_mode(Some(SandboxMode::DangerFullAccess), &[]),
+            EffectiveSandbox {
+                mode: SandboxMode::DangerFullAccess,
+                source: "approved"
+            }
+        );
+    }
+
     /// M5i 接线 #10（验收 #9）：M5Host::assemble 生产装配——一次构造 terminal/fs/shell/
     /// bash_jobs（+code，python 可用时）全部句柄并真实驱动：bash 前台真跑（echo）、
     /// fs write→read 生命周期、glob 匹配——非仅测试可配，宿主生产面可用。

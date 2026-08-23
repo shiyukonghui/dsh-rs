@@ -415,6 +415,20 @@ pub fn fold_effective_sandbox_mode(events: &[Value]) -> EffectiveSandbox {
     effective
 }
 
+/// 完整解析优先级（M5-DESIGN §3.3；验收 #3）：**approved 显式 mode（审批缝提供，
+/// §3.4 解耦——缺省无通道即 None，fail-closed）> 会话 `sandbox/mode` 最后一跳 > 默认
+/// read-only**。approved 输入由调用方经既有 ApprovalProvider 缝裁决后传入，折叠层不
+/// 伪造批准来源；TaskHost 把两者汇齐后调本函数得 `SandboxPolicy.mode`。
+pub fn resolve_sandbox_mode(approved: Option<SandboxMode>, events: &[Value]) -> EffectiveSandbox {
+    match approved {
+        Some(m) => EffectiveSandbox {
+            mode: m,
+            source: "approved",
+        },
+        None => fold_effective_sandbox_mode(events),
+    }
+}
+
 /// `sandbox:policy` 系统提示段（order 110；验收 #3 系统提示注入）：有效模式 + 可写根
 /// （仅 workspace-write 产名单，复用 dsh-sandbox::writable_roots）。
 pub fn sandbox_policy_segment(

@@ -2790,5 +2790,33 @@ clippy + DECISIONS 互查 + git 闭环）。
 
 ---
 
+## D-075（M5 编码·step7h）：approved > session > default 完整解析优先级（验收 #3 补档）
+
+**日期**：2026（M5 round 27/28）。
+**触发问题**：D-074 的 fold 只落了 session+default 两档、把 approved 级留为「预留未被实现」
+的槽位；验收 #3 明文要求「模式解析优先级（approved > session `sandbox/mode` > 默认
+read-only）」——逐条互查暴露出该档是硬性验收项，不能以「预留」自占地通过。
+**考虑的选项**：1. **`resolve_sandbox_mode(approved: Option<SandboxMode>, events) ->
+EffectiveSandbox`（采用）**：完整三档 pure resolver——approved 显式（`source:"approved"`）
+> 会话最后一跳（复用 fold，`source:"session"`）> 默认 read-only（`source:"default"`）。
+approved 输入由调用方经既有 ApprovalProvider 缝（§3.4 解耦，`ApprovalOutcome` 四态
+fail-closed，缺省无通道即 None）裁决后传入——折叠层**不伪造批准来源**，approved 的来源与
+裁决归审批缝。2. 等 `approval/decided` 事件落盘后再接线（事件发射方不存在，验收前无法
+闭合该档，弃——需一个同步可测的纯函数，而非等待异步发射方）。3. 删除 approved 档
+（倒退验收，弃）。
+**验收盘点（互查证据）**：#2a 树级超时杀 = dsh-shell executor `wait_timeout` 预算 →
+`subprocess::terminate`（Windows taskkill /T /F + win_job 确定性整树）→ `timed_out` 置位 +
+`render_bash_result` 产出 `[timed out after Nms]` 标记（tool_bash.rs:181）+ timedOut/aborted
+互斥（aborted 恒 false，结构保证）。#2 subprocess 真实 spawn/有限输出/scrub env/terminal
+seam（step5 已交付）。
+**预期影响与回滚点**：web_m5.rs（resolve_sandbox_mode）+ web.rs（四档个案纯测：默认 /
+会话 / approved 覆盖会话（含更宽 danger 被覆盖）/ approved 无会话）；dsh-cli 92 测试全绿 +
+clippy 零告警。回滚 = 撤本提交。
+**待办**：step8 M5-ACCEPTANCE（全量 `cargo test --workspace` + clippy `-D warnings` +
+DECISIONS #1-10 逐条互查 + git 闭环）。read_image 非验收项（#4 仅 read/write/edit），NOT_BOUND
+诚实降级由 D-069 记录。
+
+---
+
 
 
