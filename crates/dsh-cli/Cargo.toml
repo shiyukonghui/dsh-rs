@@ -33,6 +33,13 @@ dsh-session-query = { path = "../dsh-session-query" }
 # M4h 补实：jobs/schedule 宿主服务 seam（工具 bind + 帧 + 到期注入）
 dsh-jobs = { path = "../dsh-jobs" }
 dsh-schedule = { path = "../dsh-schedule" }
+# M5h: 执行工具接线 — fs/shell/terminal/code-runtime/sandbox 服务 + 纯面
+dsh-fs = { path = "../dsh-fs" }
+dsh-shell = { path = "../dsh-shell" }
+dsh-sandbox = { path = "../dsh-sandbox" }
+dsh-terminal = { path = "../dsh-terminal" }
+dsh-code-runtime = { path = "../dsh-code-runtime" }
+dsh-subprocess = { path = "../dsh-subprocess" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

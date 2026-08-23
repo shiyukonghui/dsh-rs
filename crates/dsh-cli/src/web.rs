@@ -27,6 +27,11 @@ use tiny_http::{Header, Method, Response, Server};
 use crate::session_host::{EventSink, SessionHost};
 use crate::Boot;
 
+/// M5h web 接线（M5 工具注册 + 宿主句柄绑定；独立模块承载，避免 web.rs 膨胀）。
+pub mod web_m5;
+#[allow(unused_imports)]
+pub use web_m5::{register_m5_tools_with_host, M5HostServices};
+
 /// trust fence（阶段4）：判定请求 Host 头是否为 loopback 权威
 /// （对齐前端 `isLoopbackHostname`：localhost / `[::1]` / 127/8）。
 fn host_is_loopback(request: &tiny_http::Request) -> bool {
@@ -4253,5 +4258,245 @@ mod tests {
             None,
             "cap 到达 → 不续跑"
         );
+    }
+
+    // ---- M5h 接线测试（step7；register_m5_tools_with_host） ----
+
+    /// 内存终端后端：echo 文本、缓冲读、记录 signal/close（web 接线测试专用替身；
+    /// dsh-terminal 测试内的 FakeBackend 不导出，D-068 记录此重复）。
+    #[derive(Debug, Clone)]
+    struct M5FakeBackend {
+        sent: Vec<String>,
+        read_buf: String,
+        signaled: Vec<dsh_terminal::TerminalSignal>,
+        closed: bool,
+        status: dsh_terminal::TerminalSessionStatus,
+    }
+    impl Default for M5FakeBackend {
+        fn default() -> Self {
+            M5FakeBackend {
+                sent: Vec::new(),
+                read_buf: String::new(),
+                signaled: Vec::new(),
+                closed: false,
+                status: dsh_terminal::TerminalSessionStatus::Running,
+            }
+        }
+    }
+    impl dsh_terminal::TerminalBackend for M5FakeBackend {
+        fn open(&mut self, _owner: &str, _cfg: &dsh_terminal::TerminalConfig) -> Result<(), dsh_terminal::TerminalError> {
+            Ok(())
+        }
+        fn send(&mut self, req: &dsh_terminal::TerminalSendRequest) -> Result<dsh_terminal::TerminalSendResult, dsh_terminal::TerminalError> {
+            self.sent.push(format!("{}submit={}", req.text, req.submit));
+            if self.status == dsh_terminal::TerminalSessionStatus::Running {
+                self.read_buf.push_str(&format!("echo:{}", req.text));
+            }
+            Ok(dsh_terminal::TerminalSendResult {
+                viewport: self.read_buf.clone(),
+                wait_reason: dsh_terminal::TerminalWaitReason::StdinRead,
+                session_status: self.status,
+                truncated: false,
+            })
+        }
+        fn read(&mut self, max_read_bytes: usize) -> Result<String, dsh_terminal::TerminalError> {
+            let mut buf = String::new();
+            std::mem::swap(&mut buf, &mut self.read_buf);
+            buf.truncate(max_read_bytes);
+            Ok(buf)
+        }
+        fn signal(&mut self, sig: dsh_terminal::TerminalSignal) -> Result<(), dsh_terminal::TerminalError> {
+            self.signaled.push(sig);
+            if matches!(sig, dsh_terminal::TerminalSignal::Sigkill) {
+                self.status = dsh_terminal::TerminalSessionStatus::Exited;
+            }
+            Ok(())
+        }
+        fn close(&mut self) -> Result<(), dsh_terminal::TerminalError> {
+            self.closed = true;
+            Ok(())
+        }
+        fn label(&self) -> &str {
+            "fake"
+        }
+        fn kind(&self) -> dsh_terminal::TerminalBackendKind {
+            dsh_terminal::TerminalBackendKind::Bash
+        }
+    }
+
+    /// M5i 接线 #1：全部 M5 工具注册可见；无宿主句柄 → 结构化 NOT_BOUND（诚实）。
+    #[test]
+    fn register_all_m5_tools_visible_and_unbound_fail_loud() {
+        use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
+        let registry = ToolRegistry::new(ToolExecutionMode::Native);
+        register_m5_tools_with_host(&registry, None);
+        for name in [
+            "bash", "read", "write", "edit", "read_image", "glob", "grep",
+            "str_replace_editor", "terminal_open", "terminal_send", "terminal_read",
+            "terminal_signal", "terminal_close", "terminal_list",
+        ] {
+            assert!(
+                registry.get(name, None).is_some(),
+                "{name} registered+visible"
+            );
+        }
+        // 未绑定的 bash：结构化 isError（code NOT_BOUND），绝不伪装成功。
+        let input = ToolExecutionInput::new(
+            "b1",
+            "bash",
+            serde_json::json!({ "command": "echo hi", "description": "d" }),
+            Some("agent-1".to_string()),
+        );
+        let res = registry.execute(&input, None);
+        assert!(res.is_error, "unbound bash fails loud");
+        let info = res.error.as_ref().and_then(|e| e.info.as_ref());
+        assert_eq!(
+            info.map(|i| i.code.as_str()).unwrap_or(""),
+            "NOT_BOUND",
+            "结构化 NOT_BOUND code"
+        );
+        // 无 agent 调用者的 terminal_open：语义校验错误（不 panic）。
+        let input = ToolExecutionInput::new(
+            "t0", "terminal_open", serde_json::json!({ "type": "bash" }), None,
+        );
+        let res = registry.execute(&input, None);
+        assert!(res.is_error, "agent-less terminal_open rejected");
+    }
+
+    /// M5i 接线 #2：terminal 宿主句柄在场 → 六件套走真实注册表/FakeBackend 全生命周期：
+    /// open → list（属主过滤）→ send → read → signal → close，foreign-owner 被拒。
+    #[test]
+    fn register_m5_tools_with_terminal_host_binds_really() {
+        use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
+        let registry = ToolRegistry::new(ToolExecutionMode::Native);
+        let term = Rc::new(std::cell::RefCell::new(
+            dsh_terminal::TerminalSessionService::new(),
+        ));
+        term.borrow_mut()
+            .register_backend(
+                dsh_terminal::BackendDefinition {
+                    id: "bash".into(),
+                    kind: dsh_terminal::TerminalBackendKind::Bash,
+                    label: "fake bash".into(),
+                },
+                Box::new(|_cfg| Box::new(M5FakeBackend::default())),
+            )
+            .expect("register fake backend");
+        let host = M5HostServices { terminal: Some(term) };
+        register_m5_tools_with_host(&registry, Some(&host));
+
+        // open
+        let res = registry.execute(
+            &ToolExecutionInput::new(
+                "t1", "terminal_open", serde_json::json!({ "type": "bash", "name": "work" }),
+                Some("agent-1".into()),
+            ),
+            None,
+        );
+        assert!(!res.is_error, "open ok: {:?}", res.error);
+        let session_id = res
+            .value
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!session_id.is_empty(), "sessionId allocated");
+
+        // list（属主过滤：agent-1 可见，foreign 不可见）
+        let res = registry.execute(
+            &ToolExecutionInput::new(
+                "t2",
+                "terminal_list",
+                serde_json::json!({}),
+                Some("agent-1".into()),
+            ),
+            None,
+        );
+        assert!(!res.is_error);
+        let arr = res.value.unwrap()["sessions"].as_array().unwrap().clone();
+        assert_eq!(arr.len(), 1, "agent-1 只见自己的会话");
+        assert_eq!(arr[0]["sessionId"].as_str().unwrap(), session_id);
+
+        // send（假后端 echo 进 viewport）
+        let res = registry.execute(
+            &ToolExecutionInput::new(
+                "t3",
+                "terminal_send",
+                serde_json::json!({ "sessionId": session_id, "text": "ls", "submit": true }),
+                Some("agent-1".into()),
+            ),
+            None,
+        );
+        assert!(!res.is_error, "send ok: {:?}", res.error);
+        let v = res.value.unwrap();
+        assert!(v["viewport"].as_str().unwrap_or("").contains("echo:ls"));
+        assert_eq!(v["waitReason"].as_str().unwrap(), "stdin_read");
+        assert_eq!(v["sessionStatus"]["kind"].as_str().unwrap(), "running");
+
+        // read（滚缓冲）
+        let res = registry.execute(
+            &ToolExecutionInput::new(
+                "t4",
+                "terminal_read",
+                serde_json::json!({ "sessionId": session_id }),
+                Some("agent-1".into()),
+            ),
+            None,
+        );
+        assert!(!res.is_error, "read ok");
+        assert!(
+            res.value.unwrap()["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("echo:ls")
+        );
+
+        // signal（SIGTERM → 送达）
+        let res = registry.execute(
+            &ToolExecutionInput::new(
+                "t5",
+                "terminal_signal",
+                serde_json::json!({ "sessionId": session_id, "signal": "SIGTERM" }),
+                Some("agent-1".into()),
+            ),
+            None,
+        );
+        assert!(!res.is_error, "signal ok");
+        assert_eq!(res.value.unwrap()["delivered"], true);
+
+        // foreign-owner 不得操作（权威拒绝）
+        let res = registry.execute(
+            &ToolExecutionInput::new(
+                "t6",
+                "terminal_signal",
+                serde_json::json!({ "sessionId": session_id, "signal": "SIGINT" }),
+                Some("agent-2".into()),
+            ),
+            None,
+        );
+        assert!(res.is_error, "foreign owner denied");
+
+        // close（属主）
+        let res = registry.execute(
+            &ToolExecutionInput::new(
+                "t7",
+                "terminal_close",
+                serde_json::json!({ "sessionId": session_id }),
+                Some("agent-1".into()),
+            ),
+            None,
+        );
+        assert!(!res.is_error, "close ok");
+        // 关闭后会话已删：后续 send 报错。
+        let res = registry.execute(
+            &ToolExecutionInput::new(
+                "t8",
+                "terminal_send",
+                serde_json::json!({ "sessionId": session_id, "text": "x", "submit": true }),
+                Some("agent-1".into()),
+            ),
+            None,
+        );
+        assert!(res.is_error, "closed session gone");
     }
 }

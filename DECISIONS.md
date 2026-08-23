@@ -2568,5 +2568,41 @@ nan→invalid-output/契约误用）全绿 + clippy 零告警；`run()` 总值�
 
 ---
 
+## D-068（M5 编码·step7a）：M5 工具 web 接线——slot-bind 定义器 + terminal 六件套真实绑定；
+bash/fs/搜索/sr-editor 诚实 NOT_BOUND；run_code 交注册表保留传输
+
+**日期**：2026（M5 round 15）。
+**触发问题**：M5 各 crate 只有纯面（schema/parse/render），要把它们装配成 `dsh-tools`
+可注册执行工具、并把宿主服务句柄 bind 进去（M5-DESIGN §8 的 register_m5_tools_with_host）。
+**考虑的选项**：1. **dsh-tools 新增通用 slot-bind 定义器 [`M5Tool`]+[`define_m5_tool`]（采用）**
+：参数/输出/渲染由调用方（web.rs 接线）传入，execute 从共享槽读入——已 bind → 委托真实
+服务，未 bind → 结构化 `NOT_BOUND`（复用 `m4::not_bound_failure`，M4 同款诚实承诺）；不
+引用任何 M5 crate（dsh-tools 是被依赖基座，避免依赖环）。2. 复制 m4.rs 的 define_bound
+进 web.rs（重复 + 没实体）；3. 强行让 dsh-tools 依赖 M5 crate（依赖环）。
+**最终选择**：选项 1。web.rs 增 `web/web_m5.rs`（独立模块承载，web.rs 已 4262 行）+ 顶层
+re-export `M5HostServices`/`register_m5_tools_with_host`。
+**接线语义**：`M5HostServices { terminal: Option<Rc<RefCell<TerminalSessionService>>> }`；
+terminal 六件套真实绑定（owner=agent 必填；send/read/signal/close 走注册表授权，open→
+list→send→read→signal→close 全生命周期被 `M5FakeBackend` 端到端测试覆盖；foreign-owner
+拒绝；closed 会话后访问报错）。`bash/read/write/edit/read_image/glob/grep/str_replace_editor`
+登记定义（schema+校验）+ NOT_BOUND（对应宿主句柄后续轮接入）。fs/搜索 schema 定义在
+接线层 web_m5.rs（单消费者 = register_m5_tools_with_host），D 记录此归属。
+**诚实偏差（D 记录）**：(a) **run_code 不登记**——`ToolRegistry::register_global` 无条件保留
+该名（RUN_CODE_NAME，Code Mode 呈现传输，dsh-tools runtime 注入占位桩）→ 重复登记被拒；
+真实运行面绑定属 registry/run_code binder 步（后续轮），其间占位桩诚实报
+"requires a code runtime"。(b) terminal signal 渲染不声称虚构前台进程组
+（ConPTY/Windows 无 PGID，D-064 DIV）→ 输出 `delivered SIGx` 而非 reference 的
+"to foreground process group N"。(c) terminal_open 的 cwd 参数当前解析但忽略（backend
+暂无 cwd 通道，后续轮）。测试替身 `M5FakeBackend` 复制了 dsh-terminal 测试内
+FakeBackend 语义（其不导出，D 记录此重复）。
+**预期影响与回滚点**：dsh-tools m5.rs + dsh-cli web/web_m5.rs + web.rs（mod + 2 接线测试）
++ dsh-cli/ dsh-tools Cargo 依赖；dsh-cli 83 测试全绿 + workspace clippy `-D warnings` 零告警
++ workspace check 绿。回滚 = 撤本提交。
+**待办（后续 binder 轮）**：bash→LocalBashExecutor + job producer；fs 4/glob/grep/sr-editor→
+LocalFileSystem+SandboxPolicy+Observation；run_code→registry 传输替换 + python runtime +
+嵌套 tools 派发；M5g 定时 tick。
+
+---
+
 
 

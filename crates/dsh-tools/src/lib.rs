@@ -13,6 +13,7 @@
 pub mod guard;
 pub mod json_schema;
 pub mod m4;
+pub mod m5;
 pub mod py_types;
 pub mod runtime;
 pub mod schema;
@@ -20,32 +21,33 @@ pub mod ts_types;
 pub mod types;
 
 pub use guard::{
-    canonicalize, detailed_reminder, preview_arguments, tool_timeout_message,
-    tool_timeout_result, timeout_exceeded, validate_thresholds, wildcard_matches, GENTLE_REMINDER,
-    DEFAULT_THRESHOLDS, Reminder, RepeatTracker, TOOL_TIMEOUT,
-};
-pub use m4::{
-    exit_plan_mode, job_kill, job_list, job_output, schedule_create, schedule_delete, schedule_list,
-    todo_write, workflow, M4Tool, CODE_NOT_BOUND,
+    canonicalize, detailed_reminder, preview_arguments, timeout_exceeded, tool_timeout_message,
+    tool_timeout_result, validate_thresholds, wildcard_matches, Reminder, RepeatTracker,
+    DEFAULT_THRESHOLDS, GENTLE_REMINDER, TOOL_TIMEOUT,
 };
 pub use json_schema::{
     assert_object_json_schema, assert_supported_json_schema, validate_json_schema_value,
     JsonSchemaError, JsonSchemaNode, JsonSchemaScalar, JsonSchemaType, ObjectJsonSchema,
 };
+pub use m4::{
+    exit_plan_mode, job_kill, job_list, job_output, schedule_create, schedule_delete,
+    schedule_list, todo_write, workflow, M4Tool, CODE_NOT_BOUND,
+};
+pub use m5::{define_m5_tool, M5Tool};
 pub use py_types::{json_schema_to_py, render_tools_sdk_py};
 pub use runtime::{
-    ToolErrorInfo, ToolExecutionClass, ToolExecutionInput, ToolExecutionMode, ToolExecutionResult,
-    ToolGuard, ToolRegistry, ToolRestriction, ToolView, ApprovalOutcome, ApprovalProvider,
-    PreToolDecision, ToolPreDecision,
+    ApprovalOutcome, ApprovalProvider, PreToolDecision, ToolErrorInfo, ToolExecutionClass,
+    ToolExecutionInput, ToolExecutionMode, ToolExecutionResult, ToolGuard, ToolPreDecision,
+    ToolRegistry, ToolRestriction, ToolView,
 };
 pub use schema::{
-    define_tool, parameter_schema_spec_to_json_schema, validate_args, value_schema_spec_to_json_schema,
-    DefineToolOptions, ToolArgsError, ToolDefinitionError,
+    define_tool, parameter_schema_spec_to_json_schema, validate_args,
+    value_schema_spec_to_json_schema, DefineToolOptions, ToolArgsError, ToolDefinitionError,
 };
 pub use ts_types::{json_schema_to_ts, render_tools_sdk, ToolSdkSchema, SDK_INSTRUCTIONS};
 pub use types::{
-    ToolArn, ToolCallView, ToolDefinition, ToolExecution, ToolExecutionError,
-    ToolExecutionSnapshot, ToolExecute, ToolFailureData, ToolFinalize, ToolIsConcurrencySafe,
+    ToolArn, ToolCallView, ToolDefinition, ToolExecute, ToolExecution, ToolExecutionError,
+    ToolExecutionSnapshot, ToolFailureData, ToolFinalize, ToolIsConcurrencySafe,
     ToolOutputDefinition, ToolPresentCall, ToolPresentResult, ToolPresentationMeta, ToolRender,
     ToolResult, ToolResultView, ToolRunContext, ToolSignal, CODE_INVALID_ARGS,
     CODE_INVALID_TOOL_OUTPUT, CODE_UNKNOWN_TOOL, RUN_CODE_NAME, TOOL_ABORTED,
