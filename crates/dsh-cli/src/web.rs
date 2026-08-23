@@ -1789,6 +1789,44 @@ pub fn register_m4_tools(registry: &dsh_tools::ToolRegistry) {
     register_m4_tools_with_host(registry, None);
 }
 
+// ---------------------------------------------------------------------------
+// M6 step1（验收 #2）：服务器装配工厂 —— 把 M4/M5 工具 + 宿主组装成 AgentLoopHost 的
+// 真实注册表（共享 store：与 SessionHost 同店 → 前端读模型同源）；装配方传入 provider/
+// model（生产 = deepseek + 配置端点；测试 = mock）与两个宿主（M4 + M5）。
+// ---------------------------------------------------------------------------
+
+/// 装配 LoopHost——真实注册表 = `register_m4_tools_with_host(m4)` +
+/// `register_m5_tools_with_host(m5.services)`（fs/terminal/shell/bash/code 宿主 bind）。
+/// 单一默认 agent（provider/model 由装配方指定；session_id "default" 与前端会话入口一致）。
+/// 宿主生命周期清理（`M5Host::shutdown` 等）由装配方挂 disposer（step2 补实）。
+pub fn assemble_server_loop(
+    session_store: Rc<dsh_session::store::SessionStore>,
+    workspace_root: std::path::PathBuf,
+    llm: Rc<dsh_llm::LlmRuntime>,
+    provider: &str,
+    model: &str,
+    m4: M4HostServices,
+    m5: web_m5::M5Host,
+) -> Result<Rc<dsh_agent_loop::AgentLoopHost>, String> {
+    let tools = Rc::new(dsh_tools::ToolRegistry::new(
+        dsh_tools::ToolExecutionMode::Native,
+    ));
+    register_m4_tools_with_host(&tools, Some(&m4));
+    register_m5_tools_with_host(&tools, Some(&m5.services));
+    let config = dsh_agent_loop::AgentLoopConfig {
+        max_parallel_tool_calls: None,
+        agents: vec![dsh_agent_loop::ConfiguredAgent {
+            id: "default".into(),
+            provider: Some(provider.to_string()),
+            model: Some(model.to_string()),
+            session_id: Some("default".into()),
+            max_tokens: None,
+            cwd: Some(workspace_root.to_string_lossy().into_owned()),
+            resume_session_id: None,
+        }],
+    };
+    dsh_agent_loop::AgentLoopHost::with_store(config, llm, tools, session_store)
+}
 
 fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) -> Value {
     match method {
@@ -5198,6 +5236,164 @@ mod tests {
         }
 
         // 清理
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M6i 验收 #2：服务器装配工厂 `assemble_server_loop`——真实注册表（M4+M5 工具 +
+    /// 宿主 bind，共享 store 与 SessionHost 同店）；一轮真实 loop 回合（mock LLM 脚本先发
+    /// `todo_write` 工具调用）经生产路径 `run_rust_loop` 驱动，M4 todo_write 真身执行并落
+    /// `todo/write` 事件到共享 store（TodoWriteHost bind agent "default"）。
+    #[test]
+    fn assemble_server_loop_builds_loop_host_with_m4_m5_and_drives_a_turn() {
+        use dsh_llm::{CallId, ContentBlock, FinishReason, StreamChunk, ToolCallBlock};
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+
+        fn todo_chunks(id: &str) -> Vec<StreamChunk> {
+            let args = r#"{"todos":[{"content":"assemble-it","status":"in_progress"}]}"#;
+            vec![
+                StreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: CallId::from_raw(id),
+                    name: Some("todo_write".into()),
+                    arguments_delta: args.into(),
+                },
+                StreamChunk::BlockEnd {
+                    index: 0,
+                    block: ContentBlock::ToolCall(ToolCallBlock {
+                        id: CallId::from_raw(id),
+                        name: "todo_write".into(),
+                        arguments: args.into(),
+                    }),
+                },
+                StreamChunk::Finish {
+                    reason: FinishReason::ToolCalls,
+                    replay_state: None,
+                },
+            ]
+        }
+
+        fn text_chunks(text: &str) -> Vec<StreamChunk> {
+            vec![
+                StreamChunk::BlockStart {
+                    index: 0,
+                    block_type: "text".parse().unwrap(),
+                },
+                StreamChunk::TextDelta {
+                    index: 0,
+                    text: text.into(),
+                },
+                StreamChunk::BlockEnd {
+                    index: 0,
+                    block: ContentBlock::text(text),
+                },
+                StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay_state: None,
+                },
+            ]
+        }
+
+        struct Adapter {
+            script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>,
+        }
+        impl dsh_llm::LlmAdapter for Adapter {
+            fn stream(
+                &self,
+                _options: dsh_llm::GenerateOptions,
+            ) -> Box<dyn Iterator<Item = StreamChunk>> {
+                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                Box::new(next.into_iter())
+            }
+        }
+        let script = Rc::new(RefCell::new(VecDeque::from_iter([
+            todo_chunks("t1"),
+            text_chunks("todo tracked"),
+        ])));
+        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Rc::new(Adapter { script }))
+            .unwrap();
+
+        // 会话宿主（共享 store）+ todo 宿主（bind agent "default" → session "default"）。
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let todo = Rc::new(crate::web::dsh_cli_host::TodoWriteHost::new(
+            session_host.clone(),
+            "default".into(),
+        ));
+        todo.bind_agent("default", "default");
+        let m4 = M4HostServices {
+            jobs: None,
+            schedule: None,
+            todo: Some(todo),
+        };
+
+        // 工作区 + M5 宿主（真实生产工厂）。
+        let root = std::env::temp_dir().join(format!("dsh-m6-assemble-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+
+        let loop_host = assemble_server_loop(
+            session_host.store.clone(),
+            root.clone(),
+            llm,
+            "mock",
+            "mock-model",
+            m4,
+            m5,
+        )
+        .expect("assemble_server_loop ok");
+
+        // 视图 = 真实注册表：M4 + M5 全工具可见（保证 agent 可调用面）。
+        let names: Vec<String> = loop_host
+            .tools
+            .known_names(None)
+            .into_iter()
+            .collect();
+        for want in [
+            "todo_write",
+            "job_list",
+            "job_output",
+            "schedule_create",
+            "write",
+            "read",
+            "edit",
+            "glob",
+            "grep",
+            "str_replace_editor",
+            "bash",
+            "terminal_open",
+            "terminal_send",
+        ] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "loop registry missing {want}; have {names:?}"
+            );
+        }
+
+        // 装配进 boot → 生产路径 run_rust_loop 驱动一轮真实回合。
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(loop_host.clone());
+        crate::run_rust_loop(&boot, "default", "please track my todo").expect("turn runs");
+
+        // 事件落共享 store（同店）：todo 宿主真实写 + 工具调用 + 收尾 assistant。
+        let evs = session_host.events("default");
+        assert!(
+            evs.iter().any(|e| e.kind.as_str() == "todo/write"),
+            "todo/write landed in shared store: {evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| e.kind.as_str() == "tool/call"),
+            "tool/call seen: {evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| e.kind.as_str() == "assistant/message"),
+            "final assistant message in store"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -2932,5 +2932,39 @@ PayloadsResolver 契约不匹配，否）；② 把 key 写进 WebConfig/代码�
 
 ---
 
+## D-079（M6 编码·step1a）：服务器装配工厂核心——`assemble_server_loop`（真实注册表
+M4+M5 + 共享 SessionStore + 生产路径一轮真实工具回合；验收 #2）
+
+**日期**：2026（M6 round 4/5）。
+**触发问题**：step1（服务器装配工厂）进入编码，TDD 红→绿。
+**设计落点（自底向上实测）**：既有骨架 = web.rs 测试 `rpc_prompt_routes...`（mock LlmRuntime
+`register_adapter` + AgentLoopHost::with_store + boot.agent_loop + run_rust_loop）；`SessionHost.
+store: Rc<SessionStore>` 公开可 clone 共享；`TodoWriteHost::new(host, default_session)` +
+`bind_agent` 归属登记；`M4HostServices{jobs, schedule, todo}` / `M5Host::assemble(root)` 均公开；
+驱动一轮工具回合的 mock 脚本镜像 dsh-agent-loop `m2e2_driver::tool_call_chunks`
+（ToolCallDelta + BlockEnd(ToolCall) + Finish::ToolCalls → 第二轮文本收尾）。
+**实现（红→绿）**：`pub fn assemble_server_loop(session_store, workspace_root, llm, provider,
+model, m4, m5) -> Result<Rc<AgentLoopHost>, String>`——ToolRegistry::new(Native) +
+register_m4_tools_with_host(m4) + register_m5_tools_with_host(m5.services) + 单一默认 agent
+{id "default", provider, model, session_id "default", cwd=workspace_root} +
+AgentLoopHost::with_store(config, llm, tools, session_store)。红测先（E0425 assemble_server_loop
+未定义）→ 绿（93 测全绿 + clippy 零告警 + check 绿）。
+**红测断言（验收 #2 可互查）**：① 视图 known_names ⊇ {todo_write, job_list, job_output,
+schedule_create, write, read, edit, glob, grep, str_replace_editor, bash, terminal_open,
+terminal_send}（= M4+M5 全工具真实注册表）；② mock LLM 一轮 `todo_write` 工具调用经生产路径
+`run_rust_loop` 驱动 → M4 todo_write 真身执行 + `todo/write` 事件落共享 store + tool/call +
+收尾 assistant/message；③ store 与 SessionHost 同店。
+**决定/边界**：① provider/model 由装配方传入（生产=deepseek+端点，测试=mock）——装配函数不
+硬编码 provider；② `M5Host::shutdown` disposer 属 step2（生命周期），本步仅装配；③ run_code 在
+Native 视图不可见（Code-mode 注入），故未列入断言集（诚实，不伪造）。④ workspace_root 传装配
+方（wss_root 在生产由 P2 WebConfig 提供）。
+**预期影响与回滚点**：web.rs（+assemble_server_loop + M6i 验收 #2 集成测试）；dsh-cli 93 测全绿 +
+clippy 零告警 + check 绿。回滚 = 撤本提交。
+**待办**：step1b serve() 接线（&mut Boot / 配置 flag + workspace_root + llm 装配 + enable
+agent loop；诚实降级）→ step2 生命周期 shutdown → step3 tick 注入 → step4 sandbox 投影 →
+step5 LLM 桥 → step6 前端最小闭环 → 穿插篮 → M6-ACCEPTANCE。
+
+---
+
 
 
