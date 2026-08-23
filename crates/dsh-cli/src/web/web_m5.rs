@@ -19,7 +19,9 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use dsh_code_runtime::run_code::parse_run_code_args;
-use dsh_code_runtime::{CodeRunFailure, CodeRunRequest, CodeRunResult, CodeRuntime, PythonCodeRuntime};
+use dsh_code_runtime::{
+    CodeRunFailure, CodeRunRequest, CodeRunResult, CodeRuntime, PythonCodeRuntime, PythonConfig,
+};
 use dsh_fs::grep::{
     format_grep_output, retain_grep_matches, GrepMatch, RetainedMatches, GREP_MAX_LINE_BYTES,
     GREP_MAX_MATCHES,
@@ -39,6 +41,7 @@ use dsh_jobs::{
     JobRead, JobRegistry, JobRegistryConfig, JobSettlement, JobStartError, JobStatus,
     ProducerHooks, StartSpec,
 };
+use dsh_sandbox::SandboxMode;
 use dsh_shell::{
     bash_tool_parameters, parse_bash_args, render_bash_result, BashConfig, LocalBashExecutor,
     ShellCollectedOutput, ShellError, ShellExecRequest, ShellExecSpec, ShellProcess,
@@ -335,6 +338,100 @@ pub struct M5HostServices {
     pub bash_jobs: Option<Rc<BashJobsBridge>>,
     /// code runtime（run_code 传输的真实 execute 覆盖；缺省 → 注册表占位桩诚实报错）。
     pub code: Option<Rc<PythonCodeRuntime>>,
+}
+
+/// M5 宿主生产装配（M5-DESIGN §8；验收 #9）：一次构造全部宿主句柄，root 为工作区。
+/// terminal/fs/shell/bash_jobs 恒在场；code 仅 python 可用时装配（诚实——无 runtime 时
+/// run_code 保持注册表占位桩）。会话清理钩子（fs owner 登记释放，D-069 记录）随宿主
+/// 生命周期由装配方在会话结束调用（预留）。
+pub struct M5Host {
+    pub services: M5HostServices,
+}
+
+impl M5Host {
+    pub fn assemble(root: PathBuf) -> Result<Self, String> {
+        let root_abs = root.canonicalize().unwrap_or(root);
+        let terminal = Rc::new(RefCell::new(TerminalSessionService::new()));
+        let fs = Rc::new(FsHost::new(root_abs.clone()));
+        let shell = Rc::new(ShellHost::new(root_abs.clone())?);
+        let bash_jobs = Rc::new(BashJobsBridge::new());
+        let code = dsh_code_runtime::python_available()
+            .then(|| Rc::new(PythonCodeRuntime::new(PythonConfig::default())));
+        Ok(M5Host {
+            services: M5HostServices {
+                terminal: Some(terminal),
+                fs: Some(fs),
+                shell: Some(shell),
+                bash_jobs: Some(bash_jobs),
+                code,
+            },
+        })
+    }
+
+    /// 便捷注册：全工具 + 全部在场句柄 bind 进目标 registry。
+    pub fn register(&self, registry: &dsh_tools::ToolRegistry) {
+        register_m5_tools_with_host(registry, Some(&self.services));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// effectiveSandboxMode / sandbox:policy（M5-DESIGN §8；验收 #3 会话事件投影 + 系统提示段）
+// ---------------------------------------------------------------------------
+
+/// effectiveSandboxMode fold 结果：模式 + 来源（"session"/"delegation"/"default"）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveSandbox {
+    pub mode: SandboxMode,
+    pub source: &'static str,
+}
+
+/// 会话事件 → effective 模式（precedence：approved > session sandbox/mode > 默认
+/// read-only）。本 fold 实现 session+default 两档（last-wins `sandbox/mode` 事件，未知
+/// 模式忽略——log-only 语义）；approved 级联（approval/decided 事件落盘）留宿主接线
+/// 的预留槽位，D-074 记录——不伪造 approved 来源。
+pub fn fold_effective_sandbox_mode(events: &[Value]) -> EffectiveSandbox {
+    let mut effective = EffectiveSandbox {
+        mode: SandboxMode::ReadOnly,
+        source: "default",
+    };
+    for e in events {
+        if e["type"].as_str() != Some("sandbox/mode") {
+            continue;
+        }
+        let Some(data) = e.get("data") else { continue };
+        let Some(mode_str) = data.get("mode").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(m) = mode_str.parse::<SandboxMode>() else {
+            continue;
+        };
+        effective.mode = m;
+        effective.source = if data.get("source").and_then(Value::as_str) == Some("delegation") {
+            "session-delegation"
+        } else {
+            "session"
+        };
+    }
+    effective
+}
+
+/// `sandbox:policy` 系统提示段（order 110；验收 #3 系统提示注入）：有效模式 + 可写根
+/// （仅 workspace-write 产名单，复用 dsh-sandbox::writable_roots）。
+pub fn sandbox_policy_segment(
+    mode: SandboxMode,
+    workspace_root: Option<&std::path::Path>,
+) -> String {
+    let roots = dsh_sandbox::writable_roots(mode, workspace_root.map(|p| p.to_path_buf()));
+    let roots_text = if roots.is_empty() {
+        "(none — read-only)".to_string()
+    } else {
+        roots
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!("sandbox: policy — effective mode {mode}\nwritable roots: {roots_text}")
 }
 
 /// 注册全部 M5 工具（M5-DESIGN §8 工具集）到一个 registry。

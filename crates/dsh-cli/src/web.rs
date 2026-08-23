@@ -5049,4 +5049,109 @@ mod tests {
         assert_eq!(v["value"]["ok"], true);
         assert_eq!(v["value"]["n"], 7);
     }
+
+    /// M5i 接线 #9：effectiveSandboxMode 会话事件 fold（last-wins `sandbox/mode`；未知
+    /// 模式忽略；delegation 源标记；缺省 read-only）+ `sandbox:policy` 系统提示段
+    /// （仅 workspace-write 产可写根名单）。
+    #[test]
+    fn fold_effective_sandbox_mode_last_wins_and_policy_segment() {
+        use serde_json::json;
+
+        // 空事件 → read-only/default。
+        let e = web_m5::fold_effective_sandbox_mode(&[]);
+        assert_eq!(e.mode.as_str(), "read-only");
+        assert_eq!(e.source, "default");
+
+        // last-wins：workspace-write → danger（delegation 源标记）。
+        let events = vec![
+            json!({ "type": "sandbox/mode", "data": { "mode": "workspace-write" } }),
+            json!({ "type": "sandbox/mode", "data": { "mode": "danger-full-access", "source": "delegation" } }),
+        ];
+        let e = web_m5::fold_effective_sandbox_mode(&events);
+        assert_eq!(e.mode.as_str(), "danger-full-access");
+        assert_eq!(e.source, "session-delegation");
+
+        // 非 sandbox/mode 事件 + 未知模式被忽略（log-only 语义）。
+        let events = vec![
+            json!({ "type": "user/message", "data": {} }),
+            json!({ "type": "sandbox/mode", "data": { "mode": "nonsense-mode" } }),
+            json!({ "type": "sandbox/mode", "data": { "mode": "workspace-write" } }),
+        ];
+        let e = web_m5::fold_effective_sandbox_mode(&events);
+        assert_eq!(e.mode.as_str(), "workspace-write");
+        assert_eq!(e.source, "session");
+
+        // sandbox:policy 段：read-only → 无根；(workspace-write → 含工作区根)。
+        let ro = web_m5::sandbox_policy_segment(dsh_sandbox::SandboxMode::ReadOnly, None);
+        assert!(ro.contains("read-only"), "{ro}");
+        assert!(ro.contains("(none — read-only)"), "{ro}");
+        let root = std::env::temp_dir().join("dsh-policy-seg");
+        let ws = web_m5::sandbox_policy_segment(dsh_sandbox::SandboxMode::WorkspaceWrite, Some(&root));
+        assert!(ws.contains("workspace-write"), "{ws}");
+        assert!(ws.contains("dsh-policy-seg"), "{ws}");
+    }
+
+    /// M5i 接线 #10（验收 #9）：M5Host::assemble 生产装配——一次构造 terminal/fs/shell/
+    /// bash_jobs（+code，python 可用时）全部句柄并真实驱动：bash 前台真跑（echo）、
+    /// fs write→read 生命周期、glob 匹配——非仅测试可配，宿主生产面可用。
+    #[test]
+    fn m5_host_assemble_drives_real_tools() {
+        use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
+        fn bash_available() -> bool {
+            #[cfg(windows)]
+            {
+                ["C:\\Program Files\\Git\\bin\\bash.exe", "C:\\Program Files\\Git\\usr\\bin\\bash.exe", "C:\\Windows\\System32\\bash.exe"]
+                    .iter()
+                    .any(|p| std::path::Path::new(p).exists())
+            }
+            #[cfg(not(windows))]
+            {
+                true
+            }
+        }
+        let root = std::env::temp_dir().join(format!("dsh-m5-assemble-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+
+        let host = web_m5::M5Host::assemble(root.clone()).expect("m5 host assembles");
+        // 全部宿主句柄在场。
+        assert!(host.services.terminal.is_some());
+        assert!(host.services.fs.is_some());
+        assert!(host.services.shell.is_some());
+        assert!(host.services.bash_jobs.is_some());
+
+        let registry = ToolRegistry::new(ToolExecutionMode::Native);
+        host.register(&registry);
+        let exec = |call_id: &str, name: &str, args: serde_json::Value| {
+            registry.execute(
+                &ToolExecutionInput::new(call_id, name, args, Some("agent-1".into())),
+                None,
+            )
+        };
+
+        // fs write → read → glob 全生命周期（生产装配真实驱动）。
+        let res = exec("a1", "write", serde_json::json!({ "file_path": "hello.txt", "content": "hello assemble\n" }));
+        assert!(!res.is_error, "assemble write: {:?}", res.error);
+        let res = exec("a2", "read", serde_json::json!({ "file_path": "hello.txt" }));
+        assert!(!res.is_error, "assemble read ok");
+        assert_eq!(res.value.unwrap()["lines"][0]["text"], "hello assemble");
+        let res = exec("a3", "glob", serde_json::json!({ "pattern": "*.txt" }));
+        assert!(!res.is_error, "assemble glob ok");
+        let matches = res.value.unwrap()["matches"].as_array().unwrap().clone();
+        assert!(matches.iter().any(|m| m.as_str().unwrap_or("").ends_with("hello.txt")));
+
+        // bash 前台（Git Bash 门控）。
+        if bash_available() {
+            let res = exec("a4", "bash", serde_json::json!({ "command": "echo assembled-bash", "description": "test" }));
+            assert!(!res.is_error, "assemble bash: {:?}", res.error);
+            assert_eq!(res.value.unwrap()["exitCode"], 0);
+        } else {
+            eprintln!("bash unavailable; skipping assemble bash path");
+        }
+
+        // 清理
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

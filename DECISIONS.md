@@ -2760,5 +2760,35 @@ step8 M5-ACCEPTANCE。
 
 ---
 
+## D-074（M5 编码·step7g）：M5Host 生产装配工厂（验收 #9，一次构造全宿主句柄；非仅测试
+可配）+ effectiveSandboxMode 会话事件 fold + `sandbox:policy` 系统提示段（验收 #3 注入）
+
+**日期**：2026（M5 round 25/26）。
+**触发问题**：M5HostServices 此前只在测试逐字段构建（terminal/fs/shell/bash_jobs/code
+五句柄无生产装配点，缺口「only built in tests」）；§8 的 effectiveSandboxMode 回放 fold 与
+`sandbox:policy` 系统提示段（验收 #3 系统提示注入）无纯面。
+**考虑的选项**：1. **`M5Host::assemble(root)`（采用）**：root 规范化（canonicalize）后一次
+构造 terminal（`TerminalSessionService::new`）+ fs（FsHost）+ shell（ShellHost，root 锚定
+cwd）+ bash_jobs（BashJobsBridge）+ code（仅 `python_available()` 装配——诚实：无 runtime
+时 run_code 保持注册表占位桩）；`register()` 便捷注册全工具 + bind。会话清理钩子（fs owner
+登记释放，D-069 记录）随宿主生命周期由装配方调用，预留。2. 每句柄一支工厂（分散、无组合
+归宿，弃）。3. code 无 python 也强行装配（run 才失败——运行时炸 vs 装配期诚实，弃）。
+**fold 语义（采用，纯面可测）**：precedence declared：approved > session `sandbox/mode` >
+默认 read-only。本 fold 实现 session+default 两档——last-wins `sandbox/mode` 事件（未知
+模式忽略，log-only 语义；`source:"delegation"` → `"session-delegation"` 标记）；approved
+级联（`approval/decided` 事件落盘后接线）为预留槽位，**不伪造 approved 来源**。`sandbox:
+policy` 段（order 110）：有效模式 + 可写根（仅 workspace-write 产名单，复用
+dsh-sandbox::writable_roots，read-only → "(none — read-only)"）。
+**诚实限制（D 记录）**：approved 级联未接（无 approval/decided 事件发射方）；read_image
+仍 NOT_BOUND（解码依赖评估留待 step8 前）；嵌套 tools 派发（run_code bindings）仍空。
+**预期影响与回滚点**：web_m5.rs（M5Host::assemble/register + EffectiveSandbox/fold/
+sandbox_policy_segment）+ web.rs（fold last-wins 纯测 + assemble 生产驱动 e2e：write→read→
+glob + bash 门控真跑 + 全句柄在场断言）；dsh-cli 91 测试全绿 + workspace clippy 零告警 +
+check 绿。回滚 = 撤本提交。
+**待办**：read_image 解码绑定（或诚实再降级）、step8 M5-ACCEPTANCE（全量 workspace test +
+clippy + DECISIONS 互查 + git 闭环）。
+
+---
+
 
 
