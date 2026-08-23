@@ -1,0 +1,17 @@
+[package]
+name = "dsh-subprocess"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "M5 execution primitives: managed process tree spawn, bounded collect/spill, scrubbed env, unique PTY spawn (port of the dsh subprocess capability seam)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+nix = { version = "0.30", features = ["process", "signal", "fs"] }
+which = "6"
+sysinfo = "0.38"
+
+[dev-dependencies]
+tempfile = "3"

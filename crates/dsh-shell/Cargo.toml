@@ -1,0 +1,19 @@
+[package]
+name = "dsh-shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "M5 shell capability seam: ShellExecutor request/spec split, bash-local backend, model-facing bash tool with verbatim marker vocabulary (port of the dsh shell capability seam)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dsh-session = { path = "../dsh-session" }
+dsh-tools = { path = "../dsh-tools" }
+dsh-subprocess = { path = "../dsh-subprocess" }
+dsh-sandbox = { path = "../dsh-sandbox" }
+dsh-jobs = { path = "../dsh-jobs" }
+
+[dev-dependencies]
+tempfile = "3"

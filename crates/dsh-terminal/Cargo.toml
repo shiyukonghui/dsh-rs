@@ -1,0 +1,20 @@
+[package]
+name = "dsh-terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "M5 terminal session registry: branded session ids, owner authorization, PTY backend over spawnTerminal, 6 model-facing tools, sandbox/mode lock while sessions live (port of the dsh terminal capability seam)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dsh-session = { path = "../dsh-session" }
+dsh-tools = { path = "../dsh-tools" }
+dsh-subprocess = { path = "../dsh-subprocess" }
+dsh-sandbox = { path = "../dsh-sandbox" }
+dsh-jobs = { path = "../dsh-jobs" }
+portable-pty = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

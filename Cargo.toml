@@ -17,6 +17,9 @@ members = [
   # M4 长任务编排（PLAN §6）：goal/plan/subagent/jobs/schedule/workflow
   "crates/dsh-goal", "crates/dsh-plan", "crates/dsh-subagent",
   "crates/dsh-jobs", "crates/dsh-schedule", "crates/dsh-workflow",
+  # M5 执行引擎与沙箱（PLAN §7 + M5-DESIGN.md §1）：subprocess/sandbox/fs/shell/terminal/code-runtime
+  "crates/dsh-subprocess", "crates/dsh-sandbox", "crates/dsh-fs",
+  "crates/dsh-shell", "crates/dsh-terminal", "crates/dsh-code-runtime",
 ]
 
 [workspace.package]

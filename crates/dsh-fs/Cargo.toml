@@ -1,0 +1,18 @@
+[package]
+name = "dsh-fs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "M5 filesystem capability seam: FileSystem provider contract (12 methods), local backend, observation policy, in-process sandbox fence, model-facing fs tools (port of the dsh fs capability seam)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dsh-session = { path = "../dsh-session" }
+dsh-tools = { path = "../dsh-tools" }
+globset = "0.4"
+ignore = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
