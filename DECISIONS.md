@@ -2634,5 +2634,36 @@ workspace clippy 零告警 + check 绿。回滚 = 撤本提交。
 
 ---
 
+## D-070（M5 编码·step7c）：bash 前台真实绑定——ShellHost（LocalBashExecutor，root 锚定
+cwd）；run_in_background/sandbox_permissions 诚实 `UNSUPPORTED_OPTION`；Git Bash 真跑
+端到端（Windows 候选探测）
+
+**日期**：2026（M5 round 17/18）。
+**触发问题**：D-068/D-069 的 bash 仍 NOT_BOUND；`LocalBashExecutor`（resolve+run）已备好，
+本箱 Git Bash（C:\Program Files\Git\bin\bash.exe）可真实执行，现把前台路径 bind。
+**考虑的选项**：1. **`ShellHost{executor, root}` 组合宿主（采用）**：root 锚定 BashConfig.cwd
+（bash 默认工作目录 = 宿主 root，等同 reference workspace cwd）。2. 后台立刻接入 jobs
+producer 桥（需宿主 completion tick 驱动 settle——单线程 JobRegistry 无自驱动，
+tick/装配不在本轮，诚实拒绝而非半接）。3. 逐 token 伪造沙箱（否定：无 SAND 投影，
+`result.sandbox` 恒 None）。
+**语义落地**：bash_tool 定义 execute→规范化 value（command/exitCode/signal/timedOut/
+aborted/timeoutMs/stdout{text,truncated,spillPath}/stderr/sandbox:null），render 由 value
+重建 `ShellRunResult` 走同词表 `render_bash_result`（显式=值/可见性=渲染单一真相，与
+terminal/fs 组同纪律）。executor：`parse_bash_args`（schema 硬校验，description 必填如参考）
+→ workdir 覆盖（缺省 root）→ `resolve`（timeout clamp/预算兜底）→ `run`（非零/超时 resolve
+成结果）→ 规范化值。**诚实拒绝**：`run_in_background:true` → `UNSUPPORTED_OPTION`（jobs
+producer 桥 + completion tick 未接线，次轮落地）；`sandbox_permissions` 非空 → `UNSUPPORTED_OPTION`
+（SAND 投影未接线）。agent 无需 owner（参考 bash 无属主语义）。
+**诚实限制（D 记录）**：后台 / SAND / read_image / run_code 传输均未接，均为明确
+`UNSUPPORTED_OPTION`/NOT_BOUND/保留占位，无伪造；`result.sandbox` 恒 None（本地后端零
+SAND 事实但渲染不会假装 denied）。
+**预期影响与回滚点**：web_m5.rs + web.rs（bash 真跑端到端测试：echo exitCode 0 / pwd cwd
+锚定 MSYS 规范化路径 / exit 3 非零 resolve / bg+sandbox UNSUPPORTED；bash 不可用平台门控
+跳过——诚实）；dsh-cli 85 测试全绿 + clippy 零告警 + workspace check 绿。回滚 = 撤本提交。
+**待办**：jobs producer 桥（bash 后台 + completion tick 驱动 settle）、SAND 投影、read_image
+解码、run_code 传输替换、M5g 定时 tick——step7d + step8。
+
+---
+
 
 

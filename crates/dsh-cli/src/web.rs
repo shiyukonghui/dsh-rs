@@ -4382,7 +4382,7 @@ mod tests {
                 Box::new(|_cfg| Box::new(M5FakeBackend::default())),
             )
             .expect("register fake backend");
-        let host = M5HostServices { terminal: Some(term), fs: None };
+        let host = M5HostServices { terminal: Some(term), fs: None, shell: None };
         register_m5_tools_with_host(&registry, Some(&host));
 
         // open
@@ -4516,7 +4516,7 @@ mod tests {
         let fsh = Rc::new(web_m5::FsHost::new(root.clone()));
         register_m5_tools_with_host(
             &registry,
-            Some(&M5HostServices { terminal: None, fs: Some(fsh) }),
+            Some(&M5HostServices { terminal: None, fs: Some(fsh), shell: None }),
         );
 
         let exec = |call_id: &str, name: &str, args: serde_json::Value| {
@@ -4649,6 +4649,102 @@ mod tests {
         assert!(disk.contains("replaced"), "replacement persisted: {disk}");
 
         // 清理临时 root
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 依赖 Git Bash 的真实执行（Windows 候选探测；缺 bash 时门控跳过——诚实）：
+    /// bash 工具前台真跑（echo + pwd cwd 锚定 root + 非零退出带 exit code 标记）；
+    /// run_in_background/sandbox_permissions 诚实 UNSUPPORTED（jobs 桥/D-070 未接线）。
+    #[test]
+    fn register_m5_tools_with_shell_host_binds_bash_really() {
+        use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
+        fn bash_available() -> bool {
+            #[cfg(windows)]
+            {
+                ["C:\\Program Files\\Git\\bin\\bash.exe", "C:\\Program Files\\Git\\usr\\bin\\bash.exe", "C:\\Windows\\System32\\bash.exe"]
+                    .iter()
+                    .any(|p| std::path::Path::new(p).exists())
+            }
+            #[cfg(not(windows))]
+            {
+                true
+            }
+        }
+        if !bash_available() {
+            eprintln!("bash unavailable; skipping real-execution shell binding test");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("dsh-m5-bash-test-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+
+        let registry = ToolRegistry::new(ToolExecutionMode::Native);
+        let shost = Rc::new(web_m5::ShellHost::new(root.clone()).expect("shell host"));
+        register_m5_tools_with_host(
+            &registry,
+            Some(&M5HostServices { terminal: None, fs: None, shell: Some(shost) }),
+        );
+
+        let exec = |call_id: &str, args: serde_json::Value| {
+            registry.execute(
+                &ToolExecutionInput::new(call_id, "bash", args, Some("agent-1".into())),
+                None,
+            )
+        };
+
+        // 前台 echo：exitCode 0 + stdout 文本（渲染含 [exit code: 0] 不出现）。
+        let res = exec(
+            "b1",
+            serde_json::json!({ "command": "echo hello-dsh-bash", "description": "test echo" }),
+        );
+        assert!(!res.is_error, "bash echo ok: {:?}", res.error);
+        let v = res.value.unwrap();
+        assert_eq!(v["exitCode"], 0);
+        assert!(v["stdout"]["text"].as_str().unwrap().contains("hello-dsh-bash"));
+        assert!(!v["stdout"]["truncated"].as_bool().unwrap());
+
+        // cwd 锚定宿主 root（pwd）。
+        let res = exec(
+            "b2",
+            serde_json::json!({ "command": "pwd", "description": "test pwd" }),
+        );
+        assert!(!res.is_error, "bash pwd ok: {:?}", res.error);
+        let pwd = res.value.unwrap()["stdout"]["text"].as_str().unwrap().trim().to_string();
+        assert!(pwd.contains("dsh-m5-bash-test"),
+            "pwd anchored at host root: {pwd} (root: {root:?})");
+
+        // 非零退出：exitCode 非 0，渲染出 [exit code: n]。
+        let res = exec(
+            "b3",
+            serde_json::json!({ "command": "exit 3", "description": "test nonzero" }),
+        );
+        assert!(!res.is_error, "nonzero exit resolves as result: {:?}", res.error);
+        assert_eq!(res.value.unwrap()["exitCode"], 3);
+
+        // 后台：诚实 UNSUPPORTED（jobs producer 桥未接线，D-070）。
+        let res = exec(
+            "b4",
+            serde_json::json!({ "command": "echo bg", "description": "test bg", "run_in_background": true }),
+        );
+        assert!(res.is_error, "background rejected until jobs bridge lands");
+        let code = res
+            .error
+            .as_ref()
+            .and_then(|e| e.info.as_ref())
+            .map(|i| i.code.clone())
+            .unwrap_or_default();
+        assert_eq!(code, "UNSUPPORTED_OPTION");
+
+        // sandbox_permissions：非空诚实 UNSUPPORTED（SAND 投影未接线，D-070）。
+        let res = exec(
+            "b5",
+            serde_json::json!({ "command": "echo x", "description": "test sandbox", "sandbox_permissions": "network" }),
+        );
+        assert!(res.is_error, "sandbox escalation rejected until SAND projection");
+
+        // 清理
         let _ = std::fs::remove_dir_all(&root);
     }
 }

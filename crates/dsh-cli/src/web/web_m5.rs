@@ -6,8 +6,9 @@
 //! 诚实接线原则（D-068）：工具一律先注册（定义可见、schema 可校验、模型可见 renderers
 //! 单源），再按「宿主服务句柄是否在场」决定 execute 真实委托 vs 结构化 `NOT_BOUND`——
 //! 绝不无句柄假装成功（M4 同款承诺，D-052）。真实绑定：terminal 六件套 + fs 六件套
-//! （read/write/edit/glob/grep/str_replace_editor，走 LocalFileSystem+ObservationGate）；
-//! read_image/bash/run_code 后续轮按服务柄/传输接入（D-068/D-069 记录待办）。
+//! （read/write/edit/glob/grep/str_replace_editor）+ bash 前台（resolve+run）；后台
+//! run_in_background 诚实拒绝（jobs producer 桥/tick 后续轮）；read_image 待解码服务；
+//! run_code 交注册表保留传输（D-068/D-069/D-070 记录待办）。
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -29,7 +30,10 @@ use dsh_fs::{
     LocalFileSystem, Observation, ObservationGate, OwnerId, ReadTextOptions,
     DEFAULT_MAX_OUTPUT_CHARS,
 };
-use dsh_shell::bash_tool_parameters;
+use dsh_shell::{
+    bash_tool_parameters, parse_bash_args, render_bash_result, BashConfig, LocalBashExecutor,
+    ShellCollectedOutput, ShellError, ShellExecRequest, ShellRunResult,
+};
 use dsh_terminal::{
     parse_terminal_close_args, parse_terminal_open_args, parse_terminal_read_args,
     parse_terminal_send_args, parse_terminal_signal_args, render_terminal_close,
@@ -118,17 +122,36 @@ impl FsHost {
     }
 }
 
+/// shell 宿主：本地 bash 后端（root 为默认工作目录；`On Mac/Linux` 亦可）。
+pub struct ShellHost {
+    pub executor: LocalBashExecutor,
+    pub root: PathBuf,
+}
+
+impl ShellHost {
+    /// 构造并校验 bash 配置；cwd 锚定宿主 root（工作区）。
+    pub fn new(root: PathBuf) -> Result<Self, String> {
+        let executor = LocalBashExecutor::new(BashConfig {
+            cwd: Some(root.clone()),
+            ..BashConfig::default()
+        })?;
+        Ok(ShellHost { executor, root })
+    }
+}
+
 /// M5h 宿主服务句柄集合：M5 工具组的 bind 目标。
 ///
 /// `register_m5_tools_with_host` 接受可选的 `&M5HostServices`：有句柄 → 对应工具 bind
 /// 到真实服务（fail loud 不再 NOT_BOUND）；无句柄 → 注册定义但保持 `NOT_BOUND`。
-/// 本轮装配 `terminal` + `fs`；shell/code_runtime 句柄随后续 binder 轮加入（D-068/D-069）。
+/// 装配 `terminal` + `fs` + `shell`；code_runtime 传输/tick 后续轮（D-068/D-069/D-070）。
 #[derive(Default)]
 pub struct M5HostServices {
     /// 终端会话注册表（terminal_open/send/read/signal/close/list 的真实句柄）。
     pub terminal: Option<Rc<RefCell<TerminalSessionService>>>,
     /// fs 宿主（read/write/edit/glob/grep/str_replace_editor 的真实句柄）。
     pub fs: Option<Rc<FsHost>>,
+    /// shell 宿主（bash 工具前台执行的真实句柄）。
+    pub shell: Option<Rc<ShellHost>>,
 }
 
 /// 注册全部 M5 工具（M5-DESIGN §8 工具集）到一个 registry。
@@ -168,17 +191,13 @@ pub fn register_m5_tools_with_host(
             .unwrap_or_else(|e| panic!("{name}: {e}"));
     }
 
-    // ---- bash：登记定义（纯面 schema + 校验）；execute 待 shell 宿主句柄接入（NOT_BOUND）。
+    // ---- bash：登记定义（纯面 schema + 渲染）；shell 宿主在场 → bind 真实前台执行。
     // 注：`run_code` 不在此登记——注册表保留该名注入 Code Mode 占位传输（诚实
     // "requires a code runtime" 桩）；真实运行面绑定属 registry/run_code binder 步（D-068）。
-    let bash = define_m5_tool(
-        "bash",
-        "Run a shell command in the host workspace, returning its output, exit code, and sandbox status.".into(),
-        bash_tool_parameters(true, &[]),
-        json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| vec![ContentBlock::text(render_passthrough(v))]),
-    )
-    .expect("bash defines");
+    let bash = bash_tool();
+    if let Some(shost) = host.and_then(|h| h.shell.clone()) {
+        bash.bind(bash_executor(shost));
+    }
     registry
         .register_global(Rc::clone(&bash.definition()))
         .expect("register bash");
@@ -212,6 +231,109 @@ pub fn register_m5_tools_with_host(
             .register_global(tool.definition())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// bash 工具：纯面定义（schema + 渲染）+ 宿主 executor
+// ---------------------------------------------------------------------------
+
+/// bash 工具定义：execute 产生规范化 value，render 重新组装 `ShellRunResult` 走
+/// 与 tool_bash 同词表的 `render_bash_result`（显式=值、可见性=渲染，单一真相）。
+fn bash_tool() -> M5Tool {
+    define_m5_tool(
+        "bash",
+        "Run a shell command in the host workspace, returning its output, exit code, and sandbox status.".into(),
+        bash_tool_parameters(true, &[]),
+        json!({"type":"object","additionalProperties":true}),
+        Rc::new(|_a, v| {
+            let result = ShellRunResult {
+                exit_code: v["exitCode"].as_i64().map(|n| n as i32),
+                signal: v["signal"].as_str().map(str::to_string),
+                timed_out: v["timedOut"].as_bool().unwrap_or(false),
+                aborted: v["aborted"].as_bool().unwrap_or(false),
+                timeout_ms: v["timeoutMs"].as_u64().unwrap_or(0),
+                stdout: collected_from_value(&v["stdout"]),
+                stderr: collected_from_value(&v["stderr"]),
+                // 本地 bash 后端恒无 SAND；escalation 词表为空集（本轮无提升参数）。
+                sandbox: None,
+            };
+            vec![ContentBlock::text(render_bash_result(&result, &[]))]
+        }),
+    )
+    .expect("bash defines")
+}
+
+/// 规范化 bash 执行结果（execute → value；render 只消费 value，不独走）。
+fn bash_executor(shost: Rc<ShellHost>) -> ToolExecute {
+    Rc::new(move |args, _ctx| {
+        let parsed = parse_bash_args(args).map_err(|m| invalid_args("bash", m))?;
+        if parsed.run_in_background == Some(true) {
+            return Err(unsupported(
+                "bash: run_in_background: true requires a jobs producer bridge (JobRegistry host + completion tick), not yet wired (D-070); use foreground run_in_background:false or omit",
+            ));
+        }
+        if let Some(perms) = &parsed.sandbox_permissions {
+            if !perms.is_empty() {
+                return Err(unsupported(
+                    "bash: sandbox_permissions: non-empty requires sandboxed execution (SAND mode projection not yet wired; D-070)",
+                ));
+            }
+        }
+        let request = ShellExecRequest {
+            command: parsed.command.clone(),
+            workdir: parsed.workdir.map(PathBuf::from),
+            timeout_ms: parsed.timeout_ms,
+            stdout_max_bytes: None,
+            signal: None,
+            stdin: None,
+            env: None,
+            dsh_env: None,
+        };
+        let spec = shost
+            .executor
+            .resolve(&request)
+            .map_err(|m| invalid_args("bash", m))?;
+        let result = shost
+            .executor
+            .run(&spec)
+            .map_err(|e| shell_failure("bash", e))?;
+        Ok(bash_canonical(&parsed.command, &result))
+    })
+}
+
+/// execute 面规范化值（render 依此重建 ShellRunResult）。
+fn bash_canonical(command: &str, result: &ShellRunResult) -> Value {
+    json!({
+        "command": command,
+        "exitCode": result.exit_code,
+        "signal": result.signal,
+        "timedOut": result.timed_out,
+        "aborted": result.aborted,
+        "timeoutMs": result.timeout_ms,
+        "stdout": collected_to_value(&result.stdout),
+        "stderr": collected_to_value(&result.stderr),
+        "sandbox": None::<Value>,
+    })
+}
+
+fn collected_to_value(c: &ShellCollectedOutput) -> Value {
+    json!({
+        "text": c.text,
+        "truncated": c.truncated,
+        "spillPath": c.spill_path,
+    })
+}
+
+fn collected_from_value(v: &Value) -> ShellCollectedOutput {
+    ShellCollectedOutput {
+        text: v["text"].as_str().unwrap_or("").to_string(),
+        truncated: v["truncated"].as_bool().unwrap_or(false),
+        spill_path: v["spillPath"].as_str().map(PathBuf::from),
+    }
+}
+
+fn shell_failure(tool: &str, e: ShellError) -> ToolFailureData {
+    ToolFailureData::new(format!("{tool}: {e}"), "SHELL_SPAWN", "ShellError")
 }
 
 // ---------------------------------------------------------------------------
