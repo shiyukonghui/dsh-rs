@@ -2177,4 +2177,55 @@ M4h 桩后状态；subagent_runtime.rs / dsh_cli_host / M4HostServices 均为本
 
 ---
 
+## D-054（M5 需求分析·环境实测修正）：M5 依赖清单——沙箱 Schannel 是唯一障碍，网络真实可达
+
+**日期**：2026（M5 需求阶段）
+
+**触发问题**：前几轮把「portable-pty 不在缓存 → P1(a) 不可行」「globset/ignore 无、
+fs-search 归 M6」归因于**离线受限**，依据是此前 cargo fetch/check 的 TLS 失败（历史曾
+记为出网被阻）。用户提示「网络可达，只是受限执行环境假故障，需给清单手动安装」。需用
+实测修正需求结论，并把安装清单交付用户。
+
+**实测（本日，全部直接验证）**：
+1. `rsproxy.cn:443` TCP 可达（`Test-NetConnection` True）；镜像源运行态无代理变量。
+2. **Node `fetch('https://rsproxy.cn/index/config.json')` → 200（len 81）**；**Python
+   `urllib` 同 URL → 200（len 81）**——Node/Python 用自家 TLS 栈，穿透正常。
+3. **cargo / git / PowerShell 全部失败于同一根因**：`schannel: AcquireCredentialsHandle
+   failed: SEC_E_NO_CREDENTIALS (0x8009030E)`——沙箱把「凭据/证书存储」从 TLS 上下文
+   剥掉，凡走 Windows Schannel 的传输（cargo、git、PowerShell curl）都挂；Node/Python
+   底层 OpenSSL/自栈不受影响。→ **这是沙箱运行环境假故障，非用户机器网络问题**。
+4. cargo registry `cache/` 目录在本沙箱**不可写**（写测试被拒）→ 我无法在沙箱内自补
+   依赖；必须由用户在无受限沙箱环境跑一次 fetch/build。
+
+**依赖现状盘点（registry 实查）**：
+- **已提取（registry/src 存在，可离线编译）**：jiff 全家（0.2.35/jiff-core/jiff-static/
+  jiff-tzdb/jiff-tzdb-platform）、globset 0.4.18、ignore 0.4.26、which 6.0.3、
+  sysinfo 0.38.4、nix 0.30.1、windows-sys 0.45~0.61、winapi、walkdir、memchr、
+  glob、regex、tempfile、chrono 0.2/0.4、portable-atomic 等——**M5 绝大多数候选在列**。
+- **缓存 .crate 但未提取 src**：globset/ignore 等需**一次普通 cargo check** 即入 src
+  （用户无沙箱环境跑一次即可）；portable-pty 连 .crate 都不在（indexMeta=False）。
+
+**最终选择**：M5 级依赖釐清如下，给出用户手动安装清单（command 见 M5-DEPENDENCIES.md）：
+
+| 依赖 | M5 用途 | 状态 | 需用户操作 |
+|---|---|---|---|
+| portable-pty 0.8 | terminal PTY / spawnTerminal（P1(a) 落地前提） | **缺（无 .crate 无 meta）** | `cargo fetch`/build 一次（离线路径随后可用） |
+| globset 0.4 / ignore 0.4 | fs glob/grep 引擎（参考 ripgrep 二进制 → 用同源 crate） | 已缓存待提取 | 一次 cargo check 即提取 |
+| jiff 0.2 + jiff-tzdb | P2 IANA 全时区（2026 spike 已验证离线可编译运行） | 已提取 | 无 |
+| nix/windows-sys/libc/winapi | subprocess 树级终止/PTY 平台 FFI | 已提取 | 无 |
+| which/sysinfo/tempfile/regex | 裸名可执行查找 / 进程存活 / spill / 正则 | 已提取 | 无 |
+| strip-ansi-escapes | shell 输出 ANSI 剥离（参考 shell machine 用） | **不在本地** | 需求决策 P4 后按需 fetch |
+
+**理由**：环境结论要 `DECISIONS` 权威化——「离线受限」是环境假象，真实约束 = ①沙箱
+Schannel 无凭据 ②沙箱不可写 cargo 缓存；两者都可通过用户在普通环境的一次 fetch/build
+消除。依赖引入符合方法论四（成熟库直接引入：portable-pty 是 terminal 标准选择、globset/
+ignore 是 ripgrep 同引擎、jiff 是 IANA 时区现代替代）。
+
+**预期影响与回滚点**：本条目不改代码，只修订需求结论与新增依赖随 M5 开关；回滚即删除
+本条目与 M5-DEPENDENCIES.md、M5-REQUIREMENTS.md 对应句。改动 → 提交 → 本条目互查
+（提交信息引用 D-054）。after 需求结论启动设计后，P1(a)（真实 PTY）与 fs-search
+（globset/ignore 引擎）重新变为可选落地而非推定排除。
+
+---
+
 

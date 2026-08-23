@@ -161,11 +161,12 @@ M5i M5-ACCEPTANCE    <- 依赖：上面全部（契约面 + 集成 + 全绿 + cl
 - **e2b**：参考是「experimental POC」+ 外部 E2B 云沙箱（网络/key）——本环境不可跑，且
   属于外部部署面。→ 能力表登记 + `NO_START_CAPABILITIES` 全 false（M4 同款诚实处理）。
 - **fs 搜索工具（glob/grep）**：参考 `tool-fs-search` 靠 **spawn 打包的 ripgrep 二进制**
-  （`@vscode/ripgrep`）+ 固定 argv。Rust 侧无该二进制、不可离线拉取；自造全量
-  glob/grep 引擎超出执行引擎核心范围（属搜索工具面）。→ M5 交付 `read`/`write`/`edit`/
-  `str_replace_editor` 文本工具，glob/grep 以 **seam + 能力探测后诚实 unavailable** 登记
-  （介质：若无 ripgrep 可执行体则不注册/明确不可用，不伪装）；待后续可集成 ripgrep 二进制
-  或引入成熟 glob/grep crate 时补。
+  （`@vscode/ripgrep`）+ 固定 argv。**2026 环境实测修订（D-054）**：Rust 侧不引二进制——
+  `globset` 0.4.18 + `ignore` 0.4.26（ripgrep 同源引擎 crate）已在本地 registry，可直接
+  实现同名工具（glob 匹配 + 目录遍历 + 正则内容匹配，对齐 GLOB_MAX_RESULTS=100 /
+  GREP_MAX_MATCHES=250 / SEARCH_TIMEOUT_MS=30_000 契约）。→ **推断入 M5 可选落地**：
+  M5 交付 `read`/`write`/`edit`/`str_replace_editor` + **真实 glob/grep**（用同源 crate）
+  或用户在裁定表放行时纳入；不再受「ripgrep 二进制不可得」限制。
 - **lsp**：(a) 依赖语言服务器二进制 + fs/subprocess 执行世界；(b) 参考 4 操作
   (goToDefinition/findReferences/goToImplementation/hover) + stdio JSON-RPC，属周边协议
   集成面。→ M5 交付 subprocess 原语后**可做、但不做**；登记 seam + 明确 unavailable，
@@ -210,9 +211,12 @@ M5i M5-ACCEPTANCE    <- 依赖：上面全部（契约面 + 集成 + 全绿 + cl
 - 编译验证在 Windows 主机；bash/pwsh/python 均可执行（`C:\WINDOWS\system32\bash.exe`、
   `D:\Anaconda\python.exe`、node24LTS 存在）——集成测试能用真实子进程；无法抵达的
   平台路径（POSIX 进程组/BigSur seatbelt）以 cfg 门 + 单测中的平台逻辑隔离。
-- 新依赖引入需先评估（方法论四）：`tempfile`/`regex` **已在 lock**；**spike 实测（2026）**：
-  `jiff`/`jiff-tzdb` 全家在本地缓存、**可离线编译+运行**（P2(a) 备选实测可行）；
-  `portable-pty` 不在缓存、**不可离线**（P1(a) 受限确认）；`chrono-tz` 不在缓存。
+- 新依赖引入需先评估（方法论四）：`tempfile`/`regex` **已在 lock**；**2026 环境实测
+  （D-054）**：网络真实可达（Node/Python 直连 rsproxy HTTP 200），此前「离线下拉受限」
+  是沙箱 Schannel 假故障 + 缓存目录不可写的组合；`jiff` 全家 / `globset` 0.4.18 /
+  `ignore` 0.4.26 / `which` 6.0.3 / `sysinfo` / `nix` / `windows-sys` 均已在本地 registry；
+  仅 `portable-pty` 缺、`globset/ignore` 待一次普通 `cargo check` 提取（用户手动安装清单
+  见 `M5-DEPENDENCIES.md`，D-054）。`chrono-tz` 不在本地（P2(a) 用 jiff 已够）。
 - 字段名/wire 形状/错误码逐字对齐参考源码（本文件已列权威来源）；差异显式记录。
 - `bash` tool 参数名：**参考源是 `timeoutMs`（camelCase）**，本 harness GUI 提示用
   `timeout_ms`（snake）——M5 以参考 wire 为准，并记录分叉（凡 dsh 工具参数 schema 就
@@ -264,19 +268,19 @@ M5i M5-ACCEPTANCE    <- 依赖：上面全部（契约面 + 集成 + 全绿 + cl
 
 | 决策 | 选项 | 倾向/影响 |
 |---|---|---|
-| **P1 PTY 依赖** | (a) 引成熟 `portable-pty` 库真实做 terminal(+spawnTerminal)；(b) terminal 推 M6，M5 交付 seam+unavailable | **2026 spike 确认**：`portable-pty` 不在本地缓存、不可离线拉取 → (a) 本环境不可行；**倾向 (b) 先 seam**，待可联网引库时补真实 PTY |
-| **P2 IANA 时区** | (a) 引 `jiff`+`jiff-tzdb`（**已实测可离线**，见下方决策辅助）；(b) 保持 invalid_time_zone 报错 | **2026 spike 修订**：chrono-tz 不可离线，但 `jiff-tzdb` 全套（jiff/jiff-core/jiff-static/jiff-tzdb-platform/crc32fast/serde）已在本地缓存，离线编译+运行校验通过 → (a) 可行；仍留 (b) 备选 |
+| **P1 PTY 依赖** | (a) 引 `portable-pty` 库真实做 terminal(+spawnTerminal)；(b) terminal 推 M6，M5 交付 seam+unavailable | **2026 环境实测修订（D-054）**：`portable-pty` 是本环境唯一缺失 crate，但**网络真实可达**（Node/Python 200），用户装好即可（见 `M5-DEPENDENCIES.md`）→ (a) 重新可行；用户未装前 (b) 保底 |
+| **P2 IANA 时区** | (a) 引 `jiff`+`jiff-tzdb`（**已提取+实测可离线**，见下方决策辅助）；(b) 保持 invalid_time_zone 报错 | **2026 复核（D-054 实查）**：chrono-tz 不在本地，但 `jiff-tzdb` 全套已**提取进 registry/src**（已离线编译+运行验证）→ (a) 无任何依赖障碍即可落地；仍需用户决议取 (a) 或 (b) |
 | **P3 平台沙箱 runner** | (a) seam+失败闭； (b) 引入 Landlock/bwrap FFI（不可离线验证） | 倾向 (a)，真实边界由 fs 进程内围栏承担 |
 | **P4 bash 参数名** | timeoutMs（参考）vs timeout_ms（GUI 现状） | 倾向参考 `timeoutMs`，记录分叉 |
 | **P5 lsp/e2b/out-of-process/jobs Scope** | 全部 M6（登记+诚实桩）；subprocess 原语 M5 已交付其底座 | 倾向 M6（非目标已列） |
 
 **决策辅助（供裁定参考，2026 复核）**
 
-- **P1**：本机无 PTY 验证路径。**2026 spike 实测**：`portable-pty` 不在本地 cargo 缓存
-  （仅 portable-atomic 等传递依赖），`--offline` 不可拉取 → 选 (a) 在本环境**直接失败**。
-  选 (b) 则 M5 交付 `spawnTerminal` 原语 **seam**（握法/信号/owner 语义进 types）+
-  `terminal_open/send/read/signal/close/list` 工具的 `NOT_AVAILABLE` 诚实桩；terminal
-  真实后端随未来可联网引库或平台 PTY 落地（M6）。
+- **P1**：本机无 PTY 验证路径。**2026 环境实测修订（D-054）**：`portable-pty` 不在本地
+  缓存，但网络真实可达——用户普通终端跑一次 `cargo fetch`/`check`（见 `M5-DEPENDENCIES.md`
+  清单）即入缓存 + 提取；装好后选 (a) 真实 terminal（含 spawnTerminal）可落地。未装前
+  选 (b) M5 交付 `spawnTerminal` 原语 **seam**（握法/信号/owner 语义进 types）+
+  `terminal_open/send/read/signal/close/list` 工具的 `NOT_AVAILABLE` 诚实桩。
 - **P2**：承 D-050 已把 `invalid_time_zone` 定为诚实报错并记 README Known Limitations。
   **2026 spike（实测）**：`chrono-tz` 不在本地缓存、不可离线；但 `jiff` 0.2.35 全家
   （jiff-core/jiff-static/jiff-tzdb/jiff-tzdb-platform/crc32fast/serde）**均在缓存内**，
