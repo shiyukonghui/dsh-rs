@@ -2818,5 +2818,49 @@ DECISIONS #1-10 逐条互查 + git 闭环）。read_image 非验收项（#4 仅 
 
 ---
 
+## D-076（M5 收口·step8 M5-ACCEPTANCE）：全量验收全绿 + DECISIONS 追记（dsh-sandbox
+step2 缺条目）+ flaky 测试修复 + #9 边界诚实记录
+
+**日期**：2026（M5 round 29/30）。
+**触发问题**：step8 以 M5-REQUIREMENTS 验收 #1-10 逐条互查收口——发现三处待封闭事项：
+① D-054/D-056 之后 dsh-sandbox（验收 #3 阶梯/writableRoots/系统提示）在 `787f80c` 交付但
+**无对应 DECISIONS 条目**（违反 #10「每子步 DECISIONS 对应」，早于本阶段日志纪律成熟期的
+漏记）；② dsh-fs tests/local.rs 的 `temp_ws` 全测共享 `dshfs-{pid}` 单目录，并行时
+`remove_dir_all` 与别的测试写入竞争 → 偶发「首写失败」flaky（全量跑暴露即 #1 稳定性闭环）；
+③ 验收 #9「handle_rpc_host 集成真实驱动」的实义核对。
+**处置**：
+- **① 追记 dsh-sandbox（D-076 本条一并记账）**：`787f80c` = SandboxMode kebab 阶梯/
+  `wider_modes` 严格更宽单向/`validateEscalationArgs` 同现同缺 + 非空 justification（fail-closed）/
+  `sandboxDenialMarker`+`escalationHintMarker`/`writableRoots`（仅 workspace-write 产名单，
+  read-only/danger → []）；11 测试绿。approved > session > default 三档由 D-075 闭合。
+- **② flaky 修复**：`temp_ws()` 改每测独立目录 `dshfs-{pid}-{seq}`（静态 AtomicU64 自增，
+  **不共享、不 remove**）——并行互不干扰，local 8/8 复跑 3 次稳定；测试稳定是「测试验证」
+  阶段的通过条件（#1 稳定性）。
+- **③ #9 边界诚实记录**：dsh-rs 的工具执行走 `ToolRegistry`+宿主绑定，**不经
+  `handle_rpc`**（那是 M4 会话域 RPC：session.prompt/history/event）。#9 的真实驱动 = M5 工具
+  经 `register_m5_tools_with_host` 扩展（web.rs:33 公开导出）→ 宿主句柄 bind 真实执行
+  （fs/terminal/shell/bash/code 每类真实 e2e）+ 无 handle → NOT_BOUND/UNSUPPORTED（
+  all-tools-visible-unbound 诚实测）+ 投影/事件经既有通道（sandbox/mode 词表已在
+  dsh-session::EventKind，fold 复用会话事件）。**M5 工具进 CLI `serve()` 服务器执行环属
+  M6 serve 里程碑**（serve() 现为 M4 会话 web loop；m5 工具执行面已由 M5Host::assemble
+  生产化，接线入 serve 留 M6）——显式边界，非默默省略。
+**验收证据（step8 实测）**：#1 `cargo test --workspace` **187 组结果全绿零失败** +
+clippy `-D warnings` 零告警 + workspace check 绿（本轮实测）。#2 D-058/060/066；#2a
+D-062 标记词汇 + executor wait_timeout → 树级 terminate（taskkill /T /F + win_job）+
+`[timed out after Nms]`（tool_bash.rs:181）+ timedOut/aborted 互斥。 #3 D-075 + D-076
+追记 + D-074 fold。 #4 D-059 + D-069（read/write/edit 真实执行 + schema + write_intent CAS +
+FS_SANDBOX_DENIED 进程内围栏 + 原子写 + 流式上限；read_image 非验收项 NOT_BOUND 诚实）。
+#5 D-061/062/070/071。 #6 D-065/066/067 + D-073（run_code 真实 python）。
+#7 D-071 + D-072（M5g 真实定时推进）。 #8 D-063/064/068（terminal 6 工具，决策 P 落地）。
+#9 见上。 #10 D-058..076 + git 逐提交可互查。
+**预期影响与回滚点**：仅 dsh-fs tests/local.rs（temp_ws 独立目录）+ DECISIONS.md（追记 +
+收口）；dsh-fs 8/8、全量 187 组绿。回滚 = 撤本提交（修测试夹具，无功能影响）。
+**M5 阶段结论**：需求→设计→编码→测试→部署五个阶段的「测试验证」关卡通过；M5 交付物
+（六 crate + web.rs 接线 + M5Host 生产面）齐套，#1-10 全部有实测/可互查。read_image 与
+run_code 嵌套 tools 派发为诚实降级项（D-069/D-073 记录，非验收项或渐进项）；M5 serve 接线
+归 M6。
+
+---
+
 
 

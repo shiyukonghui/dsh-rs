@@ -7,10 +7,15 @@
 use dsh_fs::{
     FsEditRequest, FsErrorCode, FsVersion, FsWriteIntent, LocalFileSystem, ResolveOptions,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 
+/// 每测独立工作区目录（`dshfs-{pid}-{seq}`，自增后缀）——**不共享、不 remove**：
+/// 共享单目录 + 并行时 `remove_dir_all` 会与别的测试写入竞争（偶发「首写失败」flaky）；
+/// 独立目录各测互不干扰，测试稳定且语义清晰。
 fn temp_ws() -> (LocalFileSystem, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("dshfs-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("dshfs-{}-{seq}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create ws");
     (LocalFileSystem::new(dir.clone()), dir)
 }
