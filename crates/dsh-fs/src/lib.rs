@@ -1,4 +1,14 @@
 //! dsh-fs — M5 文件系统能力缝（设计见 M5-DESIGN.md §4）。
 //!
-//! 处于 M5 阶段三（TDD 编码）骨架状态：provider 契约、本地后端、observation policy、
-//! 进程内围栏、model-facing 工具由红→绿逐步落地。
+//! 阶段三 TDD 骨架：先落地 `types`（FsErrorCode/FsError/branded-target/write-intent/edit-
+//! request/outcome）与 `LocalFileSystem`（resolve/readText/writeText/editText 守卫语义 +
+//! 原子写）。observation policy、sandbox fence、tool-fs 随各自红测陆续加入。
+
+mod local;
+mod types;
+
+pub use local::LocalFileSystem;
+pub use types::{
+    FsEditOutcome, FsEditRequest, FsError, FsErrorCode, FsReadText, FsTarget, FsTargetKey,
+    FsVersion, FsWriteIntent, FsWriteOutcome, ReadTextOptions, ResolveOptions,
+};
