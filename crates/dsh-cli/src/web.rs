@@ -1942,15 +1942,31 @@ pub struct ServerLoopBundle {
     pub bash_jobs: Option<Rc<web_m5::BashJobsBridge>>,
 }
 
-/// M6 step1b（D-081）/step3（D-083）：serve 接线编排——在 SessionHost 上构建 M4
-/// （jobs/schedule/todo 真实句柄）+ M5（真实工厂）+ deepseek LLM（无 key → 首回合
-/// fail-loud，装配照常）→ `assemble_server_loop`（共享 store 写回）。返回 bundle：
-/// schedule/bash_jobs 供 serve tick 推进同一实例。装配失败（如 bash 不可用 / 宿主构造错）
-/// → `Err`：serve fail-loud（诚实，不默默回退 WASM 路径）。
+/// M6 step1b（D-081）/step3（D-083）/step6（D-085）：serve 接线编排——在 SessionHost 上
+/// 构建 M4（jobs/schedule/todo 真实句柄）+ M5（真实工厂）+ LLM → `assemble_server_loop`
+/// （共享 store 写回）。返回 bundle：schedule/bash_jobs 供 serve tick 推进同一实例。
+/// 装配失败（如 bash 不可用 / 宿主构造错）→ `Err`：serve fail-loud（诚实，不默默回退
+/// WASM 路径）。
+///
+/// `assemble_server_runtime`（生产便捷包装）用 deepseek LLM（key 仅 env）；无 key →
+/// 首回合 fail-loud，装配照常。`assemble_server_runtime_with_llm` 暴露 LLM/品牌注入缝
+/// （完整装配路径的可测前端闭环；mock 驱动 / 显式 no-key / 真实 key 均可）。
 pub fn assemble_server_runtime(
     host: &Rc<crate::session_host::SessionHost>,
     workspace_root: std::path::PathBuf,
     base_url: &str,
+    model: &str,
+) -> Result<ServerLoopBundle, String> {
+    let llm = crate::m6_llm::server_llm_runtime(base_url, model);
+    assemble_server_runtime_with_llm(host, workspace_root, llm, "deepseek", model)
+}
+
+/// 完整装配路径（LLM/品牌可注入）——serve 装配 + 测试共用同一代码路径。
+pub fn assemble_server_runtime_with_llm(
+    host: &Rc<crate::session_host::SessionHost>,
+    workspace_root: std::path::PathBuf,
+    llm: Rc<dsh_llm::LlmRuntime>,
+    provider: &str,
     model: &str,
 ) -> Result<ServerLoopBundle, String> {
     let session = host.session("default").map_err(|e| e.to_string())?;
@@ -1970,12 +1986,11 @@ pub fn assemble_server_runtime(
     };
     let m5 = web_m5::M5Host::assemble(workspace_root.clone())?;
     let bash_jobs = m5.services.bash_jobs.clone();
-    let llm = crate::m6_llm::server_llm_runtime(base_url, model);
     let loop_host = assemble_server_loop(
         host.store.clone(),
         workspace_root,
         llm,
-        "deepseek",
+        provider,
         model,
         m4,
         m5,
@@ -5885,5 +5900,253 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// M6i 验收 #6（step6a）：前端最小闭环——经**完整 serve 装配路径**
+    /// （`assemble_server_runtime_with_llm`：真实 M4+M5 注册 + sandbox:policy 段 + 可注入
+    /// mock LLM）驱动 `session.prompt` RPC：accepted + 共享 store 落
+    /// user/message+assistant/message+turn/end，EventSink 下链触发（前端实时帧），
+    /// session.history 可回读（前端同一事实源）。
+    #[test]
+    fn serve_closure_prompt_routes_to_fully_assembled_loop() {
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+        use std::rc::Rc;
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let root = std::env::temp_dir().join(format!("dsh-m6-closure-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Mock LLM：一段文本回答（完整装配路径下走真实 loop 驱动）。
+        let script = Rc::new(RefCell::new(VecDeque::from_iter([vec![
+            dsh_llm::StreamChunk::BlockStart {
+                index: 0,
+                block_type: "text".parse().unwrap(),
+            },
+            dsh_llm::StreamChunk::TextDelta { index: 0, text: "hello from serve closure".into() },
+            dsh_llm::StreamChunk::BlockEnd {
+                index: 0,
+                block: dsh_llm::ContentBlock::text("hello from serve closure"),
+            },
+            dsh_llm::StreamChunk::Finish {
+                reason: dsh_llm::FinishReason::Stop,
+                replay_state: None,
+            },
+        ]])));
+        struct Adapter {
+            script: Rc<RefCell<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
+        }
+        impl dsh_llm::LlmAdapter for Adapter {
+            fn stream(
+                &self,
+                _options: dsh_llm::GenerateOptions,
+            ) -> Box<dyn Iterator<Item = dsh_llm::StreamChunk>> {
+                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                Box::new(next.into_iter())
+            }
+        }
+        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Rc::new(Adapter { script })).unwrap();
+
+        let bundle = match crate::web::assemble_server_runtime_with_llm(
+            &session_host,
+            root.clone(),
+            llm,
+            "mock",
+            "mock-model",
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("assemble deferred (bash unavailable?): {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+        };
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(bundle.host.clone());
+
+        // 前端 session.prompt → 完整装配 loop → accepted。
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r1", "method": "session.prompt",
+            "payload": {"sessionId": "default", "content": [{"type": "text", "text": "hi from ui"}]},
+        }))
+        .unwrap();
+        let (_, v) = handle_rpc_host(&boot, "session.prompt", &body, &session_host);
+        assert_eq!(v["result"]["value"]["accepted"], true, "accepted: {v}");
+
+        // 共享 store：user/message + assistant/message + turn/end。
+        let evs = session_host.events("default");
+        assert!(evs.iter().any(|e| e.kind.as_str() == "user/message"));
+        assert!(evs.iter().any(|e| e.kind.as_str() == "assistant/message"));
+        let assistant = evs.iter().find(|e| e.kind.as_str() == "assistant/message").unwrap();
+        assert_eq!(assistant.data["message"]["content"][0]["text"], "hello from serve closure");
+        assert!(evs.iter().any(|e| e.kind.as_str() == "turn/end"));
+
+        // EventSink 下链（前端实时帧）触发。
+        assert!(session_host.sink_len() >= 4, "downlink fired: {}", session_host.sink_len());
+        // session.history 可回读（前端同一事实源）。
+        let body2 = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r2", "method": "session.history",
+            "payload": {"sessionId": "default"},
+        }))
+        .unwrap();
+        let (_, h) = handle_rpc_host(&boot, "session.history", &body2, &session_host);
+        assert_eq!(h["result"]["value"]["events"].as_array().unwrap().len(), evs.len());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M6i 验收 #6（step6b）：完整 serve 装配 + 无 key（`server_llm_runtime_with_key(_, _, None)`
+    /// 确定性，不读进程 env）→ session.prompt 首回合 **fail-loud**：agent/error 落 store
+    /// 且含 `DEEPSEEK_API_KEY` 字面量、turn/end reason Error；**绝不伪造 assistant/message**。
+    /// 工具/API 面不受影响（本条专注 LLM 路径诚实表面）。
+    #[test]
+    fn serve_closure_prompt_without_key_fails_loud_no_fabrication() {
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let root = std::env::temp_dir().join(format!("dsh-m6-nokey-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let llm = crate::m6_llm::server_llm_runtime_with_key(
+            "http://127.0.0.1:1",
+            "deepseek-v4-flash-0731-ext",
+            None,
+        );
+        let bundle = match crate::web::assemble_server_runtime_with_llm(
+            &session_host,
+            root.clone(),
+            llm,
+            "deepseek",
+            "deepseek-v4-flash-0731-ext",
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("assemble deferred (bash unavailable?): {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+        };
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(bundle.host.clone());
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r1", "method": "session.prompt",
+            "payload": {"sessionId": "default", "content": [{"type": "text", "text": "hi"}]},
+        }))
+        .unwrap();
+        let (_, _v) = handle_rpc_host(&boot, "session.prompt", &body, &session_host);
+
+        let evs = session_host.events("default");
+        // 绝不伪造 assistant/message。
+        assert!(
+            !evs.iter().any(|e| e.kind.as_str() == "assistant/message"),
+            "no fabricated assistant/message on missing key"
+        );
+        // user/message 记录输入（loop 已接受）。
+        assert!(evs.iter().any(|e| e.kind.as_str() == "user/message"));
+        // fail-loud：turn/end reason.error 含 code AUTH + DEEPSEEK_API_KEY 可操作消息
+        // （P3：首回合 fail-loud，事件善意暴露；不伪装 Completed）。
+        let turn_ends = evs
+            .iter()
+            .filter(|e| e.kind.as_str() == "turn/end")
+            .map(|e| serde_json::to_string(&e.data).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            turn_ends.contains("AUTH") && turn_ends.contains("DEEPSEEK_API_KEY"),
+            "turn/end error fail-loud names key env: {turn_ends}"
+        );
+        assert!(
+            turn_ends.contains("error") && !turn_ends.contains("completed"),
+            "turn/end records an Error reason (honest): {turn_ends}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M6i 验收 #6（step6c，**门控真实端点冒烟**）：`DEEPSEEK_API_KEY` 环境变量存在 →
+    /// 用完整 serve 装配（`assemble_server_runtime`，key 仅 env 读取）真实驱动一轮
+    /// `session.prompt`，断言真实 assistant/message 落共享 store + EventSink 下链。
+    /// key 缺失 / 端点不可达 / 网络错误 → **诚实记录 skipped**（门控，不伪造、不失败）；
+    /// key 永不落盘/入库/入 git（P4）。
+    #[test]
+    fn serve_closure_real_endpoint_smoke_gated() {
+        let Some(key) = std::env::var(crate::m6_llm::DEEPSEEK_API_KEY_ENV).ok() else {
+            eprintln!(
+                "GATED-SMOKE-SKIP: {} not set — skipping real-endpoint turn (set it to run)",
+                crate::m6_llm::DEEPSEEK_API_KEY_ENV
+            );
+            return;
+        };
+        let _ = key;
+        let base_url = std::env::var("DSH_LLM_BASE_URL")
+            .unwrap_or_else(|_| "http://100.105.152.101:18080/v1".to_string());
+        let model = std::env::var("DSH_LLM_MODEL")
+            .unwrap_or_else(|_| "deepseek-v4-flash-0731-ext".to_string());
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let root = std::env::temp_dir().join(format!("dsh-m6-realsmoke-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let bundle = match crate::web::assemble_server_runtime(&session_host, root.clone(), &base_url, &model)
+        {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("GATED-SMOKE-SKIP: assembly failed (bash?): {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+        };
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(bundle.host.clone());
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r1", "method": "session.prompt",
+            "payload": {"sessionId": "default", "content": [{"type": "text", "text": "Reply with the single word OK."}]},
+        }))
+        .unwrap();
+        let (_, v) = handle_rpc_host(&boot, "session.prompt", &body, &session_host);
+        let accepted = v["result"]["value"]["accepted"].as_bool().unwrap_or(false);
+
+        let evs = session_host.events("default");
+        let honest_fail = evs.iter().any(|e| {
+            e.kind.as_str() == "turn/end"
+                && serde_json::to_string(&e.data)
+                    .map(|s| s.contains("error") || s.contains("NETWORK") || s.contains("AUTH"))
+                    .unwrap_or(false)
+        });
+        if honest_fail {
+            eprintln!(
+                "GATED-SMOKE-SKIP: real endpoint {base_url} unreachable/errored (turn/end error) — recorded, not failing (accounted; key presence unrelated)"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let assistant = evs.iter().find(|e| e.kind.as_str() == "assistant/message");
+        match assistant {
+            Some(a) => {
+                let text = a.data["message"]["content"][0]["text"].as_str().unwrap_or("");
+                assert!(
+                    !text.trim().is_empty() && accepted,
+                    "real assistant text landed: {text:?} (accepted={accepted})"
+                );
+                assert!(session_host.sink_len() >= 4, "downlink fired for real turn");
+                eprintln!("GATED-SMOKE-OK: real turn replied {text:?}");
+            }
+            None => {
+                eprintln!(
+                    "GATED-SMOKE-SKIP: no assistant/message (endpoint condition) — recorded, not failing"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

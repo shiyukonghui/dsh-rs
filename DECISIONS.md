@@ -3131,5 +3131,44 @@ M6-ACCEPTANCE。剩余真实 LLM 冒烟需用户侧 `DEEPSEEK_API_KEY` 环境变
 
 ---
 
+## D-085（M6 编码·step6）：前端最小闭环——完整 serve 装配路径驱动 `session.prompt` +
+注入缝 + 无 key fail-loud + 门控真实端冒烟（验收 #6）
+
+**日期**：2026（M6 round 4）。
+**触发问题**：step1-5 已把 loop/tick/sandbox 装配完整；前端最小闭环需证明「完整装配路径」
+（非手工构造宿主）下 session.prompt 经前端 RPC 驱动 loop、事件经共享 store 下链/回读。
+**自下而上实测定案**：① 既有 `run_rust_loop`→`host.followup`→RPC `session.prompt` 已接线
+（M2g 手工宿主测覆盖）；**缺口** = 完整装配路径 + 可注入 LLM 缝 + 无 key fail-loud RPC 语义 +
+真实端门控冒烟。② loop 对 LLM 错误：stream Err / error-finish chunk → `Halt::Failed` →
+turn/end reason**error** + 事件落 store，**不伪造 assistant/message**（agent.rs 结构化收尾）。
+③ 无 key 时 deepseek 适配器把 resolver Err 转成 `assistant/chunk` finish-error
+（code AUTH + `missing DEEPSEEK_API_KEY: set it to enable agent turns, then retry`）+ turn/end
+error——诚实表面（fail-loud 可操作消息在事件里，无已完成伪装）。
+**实现（注入缝）**：抽 `assemble_server_runtime_with_llm(host, ws_root, llm, provider, model)`
+（完整装配路径，mock/显式 no-key/真实 key 共用）；`assemble_server_runtime`（生产）=
+它 + `server_llm_runtime`（key 仅 env）+ provider "deepseek" 的便捷包装——serve 与测试同
+代码路径。
+**红测 / 绿**：**6a**（mock LLM + 完整装配 + `session.prompt`）→ accepted:true + 共享 store
+user/message+assistant/message+turn/end + EventSink sink≥4（前端实时帧）+ session.history
+回读长度一致；**6b**（`server_llm_runtime_with_key(_,_,None)` 确定性无 key）→ 无伪造
+assistant/message + user/message 记录输入 + turn/end reason.error 含 `AUTH` 与
+`DEEPSEEK_API_KEY` 字面量（P3；工具/API 面照常）；**6c**（**门控真实端冒烟**）→ 仅当
+`DEEPSEEK_API_KEY` 存在：真实 `assemble_server_runtime` 驱动一轮，真实 assistant 文本落
+store + 下链；key 缺失/端不可达/网络错 → 诚实 `GATED-SMOKE-SKIP`（不失败、不伪造；key
+永不落盘/入 git，P4）。**踩坑**：AUTH 失败走 `assistant/chunk` finish-error + turn/end error
+（无 `agent/error` 事件）——断言对准 turn/end（比 agent/error 稳定）。**副产品**：request/header
+暴露真实 system prompt 含 `sandbox: policy — effective mode read-only`（step4 在完整装配
+路径交叉确认）。
+**证据**：dsh-cli 103 测全绿 + workspace clippy `-D warnings` 零告警 + check 绿。回滚 =
+撤本提交。
+**待办**：穿插篮（settings/.env 装配、provider caps、hooks/skill、ts-host diff/SQLite）→
+step11 M6-ACCEPTANCE（含真实端门控冒烟：需用户侧 `DEEPSEEK_API_KEY` +
+base http://100.105.152.101:18080/v1 + model deepseek-v4-flash-0731-ext）。主线 step1-6 已
+完成（装配/生命周期/tick/sandbox 投影/前端闭环）。
+
+---
+
+---
+
 
 
