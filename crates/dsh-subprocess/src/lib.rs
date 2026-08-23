@@ -10,10 +10,11 @@ mod types;
 use std::ffi::OsString;
 
 pub use backend::{spawn, SubprocessHandle};
+#[cfg(windows)]
+mod win_job;
 pub use types::{
-    ChildStdio, CollectedOutput, ProcessError, Signal, StdinMode, StdoutMode,
-    SubprocessCollect, SubprocessOutcome, SubprocessSpawnSpec, SubprocessSpill,
-    SubprocessTerminalSignal,
+    ChildStdio, CollectedOutput, ProcessError, Signal, StdinMode, StdoutMode, SubprocessCollect,
+    SubprocessOutcome, SubprocessSpawnSpec, SubprocessSpill, SubprocessTerminalSignal,
 };
 
 /// 子进程环境条目（键/值均透传 OsString，仅供 `scrubbed_parent_env` 使用）。

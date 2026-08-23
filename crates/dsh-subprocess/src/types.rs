@@ -188,12 +188,21 @@ pub struct CollectedOutput {
 
 impl CollectedOutput {
     pub fn from_bytes(data: Vec<u8>, lossy: bool, spill_path: Option<PathBuf>) -> Self {
-        Self { data, lossy, spill_path }
+        Self {
+            data,
+            lossy,
+            spill_path,
+        }
     }
 
     /// 从 offset 起按 UTF-8 损失型转换（`readFrom(0)` = 全量）。
     pub fn read_from(&self, offset: usize) -> String {
         String::from_utf8_lossy(&self.data[offset.min(self.data.len())..]).into_owned()
+    }
+
+    /// 当前缓冲的字节长度（增量读取游标下界：`nextOffset = data_len()`）。
+    pub fn data_len(&self) -> usize {
+        self.data.len()
     }
 
     pub fn lossy(&self) -> bool {
@@ -204,4 +213,3 @@ impl CollectedOutput {
         self.spill_path.as_deref()
     }
 }
-

@@ -2357,4 +2357,59 @@ sr_editor 15，dsh-fs 合计 98 全绿，clippy 零告警，workspace check 绿�
 
 ---
 
+## D-060（M5 编码·dsh-subprocess 扩展）：Windows 树终止改 Job Object；新增 wait_timeout/settle 读取/offset 读取原语
+
+**日期**：2026（M5 round 13）。
+**触发问题**：dsh-shell（step4）的前台超时杀、后台句柄读取、被 kill 终态都需要如下原语：
+`wait_timeout`（同步超时轮询，不杀）、settle 后完整读取（collector drain-to-EOF 再缓存终态）、
+`terminate` 写终态、增量 `read_stdout(offset)`/`read_stderr(offset)`。改完 `terminate` 后
+`terminate_kills_running_child` 挂 29s：此沙箱拒绝 `taskkill`（Access denied），只有 taskkill
+杀树时孙进程（`ping`）存活并握着收集管道直到自然结束，`finish_settle` join collector
+被撑满。
+**考虑的选项**：1. **Windows Job Object 树终止（本次采用）**——spawn 后立即
+`AssignProcessToJobObject`（后代自动继承 job 成员），设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，
+`terminate` 用 `TerminateJobObject` 整树杀；taskkill 降为静音兜底，`std child.kill()` 仍做
+确定性兜底。2. taskkill 保持 + `child.kill()` 兜底：能终止直系，但受限环境下孙进程存活、
+collector join 被撑满（就是触发问题的样子）。3. 为 join 设超时/跳过：牺牲「终止后必拿完整
+流」的正确性，掩盖树终止缺失。
+**最终选择**：选项 1（`crates/dsh-subprocess/src/win_job.rs`，`#[cfg(windows)]`）。
+**选择理由**：Job Object 是 Windows 整树终止的稳健原语（无 PID 复用竞态、后代自动继承、
+`TerminateJobObject` 即时整树杀，强于 `taskkill /T /F`，且受限环境下仍有效），符合
+M5-DESIGN §2.5 树终止语义；`win_job.rs` 侧已经验证 terminate 测试从 29s 降到 0.04s。
+**预期影响与回滚点**：子进程被赋入带 `KILL_ON_JOB_CLOSE` 的 job——句柄 Drop 即整树终止
+（进程已结束则为 no-op）；无对外 API 变化。新增原语：`wait_timeout(Duration)->Option<outcome>`
+（10ms 轮询 try_wait，不杀）、`finish_settle`（join collectors + 缓存终态）、
+`read_stdout/read_stderr(offset)` + `stdout_len/stderr_len/stdout_lossy/stderr_lossy/...spill_path`、
+`CollectedOutput::data_len()`；`dsh-shell` 仅依赖这些面。环境注记：`taskkill` 的 stderr 被静音
+（它是兜底）；回滚 = 撤本提交即回 taskkill 版。
+
+---
+
+## D-061（M5 编码·dsh-shell 核心）：request/spec 分裂 + resolve clamp + bash-local 后端与沙箱内 bash 不可用的测试门控
+
+**日期**：2026（M5 round 13）。
+**触发问题**：step4 第一块——dsh-shell 能力缝：需要 `flake` 参考 `shell/shell + bash-local`
+的 request/spec 分裂与 resolve（缺省兜底：timeout 120s / max 600s / maxOutputBytes 64KiB /
+spill 64MiB / grace 3s，`clampTimeout` 算术）、bash `-c` 后端与后台句柄。同时发现本 DSH
+沙箱（Windows）**无法启动任何 bash**：Git Bash(msys) 创建 signal pipe/共享内存被拒
+（Win32 error 5，exit 0xC0000142），WSL 启动器 `CreateInstance/E_ACCESSDENIED`。
+**考虑的选项**：1. **bash 程序解析 = config.bash_path 显式 > Windows 候选（Git Bash 优先）>
+裸 `bash`（本次采用）**：避开 system32\bash 这个 WSL 启动器。2. 测试改走 `cmd`/假后端：
+背叛「真实 bash 语义」的验收目标。3. **Executor 集成测试用一次性可用性探测自跳**
+（`tests/executor.rs`）：探测失败则打印明确原因（非实现缺陷）并跳过，在 Linux/正常
+开发机/CI 上真实跑。4. `ShellRunResult.aborted` 恒 false：dsh-subprocess 信号面尚未接线
+（step5+ 再补）。5. `ShellExecRequest` 暂不携带 `sandbox_policy` 字段：非 confining 后端
+忽略之，sandboxing executor 落地时再随其类型加入。
+**最终选择**：选项 1 + 选项 3 + 4、5 记录在案。
+**选择理由**：bash 解析与统一 baseline 直接复刻参考；探测门控是「环境不可用则显式跳过、
+可用则真实跑」的诚实门控（方法论四：环境问题是临时阻碍，不降级架构也不假绿）；
+aborted/sandbox_policy 是 D-054 已标注的延后面，不提前造类型。
+**预期影响与回滚点**：`crates/dsh-shell/` 新增 `types/resolve/executor` 三模块 +
+`tests/resolve.rs`（6 纯面）+ `tests/executor.rs`（7 集成，本箱 7 用例探测到 bash 不可用
+即跳过，全绿）；decode_errors 引用 `DEFAULT_MAX_SPILL_BYTES=64MiB` 等常量集中导出。
+回滚 = 撤本提交。
+
+---
+
+
 

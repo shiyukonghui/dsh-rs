@@ -100,7 +100,12 @@ fn scrub_handles_lowercase_key_pattern_via_uppercase_probe() {
     ];
     let out: Vec<(String, String)> = scrubbed_parent_env(&src)
         .into_iter()
-        .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.to_string_lossy().into_owned(),
+            )
+        })
         .collect();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].0, "normal");

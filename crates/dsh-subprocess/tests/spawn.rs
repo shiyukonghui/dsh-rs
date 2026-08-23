@@ -11,11 +11,17 @@ fn echo_argv(text: &str) -> (String, Vec<String>) {
     #[cfg(windows)]
     {
         // cmd /c echo <text> —— text 为纯字母数字避免转义歧义
-        ("cmd".to_string(), vec!["/c".to_string(), "echo".to_string(), text.to_string()])
+        (
+            "cmd".to_string(),
+            vec!["/c".to_string(), "echo".to_string(), text.to_string()],
+        )
     }
     #[cfg(not(windows))]
     {
-        ("/bin/sh".to_string(), vec!["-c".to_string(), format!("echo {text}")])
+        (
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), format!("echo {text}")],
+        )
     }
 }
 

@@ -59,9 +59,7 @@ fn drain_pipe<R: Read + Send + 'static>(
                                 spill_path = Some(path.clone());
                                 spill_file = Some(std::io::BufWriter::new(file));
                                 use std::io::Write;
-                                let _ = spill_file
-                                    .as_mut()
-                                    .and_then(|w| w.write_all(&tail).ok());
+                                let _ = spill_file.as_mut().and_then(|w| w.write_all(&tail).ok());
                                 // 已溢出：完整流落盘，内存清空（readFrom(0) 恢复自 spill）
                                 tail.clear();
                             }
@@ -81,7 +79,10 @@ fn drain_pipe<R: Read + Send + 'static>(
         use std::io::Write;
         let _ = file.flush();
     }
-    CollectResult { data: tail, spill_path }
+    CollectResult {
+        data: tail,
+        spill_path,
+    }
 }
 
 /// 单测可并发的短 ID（生产侧将由宿主注入唯一前缀）。
@@ -95,25 +96,28 @@ fn uuid_fallback() -> String {
 }
 
 /// 有界收集：后台线程 drain 管道 → 内存 capped + 可选 spill。
+/// 返回 (结果槽, join 句柄)——wait 时 join 以便「流排干后再 settle」（镜像参考
+/// done 在 stdio 关闭后 resolve 的语义）。
 fn start_collector(
     reader: impl Read + Send + 'static,
     cfg: &SubprocessCollect,
-) -> Arc<Mutex<CollectedOutput>> {
+) -> (Arc<Mutex<CollectedOutput>>, thread::JoinHandle<()>) {
     let max_bytes = cfg.max_bytes;
-    let spill = cfg
-        .spill
-        .as_ref()
-        .map(|s| (s.max_bytes, s.dir.clone()));
-    let out = Arc::new(Mutex::new(CollectedOutput::from_bytes(Vec::new(), false, None)));
+    let spill = cfg.spill.as_ref().map(|s| (s.max_bytes, s.dir.clone()));
+    let out = Arc::new(Mutex::new(CollectedOutput::from_bytes(
+        Vec::new(),
+        false,
+        None,
+    )));
     let out2 = out.clone();
-    thread::spawn(move || {
+    let join = thread::spawn(move || {
         let res = drain_pipe(reader, max_bytes, spill);
         // lossy：原字节非合法 UTF-8 → 标记（供诊断；前端 lossy-render 据此提示）
         let lossy = std::str::from_utf8(&res.data).is_err();
         let mut slot = out2.lock().expect("collector lock");
         *slot = CollectedOutput::from_bytes(res.data, lossy, res.spill_path);
     });
-    out
+    (out, join)
 }
 
 /// 参考 `spawn()`（`subprocess-local/src/spawn.ts`）：装配零默认 spec → 真实子进程。
@@ -179,8 +183,13 @@ pub fn spawn(spec: &SubprocessSpawnSpec) -> Result<SubprocessHandle, ProcessErro
         }
     }
 
-    let mut child = cmd.spawn().map_err(|e| ProcessError::Spawn(e.to_string()))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ProcessError::Spawn(e.to_string()))?;
     let pid = child.id();
+
+    // 收集线程 join 句柄（settle 时 join：流排干后再缓存 outcome）
+    let mut pending_joins: Vec<thread::JoinHandle<()>> = Vec::new();
 
     // stdin WriteBytes：写入后关闭（一次性数据）
     if let StdinMode::WriteBytes(data) = &spec.stdio.stdin {
@@ -195,14 +204,18 @@ pub fn spawn(spec: &SubprocessSpawnSpec) -> Result<SubprocessHandle, ProcessErro
     let stdout_slot = match &spec.stdio.stdout {
         StdoutMode::Collect(cfg) => {
             let rd = child.stdout.take().expect("collect stdout piped");
-            Some(start_collector(rd, cfg))
+            let (slot, join) = start_collector(rd, cfg);
+            pending_joins.push(join);
+            Some(slot)
         }
         _ => None,
     };
     let stderr_slot = match &spec.stdio.stderr {
         StdoutMode::Collect(cfg) => {
             let rd = child.stderr.take().expect("collect stderr piped");
-            Some(start_collector(rd, cfg))
+            let (slot, join) = start_collector(rd, cfg);
+            pending_joins.push(join);
+            Some(slot)
         }
         _ => None,
     };
@@ -212,8 +225,18 @@ pub fn spawn(spec: &SubprocessSpawnSpec) -> Result<SubprocessHandle, ProcessErro
         pid,
         stdout_slot,
         stderr_slot,
+        joins: pending_joins,
         outcome: None,
         grace_ms: spec.grace_ms,
+        #[cfg(windows)]
+        job: {
+            // spawn 后立即赋入 job（其后代自动继承成员资格）；失败静默降级。
+            let job = crate::win_job::Job::new();
+            if let Some(j) = &job {
+                let _ = j.add_pid(pid);
+            }
+            job
+        },
     })
 }
 
@@ -223,39 +246,78 @@ pub struct SubprocessHandle {
     pub pid: u32,
     stdout_slot: Option<Arc<Mutex<CollectedOutput>>>,
     stderr_slot: Option<Arc<Mutex<CollectedOutput>>>,
+    joins: Vec<thread::JoinHandle<()>>,
     outcome: Option<SubprocessOutcome>,
     grace_ms: u64,
+    #[cfg(windows)]
+    job: Option<crate::win_job::Job>,
 }
 
 impl SubprocessHandle {
     /// 等待运行结束；settle 一次（首次后缓存），从不 reject。
+    /// 返回前 join 收集线程：进程退出后管道关闭 → 收集器到 EOF → 结果落槽，
+    /// 保证「流排干后再读」不丢尾（镜像参考 done 在 stdio 关闭后 resolve）。
     pub fn wait(&mut self) -> SubprocessOutcome {
         if let Some(o) = &self.outcome {
             return o.clone();
         }
-        let outcome = if let Some(child) = self.child.as_mut() {
-            let status = child.wait();
-            match status {
-                Ok(st) => {
-                    if let Some(code) = st.code() {
-                        SubprocessOutcome { exit_code: Some(code), signal: None }
-                    } else if st.success() {
-                        SubprocessOutcome { exit_code: Some(0), signal: None }
-                    } else {
-                        // 信号终止（code() == None）：按平台惯例推断
-                        SubprocessOutcome { exit_code: None, signal: None }
+        let outcome = self.reap_child();
+        self.finish_settle(outcome)
+    }
+
+    /// 带超时的等待：在 `timeout` 内进程退出则返回 outcome，否则返回 None
+    /// （不 kill；调用方自行 terminate）。单线程核心的同步超时手段（try_wait 轮询）。
+    pub fn wait_timeout(&mut self, timeout: std::time::Duration) -> Option<SubprocessOutcome> {
+        if let Some(o) = &self.outcome {
+            return Some(o.clone());
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.try_reap_child() {
+                Some(outcome) => return Some(self.finish_settle(outcome)),
+                None => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
                     }
-                }
-                Err(_) => {
-                    // wait 错误不应出现；归为运行异常而非 spawn 级
-                    SubprocessOutcome { exit_code: None, signal: None }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
             }
-        } else {
-            SubprocessOutcome { exit_code: None, signal: None }
-        };
+        }
+    }
+
+    /// 子进程 wait + 收集线程 join，缓存 outcome。
+    fn finish_settle(&mut self, outcome: SubprocessOutcome) -> SubprocessOutcome {
+        for join in self.joins.drain(..) {
+            let _ = join.join();
+        }
         self.outcome = Some(outcome.clone());
         outcome
+    }
+
+    /// 阻塞 wait 子进程并映射 outcome。
+    fn reap_child(&mut self) -> SubprocessOutcome {
+        if let Some(child) = self.child.as_mut() {
+            match child.wait() {
+                Ok(st) => map_status(st),
+                Err(_) => SubprocessOutcome {
+                    exit_code: None,
+                    signal: None,
+                },
+            }
+        } else {
+            SubprocessOutcome {
+                exit_code: None,
+                signal: None,
+            }
+        }
+    }
+
+    /// 非阻塞 try_wait；未退出 → None。
+    fn try_reap_child(&mut self) -> Option<SubprocessOutcome> {
+        self.child
+            .as_mut()
+            .and_then(|c| c.try_wait().ok().flatten())
+            .map(map_status)
     }
 
     /// 收集的 stdout 全量（readFrom(0) 语义，非消费）。
@@ -274,13 +336,116 @@ impl SubprocessHandle {
             .unwrap_or_default()
     }
 
+    /// 增量读取：从 `offset` 起的 stdout 文本（非消费快照）。
+    pub fn read_stdout(&self, offset: usize) -> String {
+        self.stdout_slot
+            .as_ref()
+            .map(|s| s.lock().expect("stdout lock").read_from(offset))
+            .unwrap_or_default()
+    }
+
+    /// 增量读取：从 `offset` 起的 stderr 文本。
+    pub fn read_stderr(&self, offset: usize) -> String {
+        self.stderr_slot
+            .as_ref()
+            .map(|s| s.lock().expect("stderr lock").read_from(offset))
+            .unwrap_or_default()
+    }
+
+    /// 当前 stdout 缓冲的字节长度（增量游标下界）。
+    pub fn stdout_len(&self) -> usize {
+        self.stdout_slot
+            .as_ref()
+            .map(|s| s.lock().expect("stdout lock").data_len())
+            .unwrap_or(0)
+    }
+
+    /// 当前 stderr 缓冲的字节长度。
+    pub fn stderr_len(&self) -> usize {
+        self.stderr_slot
+            .as_ref()
+            .map(|s| s.lock().expect("stderr lock").data_len())
+            .unwrap_or(0)
+    }
+
+    /// stdout 是否损失型（原字节非合法 UTF-8）。
+    pub fn stdout_lossy(&self) -> bool {
+        self.stdout_slot
+            .as_ref()
+            .map(|s| s.lock().expect("stdout lock").lossy())
+            .unwrap_or(false)
+    }
+
+    /// stderr 是否损失型。
+    pub fn stderr_lossy(&self) -> bool {
+        self.stderr_slot
+            .as_ref()
+            .map(|s| s.lock().expect("stderr lock").lossy())
+            .unwrap_or(false)
+    }
+
+    /// stdout 完整流 spill 文件（若溢出落盘）。
+    pub fn stdout_spill_path(&self) -> Option<std::path::PathBuf> {
+        self.stdout_slot.as_ref().and_then(|s| {
+            s.lock()
+                .expect("stdout lock")
+                .spill_path()
+                .map(|p| p.to_path_buf())
+        })
+    }
+
+    /// stderr 完整流 spill 文件（若溢出落盘）。
+    pub fn stderr_spill_path(&self) -> Option<std::path::PathBuf> {
+        self.stderr_slot.as_ref().and_then(|s| {
+            s.lock()
+                .expect("stderr lock")
+                .spill_path()
+                .map(|p| p.to_path_buf())
+        })
+    }
+
     /// 终止（树级；本次增量先落 Windows taskkill + unix killpg 骨架，后续细化）。
+    /// 终止后 settle 终态 outcome（wait 缓存），供调用方读取被 kill 后的状态。
     pub fn terminate(&mut self) {
-        if let Some(child) = self.child.as_mut() {
+        if let Some(mut child) = self.child.take() {
             let pid = child.id();
+            // 树级终止：优先平台原语（Windows Job Object / unix killpg），taskkill 兜底；
+            // 受限环境两者被拒时仍用 std child.kill() 保证确定性终止。
+            #[cfg(windows)]
+            if let Some(job) = &self.job {
+                job.kill();
+            }
             let _ = kill_tree(pid, self.grace_ms);
-            let _ = child.wait();
-            self.child = None;
+            let _ = child.kill();
+            let outcome = match child.wait() {
+                Ok(st) => map_status(st),
+                Err(_) => SubprocessOutcome {
+                    exit_code: None,
+                    signal: None,
+                },
+            };
+            self.finish_settle(outcome);
+        }
+    }
+}
+
+/// 参考 `map_status`（`spawn.ts`）：把 `std::process::ExitStatus` 映成 outcome。
+fn map_status(st: std::process::ExitStatus) -> SubprocessOutcome {
+    if let Some(code) = st.code() {
+        SubprocessOutcome {
+            exit_code: Some(code),
+            signal: None,
+        }
+    } else if st.success() {
+        SubprocessOutcome {
+            exit_code: Some(0),
+            signal: None,
+        }
+    } else {
+        // 信号终止（code() == None）：按平台惯例推断
+        SubprocessOutcome {
+            exit_code: None,
+            signal: None,
         }
     }
 }
@@ -291,6 +456,8 @@ fn kill_tree(pid: u32, _grace_ms: u64) -> std::io::Result<()> {
     {
         let _ = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
         Ok(())
     }
