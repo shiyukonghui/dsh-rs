@@ -16,3 +16,7 @@ pub use types::{
 /// 进程内沙箱围栏（写路径守卫）。
 pub mod sandbox;
 pub use sandbox::{checked_target, SandboxPolicy};
+
+/// observation policy（read-before-edit / version CAS 决策）。
+pub mod policy;
+pub use policy::{Observation, ObservationGate, OwnerId};
