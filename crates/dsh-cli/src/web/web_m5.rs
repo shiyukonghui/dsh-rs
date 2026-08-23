@@ -14,6 +14,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 use dsh_fs::grep::{
     format_grep_output, retain_grep_matches, GrepMatch, RetainedMatches, GREP_MAX_LINE_BYTES,
@@ -252,6 +255,64 @@ impl BashJobsBridge {
     pub fn read(&self, id: &str, caller: Option<&str>) -> Result<JobRead, dsh_jobs::JobOpsError> {
         self.registry.borrow_mut().read(id, caller)
     }
+}
+
+// ---------------------------------------------------------------------------
+// M5g 定时推进（M5-DESIGN §8；M5-REQUIREMENTS 验收 #7）：服务层线程 tick → mpsc →
+// 主线程 `m5g_tick_once`（ScheduleHost::dispatch_due 到期注入 + BashJobsBridge::pump
+// 合作结算——非手工）。核心（折叠/到期/jobs 泵）留在主线程；线程只发 tick（Send 安全）。
+// ---------------------------------------------------------------------------
+
+/// 服务层 tick 发送器：每 `interval_ms` 向 mpsc 推一个 tick；`Drop` 置停（线程退出）。
+pub struct M5gTick {
+    rx: mpsc::Receiver<()>,
+    stop: Arc<AtomicBool>,
+}
+
+impl M5gTick {
+    /// 起服务层线程（间隔 ≥1ms；线程名 m5g-tick）。
+    pub fn start(interval_ms: u64) -> Self {
+        let (tx, rx) = mpsc::channel::<()>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = stop.clone();
+        let tx_t = tx;
+        let _handle = std::thread::Builder::new()
+            .name("m5g-tick".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(interval_ms.max(1)));
+                if stop_t.load(Ordering::Relaxed) || tx_t.send(()).is_err() {
+                    break;
+                }
+            });
+        M5gTick { rx, stop }
+    }
+
+    /// 主线程阻塞等一个 tick（带超时）；false = 超时（避免无限等待）。
+    pub fn wait_tick(&self, timeout: Duration) -> bool {
+        self.rx.recv_timeout(timeout).is_ok()
+    }
+}
+
+impl Drop for M5gTick {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // 线程 sleep 最迟 interval_ms 后退出；handle 已 detach（Builder::spawn 在线程退出
+        // 时释放名字内存，join 由 stop 旗标保证有界）。
+    }
+}
+
+/// 主线程 tick_once：ScheduleHost 到期注入（dispatch_due）+ jobs 桥合作结算（pump）。
+/// 返回 (framing 文本, 派发的 schedule id)。由 M5g 主循环消费服务线程的 tick 调用。
+pub fn m5g_tick_once(
+    sched: &Rc<crate::web::dsh_cli_host::ScheduleHost>,
+    bridge: Option<&BashJobsBridge>,
+    now_epoch: i64,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let (framing, dispatched) = sched.dispatch_due(now_epoch)?;
+    if let Some(b) = bridge {
+        b.pump();
+    }
+    Ok((framing, dispatched))
 }
 
 /// M5h 宿主服务句柄集合：M5 工具组的 bind 目标。

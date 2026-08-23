@@ -4842,4 +4842,138 @@ mod tests {
         // 清理
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    fn m5g_epoch_now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    /// M5i 接线 #6（验收 7）：M5g 服务层 tick 线程 → mpsc → 主线程 tick_once 自动驱动
+    /// schedule 到期（**非手工** dispatch_due：主循环只消费线程 tick，到期由 tick_once
+    /// 触发）。after(0s) 记录经线程 tick 自动派发 + 落日志。
+    #[test]
+    fn m5g_tick_service_thread_drives_schedule_dispatch_automatically() {
+        let host_store = SessionHost::in_memory();
+        let _ = host_store.session("default");
+        let sched_session = host_store.session("default").expect("default live");
+        let sched = Rc::new(dsh_cli_host::ScheduleHost::new(sched_session));
+        let now = m5g_epoch_now_ms();
+        let id = sched
+            .create("after", "m5g automation ping", Some(1), None, None, now)
+            .expect("create after(1)");
+
+        let tick = web_m5::M5gTick::start(15);
+        let mut fired = false;
+        // 主循环：仅消费服务线程 tick → tick_once（唯一触发点；不直接调 dispatch_due）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        for _ in 0..300 {
+            assert!(std::time::Instant::now() < deadline, "tick starvation");
+            if !tick.wait_tick(std::time::Duration::from_millis(50)) {
+                continue;
+            }
+            let (_framing, dispatched) = web_m5::m5g_tick_once(&sched, None, m5g_epoch_now_ms())
+                .expect("tick_once ok");
+            if dispatched.contains(&id) {
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired, "schedule {id} auto-fired via service tick (non-manual)");
+        // 派发事件已落会话日志（schedule/change ≥2：create + dispatch）。
+        let evs = host_store.events("default");
+        let sched_events = evs
+            .iter()
+            .filter(|e| e.kind == dsh_session::types::EventKind::ScheduleChange)
+            .count();
+        assert!(sched_events >= 2, "create + dispatch events: {sched_events}");
+    }
+
+    /// M5i 接线 #7（验收 5/7）：M5g 服务线程 tick 自动结算 bash 后台 job（**非手工** pump：
+    /// 主循环只 eat tick → tick_once（bridge.pump 内建），job 终态自动 arrive）。
+    #[test]
+    fn m5g_tick_auto_settles_bash_background_job() {
+        use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
+        fn bash_available() -> bool {
+            #[cfg(windows)]
+            {
+                ["C:\\Program Files\\Git\\bin\\bash.exe", "C:\\Program Files\\Git\\usr\\bin\\bash.exe", "C:\\Windows\\System32\\bash.exe"]
+                    .iter()
+                    .any(|p| std::path::Path::new(p).exists())
+            }
+            #[cfg(not(windows))]
+            {
+                true
+            }
+        }
+        if !bash_available() {
+            eprintln!("bash unavailable; skipping M5g auto-settle test");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("dsh-m5-tick-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+
+        let registry = ToolRegistry::new(ToolExecutionMode::Native);
+        let shost = Rc::new(web_m5::ShellHost::new(root.clone()).expect("shell host"));
+        let bridge = Rc::new(web_m5::BashJobsBridge::new());
+        register_m5_tools_with_host(
+            &registry,
+            Some(&M5HostServices {
+                terminal: None,
+                fs: None,
+                shell: Some(shost),
+                bash_jobs: Some(bridge.clone()),
+            }),
+        );
+
+        let res = registry.execute(
+            &ToolExecutionInput::new(
+                "bg1",
+                "bash",
+                serde_json::json!({
+                    "command": "sleep 0.2; echo auto-settled",
+                    "description": "M5g auto-settle",
+                    "run_in_background": true,
+                }),
+                Some("agent-1".into()),
+            ),
+            None,
+        );
+        assert!(!res.is_error, "bg start: {:?}", res.error);
+        let job_id = res.value.unwrap()["jobId"].as_str().expect("jobId").to_string();
+
+        // 主循环：只 eat tick → tick_once(sched, bridge)（内建 pump），绝不手工 pump。
+        let host_store = SessionHost::in_memory();
+        let _ = host_store.session("default");
+        let sched = Rc::new(dsh_cli_host::ScheduleHost::new(
+            host_store.session("default").expect("sess"),
+        ));
+        let tick = web_m5::M5gTick::start(15);
+        let now = m5g_epoch_now_ms();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut settled = false;
+        for _ in 0..300 {
+            assert!(std::time::Instant::now() < deadline, "job never settled");
+            if !tick.wait_tick(std::time::Duration::from_millis(50)) {
+                continue;
+            }
+            let _ = web_m5::m5g_tick_once(&sched, Some(bridge.as_ref()), now)
+                .expect("tick_once ok");
+            if let Ok(read) = bridge.read(&job_id, Some("agent-1")) {
+                if read.snapshot.status.as_str() == "completed" {
+                    assert!(read.text.contains("auto-settled"), "full output: {}", read.text);
+                    settled = true;
+                    break;
+                }
+            }
+        }
+        assert!(settled, "bash bg job auto-settled via M5g service tick");
+
+        // 清理
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

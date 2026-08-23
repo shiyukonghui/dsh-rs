@@ -2696,5 +2696,34 @@ step8 M5-ACCEPTANCE。
 
 ---
 
+## D-072（M5 编码·step7e）：M5g 定时推进（验收 #7）——服务层线程 tick（mpsc）→ 主线程
+`m5g_tick_once`（`ScheduleHost::dispatch_due` 到期注入 + `BashJobsBridge::pump` 合作结算）；
+真实线程自动化测试（schedule after(1s) 自动派发落日志 / bash 后台 job 自动 settle**非手工**）
+
+**日期**：2026（M5 round 21/22）。
+**触发问题**：M5-REQUIREMENTS 验收 #7 要求 schedule「真实定时推进（宿主 tick 线程 + mpsc →
+`dispatch_due` 自动触发，非手工）；M5-DESIGN §8：服务层线程 tick（1s 或配置间隔）→ mpsc 桥 →
+主线程 `ScheduleHost::dispatch_due(now_epoch)`；M5g 同时驱动 jobs 泵。
+**考虑的选项**：1. **`M5gTick`（服务线程仅发 tick）+ `m5g_tick_once(sched, bridge, now)`（主线程泵，
+采用）**：核心（ScheduleHost 折叠/到期 + BashJobsBridge::pump）留主线程——两者均 Rc/RefCell 非
+Send，线程只推 mpsc tick（Send 安全），D-004 单线程注册表承诺不变。2. 线程直接持 Rc<ScheduleHost>
+/RefCell<JobRegistry>（非 Send 不可共享，弃）。3. tick 进 serve() 请求循环（M5 服务器面未在
+dsh-rs CLI 装配，无附着点；作宿主侧注入点预留，弃）。
+**tick_once 语义**：dispatch_due → ((framing, dispatched)) → bridge.pump() → Ok。M5g 主循环
+只 `wait_tick` eat tick 后调 tick_once；测试证明「非手工」：schedule after(1s) 经线程 tick
+自动派发（dispatch 事件落会话日志 ≥2）；bash 后台 `sleep 0.2; echo auto-settled` 经 tick 自动
+settle completed + 全文，全程零手工 dispatch_due/pump。M5gTick Drop 置停（线程链路有界退出）。
+**诚实限制（D 记录）**：M5gTick 是服务层 tick 输送器；真实 M5 服务器装配（serve 宿主注入点）
+仍按 M5-DESIGN 在宿主侧预留；本实现交付「线程 + mpsc + 主线程泵」三件套 + 自动化证明，满足验收
+#7 可测试语义。SAND/read_image/run_code 仍待（D-070 严格）。
+**预期影响与回滚点**：web_m5.rs（M5gTick + m5g_tick_once）+ web.rs（2 集成测试：schedule 自动
+派发落日志 / bash 后台自动 settle，bash 不可用平台门控跳过）；dsh-cli 88 测试全绿 + clippy 零
+告警 + workspace check 绿。回滚 = 撤本提交。
+**待办**：SAND/mode 会话事件投影（effectiveSandboxMode fold + sandbox:policy 系统提示段）、
+read_image 解码绑定、run_code 传输替换、web.rs 宿主装配（M5HostServices 生产工厂）、
+step8 M5-ACCEPTANCE。
+
+---
+
 
 
