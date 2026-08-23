@@ -482,6 +482,73 @@ pub fn sandbox_policy_segment(
 /// `sandbox:policy` 段在系统提示中的 order（100–199 工具指引带内；§3.3 约定 110）。
 pub const SANDBOX_POLICY_ORDER: f64 = 110.0;
 
+/// M6 step9（D-088）：skill = 通用 prompt 段注册——`SystemPrompt::section` 的统一入口
+/// （step4 sandbox:policy 同一条缝）。`text` 静态文本，组装可见；重名（同 scope）→ `Err`。
+/// 动态段用 `dsh_system_prompt::PromptSectionText::Fn` 经 `register_sandbox_policy_section`
+/// 走本函数（同缝）。
+pub fn register_prompt_section(
+    prompt: &dsh_system_prompt::SystemPrompt,
+    name: &str,
+    order: f64,
+    text: String,
+) -> Result<(), String> {
+    let _undo = prompt.section(
+        None,
+        &PromptSection {
+            name: name.to_string(),
+            order,
+            text: PromptSectionText::Static(text),
+            complete: false,
+        },
+    )?;
+    Ok(())
+}
+
+/// M6 step9（D-088）：宿主否决谓词——`(tool_name) -> Option<reason>`；`Some` → deny。
+pub type HostVeto = dyn Fn(&str) -> Option<String>;
+
+/// M6 step9（D-088）：hooks = pre-execute 宿主钩子——dsh-tools pre-decision 缝延伸。
+/// 每次工具执行前调用：先向 `session` 记录 `hookInvoked`（tool/callId/agent，与 TS
+/// `HookInvoked` 对齐，`EventKind::HookInvoked`），再按 `veto` 裁决：`Some(reason)` →
+/// `PreToolDecision::Deny`（工具被拒，原因上抛）；`None` → 放行（delegate）。
+/// 装配方可注册多个；首个非 None 即最终决策（dsh-tools 语义）。
+pub fn register_pre_execute_hook(
+    registry: &dsh_tools::ToolRegistry,
+    session: Rc<dsh_session::Session>,
+    veto: Rc<HostVeto>,
+) -> Result<(), String> {
+    use dsh_session::types::EventKind;
+    let sess = session.clone();
+    let veto2 = veto.clone();
+    registry
+        .add_pre_decision(
+            Rc::new(move |exec| {
+                let _ = sess.append(
+                    EventKind::HookInvoked,
+                    serde_json::json!({
+                        "tool": exec.call.name,
+                        "toolCallId": exec.call.call_id,
+                        "agent": exec.call.agent,
+                    }),
+                    None,
+                );
+                veto2(&exec.call.name).map(|reason| dsh_tools::PreToolDecision::Deny { reason })
+            }),
+            None,
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// M6 step9（D-088）：把「记录 + 放行」的宿主 pre-execute 钩子接到装配 loop 上
+/// （`assemble_server_loop` 调用；记录供宿主钩子面可见，放行保持既有语义）。
+pub fn wire_recording_pre_execute_hook(
+    registry: &dsh_tools::ToolRegistry,
+    session: Rc<dsh_session::Session>,
+) -> Result<(), String> {
+    register_pre_execute_hook(registry, session, Rc::new(|_name| None))
+}
+
 /// M6 step4（D-084）：沙箱投影——把动态 `sandbox:policy` 段（order 110，Fn provider）
 /// 注册进 loop 的 SystemPrompt。provider 每次装配从共享 store 的 default 会话事件
 /// 现算 `resolve_sandbox_mode(None, events)`（approved 缝缺省无通道 → fail-closed 走

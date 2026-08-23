@@ -1946,7 +1946,18 @@ pub fn assemble_server_loop(
             resume_session_id: None,
         }],
     };
-    let host = dsh_agent_loop::AgentLoopHost::with_store(config, llm, tools, session_store)?;
+    let host = dsh_agent_loop::AgentLoopHost::with_store(config, llm, tools.clone(), session_store)?;
+    // M6 step9（D-088）：宿主 pre-execute 钩子——把「记录 + 放行」钩子接上共享
+    // `default` 会话（dsh-tools pre-decision 缝延伸；`hookInvoked` 事件记录 vs TS
+    // `HookInvoked` 对齐；放行保持既有语义）。
+    {
+        let sid = dsh_session::types::SessionId::from_raw("default".to_string());
+        let session = host
+            .store
+            .get(&sid)
+            .ok_or_else(|| "default session missing for pre-execute hook".to_string())?;
+        web_m5::wire_recording_pre_execute_hook(&tools, session)?;
+    }
     // M6 step4（D-084）：sandbox:policy 投影——把动态段（order 110）注册进宿主 prompt；
     // provider 每次装配从共享 store 现算有效沙箱模式（fail-closed 缺省 read-only）。
     web_m5::register_sandbox_policy_section(
@@ -6141,6 +6152,187 @@ mod tests {
             "caps default contextWindow present"
         );
         assert_eq!(caps["retry"]["mode"], "normal", "real retry policy view");
+    }
+
+    /// M6i 验收 step9（D-088）：skill = 通用 prompt 段注册——`register_prompt_section`
+    /// （skill: 能力段；step4 sandbox:policy 同一缝的通用化）。静态段组装可见；重名 Err。
+    #[test]
+    fn skill_prompt_section_registers_generic() {
+        use dsh_system_prompt::{Config as PromptConfig, SystemPrompt};
+        let prompt = SystemPrompt::new(&PromptConfig::default(), Rc::new(|| {})).expect("prompt");
+        // skill 段（order 120：工具指引带内；复用 step4 同一的 section 缝）。
+        web_m5::register_prompt_section(
+            &prompt,
+            "skill:grep",
+            120.0,
+            "skill:grep — the grep tool is available.\n".to_string(),
+        )
+        .expect("skill section registers");
+        let assembly = prompt.assemble(&Default::default()).unwrap();
+        let seg = assembly
+            .sections
+            .iter()
+            .find(|s| s.name == "skill:grep")
+            .expect("skill section in assembly");
+        assert!(seg.text.contains("grep tool is available"), "{}", seg.text);
+        // 重名 → Err（唯一名不变式）。
+        let dup = web_m5::register_prompt_section(
+            &prompt,
+            "skill:grep",
+            120.0,
+            "dup".to_string(),
+        );
+        assert!(dup.is_err(), "duplicate skill section rejected");
+    }
+
+    /// M6i 验收 step9（D-088）：hooks = pre-execute 宿主钩子——装配级否决。
+    /// `assemble_server_loop` 已接记录钩子（`hookInvoked` 落共享 store）；再叠一个
+    /// 宿主否决钩子（deny bash）。mock LLM 一轮请求 bash → 钩子否决：hookInvoked
+    /// 记录（tool=bash）+ 拒绝原因上抛到事件流；其余工具保持放行。
+    #[test]
+    fn m6_loop_turn_host_pre_execute_veto_denies_bash() {
+        use dsh_llm::{CallId, ContentBlock, FinishReason, StreamChunk, ToolCallBlock};
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+
+        fn bash_chunks(id: &str) -> Vec<StreamChunk> {
+            let args = r#"{"command":"ls","description":"list"}"#;
+            vec![
+                StreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: CallId::from_raw(id),
+                    name: Some("bash".into()),
+                    arguments_delta: args.into(),
+                },
+                StreamChunk::BlockEnd {
+                    index: 0,
+                    block: ContentBlock::ToolCall(ToolCallBlock {
+                        id: CallId::from_raw(id),
+                        name: "bash".into(),
+                        arguments: args.into(),
+                    }),
+                },
+                StreamChunk::Finish {
+                    reason: FinishReason::ToolCalls,
+                    replay_state: None,
+                },
+            ]
+        }
+
+        fn text_chunks(text: &str) -> Vec<StreamChunk> {
+            vec![
+                StreamChunk::BlockStart {
+                    index: 0,
+                    block_type: "text".parse().unwrap(),
+                },
+                StreamChunk::TextDelta {
+                    index: 0,
+                    text: text.into(),
+                },
+                StreamChunk::BlockEnd {
+                    index: 0,
+                    block: ContentBlock::text(text),
+                },
+                StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay_state: None,
+                },
+            ]
+        }
+
+        struct Adapter {
+            script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>,
+        }
+        impl dsh_llm::LlmAdapter for Adapter {
+            fn stream(
+                &self,
+                _options: dsh_llm::GenerateOptions,
+            ) -> Box<dyn Iterator<Item = StreamChunk>> {
+                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                Box::new(next.into_iter())
+            }
+        }
+        let script = Rc::new(RefCell::new(VecDeque::from_iter([
+            bash_chunks("b1"),
+            text_chunks("bash was denied"),
+        ])));
+        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Rc::new(Adapter { script }))
+            .unwrap();
+
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let m4 = M4HostServices {
+            jobs: None,
+            schedule: None,
+            todo: None,
+        };
+        let root = std::env::temp_dir().join(format!("dsh-m6-hook-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let loop_host = assemble_server_loop(
+            session_host.store.clone(),
+            root.clone(),
+            llm,
+            "mock",
+            "mock-model",
+            m4,
+            m5,
+        )
+        .expect("assemble ok");
+
+        // 宿主否决钩子叠上（记录钩子已由装配接好；否决钩子先落先裁决）。
+        {
+            let sid = dsh_session::types::SessionId::from_raw("default".to_string());
+            let session = loop_host
+                .store
+                .get(&sid)
+                .expect("default session in shared store");
+            web_m5::register_pre_execute_hook(
+                &loop_host.tools,
+                session,
+                Rc::new(|name| {
+                    if name == "bash" {
+                        Some("bash disabled by host hook".to_string())
+                    } else {
+                        None
+                    }
+                }),
+            )
+            .expect("veto hook registers");
+        }
+
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(loop_host.clone());
+        crate::run_rust_loop(&boot, "default", "run bash ls")
+            .expect("turn runs to completion");
+
+        // 证据 1：hookInvoked 记录了 bash（pre-execute 钩子真实触发）。
+        let evs = session_host.events("default");
+        let tools_visited: Vec<String> = evs
+            .iter()
+            .filter(|e| e.kind == dsh_session::types::EventKind::HookInvoked)
+            .map(|e| e.data["tool"].as_str().unwrap_or("?").to_string())
+            .collect();
+        assert!(
+            tools_visited.iter().any(|t| t == "bash"),
+            "hookInvoked fired for bash: {tools_visited:?}"
+        );
+        // 证据 2：拒绝原因上抛（工具结果/错误流的串行化文本含宿主否决理由）。
+        let whole: String = evs
+            .iter()
+            .map(|e| serde_json::to_string(&e.data).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            whole.contains("bash disabled by host hook"),
+            "deny reason surfaced in event stream (got: {whole})"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// M6i 验收 #6（step6c，**门控真实端点冒烟**）：`DEEPSEEK_API_KEY` 环境变量存在 →

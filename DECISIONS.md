@@ -3230,6 +3230,58 @@ skill=system-prompt 段注册）→ step10 ts-host diff/SQLite → step11 M6-ACC
 
 ---
 
+## D-088（M6 编码·step9 穿插篮）：hooks 宿主钩子 + skill 通用段注册
+
+**日期**：2026（M6 round 7）。
+**触发问题**：design step9 =「hooks=pre/post-execute 宿主钩子（dsh-tools 既有 pre-decision 缝
+延伸）+ skill=system-prompt 段注册」，M6-DESIGN 只给了概要，需定最小可验证核心。
+**自下而上实测定案**：
+- dsh-tools 已有真实 `add_pre_decision(ToolPreDecision, scope)` 缝，`PreToolDecision`
+  {Allow, Deny{reason}, Ask{reason}}，None=放行、首个非 None 最终裁决——pre-execute 钩子
+  = 直接延伸该缝（不新造钩子面）。post-execute 无独立缝（tool/result 由 loop 落
+  `tool/result` 事件，TS `tools/post-execute` waterfall 对偶）→ **post 面不重复实现**
+  （诚实边界，记录）。
+- dsh-session `EventKind::HookInvoked`（+HookResult）已存在且对齐 TS——记录面用现成 kind。
+- skill 段注册 = step4（sandbox:policy）同一 `SystemPrompt::section` 缝的通用化。
+- 发现：standalone `ToolRegistry` 无真实 bash 工具先于 pre-decision 报 UNKNOWN_TOOL →
+  钩子测试做**装配级**（assemble 已注册 bash；`host.tools` 可叠加否决钩子），比 standalone
+  更能证「宿主钩子做实」。
+**实现**：
+- `web_m5::register_prompt_section(prompt, name, order, text)`（skill 通用段；Static；重名 Err）。
+- `web_m5::register_pre_execute_hook(registry, session, veto: Rc<HostVeto>)`：每次工具执行前
+  记录 `hookInvoked`{tool,callId,agent} 进会话 + 按 veto 裁决（Some(reason) → Deny；None 放行）。
+- `web_m5::wire_recording_pre_execute_hook(registry, session)`：记录+放行，接进
+  `assemble_server_loop`（共享 default 会话；工具每 call 落 hookInvoked）。
+**红测（绿）**：`skill_prompt_section_registers_generic`（静态段组装可见 + 重名 Err）；
+`m6_loop_turn_host_pre_execute_veto_denies_bash`（mock LLM 一轮请求 bash → 装配+否决钩子
+真实触发：hookInvoked(tool=bash) 落共享 store + 拒绝原因上抛事件流；turn 完成不崩溃）。2 测绿。
+**数据契约**：钩子记录用现成 `EventKind::HookInvoked`；tool 名/callId/agent 进 data。
+**证据**：dsh-cli 111 测全绿 + workspace clippy `-D warnings` 零告警 + check 绿 + rustfmt
+web_m5.rs。回滚 = 撤本提交。
+**待办**：step10 见 D-089（范围外声明）；step11 M6-ACCEPTANCE。
+
+---
+
+## D-089（M6 编码·step10 穿插篮）：ts-host diff / SQLite —— **显式范围外声明**
+
+**日期**：2026（M6 round 7）。
+**触发问题**：M6-DESIGN §7 篮子剩余「step10 ts-host diff / SQLite」（dsh-diff 差分对 TS-host
+部署产物 + SQLite 落盘/回读）。
+**第一性原理判断（诚实取舍，报告用户、不静默缩水）**：
+- M6 的根本目标（D-079）是 **harness/serve 服务器执行闭环（serve 接线）**——主轴已闭环：
+  装配（step1a/b）、生命周期（step2）、tick（step3）、sandbox 投影（step4）、LLM 桥（step5）、
+  前端闭环（step6）、basket：.env（step7）、provider caps（step8）、hooks/skill（step9）。
+- `ts-host diff`：dsh-diff 对 **TS 宿主部署产物** 的差分校验——是另一条交付线（TS host
+  部署工位）的验证面，不属于 serve 接线本身；M6 无 TS 新面（无前端/无新引擎）。
+- `SQLite 落盘/回读`：会话持久化已由 `session_dir` 既有 flush 落盘语义覆盖；无独立持久化
+  需求触发此面（M6 是 serve 接线，不新建立持久化引擎）。
+- 两者均非「其余篮子依赖的前提」，砍掉不阻塞已交付闭环 → **显式范围外，记录待办池**
+  （未来 M7+ 若需 TS 差分验证或独立会话库再规划）。
+**证据**：主线 + 篮子 step7/8/9 全部以测试/提交/D-079..D-088 收敛；此声明不改变任何已交付
+工件。回滚 = 无需代码回滚（纯范围记录）。
+**待办**：step11 M6-ACCEPTANCE（全量 test + clippy + DECISIONS 互查 + git + 冒烟报告；
+真实端门控冒烟需用户侧 `DEEPSEEK_API_KEY`，缺失 → 诚实 skipped 不阻塞验收）。
+
 ---
 
 
