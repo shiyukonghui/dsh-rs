@@ -53,6 +53,10 @@ pub struct Boot {
     /// M2g：可选的 Rust AgentLoopHost（装配了真实 agent-loop 服务；Some 时
     /// `session.prompt`/`agent.run` 改驱 Rust loop，None 保留 M1 WASM loop 路径）。
     pub agent_loop: Option<Rc<dsh_agent_loop::AgentLoopHost>>,
+    /// M6（step8，D-087）：装配 loop 的真实 provider catalog 视图
+    /// （`server_catalog_view`：models 目录 + 容量默认 + 重试策略）。`llm.models`
+    /// 以此做 provider caps 列录；None（未启用 agent_loop）→ 回退既有 Boot.llm 目录。
+    pub agent_catalog: Option<serde_json::Value>,
     /// M3b：settings 能力缝（namespace 注册 + describe/update/replace/mutate + 文件）。
     /// `Rc<RefCell>`——web RPC 只持 `&Boot`，跨请求共享可变状态。
     pub settings: Rc<std::cell::RefCell<dsh_settings::SettingsProvider>>,
@@ -230,6 +234,7 @@ pub fn boot(
         llm,
         refresh,
         agent_loop: None,
+        agent_catalog: None,
         settings,
         credentials: Rc::new(std::cell::RefCell::new(
             dsh_credentials::CredentialProvider::memory(),

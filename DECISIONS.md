@@ -3197,5 +3197,40 @@ step11 M6-ACCEPTANCE（真实端门控冒烟需用户侧 `DEEPSEEK_API_KEY`）�
 
 ---
 
+## D-087（M6 编码·step8 穿插篮）：provider caps 做实——llm.models 从真实 catalog 列录
+
+**日期**：2026（M6 round 6）。
+**触发问题**：`llm.models` RPC 此前由 `Boot.llm`（WASM-rt）注册表驱动，只有模型名数组；
+装配 loop 的真实 `DeepSeekConnection.models` catalog（容量/重试/模式）未上 RPC。
+**自下而上实测定案**：① caps 真实数据位于 m6_llm 装配的 `DeepSeekConnection`（models 目录 +
+default_context_window/max_tokens + retry_policy），适配器闭包内、无暴露缝——由 serve「装配即
+注入」最简洁（base/model 在 serve 局部）而非反向从 AgentLoopHost 里挖。② `ResolvedRetryPolicy`
+无 Serialize derive → 手构 retry 视图（mode + maxRetries/retryableCodes + backoff）。③
+`RequestDefaults` 字段为 `thinking: Option<Thinking>`/`reasoning_effort: Option<Effort>`（无
+Display）→ `{:?}` 小写渲染。④ wire 形状保持：groups 只含 `{id,name,models:[{id,name}]}`（既有
+schema consumer 兼容），容量/重试走 `llm.models` value 的**增量 `caps`** 字段（不破坏既存
+groups 消费方）。
+**实现**：`m6_llm::server_catalog_view(base, model)` → `{provider, models[含 contextWindow/
+maxTokens/inputModalities 精确项], defaults{contextWindow,maxTokens,thinking,reasoningEffort},
+retry{mode,…}}`（真实值，缺省以 defaults 为准不伪造）。`Boot.agent_catalog: Option<Value>`
+（None 默认；boot()/boot_with_sessions 各 +None）；serve 装配成功后
+`boot.agent_catalog = Some(server_catalog_view(...))`；`llm_catalog` 有 catalog 时优先列真实
+groups（回退逻辑保留）；`llm.models` value += `caps`。
+**红测（绿）**：`server_catalog_view_lists_real_deepseek_caps`（provider/models 含装配模型 +
+defaults 容量 >0 + retry.mode 在）；`llm_models_reflects_assembled_catalog_caps`（groups 真实
+provider+模型 wire 形状 + caps 容量/重试真实；handle_rpc 全链路）。2 测绿。
+**诚实边界**：目录只含装配 catalog（`DeepSeekCatalogModel::new` 无精确容量 → 该模型条目
+省略 contextWindow/maxTokens，走 defaults——不伪造精确值）；前端可发现的真实模型列表取决于
+catalog 装配（本实现含装配模型 + defaults 语义）。
+**证据**：dsh-cli 109 测全绿 + workspace clippy `-D warnings` 零告警 + check 绿。回滚 = 撤本
+提交。
+**待办**：step9 hooks/skill（hooks=pre/post-execute 宿主钩子（dsh-tools pre-decision 缝延伸）；
+skill=system-prompt 段注册）→ step10 ts-host diff/SQLite → step11 M6-ACCEPTANCE（真实端门控
+冒烟需用户侧 `DEEPSEEK_API_KEY`）。
+
+---
+
+---
+
 
 

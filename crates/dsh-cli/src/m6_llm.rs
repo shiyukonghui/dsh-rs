@@ -89,6 +89,80 @@ pub fn server_llm_runtime(base_url: &str, model: &str) -> Rc<LlmRuntime> {
     server_llm_runtime_with_key(base_url, model, key.as_deref())
 }
 
+/// M6 step8（D-087）：provider caps 做实——从真实 `DeepSeekConnection.models` catalog
+/// 构建 provider 目录视图（wire `llm.models` groups 消费 id/name；`caps` 增量附加
+/// contextWindow/maxTokens/inputModalities + 默认容量 + 重试策略）。诚实：只列真实
+/// catalog 条目（装配模型精确值缺省时以 defaults 为准，不伪造容量）。
+pub fn server_catalog_view(base_url: &str, model: &str) -> serde_json::Value {
+    use dsh_llm::retry::ResolvedRetryPolicy;
+    let conn = deepseek_connection(base_url, model);
+    let models: Vec<serde_json::Value> = conn
+        .models
+        .iter()
+        .map(|m| {
+            let mut o = serde_json::Map::new();
+            o.insert("id".into(), serde_json::Value::String(m.id.clone()));
+            if let Some(n) = &m.name {
+                o.insert("name".into(), serde_json::Value::String(n.clone()));
+            }
+            if let Some(d) = &m.description {
+                o.insert("description".into(), serde_json::Value::String(d.clone()));
+            }
+            if let Some(c) = m.context_window {
+                o.insert("contextWindow".into(), serde_json::Value::from(c));
+            }
+            if let Some(t) = m.max_tokens {
+                o.insert("maxTokens".into(), serde_json::Value::from(t));
+            }
+            if let Some(mods) = &m.input_modalities {
+                o.insert(
+                    "inputModalities".into(),
+                    serde_json::Value::Array(
+                        mods.iter()
+                            .map(|x| serde_json::Value::String(format!("{x:?}").to_lowercase()))
+                            .collect(),
+                    ),
+                );
+            }
+            serde_json::Value::Object(o)
+        })
+        .collect();
+    let mut defaults = serde_json::Map::new();
+    defaults.insert("contextWindow".into(), serde_json::Value::from(conn.default_context_window));
+    defaults.insert("maxTokens".into(), serde_json::Value::from(conn.max_tokens));
+    if let Some(t) = &conn.defaults.thinking {
+        defaults.insert(
+            "thinking".into(),
+            serde_json::Value::String(format!("{t:?}").to_lowercase()),
+        );
+    }
+    if let Some(e) = &conn.defaults.reasoning_effort {
+        defaults.insert(
+            "reasoningEffort".into(),
+            serde_json::Value::String(format!("{e:?}").to_lowercase()),
+        );
+    }
+    // 重试策略视图（真实 ResolvedRetryPolicy：模式 + 上限 + 退避）。
+    let retry = match &conn.retry_policy {
+        ResolvedRetryPolicy::Normal(n) => serde_json::json!({
+            "mode": "normal",
+            "maxRetries": n.max_retries,
+            "retryableCodes": n.retryable_codes,
+            "backoff": {"initialDelayMs": n.backoff.initial_delay_ms, "maxDelayMs": n.backoff.max_delay_ms, "jitterRatio": n.backoff.jitter_ratio},
+        }),
+        ResolvedRetryPolicy::Always(a) => serde_json::json!({
+            "mode": "always",
+            "backoff": {"initialDelayMs": a.backoff.initial_delay_ms, "maxDelayMs": a.backoff.max_delay_ms, "jitterRatio": a.backoff.jitter_ratio},
+        }),
+    };
+    serde_json::json!({
+        "provider": "deepseek",
+        "models": models,
+        "defaults": serde_json::Value::Object(defaults),
+        "retry": retry,
+    })
+}
+
 /// 驱动一轮 stream 的辅助（测试用）：provider/model 缺省 deepseek + 装配模型。
 pub fn stream_once(runtime: &LlmRuntime, model: &str) -> Vec<StreamChunk> {
     let options = dsh_llm::types::GenerateOptions {
@@ -236,5 +310,33 @@ mod tests {
             }
             other => panic!("expected auth error finish, got {other:?}"),
         }
+    }
+
+    /// M6 step8（D-087）：provider caps 做实——`server_catalog_view` 从真实
+    /// `DeepSeekConnection.models` catalog 列录（含容量默认/重试/模式），不伪造。
+    #[test]
+    fn server_catalog_view_lists_real_deepseek_caps() {
+        let model = "deepseek-v4-flash-0731-ext";
+        let view = server_catalog_view("http://127.0.0.1:1", model);
+        assert_eq!(view["provider"], "deepseek");
+        let models = view["models"].as_array().expect("models array");
+        assert!(!models.is_empty(), "catalog lists the assembled model");
+        assert_eq!(models[0]["id"], model, "real model id from catalog");
+        // 容量默认（catalog 精确值缺省时正面值；装配模型条目无精确值 → 用默认）。
+        let defaults = &view["defaults"];
+        assert!(
+            defaults["contextWindow"].as_u64().unwrap_or(0) > 0,
+            "default context window present"
+        );
+        assert!(
+            defaults["maxTokens"].as_u64().unwrap_or(0) > 0,
+            "default max tokens present"
+        );
+        // 重试策略（真实 ResolvedRetryPolicy 视图：模式 + 上限）。
+        assert!(
+            view["retry"]["mode"].as_str().is_some(),
+            "retry mode present: {}",
+            view["retry"]
+        );
     }
 }

@@ -221,6 +221,8 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
             M6_SERVE_TICK_INTERVAL_MS
         );
         boot.agent_loop = Some(bundle.host.clone());
+        // M6 step8（D-087）：真实 provider catalog 视图注入 Boot（llm.models caps）。
+        boot.agent_catalog = Some(crate::m6_llm::server_catalog_view(&base_url, &model));
         tick_schedule = Some(bundle.schedule.clone());
         tick_bridge = bundle.bash_jobs.clone();
     }
@@ -797,6 +799,29 @@ pub fn handle_rpc_host(
 /// （`{id,name,models:[{id,name}]}`）。
 fn llm_catalog(boot: &Boot) -> (Value, Value) {
     let registered = boot.llm.lock().unwrap().providers();
+    // M6 step8（D-087）：装配 loop 的真实 provider catalog 优先（groups 只含 id/name
+    // 保持 wire 形状；容量/重试走 llm.models 的 `caps` 增量）。
+    if let Some(view) = &boot.agent_catalog {
+        let provider = view["provider"].as_str().unwrap_or("deepseek").to_string();
+        let models: Vec<Value> = view["models"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|m| {
+                        let id = m["id"].as_str().unwrap_or("?").to_string();
+                        serde_json::json!({"id": id.clone(), "name": id})
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let first_model = models
+            .first()
+            .and_then(|m| m["id"].as_str().map(str::to_string))
+            .unwrap_or_else(|| provider.clone());
+        let current = serde_json::json!({"provider": provider.clone(), "model": first_model});
+        let groups = serde_json::json!([{ "id": provider.clone(), "name": provider, "models": models }]);
+        return (current, groups);
+    }
     if registered.is_empty() {
         // 空注册表：内置 loop 目录组（echo/llm/tool 真实存在）。
         let groups = serde_json::json!([{
@@ -2453,6 +2478,8 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             let (_, groups) = llm_catalog(boot);
             serde_json::json!({"ok": true, "value": {
                 "groups": groups,
+                // M6 step8（D-087）：真实装配 catalog 的容量/重试增量（无 → null）。
+                "caps": boot.agent_catalog.clone().unwrap_or(Value::Null),
                 "failures": [],
             }})
         }
@@ -2572,6 +2599,7 @@ mod tests {
             llm: dsh_core::new_llm(),
             refresh: std::rc::Rc::new(|| Ok(())),
             agent_loop: None,
+            agent_catalog: None,
             settings: std::rc::Rc::new(std::cell::RefCell::new(
                 dsh_settings::SettingsProvider::memory(),
             )),
@@ -6081,6 +6109,38 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M6i 验收 step8（D-087）：`llm.models` 在装配 catalog（serve 注入 Boot.agent_catalog）
+    /// 时从真实 `DeepSeekConnection` 列录——groups 保持 wire 形状（provider+模型 id/name），
+    /// `caps` 增量含容量默认 + 重试策略（真实值，不伪造）。
+    #[test]
+    fn llm_models_reflects_assembled_catalog_caps() {
+        let model = "deepseek-v4-flash-0731-ext";
+        let mut boot = boot_with_sessions();
+        boot.agent_catalog = Some(crate::m6_llm::server_catalog_view("http://127.0.0.1:1", model));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r1", "method": "llm.models",
+            "payload": {},
+        }))
+        .unwrap();
+        let (_, v) = handle_rpc(&boot, "llm.models", &body);
+        let value = &v["result"]["value"];
+        let groups = value["groups"].as_array().expect("groups array");
+        assert_eq!(groups[0]["id"], "deepseek", "real provider group");
+        assert_eq!(
+            groups[0]["models"][0]["id"],
+            model,
+            "real catalog model id in wire shape"
+        );
+        let caps = &value["caps"];
+        assert_eq!(caps["provider"], "deepseek");
+        assert_eq!(caps["models"][0]["id"], model);
+        assert!(
+            caps["defaults"]["contextWindow"].as_u64().unwrap_or(0) > 0,
+            "caps default contextWindow present"
+        );
+        assert_eq!(caps["retry"]["mode"], "normal", "real retry policy view");
     }
 
     /// M6i 验收 #6（step6c，**门控真实端点冒烟**）：`DEEPSEEK_API_KEY` 环境变量存在 →
