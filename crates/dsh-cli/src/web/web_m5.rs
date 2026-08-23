@@ -47,6 +47,7 @@ use dsh_shell::{
     ShellCollectedOutput, ShellError, ShellExecRequest, ShellExecSpec, ShellProcess,
     ShellProcessStatus, ShellRunResult,
 };
+use dsh_system_prompt::{PromptSection, PromptSectionText};
 use dsh_terminal::{
     parse_terminal_close_args, parse_terminal_open_args, parse_terminal_read_args,
     parse_terminal_send_args, parse_terminal_signal_args, render_terminal_close,
@@ -476,6 +477,48 @@ pub fn sandbox_policy_segment(
             .join(", ")
     };
     format!("sandbox: policy — effective mode {mode}\nwritable roots: {roots_text}")
+}
+
+/// `sandbox:policy` 段在系统提示中的 order（100–199 工具指引带内；§3.3 约定 110）。
+pub const SANDBOX_POLICY_ORDER: f64 = 110.0;
+
+/// M6 step4（D-084）：沙箱投影——把动态 `sandbox:policy` 段（order 110，Fn provider）
+/// 注册进 loop 的 SystemPrompt。provider 每次装配从共享 store 的 default 会话事件
+/// 现算 `resolve_sandbox_mode(None, events)`（approved 缝缺省无通道 → fail-closed 走
+/// 会话折叠/read-only 默认）→ `sandbox_policy_segment`。装配后调用（store 已种子
+/// default）。段名唯一；重复注册抛错。无事件/读失败 → read-only 默认（fail-closed，
+/// 不伪造批准来源）。
+pub fn register_sandbox_policy_section(
+    prompt: &dsh_system_prompt::SystemPrompt,
+    session_store: Rc<dsh_session::store::SessionStore>,
+    default_session: &str,
+    workspace_root: std::path::PathBuf,
+) -> Result<(), String> {
+    use dsh_session::types::SessionId;
+    let sid = SessionId::from_raw(default_session.to_string());
+    let text = PromptSectionText::Fn(Rc::new(move |_ctx| {
+        let events: Vec<serde_json::Value> = session_store
+            .get(&sid)
+            .map(|s| {
+                s.events()
+                    .into_iter()
+                    .map(|e| serde_json::json!({ "type": e.kind.as_str(), "data": e.data }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let eff = resolve_sandbox_mode(None, &events);
+        sandbox_policy_segment(eff.mode, Some(&workspace_root))
+    }));
+    let _undo = prompt.section(
+        None,
+        &PromptSection {
+            name: "sandbox:policy".to_string(),
+            order: SANDBOX_POLICY_ORDER,
+            text,
+            complete: false,
+        },
+    )?;
+    Ok(())
 }
 
 /// 注册全部 M5 工具（M5-DESIGN §8 工具集）到一个 registry。

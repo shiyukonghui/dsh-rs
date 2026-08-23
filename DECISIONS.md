@@ -3096,7 +3096,39 @@ escalation 校验 fail-closed）→ step6 前端最小闭环 → 穿插篮（set
 hooks/skill、ts-host diff/SQLite）→ M6-ACCEPTANCE（真实端点门控冒烟）。
 
 ---
----
+
+## D-084（M6 编码·step4）：sandbox:policy 投影——动态段（order 110）注册进 loop
+SystemPrompt（验收 #5）
+
+**日期**：2026（M6 round 3）。
+**触发问题**：step3 后 serve 执行闭环具备推进点；沙箱语义（有效模式 + 可写根）需投影进
+agent 的 system prompt（M5-DESIGN §3.3/§8；验收 #5）。
+**自下而上实测定案**：① dsh-system-prompt `PromptSectionText::Fn(Rc<dyn Fn(&AssembleContext)
+-> String>)` 是每装配求值的动态段 provider——无需改 dsh-agent-loop/dsh-system-prompt；
+② `SessionStore::get(&SessionId)` + `Session::events()` 提供共享 store 会话事件读；
+③ `resolve_sandbox_mode(None, events)` + `sandbox_policy_segment(mode, root)`（D-070 已有）
+直接复用，approved 缝缺省无通道 → fail-closed（会话折叠/read-only 默认，不伪造批准来源）。
+**实现**：`web_m5::register_sandbox_policy_section(prompt, store, default_session, ws_root)`
+——注册 `sandbox:policy`（`SANDBOX_POLICY_ORDER = 110.0`，100–199 工具指引带）Fn provider：
+每次装配读 default 会话事件 → `resolve_sandbox_mode(None, …)` → 段文本含
+`effective mode` + 可写根名单（workspace-write 产名单，read-only 为 none）。
+`assemble_server_loop` 在 with_store 后接线（传 default 会话 + ws_root）。
+**红测（验收 #5）**：离核 prompt（真实 SystemPrompt）装配：缺省 → `read-only` +
+`writable roots: (none …)`；会话 `sandbox/mode` **workspace-write** 事件 → 重装配 → 投影
+写模式 + workspace root 入写根名单；垃圾 mode 事件 → **忽略**（不留未知文本，上一个有效
+模式保留）。**踩坑**：`with_default_session()` mint 的会话 id 是 `session-N` 而非
+`default`——helper 显式接受 session_id（装配传实际默认 agent 会话），测试显式创建
+`default` 会话。
+**诚实边界**：escalation fail-closed（工具传 sandbox_permissions 且无审批通道拒绝）属
+approval 缝语义，本步在 resolve 面（approved=None → 不进会话折叠）已覆盖；真实审批通道
+启用不属 M6 范围。
+**证据**：dsh-cli 100 测全绿 + workspace clippy `-D warnings` 零告警 + check 绿；rustfmt
+仅 web_m5.rs（--edition 2021）。回滚 = 撤本提交。
+**待办**：step6 前端最小闭环（复用 session/event downlink + history；RPC 集成测 + 门控真实
+端点冒烟）→ 穿插篮（settings/.env、provider caps、hooks/skill、ts-host diff/SQLite）→
+M6-ACCEPTANCE。剩余真实 LLM 冒烟需用户侧 `DEEPSEEK_API_KEY` 环境变量
+（base http://100.105.152.101:18080/v1、model deepseek-v4-flash-0731-ext）。
+
 ---
 
 

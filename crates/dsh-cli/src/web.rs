@@ -1908,6 +1908,14 @@ pub fn assemble_server_loop(
         }],
     };
     let host = dsh_agent_loop::AgentLoopHost::with_store(config, llm, tools, session_store)?;
+    // M6 step4（D-084）：sandbox:policy 投影——把动态段（order 110）注册进宿主 prompt；
+    // provider 每次装配从共享 store 现算有效沙箱模式（fail-closed 缺省 read-only）。
+    web_m5::register_sandbox_policy_section(
+        &host.prompt,
+        host.store.clone(),
+        "default",
+        workspace_root.clone(),
+    )?;
     // M6 step2（D-082）：宿主生命周期清理——`host.teardown()` 时执行 M5 关停
     // （bash bg 树 kill + settle Killed；terminal dispose），无孤儿进程。
     host.add_disposer(Rc::new(move || m5.shutdown()));
@@ -5811,5 +5819,71 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M6i 验收 #5：sandbox:policy 投影——`register_sandbox_policy_section` 把动态段
+    /// （order 110，Fn provider）注册进 loop SystemPrompt：缺省 read-only；会话
+    /// `sandbox/mode` workspace-write → 重装配读模型可见；垃圾 mode 不推翻（fail-closed
+    /// 忽略，绝不落未知文本）。
+    #[test]
+    fn sandbox_policy_section_registers_dynamic_projection() {
+        use dsh_system_prompt::{Config as PromptConfig, SystemPrompt};
+        use dsh_session::store::SessionStore;
+        use dsh_session::types::{EventKind, SessionId};
+        let prompt = SystemPrompt::new(&PromptConfig::default(), Rc::new(|| {})).expect("prompt");
+        let store = Rc::new(SessionStore::new());
+        let session = store
+            .create(
+                Some(SessionId::from_raw("default".to_string())),
+                &dsh_session::CreateSessionOptions { seed: None, meta: None },
+            )
+            .expect("default session");
+        let ws = std::env::temp_dir().join(format!("dsh-m6-sandbox-{}", std::process::id()));
+        if ws.exists() {
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+        std::fs::create_dir_all(&ws).unwrap();
+
+        web_m5::register_sandbox_policy_section(&prompt, store.clone(), "default", ws.clone())
+            .expect("sandbox:policy section registers");
+
+        let find_seg = |assembly: &dsh_system_prompt::PromptAssembly| {
+            assembly
+                .sections
+                .iter()
+                .find(|s| s.name == "sandbox:policy")
+                .expect("sandbox:policy in assembly")
+                .text
+                .clone()
+        };
+
+        // 缺省：read-only（写根：none）。
+        let text0 = find_seg(&prompt.assemble(&Default::default()).unwrap());
+        assert!(text0.contains("read-only"), "default read-only: {text0:?}");
+        assert!(text0.contains("writable roots:"), "roots line: {text0:?}");
+
+        // 会话事件 → workspace-write → 重装配投影（写根落名单）。
+        session
+            .append(EventKind::SandboxMode, json!({"mode": "workspace-write", "source": "session"}), None)
+            .expect("append sandbox/mode");
+        let text1 = find_seg(&prompt.assemble(&Default::default()).unwrap());
+        assert!(text1.contains("workspace-write"), "session mode projected: {text1:?}");
+        assert!(
+            text1.contains(&ws.to_string_lossy().into_owned()),
+            "workspace root among writable roots: {text1:?}"
+        );
+
+        // fail-closed：垃圾 mode 不推翻（被忽略，不落未知文本）。
+        session
+            .append(EventKind::SandboxMode, json!({"mode": "garbage-mode", "source": "session"}), None)
+            .expect("append garbage mode");
+        let text2 = find_seg(&prompt.assemble(&Default::default()).unwrap());
+        assert!(!text2.contains("garbage"), "unknown mode ignored (fail-closed): {text2:?}");
+        assert!(
+            text2.contains("workspace-write"),
+            "last valid session mode preserved: {text2:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }
