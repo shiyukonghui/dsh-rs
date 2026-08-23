@@ -2206,6 +2206,10 @@ fs-search 归 M6」归因于**离线受限**，依据是此前 cargo fetch/check
   （用户无沙箱环境跑一次即可）；portable-pty 连 .crate 都不在（indexMeta=False）。
 
 **最终选择**：M5 级依赖釐清如下，给出用户手动安装清单（command 见 M5-DEPENDENCIES.md）：
+**round6 复核（实测）**：`nix 0.30 + which 6 + sysinfo 0.38` 临时 crate `cargo run --offline`
+编译+运行通过（output `which_ok=true cpu=true`）→ M5a subprocess 的树级终止/裸名查找/
+liveness 依赖栈全就绪；globset/ignore 提取仍被沙箱写 registry/src 拒绝（留用户一次
+`cargo check`），portable-pty 仍缺（装机未进行）。
 
 | 依赖 | M5 用途 | 状态 | 需用户操作 |
 |---|---|---|---|
