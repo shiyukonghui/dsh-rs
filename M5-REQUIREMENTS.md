@@ -175,8 +175,9 @@ M5i M5-ACCEPTANCE    <- 依赖：上面全部（契约面 + 集成 + 全绿 + cl
   → sandbox 交付 **策略归属性（解析/事件/提示/escalation）+ fs 进程内围栏**（真实边界）；
   argv confiner 作为 **seam 声明 + 无 runner 时的 fail-closed 拒绝**（绝不静默返回原
   argv），待后续可引安全库/平台 runner 时填补。**诚实降级而非隐蔽绕过**。
-- **IANA 全时区**（chrono-tz/jiff-tzdb）：不在 lock，且不可离线拉取——继续保持
-  `invalid_time_zone` 诚实报错（继承 D-050），引入成熟库的评估入「决策 P」备选。
+- **IANA 全时区**（chrono-tz/jiff-tzdb）：**2026 spike 复核**——`chrono-tz` 不可离线，但
+  `jiff`/`jiff-tzdb` 全家在本地缓存、**离线编译+运行已验证可行** → 需用户裁定（P2）是否
+  纳入 M5；未裁定前保持 `invalid_time_zone` 诚实报错（继承 D-050）不负债。
 - **workflow JS 引擎**：继承 D-051/D-053 = 保持桩（M5 不重开）。
 - **out-of-process subagent provider**（acp/claude-code/codex/dsh-sdk）：M5 交付
   subprocess 原语后**可 spawn 外部进程**，但完整 provider 适配/网络协议是大块；
@@ -185,6 +186,21 @@ M5i M5-ACCEPTANCE    <- 依赖：上面全部（契约面 + 集成 + 全绿 + cl
    `scrubbedParentEnv`（执行时清洗）作为**真实边界**；`.env` 文件解析仍留 M6 服务层
   （本机凭据文件不可验，且属配置面非执行面）。
 - **真实浏览器 E2E**：本环境不可跑（沿用 D-022/D-036，以 `handle_rpc_host` 集成 + 单测代偿）。
+
+**M5+ 遗留项完整性裁定（2026 复核：既往前兆逐条对照，不得静默遗漏）**
+
+| # | 既有 defer 项（来源文件:行号） | 本 M5 裁定 |
+|---|---|---|
+| 1 | guard 真抢占（DECISIONS:1744「真正可抢占接线留 M4/M5 executor」、M3-ACC:57「真抢占留 M4/M5」） | **入 M5**：M3 只交付了「同步 wall-clock 后置度量」（无并发抢占的诚实降级）；M5 的 subprocess/`terminate()` 提供**真实树级终止**，shell/fs 工具的超时→kill 抢占成为真实可实现——补 `timeout` 预算触发树级终止 + `[timed out after …]` 标记（对齐参考 timedOut/aborted 互斥语义），收掉这条欠账 |
+| 2 | OS 级 watch（M3-REQ:109「无 OS 级 watch，M5 可选轮询」） | **M5 可选、默认不做**：HMR 已用 notify 后台线程 + mpsc 桥（M35）实现真实 OS watch；「外部编辑热更新」依赖 fs 监听场景，非执行引擎核心 → 登记 seam，M5 不展开（避免与能力缝范围纠缠） |
+| 3 | settings YAML 注释保真 leaf-diff（M3-REQ:45「M5 范围」） | **推 M6（配置面）**：settings 属配置持久化非执行面；M5 聚焦执行引擎，此条连同凭据 .env 服务层一并 M6 |
+| 4 | ts-host 差分编排（DECISIONS:848/D-022「session-host.mjs 等属 M5」） | **推 M6（Cordis-equivalence 差分面）**：属 dsh-diff 差分基建而非执行引擎；M5 不重开 |
+| 5 | SQLite backlog（DECISIONS:870 历史「M5 范围」 vs M1-REQ:103「M2+」归属不一致） | **推 M6（持久化面）**：M5 用 JSONL/临时文件（已有）；SQLite 是存储后端选型，与执行引擎正交，且归属历史不一致需在 M6 单独裁决 |
+| 6 | 持久 ToolRegistry 注入点（DECISIONS:2101/D-052「M4i/M5 若宿主开放 registry 再真挂」） | **入 M5（web.rs 接线）**：M5h 在 `M4HostServices` 扩展后，fs/shell/code-runtime 工具以「定义 + 宿主 bind」挂进既有 registry（复用 M4Tool 模式）；即「宿主开放 registry」落定 |
+| 7 | subagent 真实目录源（DECISIONS:2113 历史「M5 in-process driver」→ 已被 M4i 实驱动覆盖） | **已结**：M4i 已补 in-process 实驱动；M5 只剩 out-of-process（非目标，M6） |
+| 8 | schedule 定时推进（DECISIONS:2170/D-053「定时推进属 M5 宿主调度」） | **入 M5**：M5g 宿主自动 tick（服务层线程 + mpsc 桥 + `dispatch_due`），非手工调用 |
+| 9 | run_code 占位→真实（DECISIONS:956/996/D-024/025、runtime.rs:966） | **入 M5**：python 后端真实接线替换 `placeholder_run_code`；TS worker 桩保留 |
+| 10 | bash/pwsh/terminal producer（DECISIONS:1808/1987/D-044/049、M4-REQ:146） | **入 M5**：M5g 把 subprocess/shell 句柄桥接成 `JobHooks` 进 `JobRegistry`（bash producer 真实；terminal producer 随 P1） |
 
 **假设 / 约束**
 
@@ -222,6 +238,9 @@ M5i M5-ACCEPTANCE    <- 依赖：上面全部（契约面 + 集成 + 全绿 + cl
 2. **subprocess**：真实 spawn（argv/cwd/stdin data/stdout collect+spill）/ 树级 terminate
    （Windows taskkill /T 路径至少单测隔离）/ 有界输出 tail / scrub env（KEY/SECRET 清除）/
    `terminal` 原语 seam（PTY 依赖决策落地）。
+2a. **guard 真抢占（M3 欠账收口）**：shell/fs 工具的超时预算触发**真实树级 kill**（非 M3
+   后置度量）；结果带 `[timed out after …]` 标记 + `timedOut`/`aborted` 互斥分类（对齐
+   参考 timedOut/aborted；账目对 D-042/M3-ACC:57）。
 3. **sandbox**：模式解析优先级（approved > session `sandbox/mode` > 默认 read-only）/
    严格更宽阶梯（read-only→ws-write→danger 单向）/ 审批四态 fail-closed /
    `writableRoots` 唯一来源 / 系统提示注入 / `sandbox/mode` 会话事件 + 回放 fold。
