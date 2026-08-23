@@ -1,14 +1,20 @@
 //! dsh-subprocess — M5 执行世界最底层原语（设计见 M5-DESIGN.md §2）。
 //!
-//! 由红→绿测试驱动（tests/scrub.rs、tests/signal.rs 先行）：`scrubbed_parent_env` 与
-//! `Signal`/`SubprocessTerminalSignal` 词汇已落地；其余（spawn/collect/terminate/
-//! spawnTerminal）将在各自红测后陆续加入。
+//! 由红→绿测试驱动（tests/scrub.rs、tests/signal.rs、tests/spawn.rs 先行）：已落地
+//! `scrubbed_parent_env`、`Signal`/`SubprocessTerminalSignal` 词汇、`spawn` 原语（零默认
+//! spec、有界收集、spill）、树级终止骨架。平台 cfg 细化与 spawnTerminal 随后续红测加入。
 
+mod backend;
 mod types;
 
 use std::ffi::OsString;
 
-pub use types::{Signal, SubprocessTerminalSignal, SubprocessTerminalSignal as TerminalSignal};
+pub use backend::{spawn, SubprocessHandle};
+pub use types::{
+    ChildStdio, CollectedOutput, ProcessError, Signal, StdinMode, StdoutMode,
+    SubprocessCollect, SubprocessOutcome, SubprocessSpawnSpec, SubprocessSpill,
+    SubprocessTerminalSignal,
+};
 
 /// 子进程环境条目（键/值均透传 OsString，仅供 `scrubbed_parent_env` 使用）。
 pub type EnvEntry = (OsString, OsString);

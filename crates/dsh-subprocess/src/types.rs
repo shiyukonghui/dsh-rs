@@ -1,9 +1,14 @@
 //! dsh-subprocess 类型面（M5-DESIGN §2.2–§2.4）。
 //!
-//! 逐字对齐参考 `subprocess/subprocess/src/types.ts`：先落地由红测驱动的信号词汇，
-//! 其余类型（SpawnSpec/Collect/Handle）随各自红测逐步加入。
+//! 逐字对齐参考 `subprocess/subprocess/src/types.ts`：信号词汇、spawn spec（零默认）、
+//! stdio 三态、有界收集/spill、句柄与 outcome。
 
 use std::fmt;
+use std::path::{Path, PathBuf};
+
+// ---------------------------------------------------------------------------
+// 信号词汇
+// ---------------------------------------------------------------------------
 
 /// 参考 `SubprocessTerminalSignal`：五个可终止信号，全平台映射。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,3 +74,134 @@ impl std::str::FromStr for Signal {
         Ok(Signal::Terminating(sig))
     }
 }
+
+// ---------------------------------------------------------------------------
+// spawn spec（零默认）
+// ---------------------------------------------------------------------------
+
+/// 参考 `SubprocessSpawnSpec`：**零默认**——argv/cwd/stdio/graceMs 全显式；
+/// signal?/env? 可选。绝不在 `spawn()` 内部隐藏默认值。
+#[derive(Debug, Clone)]
+pub struct SubprocessSpawnSpec {
+    /// 精确 argv（argv[0] 为可执行或已解析路径）。
+    pub argv: Vec<String>,
+    /// 显式工作目录。
+    pub cwd: PathBuf,
+    /// stdio 三态（见 [`ChildStdio`]）。
+    pub stdio: ChildStdio,
+    /// SIGTERM→SIGKILL 宽限毫秒（≤ MAX_TIMER_DELAY_MS）。
+    pub grace_ms: u64,
+    /// 取消 → 树级 terminate。
+    pub signal: Option<Signal>,
+    /// 显式环境（缺省时实现用 scrubbed 父环境）。
+    pub env: Option<Vec<(String, String)>>,
+}
+
+/// 三路 stdio 描述（参考 `spawn.ts` 的 `stdio` 形）。
+#[derive(Debug, Clone)]
+pub struct ChildStdio {
+    pub stdin: StdinMode,
+    pub stdout: StdoutMode,
+    pub stderr: StdoutMode,
+}
+
+/// 参考 stdin 三态：`'ignore' | 'pipe' | {data}`。
+#[derive(Debug, Clone)]
+pub enum StdinMode {
+    /// 子进程读端接 null。
+    Ignore,
+    /// 不透写；宿主保留句柄（后续可写）。
+    Pipe,
+    /// 写入这些字节后关闭（一次性给数据）。
+    WriteBytes(Vec<u8>),
+}
+
+/// 参考 stdout/stderr 三态（共用一型）。
+#[derive(Debug, Clone)]
+pub enum StdoutMode {
+    /// 透传管道（宿主读）。
+    Pipe,
+    /// 继承宿主输出。
+    Inherit,
+    /// 有界收集 + 可选 spill（可恢复完整流）。
+    Collect(SubprocessCollect),
+}
+
+/// 有界收集预算；`spill` 缺省 = 仅内存 tail（诊断形），带 spill = 完整流落盘。
+#[derive(Debug, Clone)]
+pub struct SubprocessCollect {
+    pub max_bytes: usize,
+    pub spill: Option<SubprocessSpill>,
+}
+
+/// 溢出落盘：总量上限 + 目录（0700）。
+#[derive(Debug, Clone)]
+pub struct SubprocessSpill {
+    pub max_bytes: u64,
+    pub dir: PathBuf,
+}
+
+// ---------------------------------------------------------------------------
+// outcome / 收集
+// ---------------------------------------------------------------------------
+
+/// spawn 级错误（极少；编译/路径/权限等），区别于运行 outcome。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessError {
+    Spawn(String),
+    Io(String),
+}
+
+impl std::error::Error for ProcessError {}
+
+impl fmt::Display for ProcessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProcessError::Spawn(msg) => write!(f, "spawn failed: {msg}"),
+            ProcessError::Io(msg) => write!(f, "io: {msg}"),
+        }
+    }
+}
+
+impl From<std::io::Error> for ProcessError {
+    fn from(e: std::io::Error) -> Self {
+        ProcessError::Io(e.to_string())
+    }
+}
+
+/// 参考 `SubprocessOutcome`：运行后的稳定事实（exitCode/signal）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubprocessOutcome {
+    /// 退出码；`None` = 被信号终止。
+    pub exit_code: Option<i32>,
+    /// 终止信号名（若被信号终止）。
+    pub signal: Option<Signal>,
+}
+
+/// 有界收集结果：offset-based 非消费 reader + lossy/spill 标记。
+#[derive(Debug)]
+pub struct CollectedOutput {
+    data: Vec<u8>,
+    lossy: bool,
+    spill_path: Option<PathBuf>,
+}
+
+impl CollectedOutput {
+    pub fn from_bytes(data: Vec<u8>, lossy: bool, spill_path: Option<PathBuf>) -> Self {
+        Self { data, lossy, spill_path }
+    }
+
+    /// 从 offset 起按 UTF-8 损失型转换（`readFrom(0)` = 全量）。
+    pub fn read_from(&self, offset: usize) -> String {
+        String::from_utf8_lossy(&self.data[offset.min(self.data.len())..]).into_owned()
+    }
+
+    pub fn lossy(&self) -> bool {
+        self.lossy
+    }
+
+    pub fn spill_path(&self) -> Option<&Path> {
+        self.spill_path.as_deref()
+    }
+}
+
