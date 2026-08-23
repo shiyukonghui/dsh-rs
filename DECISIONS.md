@@ -3284,5 +3284,30 @@ web_m5.rs。回滚 = 撤本提交。
 
 ---
 
+## M6-ACCEPTANCE（M6 编码·step11 验收记录）
+
+**日期**：2026（M6 round 7）。
+**通过条件**：全量 test 全绿 + clippy `-D warnings` 零告警 + DECISIONS 与 git 互查 +
+真实端门控冒烟（key 缺失 → 诚实 skipped，不阻塞）。
+**验收证据（决策↔提交互查链，D-077 → D-089）**：
+- 88a327b（D-077 需求网关 M6-REQUIREMENTS）→ 6f064f2（D-078 设计网关 M6-DESIGN）
+- 53b23a8（D-079 step1a 装配工厂）→ 6a74b76（D-080 step5 LLM 桥）
+- 01425f8（D-081 step1b serve 接线；P2 workspace_root=WebConfig）→ 7ddd373（D-082 step2
+  生命周期无孤儿）→ 1384f62（D-083 step3 tick 单推进点）→ 9df5db4（D-084 step4 sandbox
+  投影）→ 158182d（D-085 step6 前端闭环；P3 无 key fail-loud AUTH、P4 key 仅 env）
+- d832746（D-086 step7 .env）→ aded4c5（D-087 step8 provider caps）→ 801b358（D-088 step9
+  hooks/skill）→（D-089 step10 显式范围外声明，本提交收纳）
+**最终测试面**：dsh-cli 111 测全绿（含 step9 装配级否决钩子端到端）；workspace 全目标
+无失败；clippy `-D warnings` 零告警；check 全绿；rustfmt 仅 web_m5.rs。
+**门控冒烟**：`serve_closure_real_endpoint_smoke_gated` 当前环境无 `DEEPSEEK_API_KEY` →
+GATED-SMOKE-SKIP（诚实记录，不伪造、不失败）。用户设 key 后重跑该单向真实端即可补验证
+（base http://100.105.152.101:18080/v1, model deepseek-v4-flash-0731-ext；key 永不落盘/git）。
+**诚实边界清单**：settings YAML leaf-diff（D-086，TS 侧既有面）；post-execute 独立缝
+（D-088，tool/result 已覆盖）；step10 ts-host diff/SQLite（D-089 范围外）；真实 PTY backend
+注册与 approval 通道（D-082/D-084 延期记录）。
+**结论**：M6「harness/serve 服务器执行闭环（serve 接线）」达成。回滚 = 按 D-* 逐提交回退。
+
+---
+
 
 
