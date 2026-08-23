@@ -3065,6 +3065,38 @@ bash) 会话存在 → `shutdown()` → 断言：① bash job settle **Killed**�
 穿插篮 → M6-ACCEPTANCE。
 
 ---
+
+## D-083（M6 编码·step3）：serve 主循环 tick 注入——`ServerLoopBundle` 共享实例 +
+`recv_timeout` 自驱节拍 → 主线程 `m5g_tick_once`（验收 #4；DIV-2）
+
+**日期**：2026（M6 round 3）。
+**触发问题**：step1b 已把 loop 写入 boot.agent_loop；调度到期与 bash jobs 结算需在 serve
+主循环获得**真实推进点**（进取样在环内不可用），且 serve 主循环现为阻塞
+`incoming_requests()`。
+**设计定案（DIV-2 落地）**：`ServerLoopBundle{host, schedule, bash_jobs}`——`m4.schedule`/
+`m5.services.bash_jobs` 与 bundle 持**同一 Rc 实例**（工具注册与 tick 推进共享状态）。
+serve 主循环改 `Server::recv_timeout(M6_SERVE_TICK_INTERVAL_MS=250)`：有请求 → 派发；
+超时（无请求）→ 纯 tick；`Err`（服务器关闭）→ break 返回（等价 incoming_requests 结束）。
+每轮 tick：`m5g_tick_once(sched, Some(bridge), system_now)`（调度到期 + 合作泵）。推进点
+**唯一收敛 serve 主线程**（非 Send 宿主；M5gTick 服务线程不进 serve）。未启用 agent_loop
+→ tick 上下文空，循环等价阻塞接收（多 ≤250ms 轮询唤醒）。
+**红测（验收 #4 行为探针）**：bundle 装配（真实 M4+M5+deepseek）→ ① 调度门控：工具
+`schedule_create {after_seconds:1}` → `tick_once(now)` **不**派发（未到期）→
+`tick_once(now+1500)` **派发**（dispatch 含 sched_id + `schedule/change` dispatch 事件落
+default 会话 + framing 非空）；② jobs 自动结算：真实后台 bash（写 tick.txt）→
+`tick_once` 泵自动 settle **Completed** + 输出落盘（非手工 pump）。工具参数遵循 M4 契约
+（snake_case `after_seconds`，≥1 正整数）。
+**诚实边界**：schedule 到期注入语义为 `schedule/change` dispatch 事件（production
+deliveryMode = session-local）；真实 serve（无限循环）无法集成测，步证明 = 本 bundle 探针
+（推进点同一条代码路径）。
+**证据**：dsh-cli 99 测全绿 + workspace 全量 test 无失败 + clippy `-D warnings` 零告警 +
+check 绿。回滚 = 撤本提交。
+**待办**：step4 sandbox·policy 投影（policy 段注入 prompt + resolve_sandbox_mode +
+escalation 校验 fail-closed）→ step6 前端最小闭环 → 穿插篮（settings/.env、provider caps、
+hooks/skill、ts-host diff/SQLite）→ M6-ACCEPTANCE（真实端点门控冒烟）。
+
+---
+---
 ---
 
 

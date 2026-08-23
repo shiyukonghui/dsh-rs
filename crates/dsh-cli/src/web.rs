@@ -167,6 +167,15 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
     // seed `default`（前端会话入口）。
     let _ = host.session("default");
 
+    // M6（step3，D-083）：serve 主循环 tick 上下文（enable_agent_loop 装配时填充）。
+    // 主循环 `recv_timeout` 自驱节拍——每 tick 间隔刺探请求（有则派发），超时（无请求）
+    // 则纯推进：主线程 `m5g_tick_once`（调度到期 + jobs 合作泵）。推进点唯一收敛到
+    // serve 主线程（非 Send 宿主纪律）；工具注册与 tick 共享同一 schedule/bash_jobs
+    // 实例（ServerLoopBundle）。不启用 agent_loop 时 tick 上下文为空，循环等价于阻塞
+    // 接收（仅多 ≤tick 间隔的轮询唤醒）。
+    let mut tick_schedule: Option<Rc<crate::web::dsh_cli_host::ScheduleHost>> = None;
+    let mut tick_bridge: Option<Rc<web_m5::BashJobsBridge>> = None;
+
     // M6（step1b）：装配服务器执行闭环并写入 boot.agent_loop。
     if cfg.enable_agent_loop {
         let ws_root = match &cfg.workspace_root {
@@ -188,28 +197,52 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
             .clone()
             .or_else(|| std::env::var("DSH_LLM_MODEL").ok())
             .unwrap_or_else(|| "deepseek-chat".to_string());
-        let loop_host = assemble_server_runtime(&host, ws_root, &base_url, &model).map_err(|e| {
+        let bundle = assemble_server_runtime(&host, ws_root, &base_url, &model).map_err(|e| {
             CordisError::Internal(format!(
                 "agent loop assembly failed (enable_agent_loop, base {base_url}, model {model}): {e}"
             ))
         })?;
         eprintln!(
-            "dsh web: agent loop enabled (base {base_url}, model {model}); agent.turn/run/session.prompt now drive the Rust loop"
+            "dsh web: agent loop enabled (base {base_url}, model {model}); agent.turn/run/session.prompt now drive the Rust loop; tick every {}ms",
+            M6_SERVE_TICK_INTERVAL_MS
         );
-        boot.agent_loop = Some(loop_host);
+        boot.agent_loop = Some(bundle.host.clone());
+        tick_schedule = Some(bundle.schedule.clone());
+        tick_bridge = bundle.bash_jobs.clone();
     }
 
     let sink = host.sink.clone();
-    for request in server.incoming_requests() {
-        let root = web_root.clone();
-        let manifest = manifest.clone();
-        let sink = sink.clone();
-        // tiny_http 每请求已在线程处理；这里再派发。RPC/静态用 `&Boot`
-        // （非 Send，留在调用线程），SSE/WS 用 `EventSink`（Send+Sync）。
-        dispatch_request(request, &root, &manifest, boot, &host, &sink);
+    loop {
+        let request = match server.recv_timeout(std::time::Duration::from_millis(M6_SERVE_TICK_INTERVAL_MS)) {
+            Ok(Some(request)) => Some(request),
+            Ok(None) => None,
+            Err(_) => {
+                // 服务器关闭（等价于 incoming_requests() 结束）→ 停止服务并返回。
+                eprintln!("dsh web: recv ended; server stopping");
+                break;
+            }
+        };
+        if let Some(request) = request {
+            let root = web_root.clone();
+            let manifest = manifest.clone();
+            let sink = sink.clone();
+            // tiny_http 每请求已在线程处理；这里再派发。RPC/静态用 `&Boot`
+            // （非 Send，留在调用线程），SSE/WS 用 `EventSink`（Send+Sync）。
+            dispatch_request(request, &root, &manifest, boot, &host, &sink);
+        }
+        if let (Some(sched), Some(bridge)) = (&tick_schedule, &tick_bridge) {
+            let now = system_now_ms();
+            if let Err(e) = web_m5::m5g_tick_once(sched, Some(bridge), now) {
+                eprintln!("dsh web: tick advance failed: {e}");
+            }
+        }
     }
     Ok(WebServer { addr })
 }
+
+/// M6（step3）：serve 主循环自驱节拍间隔（毫秒）。推进点每 tick 一次：调度到期注入 +
+/// bash jobs 合作结算；非阻塞（recv_timeout），无忙轮询。
+pub const M6_SERVE_TICK_INTERVAL_MS: u64 = 250;
 
 /// 派发一个请求：`/plugins/*` bundle、`/api/*` RPC/SSE，否则静态文件（SPA fallback）。
 fn dispatch_request(
@@ -1889,16 +1922,29 @@ fn system_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// M6 step1b（D-081）：serve 接线编排——在 SessionHost 上构建 M4（jobs/schedule/todo
-/// 真实句柄）+ M5（真实工厂）+ deepseek LLM（无 key → 首回合 fail-loud，装配照常）→
-/// `assemble_server_loop`（共享 store 写回）。装配失败（如 bash 不可用 / 宿主构造错）
+/// M6 step3（D-083）：serve 递增推进 bundle——loop host + 调度宿主 + bash jobs 桥。
+/// schedule/bash_jobs 与 loop 工具注册**共享同一实例**（Rc clone）：serve 主循环的
+/// `m5g_tick_once`（调度到期 + jobs 合作泵）与 agent 工具执行推进同一状态。
+pub struct ServerLoopBundle {
+    /// 服务器执行闭环（真实 M4+M5 注册 + 共享 store）。
+    pub host: Rc<dsh_agent_loop::AgentLoopHost>,
+    /// 调度宿主（tick `dispatch_due` 的目标；与工具 schedule_create 同实例）。
+    pub schedule: Rc<crate::web::dsh_cli_host::ScheduleHost>,
+    /// bash 后台 jobs 桥（tick `pump()` 结算；与 bash run_in_background 同实例）。
+    pub bash_jobs: Option<Rc<web_m5::BashJobsBridge>>,
+}
+
+/// M6 step1b（D-081）/step3（D-083）：serve 接线编排——在 SessionHost 上构建 M4
+/// （jobs/schedule/todo 真实句柄）+ M5（真实工厂）+ deepseek LLM（无 key → 首回合
+/// fail-loud，装配照常）→ `assemble_server_loop`（共享 store 写回）。返回 bundle：
+/// schedule/bash_jobs 供 serve tick 推进同一实例。装配失败（如 bash 不可用 / 宿主构造错）
 /// → `Err`：serve fail-loud（诚实，不默默回退 WASM 路径）。
 pub fn assemble_server_runtime(
     host: &Rc<crate::session_host::SessionHost>,
     workspace_root: std::path::PathBuf,
     base_url: &str,
     model: &str,
-) -> Result<Rc<dsh_agent_loop::AgentLoopHost>, String> {
+) -> Result<ServerLoopBundle, String> {
     let session = host.session("default").map_err(|e| e.to_string())?;
     let jobs = Rc::new(std::cell::RefCell::new(dsh_jobs::registry::JobRegistry::new(
         dsh_jobs::registry::JobRegistryConfig {
@@ -1906,17 +1952,33 @@ pub fn assemble_server_runtime(
             now: Box::new(system_now_ms),
         },
     )));
+    let schedule = Rc::new(dsh_cli_host::ScheduleHost::new(session));
     let todo = Rc::new(dsh_cli_host::TodoWriteHost::new(host.clone(), "default".into()));
     todo.bind_agent("default", "default");
     let m4 = M4HostServices {
         jobs: Some(jobs),
-        schedule: Some(Rc::new(dsh_cli_host::ScheduleHost::new(session))),
+        schedule: Some(schedule.clone()),
         todo: Some(todo),
     };
     let m5 = web_m5::M5Host::assemble(workspace_root.clone())?;
+    let bash_jobs = m5.services.bash_jobs.clone();
     let llm = crate::m6_llm::server_llm_runtime(base_url, model);
-    assemble_server_loop(host.store.clone(), workspace_root, llm, "deepseek", model, m4, m5)
+    let loop_host = assemble_server_loop(
+        host.store.clone(),
+        workspace_root,
+        llm,
+        "deepseek",
+        model,
+        m4,
+        m5,
+    )?;
+    Ok(ServerLoopBundle {
+        host: loop_host,
+        schedule,
+        bash_jobs,
+    })
 }
+
 
 fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) -> Value {
     match method {
@@ -5507,7 +5569,8 @@ mod tests {
             "http://127.0.0.1:1",
             "deepseek-v4-flash-0731-ext",
         ) {
-            Ok(loop_host) => {
+            Ok(bundle) => {
+                let loop_host = bundle.host;
                 assert!(
                     Rc::ptr_eq(&host.store, &loop_host.store),
                     "loop host shares the SessionHost store (frontend read model)"
@@ -5519,9 +5582,10 @@ mod tests {
                         "serve loop registry missing {want}; have {names:?}"
                     );
                 }
-                let evs0 = host.events("default").len();
-                let _ = loop_host;
-                let _ = evs0;
+                assert!(
+                    bundle.bash_jobs.is_some(),
+                    "serve bundle exposes bash jobs bridge for tick"
+                );
             }
             Err(e) => {
                 eprintln!("assemble_server_runtime deferred (expect NoBash/assemble): {e}");
@@ -5629,6 +5693,121 @@ mod tests {
         assert!(
             terminal_svc.borrow().list().is_empty(),
             "terminal sessions disposed on shutdown"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M6i 验收 #4：serve 主循环 tick 推进（`m5g_tick_once` on ServerLoopBundle）——
+    /// 同一 schedule/bash_jobs 实例：① `schedule_create` 注册的 after 到期 → tick 自动
+    /// 派发（user/message 提醒落 default 会话；未到期 → 不派发）；② 后台 bash 完成 →
+    /// tick 合作泵自动结算（Completed，非手工）。这是 serve recv_timeout 自驱节拍的
+    /// 行为探针（推进点唯一收敛主线程）。
+    #[test]
+    fn server_tick_once_advances_schedule_and_settles_jobs() {
+        use dsh_jobs::JobStatus;
+        use dsh_tools::ToolExecutionInput;
+        use dsh_session::types::EventKind;
+        let host = SessionHost::in_memory();
+        let _ = host.session("default");
+        let root = std::env::temp_dir().join(format!("dsh-m6-tick-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let bundle = match crate::web::assemble_server_runtime(
+            &host,
+            root.clone(),
+            "http://127.0.0.1:1",
+            "deepseek-v4-flash-0731-ext",
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("assemble_server_runtime deferred (bash unavailable?): {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+        };
+        let now = crate::web::system_now_ms();
+
+        // ① 调度：after(0s 到期) via 工具 → 事件落 default；tick 派发。
+        let registry = bundle.host.tools.clone();
+        let agent = Some("agent-1".to_string());
+        let sres = registry.execute(
+            &ToolExecutionInput::new(
+                "s1",
+                "schedule_create",
+                serde_json::json!({
+                    "prompt": "tick reminder",
+                    "after_seconds": 1
+                }),
+                agent.clone(),
+            ),
+            None,
+        );
+        assert!(!sres.is_error, "schedule_create: {:?}", sres.error);
+        let sched_id = sres.value.unwrap()["id"].as_str().unwrap().to_string();
+        // 到期门控：after(1s) 在 now 未到期 → tick 不派发。
+        let (_, dispatched_now) = web_m5::m5g_tick_once(
+            &bundle.schedule,
+            bundle.bash_jobs.as_deref(),
+            now,
+        )
+        .expect("tick_once ok");
+        assert!(
+            !dispatched_now.contains(&sched_id),
+            "after(1s) must NOT dispatch before due: {dispatched_now:?}"
+        );
+        // now+1500ms → 到期 → tick 自动派发提醒（user/message 落 default）。
+        let (framing, dispatched) = web_m5::m5g_tick_once(
+            &bundle.schedule,
+            bundle.bash_jobs.as_deref(),
+            now + 1500,
+        )
+        .expect("tick_once ok");
+        assert!(
+            dispatched.contains(&sched_id),
+            "after(1s) dispatched by tick when due: {dispatched:?}"
+        );
+        // dispatch_due 向调度宿主会话追加 `schedule/change` dispatch 事件（非 user 消息）。
+        let has_dispatch = host
+            .events("default")
+            .iter()
+            .any(|e| {
+                e.kind == EventKind::ScheduleChange
+                    && e.data.get("operation").and_then(|v| v.as_str()) == Some("dispatch")
+            });
+        assert!(has_dispatch, "tick dispatched schedule/change into default session");
+        assert!(!framing.is_empty(), "tick produced framing text: {framing:?}");
+
+        // ② 后台 bash 完成 → tick 泵自动结算 Completed（非手工）。
+        let bres = registry.execute(
+            &ToolExecutionInput::new(
+                "b1",
+                "bash",
+                serde_json::json!({
+                    "command": format!("echo TICK > {}", root.join("tick.txt").display().to_string().replace('\\', "/")),
+                    "description": "m6 tick settle",
+                    "run_in_background": true
+                }),
+                agent.clone(),
+            ),
+            None,
+        );
+        assert!(!bres.is_error, "bash bg: {:?}", bres.error);
+        let bgid = bres.value.unwrap()["jobId"].as_str().unwrap().to_string();
+        let bridge = bundle.bash_jobs.clone().unwrap();
+        // 尚未 tick：running 或完成但未结算（泵未调）。
+        // tick 一次（now 之后，进程应已退出）→ 合作泵结算 Completed。
+        web_m5::m5g_tick_once(&bundle.schedule, Some(&bridge), now + 2000).expect("tick once");
+        assert_eq!(
+            bridge.read(&bgid, agent.as_deref()).unwrap().snapshot.status,
+            JobStatus::Completed,
+            "tick pump settled bg job Completed automatically"
+        );
+        assert!(
+            root.join("tick.txt").exists(),
+            "bg output landed (completed before pump)"
         );
 
         let _ = std::fs::remove_dir_all(&root);
