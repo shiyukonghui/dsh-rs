@@ -249,3 +249,28 @@ M5i M5-ACCEPTANCE    <- 依赖：上面全部（契约面 + 集成 + 全绿 + cl
 | **P3 平台沙箱 runner** | (a) seam+失败闭； (b) 引入 Landlock/bwrap FFI（不可离线验证） | 倾向 (a)，真实边界由 fs 进程内围栏承担 |
 | **P4 bash 参数名** | timeoutMs（参考）vs timeout_ms（GUI 现状） | 倾向参考 `timeoutMs`，记录分叉 |
 | **P5 lsp/e2b/out-of-process/jobs Scope** | 全部 M6（登记+诚实桩）；subprocess 原语 M5 已交付其底座 | 倾向 M6（非目标已列） |
+
+**决策辅助（供裁定参考，2026 复核）**
+
+- **P1**：本机无 PTY 验证路径；`portable-pty` 不在 `Cargo.lock` 且离线拉取受限（与本机
+  `--offline` 约束冲突）。选 (b) 则 M5 交付 `spawnTerminal` 原语 **seam**（握法/信号/
+  owner 语义进 types）+ `terminal_open/send/read/signal/close/list` 工具的
+  `NOT_AVAILABLE` 诚实桩；terminal 真实后端随未来可联网引库或平台 PTY 落地（M6）。
+  选 (a) 则需先验证 `portable-pty` 可在本机离线编译（风险：拉包失败阻塞 M5）。
+- **P2**：承 D-050 已把 `invalid_time_zone` 定为诚实报错并记 README Known Limitations；
+  引入 chrono-tz 需要离线可用且同步改 schedule 的 canonicalize/local-at 并重跑测试。
+  选 (b) 零回归，M5 不必打开。
+- **P3**：稀缺真实边界（reference 的 Seatbelt/bwrap/Landlock/ACL 全平台 FFI），本机
+  Windows 无 bwrap；纯 std 做不了。选 (a) 把「进程内 fs 围栏（canonicalize-then-contain +
+  writableRoots）」作为 M5 的真实约束面，argv confiner 留 seam + fail-closed（无 runner
+  绝不放行），后续引安全库时补真实 runner。
+- **P4**：reference 逐字是 `timeoutMs`（camelCase，见 tool-bash index.ts L254）；本仓 GUI
+  提示模板写 `timeout_ms`。M5 新增 tool 的 schema 若继续 `timeout_ms` 则与参考 wire 分叉；
+  凡 dsh 工具参数 schema 统一按参考 camelCase，避免模型学岔两套命名。差异显式记 D 条目。
+- **P5**：lsp/e2b/out-of-process subagent/jobs 均在参考里是独立大缝（进程协议 + 外部
+  服务 + FFI），M5 已把 subprocess 原语 + JobHooks 桥 + 能力登记做实，真实 provider 全
+  留 M6（与 PLAN 里程碑路线一致：M6 = mcp/acp/spill/hooks/skill）。选「M6」最省且不欠
+  架构债。
+
+> 裁定方式：可整体采纳（如「按倾向走」）或逐项指定。**本文件通过验收 + P1-P5 裁定
+> 落定后**，才进入阶段二（系统设计）；决策记录随后补记 `DECISIONS.md`。
