@@ -2493,5 +2493,32 @@ idle 推断）+ `tests/backend.rs`（4 集成，cmd/ConPTY 实跑，7s）+ `src/
 
 ---
 
+## D-065（M5 编码·dsh-code-runtime 缝 + 纯面）：可移植排除集逐字、lossless-JSON 三层防线、run_code 纯面、TS 诚实桩
+
+**日期**：2026（M5 round 14）。
+**触发问题**：step6 前半——code 执行缝契约（`code-runtime/src/{types,index}.ts`）与
+`run_code` 工具、TS worker 桩的 Rust 移植。参考仓无 python code-runtime 包（
+`WIRE_FRAME_FIELDS` 在 M5-DESIGN §7.3 只署名未给出正文）→ python 协议由我们自设计（见
+D-066）；本 D 只锁缝与纯面。
+**考虑的选项**：1. 缝常量逐字 `&[&str]` + `is_dunder_member`（无正则：`len>=5 && 双下划线
+两端`，与 TS `^__.+__$` 等语义：`__`/`____` 空中间非真 dunder）。2. lossless 三层防线：
+parse 层 serde_json 拒绝 `NaN`/`Inf` 字面量 → invalid-output；`Number` 保持（2^60 精确）；
+validate 层拦截 `-0.0`。serde_json `Number` 无法承载非有限（`from_f64(NaN)→None→Null`），
+故非有限检查是防层不变式，真实防线在 parse 层（本文档果断修掉「构造 NaN 值断言」的
+不可达测试，不留掩耳盗铃）。3. `run_code` 由 `code-runtime-python/tests`/`tool-run-code`
+（M5-DESIGN §7.4 引用但参考仓不存在）→ 按 §7.4 孤立实现：code/description 必填、
+`<parent>:code:<n>` 确定性嵌套 id、`exclude_run_code` 无递归。
+**最终选择**：选项 1+2+3。`CodeRuntime` trait：`language()/isolation()/run(&request)`
+（sync；signal 在 request 内）；`CancellationToken` = Arc<AtomicBool>；`CodeBindingFunction`
+= `Arc<dyn Fn(Value) -> Result<Value,String> + Send + Sync>`。TS 诚实桩
+`WorkerExit{"requires a code runtime"}`（DIV-3，M4 placeholder 语义保留）。
+**选择理由**：可移植承诺要求一套共享排除集、按语言拆分即失效；有机 sync 后端 + 单线程
+核心，无 async 收益；诚实桩取代假装，避免「绿但假」。
+**预期影响与回滚点**：`src/{types,seam,json_lossless,tool_code,worker_thread_stub}.rs` +
+`tests/{seam,json_lossless,tool_code}.rs` = 22 测试全绿 + clippy 零告警。python 后端接入
+后 `validate_binding_namespace` 在 boot 前逐 namespace 校验。回滚 = 撤本提交。
+
+---
+
 
 
