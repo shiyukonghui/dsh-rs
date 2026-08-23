@@ -2232,4 +2232,26 @@ ignore 是 ripgrep 同引擎、jiff 是 IANA 时区现代替代）。
 
 ---
 
+## D-055（M5 阶段关卡裁定）：P1-P5 全部按推荐倾向锁定，进入阶段二设计
+
+**日期**：2026（M5 round 8）
+
+**触发问题**：M5-REQUIREMENTS.md §6 的 P1-P5 决策点此前阻塞在人工裁定；用户回「已经缓存
+好依赖可以继续了…继续开发吧」——依赖已装（portable-pty 0.8.1 + globset 4.20 + ignore
+4.33 均已入 registry src），权限升级为 danger-full-access，审批关闭。
+
+**最终选择**（逐项，理由见 M5-REQUIREMENTS §6）：P1=(a) 引 portable-pty 0.8.1 真实做
+terminal（round8 离线端到端实测 `openpty`+`spawn_command` 通过）；P2=(a) jiff+jiff-tzdb
+IANA 全时区（已提取+离线运行验证）；P3=(a) 平台 runner seam+失败闭、真实边界由 fs 进程内
+围栏承担；P4=参考 `timeoutMs` camelCase（凡 dsh 工具参数 schema，差异记 D）；P5=lsp/e2b/
+out-of-process/jobs 真实 provider 全归 M6（登记+诚实桩）。
+
+**理由**：用户明确放行且依赖实测可用，五条均无环境或架构障碍；P2/P4/P5 与 wire 对齐纪律
+一致，P1 由用户手动安装解锁。
+
+**预期影响与回滚点**：阶段关卡通过 → 进入阶段二系统设计（M5-DESIGN.md）；回滚 = 改回
+M5-REQUIREMENTS §6 表 + 撤本条目。改动 → 提交 → 本条目互查（提交信息引用 D-055）。
+
+---
+
 

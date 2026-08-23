@@ -264,15 +264,21 @@ M5i M5-ACCEPTANCE    <- 依赖：上面全部（契约面 + 集成 + 全绿 + cl
    handle → NOT_BOUND/UNSUPPORTED 诚实；投影/事件经既有通道。
 10. 每子步 DECISIONS 对应条目 + git 提交可互查。
 
-### 6. 关键决策点（阶段关卡待用户裁定）
+### 6. 关键决策点（阶段关卡已裁定）
 
-| 决策 | 选项 | 倾向/影响 |
+> **2026 round 8 用户放行**：用户审查后回「已经缓存好依赖可以继续了…继续开发吧」，本文件
+> 所列倾向全部被采纳为最终裁定（P1 依依赖可用走 (a)、P2 走 (a)、P3 (a)、P4 参考
+> `timeoutMs`、P5 归 M6）。视为阶段关卡通过，进入阶段二（系统设计）。
+
+| 决策 | 最终裁定 | 依据 |
 |---|---|---|
-| **P1 PTY 依赖** | (a) 引 `portable-pty` 库真实做 terminal(+spawnTerminal)；(b) terminal 推 M6，M5 交付 seam+unavailable | **2026 环境实测修订（D-054）**：`portable-pty` 是本环境唯一缺失 crate，但**网络真实可达**（Node/Python 200），用户装好即可（见 `M5-DEPENDENCIES.md`）→ (a) 重新可行；用户未装前 (b) 保底 |
-| **P2 IANA 时区** | (a) 引 `jiff`+`jiff-tzdb`（**已提取+实测可离线**，见下方决策辅助）；(b) 保持 invalid_time_zone 报错 | **2026 复核（D-054 实查）**：chrono-tz 不在本地，但 `jiff-tzdb` 全套已**提取进 registry/src**（已离线编译+运行验证）→ (a) 无任何依赖障碍即可落地；仍需用户决议取 (a) 或 (b) |
-| **P3 平台沙箱 runner** | (a) seam+失败闭； (b) 引入 Landlock/bwrap FFI（不可离线验证） | 倾向 (a)，真实边界由 fs 进程内围栏承担 |
-| **P4 bash 参数名** | timeoutMs（参考）vs timeout_ms（GUI 现状） | 倾向参考 `timeoutMs`，记录分叉 |
-| **P5 lsp/e2b/out-of-process/jobs Scope** | 全部 M6（登记+诚实桩）；subprocess 原语 M5 已交付其底座 | 倾向 M6（非目标已列） |
+| **P1 PTY 依赖** | **(a) 引 `portable-pty` 0.8.1 真实做 terminal**（spawnTerminal + terminal-bash 后端 + 6 tool）；用户已装好 crate（round8 实测 `openpty`+`spawn_command` 离线运行通过） | D-054 复核 + round8 端到端验证 |
+| **P2 IANA 时区** | **(a) `jiff`+`jiff-tzdb`**（已提取 + 离线实测 `TimeZone::get` ok）；schedule canonicalize_time_zone/local-at 真实扩展，替换 D-050 invalid_time_zone 降级 | 2026 spike 实测 |
+| **P3 平台沙箱 runner** | **(a) seam + 失败闭**；真实边界由 fs 进程内围栏承担，argv confiner 留 seam，无 runner 绝不放行 | 纯 std 无法做内核 FFI |
+| **P4 bash 参数名** | **参考 `timeoutMs`（camelCase）**；凡 dsh 工具参数 schema 用参考命名，差异记 D 条目 | wire 对齐纪律 |
+| **P5 lsp/e2b/out-of-process/jobs Scope** | **全部 M6**（登记 + 诚实桩）；subprocess 原语 M5 已交付其底座 | 非目标不扩散 |
+
+> 裁定方式：以上五条均已由用户「继续开发吧」放行，进入阶段二前无需再确认；设计阶段以此为准。
 
 **决策辅助（供裁定参考，2026 复核）**
 
