@@ -2254,4 +2254,36 @@ M5-REQUIREMENTS §6 表 + 撤本条目。改动 → 提交 → 本条目互查�
 
 ---
 
+## D-056（M5 阶段二·系统设计收口）：M5-DESIGN.md 六 crate 设计 + DIV 分叉清单 + 子代理降级接管
+
+**日期**：2026（M5 round 9）
+
+**触发问题**：① 设计子代理 f672179d 两个回合零产物——任务是「读全部参考 TS + 写详尽
+M5-DESIGN.md」，超大单轮被中断且未写盘，遂由主线程独立交叉核查后直接接管撰写（中断子代理
+是停掉无产物的 in-flight 轮，不丢已存工件；此为本会话对「大交付物委托」的降级处置，记档）；
+② 设计定稿需要把六 crate 的契约、DIV 分叉、实现顺序落成可验收工件。
+
+**考虑的选项**：
+1. **主线程独立撰写 M5-DESIGN.md（本次采用）**：round 7/8 已对六缝做了逐字的独立交叉核查
+   （tool-fs write 输出信封、tool-bash camelCase 参数与全部标记词汇、shell types 逐字、
+   code-runtime python 协议 PROTOCOL_FD=3/lossless、fs 13 错误码 + 12 方法、sandbox 阶梯/
+   roots/审批优先级、jobs ProducerHooks、ScheduleHost tick 点、M4 host-bind 模板），足以直接
+   产出可信设计。
+2. **再等/重启子代理**：已触发过增量写盘导引仍无产物，重开有同样卡死风险，且主线程核查已
+   完备，重启不增信息。
+3. **跳过设计直接编码**：违反瀑布流阶段关卡（阶段二验收工件缺失）。
+
+**最终选择**：选项 1。设计文档 `M5-DESIGN.md` 含 10 节：crate 划分与依赖图、subprocess /
+sandbox / fs / shell / terminal / code-runtime 六缝逐字契约 + 各自 TDD 计划、宿主接线
+（M5HostServices/register_m5_tools/sandbox-mode 投影/定时 tick/jobs producer）、实现顺序
+8 步 + 逐步验收、DIV-1..7 分叉清单。
+
+**选择理由**：瀑布流要求阶段二产出可验收设计工件，主线程已具全部契约证据，接管是唯一可
+推进路径；DIV 清单使 wire 分叉（camelCase、诚实桩、seam+失败闭）可审计。
+
+**预期影响与回滚点**：阶段二工件落盘（M5-DESIGN.md）→ 提交易验收；回滚 = 撤 M5-DESIGN.md
+提交（设计本身不改代码，无执行风险）。改动 → 提交 → 本条目互查（提交信息引用 D-056）。
+
+---
+
 
