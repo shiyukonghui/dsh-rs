@@ -2862,5 +2862,37 @@ run_code 嵌套 tools 派发为诚实降级项（D-069/D-073 记录，非验收�
 
 ---
 
+## D-077（M6 需求分析·阶段关卡）：M6 范围裁定——服务器执行闭环（serve 接线）为主轴 +
+M5R §5 待办篮按子步穿插（用户裁定 P1 两者都要）；P2 workspace_root=web 配置缺省 CWD；
+P3 无 LLM 凭据 fail-loud；P4 注入真实测试 LLM 端点（key 仅环境变量不入库）
+
+**日期**：2026（M6 round 1/2）。
+**触发问题**：用户发起「按照流程规划和开发M6」。M5R §5 把 mcp/acp/hooks/skill、settings/.env、
+provider capabilities、ts-host 差分、SQLite 推给 M6，D-076 又把「M5 工具进 serve() 服务器执行
+环」列为 M6 serve 里程碑——M6 范围存在多个候选，需求分析必须先定界（第一性原理 + 双视角）。
+**自下而上资产实证（本阶段实测）**：`AgentLoopHost::with_store(config, llm, tools, store)` 已备
+（tools 由调用方传入 = M6 注册缝）；web.rs RPC 面已含 agent.run/agent.turn/session.prompt/
+llm.models；`agent-loop|agent.turn|agent.run` 分支在 boot.agent_loop.is_some() 时走
+`run_rust_loop`，否则 `run_turn`（cordis loop 插件）——但**生产 `dsh web` 的 boot.agent_loop=
+None**（lib.rs Boot 默认 None，仅测试装配）；register_m4_with_host/register_m5_with_host/
+M5Host::assemble 全部公开但**仅在测试调用**。结论：唯一上线缺块 = 装配 + 生命周期 + tick/sandbox
+挂入，无新引擎需求（自顶向下与自下而上相遇于「装配语义」）。
+**用户裁定（P1-P4 全部采纳）**：P1 两者都要（主轴 step1-6：装配工厂/生命周期/tick 注入/sandbox
+投影/LLM 诚实无 key/前端最小闭环；穿插 step7-10：settings/.env → provider capabilities →
+hooks/skill → ts-host 差分/SQLite）；P2 workspace_root=WebConfig 指定，缺省 CWD canonicalize；
+P3 无 DEEPSEEK_API_KEY → agent.turn fail-loud（不伪造，工具/API 面照常）；P4 测试 LLM 端点
+base_url `http://100.105.152.101:18080/v1`、model `deepseek-v4-flash-0731-ext`、key 经
+`DEEPSEEK_API_KEY` 环境变量（DeepSeekConnection 不含 key——key 在服务层桥 HTTP 头，天然不上
+git；**key 本体永不入库**）。
+**拒绝的选项**：① M6 广铺待办篮而忽略主轴（违背第一性根本目的「让已有执行面真跑」，P1 裁定
+否）；② 造新执行引擎（M5 资产全可复用，否）；③ key 入配置/文档（安全红线，否）。
+**预期影响与回滚点**：M6-REQUIREMENTS.md 为阶段一关卡产物（目标/非目标/假设/约束/边界/验收
+#1-8/裁定 P1-P4）。回滚 = 撤本提交（纯文档）。进入阶段二（系统设计）时按此文档分解，不重新
+发散需求。
+**待办**：阶段二系统设计（M6-DESIGN.md：装配工厂/Lifecycle/tick 注入/sandbox 投影/LLM 装配/
+穿插篮子步）→ 阶段三编码（TDD）→ … → M6-ACCEPTANCE。
+
+---
+
 
 
