@@ -5,13 +5,30 @@
 //!
 //! 诚实接线原则（D-068）：工具一律先注册（定义可见、schema 可校验、模型可见 renderers
 //! 单源），再按「宿主服务句柄是否在场」决定 execute 真实委托 vs 结构化 `NOT_BOUND`——
-//! 绝不无句柄假装成功（M4 同款承诺，D-052）。本轮真实绑定：terminal 六件套（本箱
-//! ConPTY 可实测）；bash/run_code/fs(read/write/edit/read_image)/glob/grep/
-//! str_replace_editor 后续轮按服务柄接入（D-068 记录待办）。
+//! 绝不无句柄假装成功（M4 同款承诺，D-052）。真实绑定：terminal 六件套 + fs 六件套
+//! （read/write/edit/glob/grep/str_replace_editor，走 LocalFileSystem+ObservationGate）；
+//! read_image/bash/run_code 后续轮按服务柄/传输接入（D-068/D-069 记录待办）。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 
+use dsh_fs::grep::{
+    format_grep_output, retain_grep_matches, GrepMatch, RetainedMatches, GREP_MAX_LINE_BYTES,
+    GREP_MAX_MATCHES,
+};
+use dsh_fs::read_render::{
+    build_window, format_read_output, parse_read_args, FileReadOutcome, ReadWindow, READ_LIMIT,
+    READ_MAX_BYTES, READ_MAX_LINE_LENGTH,
+};
+use dsh_fs::{
+    apply_insert, apply_str_replace, format_edit_output, format_file_view, format_write_output,
+    glob_search_in, grep_search_in, parse_edit_args, parse_glob_args, parse_grep_args,
+    parse_write_args, remediate_fs_error, FsEditRequest, FsError, FsTarget, FsWriteIntent,
+    LocalFileSystem, Observation, ObservationGate, OwnerId, ReadTextOptions,
+    DEFAULT_MAX_OUTPUT_CHARS,
+};
 use dsh_shell::bash_tool_parameters;
 use dsh_terminal::{
     parse_terminal_close_args, parse_terminal_open_args, parse_terminal_read_args,
@@ -32,15 +49,86 @@ const M5_RENDER_MAX_BYTES: usize = 256 * 1024;
 /// 结构化错误 code：宿主句柄缺失（复用 M4 NOT_BOUND 词表）。
 pub use dsh_tools::m4::CODE_NOT_BOUND;
 
-/// M5h 宿主服务句柄集合：terminal 工具组的 bind 目标。
+/// fs 宿主：LocalFileSystem（root 解析）+ observation gate（owner 写/编守卫）+ agent→OwnerId
+/// 稳定登记（Web 无 WeakMap；宿主会话结束时需清理——本轮接线不装会话清理钩子，D-069 记录）。
+pub struct FsHost {
+    pub fs: LocalFileSystem,
+    pub root: PathBuf,
+    gate: RefCell<ObservationGate>,
+    owners: RefCell<HashMap<String, OwnerId>>,
+    next_owner: Cell<OwnerId>,
+}
+
+impl FsHost {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            fs: LocalFileSystem::new(root.clone()),
+            root,
+            gate: RefCell::new(ObservationGate::new()),
+            owners: RefCell::new(HashMap::new()),
+            next_owner: Cell::new(1),
+        }
+    }
+
+    /// agent → 稳定 OwnerId（memoize；时间序单调分配）。
+    pub fn owner_id(&self, agent: &str) -> OwnerId {
+        if let Some(id) = self.owners.borrow().get(agent) {
+            return *id;
+        }
+        let id = self.next_owner.get();
+        self.next_owner.set(id + 1);
+        self.owners.borrow_mut().insert(agent.to_string(), id);
+        id
+    }
+
+    /// 路径以宿主 root 为 cwd 解析。
+    pub fn resolve(&self, file_path: &str) -> Result<FsTarget, FsError> {
+        self.fs.resolve(
+            file_path,
+            dsh_fs::ResolveOptions {
+                cwd: Some(self.root.clone()),
+            },
+        )
+    }
+
+    /// 写意图（observed-present → replace-if-version；否则 create-if-absent）。
+    pub fn write_intent(&self, owner: &str, target: &FsTarget) -> FsWriteIntent {
+        self.gate
+            .borrow()
+            .write_intent(self.owner_id(owner), target)
+    }
+
+    /// 编意图（未观察 → FS_NOT_OBSERVED 诚实拒绝）。
+    pub fn edit_intent(
+        &self,
+        owner: &str,
+        target: &FsTarget,
+    ) -> Result<dsh_fs::FsVersion, FsError> {
+        self.gate
+            .borrow()
+            .edit_intent(self.owner_id(owner), target)
+            .map(|v| v.version)
+    }
+
+    /// 记录一次权威观察（读/写/编成功后）。
+    pub fn record(&self, owner: &str, target: &FsTarget, obs: Observation) {
+        self.gate
+            .borrow_mut()
+            .record(self.owner_id(owner), target, obs);
+    }
+}
+
+/// M5h 宿主服务句柄集合：M5 工具组的 bind 目标。
 ///
 /// `register_m5_tools_with_host` 接受可选的 `&M5HostServices`：有句柄 → 对应工具 bind
 /// 到真实服务（fail loud 不再 NOT_BOUND）；无句柄 → 注册定义但保持 `NOT_BOUND`。
-/// 本轮仅装配 `terminal`；shell/fs/code_runtime 句柄随后续 binder 轮加入（D-068）。
+/// 本轮装配 `terminal` + `fs`；shell/code_runtime 句柄随后续 binder 轮加入（D-068/D-069）。
 #[derive(Default)]
 pub struct M5HostServices {
     /// 终端会话注册表（terminal_open/send/read/signal/close/list 的真实句柄）。
     pub terminal: Option<Rc<RefCell<TerminalSessionService>>>,
+    /// fs 宿主（read/write/edit/glob/grep/str_replace_editor 的真实句柄）。
+    pub fs: Option<Rc<FsHost>>,
 }
 
 /// 注册全部 M5 工具（M5-DESIGN §8 工具集）到一个 registry。
@@ -80,8 +168,7 @@ pub fn register_m5_tools_with_host(
             .unwrap_or_else(|e| panic!("{name}: {e}"));
     }
 
-    // ---- bash / fs 族 / 搜索 / sr-editor：登记定义（纯面 schema + 校验），
-    // execute 待对应宿主句柄接入（本轮 NOT_BOUND，诚实）。
+    // ---- bash：登记定义（纯面 schema + 校验）；execute 待 shell 宿主句柄接入（NOT_BOUND）。
     // 注：`run_code` 不在此登记——注册表保留该名注入 Code Mode 占位传输（诚实
     // "requires a code runtime" 桩）；真实运行面绑定属 registry/run_code binder 步（D-068）。
     let bash = define_m5_tool(
@@ -89,128 +176,42 @@ pub fn register_m5_tools_with_host(
         "Run a shell command in the host workspace, returning its output, exit code, and sandbox status.".into(),
         bash_tool_parameters(true, &[]),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| vec![ContentBlock::text(render_bash_value(v))]),
+        Rc::new(|_a, v| vec![ContentBlock::text(render_passthrough(v))]),
     )
     .expect("bash defines");
     registry
         .register_global(Rc::clone(&bash.definition()))
         .expect("register bash");
 
-    let fs_read = define_m5_tool(
-        "read",
-        "Read a file from the workspace with an optional line window (UTF-8).".into(),
-        json!({
-            "file_path": {"type":"string","required":true},
-            "offset": {"type":"integer"},
-            "limit": {"type":"integer"},
-        }),
-        json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| vec![ContentBlock::text(render_passthrough(v))]),
-    )
-    .expect("read defines");
-    registry
-        .register_global(fs_read.definition())
-        .expect("register read");
-
-    let fs_write = define_m5_tool(
-        "write",
-        "Write or create a text file atomically in the workspace (UTF-8).".into(),
-        json!({
-            "file_path": {"type":"string","required":true},
-            "content": {"type":"string","required":true},
-            "description": {"type":"string"},
-        }),
-        json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| vec![ContentBlock::text(render_passthrough(v))]),
-    )
-    .expect("write defines");
-    registry
-        .register_global(fs_write.definition())
-        .expect("register write");
-
-    let fs_edit = define_m5_tool(
-        "edit",
-        "Replace all exact occurrences of old_string with new_string in a text file (version-guarded by read-before-edit observation).".into(),
-        json!({
-            "file_path": {"type":"string","required":true},
-            "old_string": {"type":"string","required":true},
-            "new_string": {"type":"string","required":true},
-            "replace_all": {"type":"boolean"},
-            "description": {"type":"string"},
-        }),
-        json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| vec![ContentBlock::text(render_passthrough(v))]),
-    )
-    .expect("edit defines");
-    registry
-        .register_global(fs_edit.definition())
-        .expect("register edit");
-
-    let fs_read_image = define_m5_tool(
-        "read_image",
-        "Read an image file and return it as inline media (PNG/JPEG/WebP/GIF).".into(),
-        json!({"file_path": {"type":"string","required":true}}),
-        json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| vec![ContentBlock::text(render_passthrough(v))]),
-    )
-    .expect("read_image defines");
-    registry
-        .register_global(fs_read_image.definition())
-        .expect("register read_image");
-
-    let glob = define_m5_tool(
-        "glob",
-        "List files matching a glob pattern under the workspace, excluding VCS dirs.".into(),
-        json!({
-            "pattern": {"type":"string","required":true},
-            "path": {"type":"string"},
-        }),
-        json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| vec![ContentBlock::text(render_passthrough(v))]),
-    )
-    .expect("glob defines");
-    registry
-        .register_global(glob.definition())
-        .expect("register glob");
-
-    let grep = define_m5_tool(
-        "grep",
-        "Search file contents with an ignore-aware regex under the workspace.".into(),
-        json!({
-            "pattern": {"type":"string","required":true},
-            "path": {"type":"string"},
-            "include": {"type":"string"},
-        }),
-        json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| vec![ContentBlock::text(render_passthrough(v))]),
-    )
-    .expect("grep defines");
-    registry
-        .register_global(grep.definition())
-        .expect("register grep");
-
-    let sr_editor = define_m5_tool(
-        "str_replace_editor",
-        "View a file and apply unique string replacement or line insertion (read-before-edit)."
-            .into(),
-        json!({
-            "file_path": {"type":"string","required":true},
-            "view": {"type":"boolean"},
-            "old_string": {"type":"string"},
-            "new_string": {"type":"string"},
-            "replace_all": {"type":"boolean"},
-            "insert_line": {"type":"integer"},
-            "new_str": {"type":"string"},
-        }),
-        json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| vec![ContentBlock::text(render_passthrough(v))]),
-    )
-    .expect("str_replace_editor defines");
-    registry
-        .register_global(sr_editor.definition())
-        .expect("register str_replace_editor");
-
-    // 保持方言参数被校验（bash/run_code 次轮 bind 前，execute 已带类型语义校验）。
+    // ---- fs 六件套 + 搜索 + sr-editor：纯面定义（schema + 渲染）+ 宿主 bind ----
+    let fs_read = fs_read_tool();
+    let fs_write = fs_write_tool();
+    let fs_edit = fs_edit_tool();
+    let fs_read_image = fs_read_image_tool();
+    let glob = glob_tool();
+    let grep = grep_tool();
+    let sr_editor = sr_editor_tool();
+    if let Some(fsh) = host.and_then(|h| h.fs.clone()) {
+        fs_read.bind(fs_read_executor(fsh.clone()));
+        fs_write.bind(fs_write_executor(fsh.clone()));
+        fs_edit.bind(fs_edit_executor(fsh.clone()));
+        glob.bind(glob_executor(fsh.clone()));
+        grep.bind(grep_executor(fsh.clone()));
+        sr_editor.bind(sr_editor_executor(fsh));
+    }
+    for (name, tool) in [
+        ("read", fs_read),
+        ("write", fs_write),
+        ("edit", fs_edit),
+        ("read_image", fs_read_image),
+        ("glob", glob),
+        ("grep", grep),
+        ("str_replace_editor", sr_editor),
+    ] {
+        registry
+            .register_global(tool.definition())
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +462,437 @@ fn terminal_list_executor(svc: Rc<RefCell<TerminalSessionService>>) -> ToolExecu
 }
 
 // ---------------------------------------------------------------------------
+// fs 六件套 + 搜索 + sr-editor：纯面定义（schema + 渲染）+ 宿主 executor
+// ---------------------------------------------------------------------------
+
+fn fs_read_tool() -> M5Tool {
+    define_m5_tool(
+        "read",
+        "Read a file from the workspace into a numbered window (offset/limit line window honored)."
+            .into(),
+        json!({
+            "file_path": {"type":"string","required":true},
+            "offset": {"type":"integer"},
+            "limit": {"type":"integer"},
+        }),
+        json!({"type":"object","additionalProperties":true}),
+        Rc::new(|_a, v| {
+            let outcome = FileReadOutcome {
+                offset: v["offset"].as_u64().unwrap_or(1) as usize,
+                lines: v["lines"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|l| dsh_fs::read_render::FileTextLine {
+                                number: l["number"].as_u64().unwrap_or(0) as usize,
+                                text: l["text"].as_str().unwrap_or("").to_string(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                total_lines: v["total_lines"].as_u64().unwrap_or(0) as usize,
+                truncated_by_bytes: v["truncated"].as_bool().unwrap_or(false),
+            };
+            let text = format_read_output(v["file_path"].as_str().unwrap_or("?"), &outcome);
+            vec![ContentBlock::text(text)]
+        }),
+    )
+    .expect("read defines")
+}
+
+fn fs_write_tool() -> M5Tool {
+    define_m5_tool(
+        "write",
+        "Write or create a text file atomically in the workspace (UTF-8).".into(),
+        json!({
+            "file_path": {"type":"string","required":true},
+            "content": {"type":"string","required":true},
+            "description": {"type":"string"},
+        }),
+        json!({"type":"object","additionalProperties":true}),
+        Rc::new(|_a, v| {
+            let text = format_write_output(
+                v["file_path"].as_str().unwrap_or("?"),
+                v["operation"].as_str().unwrap_or("create"),
+            );
+            vec![ContentBlock::text(text)]
+        }),
+    )
+    .expect("write defines")
+}
+
+fn fs_edit_tool() -> M5Tool {
+    define_m5_tool(
+        "edit",
+        "Replace occurrences of old_string with new_string in a text file, version-guarded by read-before-edit observation.".into(),
+        json!({
+            "file_path": {"type":"string","required":true},
+            "old_string": {"type":"string","required":true},
+            "new_string": {"type":"string","required":true},
+            "replace_all": {"type":"boolean"},
+            "description": {"type":"string"},
+        }),
+        json!({"type":"object","additionalProperties":true}),
+        Rc::new(|_a, v| {
+            let text = format_edit_output(
+                v["file_path"].as_str().unwrap_or("?"),
+                v["replace_all"].as_bool().unwrap_or(false),
+            );
+            vec![ContentBlock::text(text)]
+        }),
+    )
+    .expect("edit defines")
+}
+
+fn fs_read_image_tool() -> M5Tool {
+    define_m5_tool(
+        "read_image",
+        "Read an image file and return it as inline media (PNG/JPEG/WebP/GIF) with dimensions."
+            .into(),
+        json!({"file_path": {"type":"string","required":true}}),
+        json!({"type":"object","additionalProperties":true}),
+        Rc::new(|_a, v| vec![ContentBlock::text(render_passthrough(v))]),
+    )
+    .expect("read_image defines")
+}
+
+fn glob_tool() -> M5Tool {
+    define_m5_tool(
+        "glob",
+        "List files matching a glob pattern under the workspace, excluding VCS dirs.".into(),
+        json!({
+            "pattern": {"type":"string","required":true},
+            "path": {"type":"string"},
+        }),
+        json!({"type":"object","additionalProperties":true}),
+        Rc::new(|_a, v| {
+            let matches: Vec<String> = v["matches"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let text = if matches.is_empty() {
+                "(no matches)".to_string()
+            } else {
+                matches.join("\n")
+            };
+            vec![ContentBlock::text(text)]
+        }),
+    )
+    .expect("glob defines")
+}
+
+fn grep_tool() -> M5Tool {
+    define_m5_tool(
+        "grep",
+        "Search file contents with an ignore-aware regex under the workspace.".into(),
+        json!({
+            "pattern": {"type":"string","required":true},
+            "path": {"type":"string"},
+            "include": {"type":"string"},
+        }),
+        json!({"type":"object","additionalProperties":true}),
+        Rc::new(|_a, v| {
+            let items: Vec<GrepMatch> = v["matches"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|m| GrepMatch {
+                            path: m["path"].as_str().unwrap_or("").to_string(),
+                            line_number: m["line_number"].as_u64().unwrap_or(0),
+                            line: m["line"].as_str().unwrap_or("").to_string(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let retained = RetainedMatches {
+                items,
+                seen: v["seen"].as_u64().unwrap_or(0) as usize,
+            };
+            let text = format_grep_output(&retained, None);
+            vec![ContentBlock::text(text)]
+        }),
+    )
+    .expect("grep defines")
+}
+
+fn sr_editor_tool() -> M5Tool {
+    define_m5_tool(
+        "str_replace_editor",
+        "View a file, apply a unique string replacement, or insert text at a line (all read-before-edit).".into(),
+        json!({
+            "file_path": {"type":"string","required":true},
+            "view": {"type":"boolean"},
+            "old_string": {"type":"string"},
+            "new_string": {"type":"string"},
+            "replace_all": {"type":"boolean"},
+            "insert_line": {"type":"integer"},
+            "new_str": {"type":"string"},
+        }),
+        json!({"type":"object","additionalProperties":true}),
+        Rc::new(|_a, v| {
+            let text = format_file_view(
+                v["file_path"].as_str().unwrap_or("?"),
+                v["content"].as_str().unwrap_or(""),
+                DEFAULT_MAX_OUTPUT_CHARS,
+                None,
+            )
+            .unwrap_or_else(|_| "(unreadable view)".to_string());
+            vec![ContentBlock::text(text)]
+        }),
+    )
+    .expect("str_replace_editor defines")
+}
+
+fn fs_read_executor(fsh: Rc<FsHost>) -> ToolExecute {
+    Rc::new(move |args, ctx| {
+        let owner = required_agent(ctx.agent.as_deref(), "read")?;
+        let input = parse_read_args(
+            args["file_path"].as_str().unwrap_or(""),
+            args.get("offset").and_then(Value::as_i64),
+            args.get("limit").and_then(Value::as_i64),
+            READ_LIMIT,
+        )
+        .map_err(|m| invalid_args("read", m))?;
+        let target = fsh
+            .resolve(&input.file_path)
+            .map_err(|e| fs_failure("read", e))?;
+        let text = fsh
+            .fs
+            .read_text(&target, ReadTextOptions { max_bytes: None })
+            .map_err(|e| fs_failure("read", e))?;
+        let window = build_window(
+            &text.content,
+            &ReadWindow {
+                offset: input.offset,
+                limit: input.limit,
+                max_line_length: READ_MAX_LINE_LENGTH,
+                max_bytes: READ_MAX_BYTES,
+            },
+            &target.display_path,
+        )
+        .map_err(|e| fs_failure("read", e))?;
+        // 权威观察：后续 write/edit 以本次所见版本做 CAS 基础。
+        fsh.record(
+            owner,
+            &target,
+            Observation::Present {
+                version: text.version,
+            },
+        );
+        let lines: Vec<Value> = window
+            .lines
+            .iter()
+            .map(|l| json!({ "number": l.number, "text": l.text }))
+            .collect();
+        Ok(json!({
+            "file_path": target.display_path,
+            "offset": input.offset,
+            "lines": lines,
+            "total_lines": window.total_lines,
+            "truncated": window.truncated_by_bytes,
+        }))
+    })
+}
+
+fn fs_write_executor(fsh: Rc<FsHost>) -> ToolExecute {
+    Rc::new(move |args, ctx| {
+        let owner = required_agent(ctx.agent.as_deref(), "write")?;
+        let input = parse_write_args(
+            args["file_path"].as_str().unwrap_or(""),
+            args["content"].as_str().unwrap_or(""),
+        )
+        .map_err(|m| invalid_args("write", m))?;
+        let target = fsh
+            .resolve(&input.file_path)
+            .map_err(|e| fs_failure("write", e))?;
+        let intent = fsh.write_intent(owner, &target);
+        let outcome = fsh
+            .fs
+            .write_text(&target, &input.content, Some(intent), None)
+            .map_err(|e| fs_failure("write", e))?;
+        fsh.record(
+            owner,
+            &target,
+            Observation::Present {
+                version: outcome.version,
+            },
+        );
+        Ok(json!({
+            "file_path": target.display_path,
+            "operation": outcome.operation,
+        }))
+    })
+}
+
+fn fs_edit_executor(fsh: Rc<FsHost>) -> ToolExecute {
+    Rc::new(move |args, ctx| {
+        let owner = required_agent(ctx.agent.as_deref(), "edit")?;
+        let input = parse_edit_args(
+            args["file_path"].as_str().unwrap_or(""),
+            args["old_string"].as_str().unwrap_or(""),
+            args["new_string"].as_str().unwrap_or(""),
+            args.get("replace_all").and_then(Value::as_bool),
+        )
+        .map_err(|m| invalid_args("edit", m))?;
+        let target = fsh
+            .resolve(&input.file_path)
+            .map_err(|e| fs_failure("edit", e))?;
+        let saw = fsh
+            .edit_intent(owner, &target)
+            .map_err(|e| fs_failure("edit", e))?;
+        let req = FsEditRequest {
+            old_string: input.old_string,
+            new_string: input.new_string,
+            replace_all: input.replace_all,
+        };
+        let outcome = fsh
+            .fs
+            .edit_text(&target, &req, Some(&saw), None)
+            .map_err(|e| fs_failure("edit", e))?;
+        fsh.record(
+            owner,
+            &target,
+            Observation::Present {
+                version: outcome.version,
+            },
+        );
+        Ok(json!({
+            "file_path": target.display_path,
+            "replace_all": req.replace_all,
+        }))
+    })
+}
+
+fn glob_executor(fsh: Rc<FsHost>) -> ToolExecute {
+    Rc::new(move |args, _ctx| {
+        let input = parse_glob_args(
+            args["pattern"].as_str().unwrap_or(""),
+            args.get("path").and_then(Value::as_str),
+        )
+        .map_err(|m| invalid_args("glob", m))?;
+        let matches = glob_search_in(&fsh.root, &input).map_err(|e| fs_failure("glob", e))?;
+        Ok(json!({ "matches": matches }))
+    })
+}
+
+fn grep_executor(fsh: Rc<FsHost>) -> ToolExecute {
+    Rc::new(move |args, _ctx| {
+        let input = parse_grep_args(
+            args["pattern"].as_str().unwrap_or(""),
+            args.get("path").and_then(Value::as_str),
+            args.get("include").and_then(Value::as_str),
+        )
+        .map_err(|m| invalid_args("grep", m))?;
+        let matches = grep_search_in(&fsh.root, &input).map_err(|e| grep_failure("grep", e))?;
+        let retained = retain_grep_matches(&matches, GREP_MAX_MATCHES, GREP_MAX_LINE_BYTES);
+        Ok(json!({
+            "matches": retained.items.iter().map(|m| json!({
+                "path": m.path, "line_number": m.line_number, "line": m.line
+            })).collect::<Vec<_>>(),
+            "seen": retained.seen,
+        }))
+    })
+}
+
+fn sr_editor_executor(fsh: Rc<FsHost>) -> ToolExecute {
+    Rc::new(move |args, ctx| {
+        let owner = required_agent(ctx.agent.as_deref(), "str_replace_editor")?;
+        let file_path = args["file_path"].as_str().unwrap_or("").to_string();
+        if file_path.trim().is_empty() {
+            return Err(invalid_args(
+                "str_replace_editor",
+                "file_path must be a non-empty string".into(),
+            ));
+        }
+        let use_view = args.get("view").and_then(Value::as_bool).unwrap_or(false);
+        let repl = args
+            .get("old_string")
+            .and_then(Value::as_str)
+            .zip(args.get("new_string").and_then(Value::as_str));
+        let insert = args
+            .get("insert_line")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .zip(args.get("new_str").and_then(Value::as_str));
+        // 读当前文本 + 版本（自动读 → CAS 基础；str_replace_editor 参考自读语义）。
+        let target = fsh
+            .resolve(&file_path)
+            .map_err(|e| fs_failure("str_replace_editor", e))?;
+        let text = fsh
+            .fs
+            .read_text(&target, ReadTextOptions { max_bytes: None })
+            .map_err(|e| fs_failure("str_replace_editor", e))?;
+        fsh.record(
+            owner,
+            &target,
+            Observation::Present {
+                version: text.version.clone(),
+            },
+        );
+        let final_text = if use_view && repl.is_none() && insert.is_none() {
+            text.content
+        } else if let (Some((old_str, new_str)), None) = (repl, insert) {
+            apply_str_replace(&text.content, old_str, new_str, &target.display_path)
+                .map_err(|e| fs_failure("str_replace_editor", e))?
+        } else if let (None, Some((line, new_str))) = (repl, insert) {
+            apply_insert(&text.content, line, new_str)
+                .map_err(|m| invalid_args("str_replace_editor", m))?
+        } else {
+            return Err(invalid_args(
+                "str_replace_editor",
+                "specify exactly one of view:true, old_string+new_string, or insert_line+new_str"
+                    .into(),
+            ));
+        };
+        if !use_view && (repl.is_some() || insert.is_some()) {
+            let outcome = fsh
+                .fs
+                .write_text(
+                    &target,
+                    &final_text,
+                    Some(FsWriteIntent::ReplaceIfVersion {
+                        version: text.version,
+                    }),
+                    None,
+                )
+                .map_err(|e| fs_failure("str_replace_editor", e))?;
+            fsh.record(
+                owner,
+                &target,
+                Observation::Present {
+                    version: outcome.version,
+                },
+            );
+        }
+        Ok(json!({
+            "file_path": target.display_path,
+            "content": final_text,
+        }))
+    })
+}
+
+fn fs_failure(tool: &str, e: FsError) -> ToolFailureData {
+    let remedied = remediate_fs_error(&e);
+    ToolFailureData::new(
+        format!("{tool}: {}", remedied.message),
+        remedied.code().as_str(),
+        "FsError",
+    )
+}
+
+fn grep_failure(tool: &str, e: dsh_fs::GrepError) -> ToolFailureData {
+    ToolFailureData::new(
+        format!("{tool}: {}", e.message),
+        format!("{:?}", e.code),
+        "GrepError",
+    )
+}
+
+// ---------------------------------------------------------------------------
 // 助手：agent / 错误 / 状态 / 信号映射
 // ---------------------------------------------------------------------------
 
@@ -555,11 +987,6 @@ fn render_passthrough(v: &Value) -> String {
     } else {
         serde_json::to_string_pretty(v).unwrap_or_else(|_| "(unrenderable output)".to_string())
     }
-}
-
-fn render_bash_value(v: &Value) -> String {
-    // 与 tool_bash 纯面渲染保持同词表；未 bind 前不可达。
-    render_passthrough(v)
 }
 
 /// 允许外部（web.rs 测试 / 未来装配）复用本模块的专用输出 schema（permissive object）。

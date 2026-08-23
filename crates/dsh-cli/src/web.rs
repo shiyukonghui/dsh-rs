@@ -4382,7 +4382,7 @@ mod tests {
                 Box::new(|_cfg| Box::new(M5FakeBackend::default())),
             )
             .expect("register fake backend");
-        let host = M5HostServices { terminal: Some(term) };
+        let host = M5HostServices { terminal: Some(term), fs: None };
         register_m5_tools_with_host(&registry, Some(&host));
 
         // open
@@ -4498,5 +4498,157 @@ mod tests {
             None,
         );
         assert!(res.is_error, "closed session gone");
+    }
+
+    /// M5i 接线 #3：fs 宿主句柄在场 → read/write/edit/glob/grep/str_replace_editor 走真实
+    /// LocalFileSystem+ObservationGate（临时 root）：write 建文件 → read 观察 → edit 版本
+    /// CAS → 未观察写既有文件被拒（read-before-write）→ glob → grep → sr_editor view/替换。
+    #[test]
+    fn register_m5_tools_with_fs_host_binds_really() {
+        use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
+        let root = std::env::temp_dir().join(format!("dsh-m5-fs-test-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap(); // w4 写入需要父目录
+        let registry = ToolRegistry::new(ToolExecutionMode::Native);
+        let fsh = Rc::new(web_m5::FsHost::new(root.clone()));
+        register_m5_tools_with_host(
+            &registry,
+            Some(&M5HostServices { terminal: None, fs: Some(fsh) }),
+        );
+
+        let exec = |call_id: &str, name: &str, args: serde_json::Value| {
+            registry.execute(&ToolExecutionInput::new(call_id, name, args, Some("agent-1".into())), None)
+        };
+
+        // write 建文件（create）
+        let res = exec(
+            "w1",
+            "write",
+            serde_json::json!({ "file_path": "hello.txt", "content": "hello world\nline two\n" }),
+        );
+        assert!(!res.is_error, "write ok: {:?}", res.error);
+        assert_eq!(res.value.unwrap()["operation"], "create");
+
+        // 未读就再写同一文件 → 读前写被拒（FS_NOT_OBSERVED carri出诚实报错）
+        let res = exec(
+            "w2",
+            "write",
+            serde_json::json!({ "file_path": "hello.txt", "content": "overwrite without read" }),
+        );
+        assert!(res.is_error, "read-before-write enforced");
+        let code = res
+            .error
+            .as_ref()
+            .and_then(|e| e.info.as_ref())
+            .map(|i| i.code.clone())
+            .unwrap_or_default();
+        assert_eq!(code, "FS_NOT_OBSERVED");
+
+        // read 观察 → read-before-write 放行（update，带窗口渲染 lines）
+        let res = exec(
+            "r1",
+            "read",
+            serde_json::json!({ "file_path": "hello.txt" }),
+        );
+        assert!(!res.is_error, "read ok: {:?}", res.error);
+        let v = res.value.unwrap();
+        assert_eq!(v["total_lines"], 2);
+        assert_eq!(v["lines"][0]["text"], "hello world");
+
+        // write（observed）→ update
+        let res = exec(
+            "w3",
+            "write",
+            serde_json::json!({ "file_path": "hello.txt", "content": "HELLO\nline two\nline three\n" }),
+        );
+        assert!(!res.is_error, "write update ok");
+        assert_eq!(res.value.unwrap()["operation"], "update");
+
+        // 另一 agent 未观察同名 → FS_NOT_OBSERVED（owner 隔离）
+        let res_other = registry.execute(
+            &ToolExecutionInput::new(
+                "o1",
+                "write",
+                serde_json::json!({ "file_path": "hello.txt", "content": "x" }),
+                Some("agent-2".into()),
+            ),
+            None,
+        );
+        assert!(res_other.is_error, "foreign owner unaobserved write rejected");
+
+        // read（agent-2 未见 → 观察 agent-2 自己；随后可 edit）
+        let _r = registry.execute(
+            &ToolExecutionInput::new(
+                "r2",
+                "read",
+                serde_json::json!({ "file_path": "hello.txt" }),
+                Some("agent-2".into()),
+            ),
+            None,
+        );
+        assert!(!_r.is_error);
+
+        // edit：agent-2 替换（版本 CAS 已观察）
+        let res = registry.execute(
+            &ToolExecutionInput::new(
+                "e1",
+                "edit",
+                serde_json::json!({ "file_path": "hello.txt", "old_string": "line three", "new_string": "line three!" }),
+                Some("agent-2".into()),
+            ),
+            None,
+        );
+        assert!(!res.is_error, "edit ok: {:?}", res.error);
+
+        // glob：匹配 .txt
+        let res = exec("g1", "glob", serde_json::json!({ "pattern": "*.txt" }));
+        assert!(!res.is_error, "glob ok");
+        let matches = res.value.unwrap()["matches"].as_array().unwrap().clone();
+        assert!(matches.iter().any(|m| m.as_str().unwrap_or("").ends_with("hello.txt")));
+
+        // 再写一个文件供 grep 多行定位
+        let res = exec(
+            "w4",
+            "write",
+            serde_json::json!({ "file_path": "src/main.rs", "content": "fn main() {}\n// needle here\n" }),
+        );
+        assert!(!res.is_error);
+        // grep：needle
+        let res = exec("g2", "grep", serde_json::json!({ "pattern": "needle" }));
+        assert!(!res.is_error, "grep ok: {:?}", res.error);
+        let body = res.value.unwrap();
+        assert_eq!(body["seen"], 1);
+        assert_eq!(body["matches"][0]["path"], "src/main.rs");
+        assert!(body["matches"][0]["line"].as_str().unwrap().contains("needle"));
+
+        // str_replace_editor view
+        let res = exec(
+            "s1",
+            "str_replace_editor",
+            serde_json::json!({ "file_path": "src/main.rs", "view": true }),
+        );
+        assert!(!res.is_error, "sr view ok");
+        assert!(res.value.unwrap()["content"].as_str().unwrap().contains("fn main()"));
+
+        // str_replace_editor str_replace（唯一替换）
+        let res = exec(
+            "s2",
+            "str_replace_editor",
+            serde_json::json!({
+                "file_path": "src/main.rs",
+                "old_string": "fn main() {}",
+                "new_string": "fn main() { /* replaced */ }",
+            }),
+        );
+        assert!(!res.is_error, "sr replace ok: {:?}", res.error);
+        // 落盘确认
+        let disk = std::fs::read_to_string(root.join("src/main.rs")).unwrap();
+        assert!(disk.contains("replaced"), "replacement persisted: {disk}");
+
+        // 清理临时 root
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

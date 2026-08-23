@@ -2604,5 +2604,35 @@ LocalFileSystem+SandboxPolicy+Observation；run_code→registry 传输替换 + p
 
 ---
 
+## D-069（M5 编码·step7b）：fs 六件套真实绑定——FsHost（LocalFileSystem + ObservationGate
++ agent→OwnerId 登记）；read/write/edit/glob/grep/str_replace_editor 全生命周期端到端
+
+**日期**：2026（M5 round 16）。
+**触发问题**：D-068 的 fs 组仍 NOT_BOUND；本地 provider（LocalFileSystem）与观察策略
+（ObservationGate）已备好，现把它们 bind 进工具 execute 槽。
+**考虑的选项**：1. **`FsHost` 组合宿主（采用）**：`LocalFileSystem(root)` + `ObservationGate`
++ `agent→OwnerId` 稳定登记（单调递增 Cell；Web 无 WeakMap 自动回收语义差异——宿主会话
+结束需 `drop_owner` 清理，本轮接线未装会话清理钩子，D 记录为下次轮事项）。2. 每个
+executor 自持本地 gate/owner map（重复 + 无组合归宿）；3. 借用 reference 的 per-session
+宿主（web 装配后置，超出本轮）。
+**语义落地**：read——`parse_read_args`→`build_window`（READ_LIMIT/READ_MAX_LINE_LENGTH/
+READ_MAX_BYTES）→ **记录 Present{version} 观察**（后续 write/edit 以所见版本 CAS）；
+write——`write_intent`（observed-present→ReplaceIfVersion，否则 CreateIfAbsent）→ 未读
+写既有文件诚实 `FS_NOT_OBSERVED`（对齐 reference read-before-write）+ 写后记录观察；
+edit——`edit_intent`（未观察 → FS_NOT_OBSERVED）→ `edit_text` CAS → 记录；
+glob/grep——`parse_glob_args`/`parse_grep_args`（校验-only 语义同纯面）→ 进程内搜索体 →
+保留上限（GREP_MAX_MATCHES/GREP_MAX_LINE_BYTES）→ 纯面 render（Found N of M matches）；
+str_replace_editor——三模式（view / str_replace 唯一 / insert），自读 + 版本 CAS 回写
+（参考工具 self-read 语义），渲染 `format_file_view` 编号视图。错误统一 `remediate_fs_error`
+（STALE→「re-read the file, then retry」；NOT_OBSERVED→「read the file, then retry」）。
+**诚实限制（D 记录）**：read_image 仍 NOT_BOUND（需图像解码服务取宽高；本轮不引图像
+解码依赖，D 留待）；bash 仍 NOT_BOUND（需 LocalBashExecutor+producer 桥，下一轮）；
+`FsHost` 无 ro 沙箱 SAND MODE 投影（SAND 模式入 web 装配时加，step7 收尾）。
+**预期影响与回滚点**：web_m5.rs + web.rs（fs 端到端测试：write/read-before-write 拒绝/
+read 观察/edit CAS/owner 隔离/glob/grep/sr_editor 替换落盘）；dsh-cli 84 测试全绿 +
+workspace clippy 零告警 + check 绿。回滚 = 撤本提交。
+
+---
+
 
 
