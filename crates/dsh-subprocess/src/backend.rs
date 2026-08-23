@@ -30,38 +30,58 @@ fn drain_pipe<R: Read + Send + 'static>(
     max_bytes: usize,
     spill: Option<(u64, PathBuf)>,
 ) -> CollectResult {
-    let mut data: Vec<u8> = Vec::new();
-    let mut spill_written = false;
+    // 始终 drain 到 EOF（避免管道满 → 子进程写阻塞/写失败）。内存仅保留尾部
+    // ≤ max_bytes；发生溢出且配置了 spill → 完整流写盘，返回 spill 路径。
+    let mut tail: Vec<u8> = Vec::new();
+    let mut spill_path: Option<PathBuf> = None;
+    let mut spill_file: Option<std::io::BufWriter<std::fs::File>> = None;
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if data.len() + n > max_bytes {
-                    let room = max_bytes.saturating_sub(data.len());
-                    data.extend_from_slice(&buf[..room]);
-                    spill_written = true;
-                    break;
+                // 到达溢出阈值后，后续字节仅写 spill（若有），否则直接丢弃。
+                if spill_path.is_some() {
+                    if let Some(file) = &mut spill_file {
+                        use std::io::Write;
+                        let _ = file.write_all(&buf[..n]);
+                    }
+                    continue;
                 }
-                data.extend_from_slice(&buf[..n]);
+                // 未溢出：追加到 tail，超限即进入溢出路径。
+                tail.extend_from_slice(&buf[..n]);
+                if tail.len() > max_bytes {
+                    match &spill {
+                        Some((_, dir)) if !tail.is_empty() => {
+                            let _ = std::fs::create_dir_all(dir);
+                            let path = dir.join(format!("spill-{}.log", uuid_fallback()));
+                            if let Ok(file) = std::fs::File::create(&path) {
+                                spill_path = Some(path.clone());
+                                spill_file = Some(std::io::BufWriter::new(file));
+                                use std::io::Write;
+                                let _ = spill_file
+                                    .as_mut()
+                                    .and_then(|w| w.write_all(&tail).ok());
+                                // 已溢出：完整流落盘，内存清空（readFrom(0) 恢复自 spill）
+                                tail.clear();
+                            }
+                        }
+                        _ => {
+                            // 无 spill：只保留最后 max_bytes 作为诊断 tail。
+                            let drop = tail.len() - max_bytes;
+                            tail.drain(..drop);
+                        }
+                    }
+                }
             }
             Err(_) => break,
         }
     }
-    let spill_path = if spill_written {
-        if let Some((max_bytes, dir)) = spill {
-            let _ = std::fs::create_dir_all(&dir);
-            let path = dir.join(format!("spill-{}.log", uuid_fallback()));
-            let truncated: Vec<u8> = data.iter().take(max_bytes as usize).cloned().collect();
-            let _ = std::fs::write(&path, &truncated);
-            Some(path)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    CollectResult { data, spill_path }
+    if let Some(file) = spill_file.as_mut() {
+        use std::io::Write;
+        let _ = file.flush();
+    }
+    CollectResult { data: tail, spill_path }
 }
 
 /// 单测可并发的短 ID（生产侧将由宿主注入唯一前缀）。
