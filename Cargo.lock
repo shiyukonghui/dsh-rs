@@ -681,6 +681,7 @@ dependencies = [
  "dsh-tools",
  "globset",
  "ignore",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

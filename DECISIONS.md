@@ -2312,4 +2312,49 @@ sandbox / fs / shell / terminal / code-runtime 六缝逐字契约 + 各自 TDD �
 
 ---
 
+## D-059（M5 编码·dsh-fs 收尾）：glob 用 ignore::overrides（rg `--glob` 同源）+ grep 进程内 regex + tool-fs/sr_editor 纯面
+
+**日期**：2026（M5 round 13）
+
+**触发问题**：step3 最后一块（tool-fs：read/write/edit/read_image + glob/grep 搜索，
+str_replace_editor）收尾。上一轮留下的 `fs_search.rs`（未提交在制品）用 `globset::GlobSet`
+直接匹配相对路径，红测暴露四处语义偏差：① globset 默认 `literal_separator=false` 使 `*`
+跨 `/`（`src/*.rs` 也会匹配 `src/sub/x.rs`，锚定失效）；② pattern 前导 `./` 使 GlobSet
+恒不匹配；③ globset 无 `!` 取反过滤语义；④ walker `hidden(true)` 原以为收录隐藏文件，
+实测 `.hidden.rs` 仍缺失。
+
+**考虑的选项**：
+1. **glob 匹配改用 `ignore::overrides::OverrideBuilder`（本次采用）**：这正是 rg
+   `--glob` 的落地机制——无 `/` 的 glob 自动变 `**/*`（任意深度匹配 basename），带 `/`
+   的 glob 锚定相对路径且 `*` 不再跨 `/`，`./` 前缀正常解析，`Whitelist`=命中 /
+   `Ignore(UnmatchedIgnore)`=未命中。隐藏收录需 `hidden(false)`（ignore crate 语义是
+   `hidden(yes)` 开启「忽略隐藏文件」，默认开启；`--hidden` = 关闭忽略）。VCS 剪枝沿用
+   `filter_entry`。
+2. 修补 GlobSet（剥 `./`、设 `literal_separator(true)`、手搓 `**` 变体）：与 rg 语义仍
+   有细微出入，纯属再造 rg 已解决的轮子。
+3. glob/grep 整个放弃（D-054 标为可选）：违背 step3 验收与模型面工具契约。
+
+grep 引擎与 glob 相反（参考 argv 无 `--no-ignore --hidden`）：遍历保持默认——隐藏忽略、
+`.gitignore`/`.ignore` 生效、仅 git 仓库内 gitignore 生效（`require_git` 默认 true，临时
+目录须有 `.git` 才触发，rg 同语义）。匹配用 `regex::bytes::Regex` 按原始字节逐行，非
+UTF-8 行显示为占位 `(line is not valid UTF-8)`（参考 `parseRecord`），不令整个搜索失败。
+tool-fs 纯映射面（`parseWriteArgs`/`formatWriteOutput`/`parseEditArgs`/`formatEditOutput`/
+`remediateFsError`/`imageMediaTypeForPath`/`formatImageReadOutput`）与 sr_editor 纯面
+（`maybeTruncate`/`matchOffsets`/`lineNumbersAt`/视渲染/`str_replace` 唯一性/`insert` 行
+插入 + 全部错误消息）逐字对齐参考；工具注册与宿主接线留 step7 web.rs。
+
+**最终选择**：选项 1 + 上述 grep 引擎；tool-fs/sr_editor 以纯函数落「映射面」。
+
+**选择理由**：Override/ignore/regex 都是 rg 同源 crate（D-054 已核离线），匹配语义逐字
+对齐参考，避免自研疯狂重造轮子；`hidden(false)`/`require_git`/bytes-regex 三处反直觉点
+经探针（`tests/globset_probe.rs`，用后即删）实证，不留猜测。
+
+**预期影响与回滚点**：`src/fs_search.rs` 重写为 Override 引擎、新增 `src/grep.rs`/
+`src/tool_fs.rs`/`src/sr_editor.rs` + 四组测试（fs_search 9 + grep 23 + tool_fs 13 +
+sr_editor 15，dsh-fs 合计 98 全绿，clippy 零告警，workspace check 绿）。DIV：`maybe_truncate`
+按 Unicode 标量截断（参考按 UTF-16 码元）；BMP 平面一致、星面字符 ±1，接受。回滚 = 撤本
+提交即回 D-056 设计的 provider/policy/fence/read 基线。
+
+---
+
 
