@@ -2462,5 +2462,36 @@ list）；clippy 零告警。真实 bash-pty 后端（portable-pty）与 6 工�
 
 ---
 
+## D-064（M5 编码·dsh-terminal PTY 后端 + 6 工具）：ConPTY 输出管道在 ClosePseudoConsole 前不 EOF → close 先丢 pair 再 join；shell 程序参数化；工具面渲染词汇逐字
+
+**日期**：2026（M5 round 13 末/14）。
+**触发问题**：step5 后半——真实 PTY 后端（`portable-pty` 0.8，Windows=ConPTY）与 6 模型面
+工具。首跑挂死（300s 超时）：面包屑定位到 `close()` 的 `reader_thread.join()`——本环境
+ConPTY 在 `TerminateProcess(child)` 后**输出管道不 EOF**（伪控制台仍持有写端），读线程
+永久阻塞，join 卡死；同样自然 exit 也不触发 EOF。另外 msys bash 起动即崩（D-061 已记），
+但 ConPTY 单元可行。
+**考虑的选项**：1. **close 先 `child.kill()` → 丢弃 pair（关 ConPTY → 管道 EOF）→ join
+（本次采用）**；`wait_for_delivery` 同时轮询 `child.try_wait()` 判 `SessionExit`（不再只靠
+reader EOF）。2. 读线程 detached（弃 join）：杀后/exit 后泄漏阻塞线程，不干净。3. 全量
+非阻塞异步读：portable-pty 0.8 无 readiness API，需自研，成本高。
+**最终选择**：选项 1 + shell 程序参数化（`PtyBackend::new(label, program)`，设计默认 bash；
+本沙箱集成测试注入 `cmd.exe`——ConPTY 可用；Linux/正常机换 bash）。6 工具纯面
+（terminal_open/send/read/signal/close/list schema + parse + 渲染词汇逐字对齐
+`tool-terminal/src/render.ts`：`started terminal session … [type: …]`、`[wait: role]`
+`[session: running|exited code=… signal=…]`、`[lines: a-b of c]`、`delivered … to
+foreground process group …`、`closed terminal session …`、list 逐行 / `(no terminal
+sessions)`；UTF-8 边界 head/tail 封顶 + `\n[output truncated]`）。
+**选择理由**：ConPTY 生命周期明确要求「关闭伪控制台才释放输出管道」，丢弃 pair 是
+portable-pty 语义下的正确顺序；轮询 try_wait 让 SessionExit 判定摆脱对 EOF 的依赖；
+程序参数化是可控注入缝（与 shell 层 test_bash 同型）；工具面纯函数 TDD 锁定逐字契约。
+**预期影响与回滚点**：`src/backend.rs`（`PtyBackend` + 后台读线程 + 有界滚动缓冲 +
+idle 推断）+ `tests/backend.rs`（4 集成，cmd/ConPTY 实跑，7s）+ `src/tool_terminal.rs` +
+`tests/tool_terminal.rs`（12 用例：schema 逐字、渲染快照、字节封顶）；dsh-terminal 合计
+28 测试全绿 + clippy 零告警 + workspace check 绿。DIV：`signal` 仅「不能机器可发送
+（ConPTY/portable-pty 0.8 无机敏信号），best-effort kill」；step7 接线映射 registry view
+→ RenderedTerminalSession（pid/exit 元数据届时补全）。回滚 = 撤本提交。
+
+---
+
 
 

@@ -313,24 +313,33 @@ fn dispose_closes_all_and_refuses_new_open() {
 #[test]
 fn list_orders_views() {
     let mut svc = service_with_fake();
-    svc.open(
-        "alice",
-        "test-bash",
-        Some("alice-term"),
-        TerminalConfig::default(),
-    )
-    .expect("open");
-    svc.open(
-        "bob",
-        "test-bash",
-        Some("bob-term"),
-        TerminalConfig::default(),
-    )
-    .expect("open");
+    let a = svc
+        .open(
+            "alice",
+            "test-bash",
+            Some("alice-term"),
+            TerminalConfig::default(),
+        )
+        .expect("open");
+    let b = svc
+        .open(
+            "bob",
+            "test-bash",
+            Some("bob-term"),
+            TerminalConfig::default(),
+        )
+        .expect("open");
     let views = svc.list();
     assert_eq!(views.len(), 2);
-    assert_eq!(views[0].owner, "alice");
-    assert_eq!(views[0].name.as_deref(), Some("alice-term"));
-    assert_eq!(views[0].backend, "test-bash");
-    assert_eq!(views[0].status, TerminalSessionStatus::Running);
+    // 不依赖 HashMap 迭代序：按键查视图。
+    let by_id: std::collections::HashMap<&TerminalSessionId, &dsh_terminal::TerminalSessionView> =
+        views.iter().map(|v| (&v.id, v)).collect();
+    let a_view = by_id.get(&a).expect("alice view exists");
+    assert_eq!(a_view.owner, "alice");
+    assert_eq!(a_view.name.as_deref(), Some("alice-term"));
+    assert_eq!(a_view.backend, "test-bash");
+    assert_eq!(a_view.status, TerminalSessionStatus::Running);
+    let b_view = by_id.get(&b).expect("bob view exists");
+    assert_eq!(b_view.owner, "bob");
+    assert_eq!(b_view.name.as_deref(), Some("bob-term"));
 }
