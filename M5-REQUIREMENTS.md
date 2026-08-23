@@ -194,8 +194,9 @@ M5i M5-ACCEPTANCE    <- 依赖：上面全部（契约面 + 集成 + 全绿 + cl
 - 编译验证在 Windows 主机；bash/pwsh/python 均可执行（`C:\WINDOWS\system32\bash.exe`、
   `D:\Anaconda\python.exe`、node24LTS 存在）——集成测试能用真实子进程；无法抵达的
   平台路径（POSIX 进程组/BigSur seatbelt）以 cfg 门 + 单测中的平台逻辑隔离。
-- 新依赖引入需先评估（方法论四）：`tempfile`/`regex` **已在 lock**（可离线用）；PTY 库
-  与 chrono-tz **不在 lock**（受离线限制，见决策 P 待用户定）。
+- 新依赖引入需先评估（方法论四）：`tempfile`/`regex` **已在 lock**；**spike 实测（2026）**：
+  `jiff`/`jiff-tzdb` 全家在本地缓存、**可离线编译+运行**（P2(a) 备选实测可行）；
+  `portable-pty` 不在缓存、**不可离线**（P1(a) 受限确认）；`chrono-tz` 不在缓存。
 - 字段名/wire 形状/错误码逐字对齐参考源码（本文件已列权威来源）；差异显式记录。
 - `bash` tool 参数名：**参考源是 `timeoutMs`（camelCase）**，本 harness GUI 提示用
   `timeout_ms`（snake）——M5 以参考 wire 为准，并记录分叉（凡 dsh 工具参数 schema 就
@@ -244,22 +245,27 @@ M5i M5-ACCEPTANCE    <- 依赖：上面全部（契约面 + 集成 + 全绿 + cl
 
 | 决策 | 选项 | 倾向/影响 |
 |---|---|---|
-| **P1 PTY 依赖** | (a) 引成熟 `portable-pty` 库真实做 terminal(+spawnTerminal)；(b) terminal 推 M6，M5 交付 seam+unavailable | (a) 需网络评估/可能要离线拉取受限；(b) 最稳但 terminal 面后置。**倾向 (b) 先 seam，视 (a) 可行性补** |
-| **P2 IANA 时区** | (a) 引 chrono-tz/jiff-tzdb（离线受限）；(b) 保持 invalid_time_zone 报错 | 承 D-050；(b) 无回归默认 |
+| **P1 PTY 依赖** | (a) 引成熟 `portable-pty` 库真实做 terminal(+spawnTerminal)；(b) terminal 推 M6，M5 交付 seam+unavailable | **2026 spike 确认**：`portable-pty` 不在本地缓存、不可离线拉取 → (a) 本环境不可行；**倾向 (b) 先 seam**，待可联网引库时补真实 PTY |
+| **P2 IANA 时区** | (a) 引 `jiff`+`jiff-tzdb`（**已实测可离线**，见下方决策辅助）；(b) 保持 invalid_time_zone 报错 | **2026 spike 修订**：chrono-tz 不可离线，但 `jiff-tzdb` 全套（jiff/jiff-core/jiff-static/jiff-tzdb-platform/crc32fast/serde）已在本地缓存，离线编译+运行校验通过 → (a) 可行；仍留 (b) 备选 |
 | **P3 平台沙箱 runner** | (a) seam+失败闭； (b) 引入 Landlock/bwrap FFI（不可离线验证） | 倾向 (a)，真实边界由 fs 进程内围栏承担 |
 | **P4 bash 参数名** | timeoutMs（参考）vs timeout_ms（GUI 现状） | 倾向参考 `timeoutMs`，记录分叉 |
 | **P5 lsp/e2b/out-of-process/jobs Scope** | 全部 M6（登记+诚实桩）；subprocess 原语 M5 已交付其底座 | 倾向 M6（非目标已列） |
 
 **决策辅助（供裁定参考，2026 复核）**
 
-- **P1**：本机无 PTY 验证路径；`portable-pty` 不在 `Cargo.lock` 且离线拉取受限（与本机
-  `--offline` 约束冲突）。选 (b) 则 M5 交付 `spawnTerminal` 原语 **seam**（握法/信号/
-  owner 语义进 types）+ `terminal_open/send/read/signal/close/list` 工具的
-  `NOT_AVAILABLE` 诚实桩；terminal 真实后端随未来可联网引库或平台 PTY 落地（M6）。
-  选 (a) 则需先验证 `portable-pty` 可在本机离线编译（风险：拉包失败阻塞 M5）。
-- **P2**：承 D-050 已把 `invalid_time_zone` 定为诚实报错并记 README Known Limitations；
-  引入 chrono-tz 需要离线可用且同步改 schedule 的 canonicalize/local-at 并重跑测试。
-  选 (b) 零回归，M5 不必打开。
+- **P1**：本机无 PTY 验证路径。**2026 spike 实测**：`portable-pty` 不在本地 cargo 缓存
+  （仅 portable-atomic 等传递依赖），`--offline` 不可拉取 → 选 (a) 在本环境**直接失败**。
+  选 (b) 则 M5 交付 `spawnTerminal` 原语 **seam**（握法/信号/owner 语义进 types）+
+  `terminal_open/send/read/signal/close/list` 工具的 `NOT_AVAILABLE` 诚实桩；terminal
+  真实后端随未来可联网引库或平台 PTY 落地（M6）。
+- **P2**：承 D-050 已把 `invalid_time_zone` 定为诚实报错并记 README Known Limitations。
+  **2026 spike（实测）**：`chrono-tz` 不在本地缓存、不可离线；但 `jiff` 0.2.35 全家
+  （jiff-core/jiff-static/jiff-tzdb/jiff-tzdb-platform/crc32fast/serde）**均在缓存内**，
+  临时 crate `jiff { features=["tzdb-bundle-platform"] }` 的 `cargo check --offline` 编译
+  通过、`cargo run --offline` 运行时 `TimeZone::get("America/New_York")` 返回 `ok: true`
+  （IANA 全时区离线可用）。→ 若裁定 P2(a)，schedule 的 canonicalize_time_zone/local-at
+  可真实扩展（替换 D-050 的 invalid_time_zone 降级），且无网络依赖；选 (b) 则零回归。
+  建议 M5 取样 2(a)（成本低）或 2(b)（严格不改），两者均不负债。
 - **P3**：稀缺真实边界（reference 的 Seatbelt/bwrap/Landlock/ACL 全平台 FFI），本机
   Windows 无 bwrap；纯 std 做不了。选 (a) 把「进程内 fs 围栏（canonicalize-then-contain +
   writableRoots）」作为 M5 的真实约束面，argv confiner 留 seam + fail-closed（无 runner
