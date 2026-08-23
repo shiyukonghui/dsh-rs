@@ -3168,6 +3168,33 @@ base http://100.105.152.101:18080/v1 + model deepseek-v4-flash-0731-ext）。主
 
 ---
 
+## D-086（M6 编码·step7 穿插篮）：`.env` 解析 + 键注入 server 装配
+
+**日期**：2026（M6 round 5）。
+**触发问题**：serve 装配参数（LLM base/model/workspace、agent-loop）只能命令行/进程 env
+单点注入；需 `.env` 文件作为进程环境的**上游可选来源**（M6-DESIGN step7）。
+**第一性原理裁剪**：design 写「settings YAML 注释保真 leaf-diff + `.env` 解析」。自下而上
+实测：dsh-settings 是内存/文件 JSON provider（无 YAML 引擎）；YAML 注释保真 leaf-diff 属
+TS-host 侧 settings 文档面（M6 非目标不建前端/不引 YAML 引擎）→ **显式 defer**（记录，
+不静默缩水）；本步落实 Rust 侧可验证的 `.env` 解析 + 装配注入。
+**实现**：`crates/dsh-cli/src/m6_env.rs`（新）：`parse_env_file`（纯：空白行/`#` 注释跳过；
+`KEY=VALUE` 两侧空白容忍；单/双引号剥除；CRLF；fail-loud——缺 `=`/空键 → Err 含行号+现场；
+无插值/内联注释，文档化为 dotenv 子集）、`load_env_file(path)`（读盘 + 解析，io 错含路径）、
+`apply_env_into_process`（**overwrite:false**——既有环境变量优先）、`apply_env_file(None|Some)`。
+接线：`WebConfig.env_file: Option<PathBuf>`；`serve()` 顶部先 apply（fail-loud，打印 applied
+条数，不打印值）；`main.rs --env-file <path>`。
+**IV-3 落位**：`.env` 仅为进程环境上游——键（含 `DEEPSEEK_API_KEY`）apply 后仍由
+`server_llm_runtime` 以 env 读取；**永不落 settings/库/git**（P4）。
+**红测（绿）**：解析基础/注释/空白/引号/CRLF/空值；坏行 Err 含行号与现场；读盘；apply
+overwrite:false（既有 env 胜，独特测试键避免并行污染）。4 测绿。
+**诚实边界**：YAML 注释保真 leaf-diff 显式 defer（TS settings 文档面，非 M6 建面）；
+`.env` 不自动加载（显式 `--env-file` opt-in，不意外吞 cwd .env）。
+**证据**：dsh-cli 107 测全绿 + workspace clippy `-D warnings` 零告警 + check 绿。回滚 =
+撤本提交。
+**待办**：step8 provider caps 做实（provider/models RPC 从真实 `DeepSeekConnection.models`
+catalog 列录：容量/重试/模式）→ step9 hooks/skill → step10 ts-host diff/SQLite →
+step11 M6-ACCEPTANCE（真实端门控冒烟需用户侧 `DEEPSEEK_API_KEY`）。
+
 ---
 
 

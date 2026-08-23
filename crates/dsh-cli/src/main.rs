@@ -258,6 +258,8 @@ fn web_main(args: &[String]) {
     let mut workspace_root: Option<PathBuf> = None;
     let mut llm_base_url: Option<String> = None;
     let mut llm_model: Option<String> = None;
+    // M6（step7）：`.env` 文件（进程环境上游；键只在进程环境生效，不落 settings/git）。
+    let mut env_file: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -299,6 +301,10 @@ fn web_main(args: &[String]) {
             "--llm-model" => {
                 i += 1;
                 llm_model = Some(args[i].clone());
+            }
+            "--env-file" => {
+                i += 1;
+                env_file = Some(PathBuf::from(&args[i]));
             }
             other if other.starts_with("--") => {
                 eprintln!("dsh web: unknown arg {other}");
@@ -349,6 +355,7 @@ fn web_main(args: &[String]) {
         enable_agent_loop,
         llm_base_url,
         llm_model,
+        env_file,
     };
     match dsh_cli::web::serve(&mut boot, cfg) {
         Ok(server) => {

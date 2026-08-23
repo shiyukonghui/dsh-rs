@@ -36,6 +36,7 @@ pub mod subagent_runtime;
 /// M6 step5b：真实 LLM 装配（deepseek 适配器 + dsh-core 流式 HTTP 桥 + 诚实 no-key
 /// fail-loud；key 仅 `DEEPSEEK_API_KEY` 环境变量）。
 pub mod m6_llm;
+pub mod m6_env;
 
 /// 启动结果：运行时上下文 + loop 插件句柄（供驱动）。
 pub struct Boot {

@@ -115,6 +115,11 @@ pub struct WebConfig {
     pub llm_base_url: Option<String>,
     /// M6：LLM 模型名（缺省 `DSH_LLM_MODEL` 环境变量，再缺省 `deepseek-chat`）。
     pub llm_model: Option<String>,
+    /// M6（step7，D-086）：`.env` 文件（进程环境上游可选来源）。serve 启动先 apply
+    /// （overwrite:false，既有环境变量优先；解析/读错 fail-loud）。`DEEPSEEK_API_KEY`
+    /// 经此进入进程环境后仍由 `server_llm_runtime` 以 env 读取——key 永不落
+    /// settings/库/git（IV-3）。
+    pub env_file: Option<PathBuf>,
 }
 
 /// 一个已运行的 Web 服务器（持有实际监听地址）。
@@ -133,6 +138,15 @@ pub struct WebServer {
 /// `boot.agent_loop`（之后 `agent.turn/agent.run/session.prompt` 走 Rust loop）。
 /// 装配失败 → fail-loud（不默默回退 WASM 路径）。
 pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> {
+    // M6 step7（D-086）：`.env` 进程环境上游——先 apply（overwrite:false），之后装配的
+    // env 读取链（DSH_LLM_BASE_URL / DSH_LLM_MODEL / DEEPSEEK_API_KEY …）透明吃到 overlay。
+    // 解析/读错 → fail-loud（绝不静默跳过坏行）；key 仅入进程环境，不落 settings/git（IV-3）。
+    if let Some(env_file) = &cfg.env_file {
+        let applied = crate::m6_env::apply_env_file(Some(env_file)).map_err(|e| {
+            CordisError::Internal(format!("web env-file {}: {e}", env_file.display()))
+        })?;
+        eprintln!("dsh web: applied {} key(s) from env-file {}", applied, env_file.display());
+    }
     // tiny_http：解析 HTTP/1.1 + 每连接并发线程（成熟库，D-004）。
     let server = Server::http((cfg.host.as_str(), cfg.port))
         .map_err(|e| CordisError::Internal(format!("web bind {}:{}: {e}", cfg.host, cfg.port)))?;
