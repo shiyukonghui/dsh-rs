@@ -2894,5 +2894,43 @@ git；**key 本体永不入库**）。
 
 ---
 
+## D-078（M6 阶段二·系统设计收口）：M6-DESIGN.md 六子步主轴 + 穿插篮 + DIV/让步清单；设计定案
+（装配工厂=真实注册表 M4+M5、SessionStore 共享、M5Host::shutdown 清理面、serve recv_timeout
+自驱节拍、llm_http stream 变体、key 仅 env fail-loud）
+
+**日期**：2026（M6 round 2/3）。
+**触发问题**：M6 需求关卡通过后进入系统设计；需把每一主轴子步落到「缝（自下而上实测）+
+设计 + TDD 计划」，并对关键组合语义定案。
+**自下而上设计证据（本阶段实测）**：① 装配骨架既有 = web.rs 测试
+`rpc_prompt_routes_to_rust_agent_loop_shared_store`（LlmRuntime::new + register_adapter →
+ToolRegistry::new(Native) → AgentLoopHost::with_store(config, llm, tools, session_host.store.clone())
+→ boot.agent_loop=Some → session.prompt 走 run_rust_loop 事件落共享 store）；② `SessionHost.store:
+Rc<SessionStore>` 公开可 clone 共享；③ dsh-core `llm_http::chat_completions(base,key,model,
+messages,tools)->Value` 是**非流式** final JSON；`dsh-llm-deepseek PayloadsResolver =
+Vec<String>`（SSE data payloads）——**真实 HTTP/SSE 流式桥缺失**，需新变体；④ serve 主循环现
+`for server.incoming_requests()` 阻塞，tiny_http `recv_timeout(d)` 可改轮询自驱节拍。
+**设计定案（全部采纳）**：S1 装配工厂 `assemble_server_loop(store, workspace_root, llm_endpoint)`
+= register_m4_with_host + register_m5_with_host(M5Host::assemble(root)) → AgentLoopHost::with_store
+(共享 store) → boot.agent_loop；真实注册表（M4+M5 全工具）。S2 `M5Host::shutdown`（幂等：
+tick stop → bash kill_all+settle Killed → terminal close_all）+ WebConfig.workspace_root（缺省
+CWD canonicalize，P2）。S3 serve 主循环 `recv_timeout` 自驱节拍 → 主线程 `m5g_tick_once`（调度
+到期 + jobs settle，推进点唯一收敛主线程；M5gTick 线程不再进 serve——IV-2）。S4 policy 段注入
+prompt（order 110）+ `resolve_sandbox_mode` + escalation 校验 fail-closed（deny+hint）。S5 LLM：
+dsh-core 新增 `chat_completions_stream -> Result<Vec<String>, 错误>`（复用既有 HTTP POST+Bearer+
+SSE 行解析；TDD）+ M6 deepseek thunk（DSH_LLM_BASE_URL 配置读写、DEEPSEEK_API_KEY 仅 env；
+无 key → 首轮 fail-loud AUTH 明确码，工具/API 面照常——P3）+ `register_adapter(["deepseek"])`。
+S6 前端最小闭环 = 复用 session/event downlink + history（re RPC 集成测试 + 门控冒烟）。
+**穿插篮子步**：step7 settings/.env → step8 provider caps（真实 catalog 列录）→ step9
+hooks/skill → step10 ts-host diff/SQLite → step11 M6-ACCEPTANCE。
+**拒绝的选项**：① M6 不建新 transport、用非流式 chat_completions 直接喂 loop（丢流式语义，
+PayloadsResolver 契约不匹配，否）；② 把 key 写进 WebConfig/代码（安全红线——仅 env，否）；
+③ serve 继续纯阻塞循环 + 独立线程持有 Rc 宿主（Rc 非 Send，多线程持非 Send 宿主要么破坏
+单线程纪律要么强制 Arc 大改，否——recv_timeout 自驱节拍最贴合单线程宿主模型）。
+**预期影响与回滚点**：M6-DESIGN.md 为阶段二关卡产物（每子步缝/设计/TDD + DIV/让步）。回滚 =
+撤本提交（纯文档）。进入阶段三编码（TDD 红→绿，逐子步 commit + D 互查）。
+**待办**：阶段三编码 step1（服务器装配工厂）开始——红测 → 绿 → 重构 → clippy → commit。
+
+---
+
 
 
