@@ -30,9 +30,14 @@ use dsh_fs::{
     LocalFileSystem, Observation, ObservationGate, OwnerId, ReadTextOptions,
     DEFAULT_MAX_OUTPUT_CHARS,
 };
+use dsh_jobs::{
+    JobRead, JobRegistry, JobRegistryConfig, JobSettlement, JobStartError, JobStatus,
+    ProducerHooks, StartSpec,
+};
 use dsh_shell::{
     bash_tool_parameters, parse_bash_args, render_bash_result, BashConfig, LocalBashExecutor,
-    ShellCollectedOutput, ShellError, ShellExecRequest, ShellRunResult,
+    ShellCollectedOutput, ShellError, ShellExecRequest, ShellExecSpec, ShellProcess,
+    ShellProcessStatus, ShellRunResult,
 };
 use dsh_terminal::{
     parse_terminal_close_args, parse_terminal_open_args, parse_terminal_read_args,
@@ -139,11 +144,122 @@ impl ShellHost {
     }
 }
 
+/// bash 后台 jobs producer 桥（M5-DESIGN §8 jobs subprocess producer，D-049 形状闭合）。
+///
+/// `JobRegistry`（app 侧 job_read/job_list/job_kill 工具的石墨契约）与 `ShellProcess`
+/// 后台句柄以 job id 关联：`start_bash` 把进程桥成 `ProducerHooks{on_cancel=kill}`；
+/// 完成结算由**宿主合作泵**驱动（`pump()`：M5g tick/服务线程调之；测试直接调）——
+/// 单线程注册表不自驱动 settle（D-004 诚实降级）。注册成功前不 spawn（producer 延迟
+/// start 在 jobs.start 内）；`start_bash` 失败由调用方掐掉进程。
+pub struct BashJobsBridge {
+    registry: RefCell<JobRegistry>,
+    processes: RefCell<HashMap<String, Rc<ShellProcess>>>,
+    outputs: RefCell<HashMap<String, String>>,
+}
+
+impl Default for BashJobsBridge {
+    fn default() -> Self {
+        Self {
+            registry: RefCell::new(JobRegistry::new(JobRegistryConfig::default())),
+            processes: RefCell::new(HashMap::new()),
+            outputs: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+impl BashJobsBridge {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 注册一个已 spawn 的后台 bash 进程为 job（owner 归属 caller；label 缺省命令摘要）。
+    /// 成功后 job 可见、可被 job_kill/job_read 操作。进程先在调用方 spawn：jobs.start
+    /// 的 producer 只回喂 hooks，不重新触发执行。
+    pub fn start_bash(
+        &self,
+        owner: &str,
+        label: &str,
+        process: Rc<ShellProcess>,
+    ) -> Result<String, JobStartError> {
+        let proc = process.clone();
+        let id = self.registry.borrow_mut().start(StartSpec {
+            kind: "bash",
+            label,
+            owner: Some(owner.to_string()),
+            producer: Box::new(move || {
+                let killer = proc.clone();
+                ProducerHooks {
+                    on_cancel: Box::new(move |_reason| {
+                        killer.kill();
+                    }),
+                    read_output: None, // final-output 语义：终态 settle 携全文，不流式滚入
+                }
+            }),
+        })?;
+        self.processes.borrow_mut().insert(id.clone(), process);
+        Ok(id)
+    }
+
+    /// 合作推进泵：滚动增量（终态走私全文）+ 探测终态 + settle + 移除。
+    /// 返回本次结算条数。由宿主 tick（M5g）或测试循环调用；幂等。
+    pub fn pump(&self) -> usize {
+        let mut finished: Vec<(String, ShellProcessStatus, Option<i32>)> = Vec::new();
+        {
+            let procs = self.processes.borrow();
+            for (id, proc) in procs.iter() {
+                // 先 done() 等到退出（collector 已 join，管道缓冲已全部落盘），
+                // 再 read_output() 收尾增量：终态轮拿到的是全文（含此前 running 轮
+                // 已消费的首段——offset 消费性，累计即完整终态输出）。
+                proc.done();
+                let delta = proc.read_output().delta;
+                if !delta.is_empty() {
+                    self.outputs
+                        .borrow_mut()
+                        .entry(id.clone())
+                        .or_default()
+                        .push_str(&delta);
+                }
+                let st = proc.status();
+                if st == ShellProcessStatus::Completed || st == ShellProcessStatus::Killed {
+                    finished.push((id.clone(), st, proc.exit_code()));
+                }
+            }
+        }
+        for (id, st, code) in &finished {
+            let status = if *st == ShellProcessStatus::Killed {
+                JobStatus::Killed
+            } else {
+                JobStatus::Completed
+            };
+            let output = self.outputs.borrow_mut().remove(id).unwrap_or_default();
+            let detail = code
+                .map(|c| format!("exit code {c}"))
+                .unwrap_or_else(|| "killed".to_string());
+            self.registry.borrow_mut().settle(
+                id,
+                JobSettlement {
+                    status,
+                    detail: Some(detail),
+                    output: Some(output),
+                },
+            );
+            self.processes.borrow_mut().remove(id);
+        }
+        finished.len()
+    }
+
+    /// job 只读投影（caller 授权围栏由注册表执行）。
+    pub fn read(&self, id: &str, caller: Option<&str>) -> Result<JobRead, dsh_jobs::JobOpsError> {
+        self.registry.borrow_mut().read(id, caller)
+    }
+}
+
 /// M5h 宿主服务句柄集合：M5 工具组的 bind 目标。
 ///
 /// `register_m5_tools_with_host` 接受可选的 `&M5HostServices`：有句柄 → 对应工具 bind
 /// 到真实服务（fail loud 不再 NOT_BOUND）；无句柄 → 注册定义但保持 `NOT_BOUND`。
-/// 装配 `terminal` + `fs` + `shell`；code_runtime 传输/tick 后续轮（D-068/D-069/D-070）。
+/// 装配 `terminal` + `fs` + `shell` + `bash_jobs`；code_runtime 传输/tick 后续轮
+/// （D-068/D-069/D-070）。
 #[derive(Default)]
 pub struct M5HostServices {
     /// 终端会话注册表（terminal_open/send/read/signal/close/list 的真实句柄）。
@@ -152,6 +268,8 @@ pub struct M5HostServices {
     pub fs: Option<Rc<FsHost>>,
     /// shell 宿主（bash 工具前台执行的真实句柄）。
     pub shell: Option<Rc<ShellHost>>,
+    /// bash 后台 jobs producer 桥（bash run_in_background 的真实句柄；缺省 → 诚实拒绝）。
+    pub bash_jobs: Option<Rc<BashJobsBridge>>,
 }
 
 /// 注册全部 M5 工具（M5-DESIGN §8 工具集）到一个 registry。
@@ -196,7 +314,8 @@ pub fn register_m5_tools_with_host(
     // "requires a code runtime" 桩）；真实运行面绑定属 registry/run_code binder 步（D-068）。
     let bash = bash_tool();
     if let Some(shost) = host.and_then(|h| h.shell.clone()) {
-        bash.bind(bash_executor(shost));
+        let bridge = host.and_then(|h| h.bash_jobs.clone());
+        bash.bind(bash_executor(shost, bridge));
     }
     registry
         .register_global(Rc::clone(&bash.definition()))
@@ -237,8 +356,8 @@ pub fn register_m5_tools_with_host(
 // bash 工具：纯面定义（schema + 渲染）+ 宿主 executor
 // ---------------------------------------------------------------------------
 
-/// bash 工具定义：execute 产生规范化 value，render 重新组装 `ShellRunResult` 走
-/// 与 tool_bash 同词表的 `render_bash_result`（显式=值、可见性=渲染，单一真相）。
+/// bash 工具定义：execute 产生规范化 value，render 依值重建 `ShellRunResult`（前台）或
+/// job 启动说明（后台返回 jobId），走 `render_bash_result` 同词表（显式=值/可见性=渲染）。
 fn bash_tool() -> M5Tool {
     define_m5_tool(
         "bash",
@@ -246,6 +365,12 @@ fn bash_tool() -> M5Tool {
         bash_tool_parameters(true, &[]),
         json!({"type":"object","additionalProperties":true}),
         Rc::new(|_a, v| {
+            if let Some(id) = v["jobId"].as_str() {
+                // 后台启动：值只含 jobId（final-output 语义，job_read 消费终态输出）。
+                return vec![ContentBlock::text(format!(
+                    "bash: background job {id} started (collect via job_read; completion settled by host tick)"
+                ))];
+            }
             let result = ShellRunResult {
                 exit_code: v["exitCode"].as_i64().map(|n| n as i32),
                 signal: v["signal"].as_str().map(str::to_string),
@@ -264,14 +389,10 @@ fn bash_tool() -> M5Tool {
 }
 
 /// 规范化 bash 执行结果（execute → value；render 只消费 value，不独走）。
-fn bash_executor(shost: Rc<ShellHost>) -> ToolExecute {
-    Rc::new(move |args, _ctx| {
+/// 后台路径：`bridge` 在场 → 起 job（jobId）；否则诚实 `UNSUPPORTED_OPTION`。
+fn bash_executor(shost: Rc<ShellHost>, bridge: Option<Rc<BashJobsBridge>>) -> ToolExecute {
+    Rc::new(move |args, ctx| {
         let parsed = parse_bash_args(args).map_err(|m| invalid_args("bash", m))?;
-        if parsed.run_in_background == Some(true) {
-            return Err(unsupported(
-                "bash: run_in_background: true requires a jobs producer bridge (JobRegistry host + completion tick), not yet wired (D-070); use foreground run_in_background:false or omit",
-            ));
-        }
         if let Some(perms) = &parsed.sandbox_permissions {
             if !perms.is_empty() {
                 return Err(unsupported(
@@ -293,12 +414,56 @@ fn bash_executor(shost: Rc<ShellHost>) -> ToolExecute {
             .executor
             .resolve(&request)
             .map_err(|m| invalid_args("bash", m))?;
+        if parsed.run_in_background == Some(true) {
+            return bash_background(&shost, &spec, &parsed.command, ctx, bridge.as_deref());
+        }
         let result = shost
             .executor
             .run(&spec)
             .map_err(|e| shell_failure("bash", e))?;
         Ok(bash_canonical(&parsed.command, &result))
     })
+}
+
+/// 后台路径：spawn ShellProcess → jobs producer 桥登记 → 返回 jobId。
+/// 登记失败（配额等）掐掉刚 spawn 的进程（不产生孤儿），诚实报错。
+fn bash_background(
+    shost: &ShellHost,
+    spec: &ShellExecSpec,
+    command: &str,
+    ctx: &dsh_tools::ToolRunContext,
+    bridge: Option<&BashJobsBridge>,
+) -> Result<Value, ToolFailureData> {
+    let bridge = bridge.ok_or_else(|| {
+        unsupported(
+            "bash: run_in_background: true requires the jobs producer bridge (BashJobsBridge host handle) — not wired for this surface",
+        )
+    })?;
+    let owner = required_agent(ctx.agent.as_deref(), "bash/run_in_background")?;
+    let process = shost
+        .executor
+        .start(spec)
+        .map_err(|e| shell_failure("bash", e))?;
+    let process = Rc::new(process);
+    let label = {
+        let joined: String = command.trim().chars().take(60).collect();
+        if joined.is_empty() {
+            "bash background".to_string()
+        } else {
+            joined
+        }
+    };
+    match bridge.start_bash(owner, &label, process.clone()) {
+        Ok(id) => Ok(json!({ "jobId": id })),
+        Err(e) => {
+            process.kill();
+            Err(ToolFailureData::new(
+                format!("bash: start background job: {e:?}"),
+                "JOB_START",
+                "JobStartError",
+            ))
+        }
+    }
 }
 
 /// execute 面规范化值（render 依此重建 ShellRunResult）。

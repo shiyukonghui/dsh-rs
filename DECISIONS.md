@@ -2665,5 +2665,36 @@ SAND 事实但渲染不会假装 denied）。
 
 ---
 
+## D-071（M5 编码·step7d·part1）：bash 后台 jobs producer 桥——BashJobsBridge（JobRegistry
++ ShellProcess 以 job id 关联；`ProducerHooks{on_cancel=kill}`；宿主合作泵 `pump()` 驱动 settle；
+final-output 终态携全文）；真实 Git Bash 端到端（jobId → pump → job_read completed 全文 + 授权围栏）
+
+**日期**：2026（M5 round 19/20）。
+**触发问题**：D-070 的后台仍 `UNSUPPORTED_OPTION`；M5-DESIGN §8 jobs subprocess producer
+（D-049 形状闭合）要求 tool-bash 后台经 `JobRegistry.start(StartSpec{producer})` 桥进程句柄。
+**考虑的选项**：1. **`BashJobsBridge{registry:RefCell<JobRegistry>, processes, outputs}`（采用）**：
+进程在调用方先 spawn（jobs.start 的 producer 只回喂 hooks，不触发执行——`producer 先跑再分配
+id`（D-049）语义下不产生孤儿：start 失败由调用方 `process.kill()` 掐掉）；`start_bash(owner,
+label, process)` 登记 job，`ProducerHooks{on_cancel=kill, read_output=None}`（final-output 语义）。
+2. produce-time spawn（jobs.start 内 spawn：OwnerQuota 失败前不 spawn，但进程句柄无法回传
+bridge/无需 registry 序——增加 executor 借入复杂度，弃）。3. 流式 read_output 逐轮滚入（注册表
+output_buf 无公开追加 API，且 bash 后台为 final-output job——D-004/TS 语义，弃流式）。
+**完成结算——合作泵 `pump()`（采用）**：单线程注册表不自驱动 settle（D-004 诚实降级），
+宿主（M5g tick/测试循环）调 `pump()`：**先 done() 等到退出（collector join，管道缓冲全落）
+再 read_output() 收尾增量**（修正初版先读后 done 丢终态缓冲的竞态——TDD 红测捕获）→ 终态
+completed/killed → `settle(status, detail=exit code, output=全文)` → 移除。App 侧 job_read/
+job_list/job_kill 共享同一 JobRegistry 语义（本桥即其宿主句柄）。幂等、first-wins。
+**诚实限制（D 记录）**：pump 是合作推进（无后台线程自动驱动——M5g 服务层线程 tick 宿主侧落，
+核心不动）；`result.sandbox` 恒 None；SAND/read_image/run_code 仍按 D-070 严格。
+**预期影响与回滚点**：web_m5.rs（BashJobsBridge + bash 后台分支：jobId 值/后台渲染词表
+"started (collect via job_read…)"）+ web.rs（真实 Git Bash 后台端到端：bg1 jobId → pump 至
+settle → read 断言 completed + 全文 job-start/job-end + foreign caller 拒绝 + 前台共存；
+bash 不可用平台门控跳过）；dsh-cli 86 测试全绿 + clippy 零告警 + workspace check 绿。回滚 =
+撤本提交。
+**待办**：M5g 定时 tick（服务层线程泵调 pump）、SAND 投影、read_image 解码、run_code 传输替换、
+step8 M5-ACCEPTANCE。
+
+---
+
 
 

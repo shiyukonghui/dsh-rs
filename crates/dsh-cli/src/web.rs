@@ -4382,7 +4382,7 @@ mod tests {
                 Box::new(|_cfg| Box::new(M5FakeBackend::default())),
             )
             .expect("register fake backend");
-        let host = M5HostServices { terminal: Some(term), fs: None, shell: None };
+        let host = M5HostServices { terminal: Some(term), fs: None, shell: None, bash_jobs: None };
         register_m5_tools_with_host(&registry, Some(&host));
 
         // open
@@ -4516,7 +4516,7 @@ mod tests {
         let fsh = Rc::new(web_m5::FsHost::new(root.clone()));
         register_m5_tools_with_host(
             &registry,
-            Some(&M5HostServices { terminal: None, fs: Some(fsh), shell: None }),
+            Some(&M5HostServices { terminal: None, fs: Some(fsh), shell: None, bash_jobs: None }),
         );
 
         let exec = |call_id: &str, name: &str, args: serde_json::Value| {
@@ -4684,7 +4684,7 @@ mod tests {
         let shost = Rc::new(web_m5::ShellHost::new(root.clone()).expect("shell host"));
         register_m5_tools_with_host(
             &registry,
-            Some(&M5HostServices { terminal: None, fs: None, shell: Some(shost) }),
+            Some(&M5HostServices { terminal: None, fs: None, shell: Some(shost), bash_jobs: None }),
         );
 
         let exec = |call_id: &str, args: serde_json::Value| {
@@ -4743,6 +4743,101 @@ mod tests {
             serde_json::json!({ "command": "echo x", "description": "test sandbox", "sandbox_permissions": "network" }),
         );
         assert!(res.is_error, "sandbox escalation rejected until SAND projection");
+
+        // 清理
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M5i 接线 #5：bash 后台 jobs producer 桥（真实 Git Bash 门控）——run_in_background:true
+    /// 返回 jobId；宿主合作泵（pump）推进至 settle；job_read 终态携全文；job 授权围栏作用
+    /// （foreign caller 拒绝）。与 app 侧 job_read/job_kill 工具共享同一 JobRegistry 语义。
+    #[test]
+    fn register_m5_tools_with_bash_jobs_bridge_background_really() {
+        use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
+        fn bash_available() -> bool {
+            #[cfg(windows)]
+            {
+                ["C:\\Program Files\\Git\\bin\\bash.exe", "C:\\Program Files\\Git\\usr\\bin\\bash.exe", "C:\\Windows\\System32\\bash.exe"]
+                    .iter()
+                    .any(|p| std::path::Path::new(p).exists())
+            }
+            #[cfg(not(windows))]
+            {
+                true
+            }
+        }
+        if !bash_available() {
+            eprintln!("bash unavailable; skipping background jobs bridge test");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("dsh-m5-bash-bg-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+
+        let registry = ToolRegistry::new(ToolExecutionMode::Native);
+        let shost = Rc::new(web_m5::ShellHost::new(root.clone()).expect("shell host"));
+        let bridge = Rc::new(web_m5::BashJobsBridge::new());
+        register_m5_tools_with_host(
+            &registry,
+            Some(&M5HostServices {
+                terminal: None,
+                fs: None,
+                shell: Some(shost),
+                bash_jobs: Some(bridge.clone()),
+            }),
+        );
+
+        // 后台启动：返回 jobId（无前台 exitCode 语义）。
+        let res = registry.execute(
+            &ToolExecutionInput::new(
+                "bg1",
+                "bash",
+                serde_json::json!({
+                    "command": "echo job-start; sleep 0.3; echo job-end",
+                    "description": "test background job",
+                    "run_in_background": true,
+                }),
+                Some("agent-1".into()),
+            ),
+            None,
+        );
+        assert!(!res.is_error, "background start ok: {:?}", res.error);
+        let v = res.value.unwrap();
+        let job_id = v["jobId"].as_str().expect("jobId").to_string();
+
+        // 合作泵推进至 settle（真实 sleep 进程）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if bridge.pump() > 0 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "job did not settle in time");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // job_read：completed + 终态全文。
+        let read = bridge.read(&job_id, Some("agent-1")).expect("read by owner ok");
+        assert_eq!(read.snapshot.status.as_str(), "completed");
+        assert!(read.text.contains("job-start"), "stdout has start: {}", read.text);
+        assert!(read.text.contains("job-end"), "stdout has end: {}", read.text);
+
+        // 授权围栏：foreign caller 拒绝。
+        assert!(bridge.read(&job_id, Some("agent-2")).is_err(), "foreign read rejected");
+
+        // 后台不再进前台路径（前台同 host 同时可用）。
+        let res = registry.execute(
+            &ToolExecutionInput::new(
+                "fg1",
+                "bash",
+                serde_json::json!({ "command": "echo fg-ok", "description": "test fg" }),
+                Some("agent-1".into()),
+            ),
+            None,
+        );
+        assert!(!res.is_error, "foreground still works with bridge present");
+        assert_eq!(res.value.unwrap()["exitCode"], 0);
 
         // 清理
         let _ = std::fs::remove_dir_all(&root);
