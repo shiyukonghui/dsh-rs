@@ -20,3 +20,6 @@ pub use sandbox::{checked_target, SandboxPolicy};
 /// observation policy（read-before-edit / version CAS 决策）。
 pub mod policy;
 pub use policy::{Observation, ObservationGate, OwnerId};
+
+/// tool `read` 纯渲染面（read_render）。
+pub mod read_render;
