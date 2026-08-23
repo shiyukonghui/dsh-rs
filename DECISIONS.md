@@ -3006,5 +3006,34 @@ step4 sandbox 投影 → step6 前端最小闭环 → 穿插篮 → M6-ACCEPTANC
 
 ---
 
+## D-081（M6 编码·step1b）：serve 接线——WebConfig +`&mut Boot` + 真实编排
+`assemble_server_runtime` + `dsh web --agent-loop`（验收 #2/#3/#6 生产入口；P2/P3）
+
+**日期**：2026（M6 round 2）。
+**触发问题**：step1a 装配工厂核心完成；需接入 `serve()`/`dsh web` 使真实服务器闭环可用。
+**设计（自下而上）**：serve 仅被 main.rs:329 调用（`&boot`）→ 改 `&mut Boot` 副作用只在一处；
+dispatch_request 收 `&Boot`（`&mut` reborrow 即可）；WebConfig 无 Default、仅 main.rs 构造
+（+4 字段只改一处）；`JobRegistryConfig.now: Box<dyn Fn()->i64>`（i64，非 u64）；`M5Host::
+assemble -> Result<Self,String>`（bash 缺失即 Err）；`SessionHost.session("default") ->
+Rc<Session>` 供 TodoWriteHost/ScheduleHost。
+**实现**：WebConfig +`workspace_root: Option<PathBuf>`（P2 缺省 CWD canonicalize）+
+`enable_agent_loop: bool`（缺省 false）+ `llm_base_url/llm_model: Option<String>`（env
+`DSH_LLM_BASE_URL`/`DSH_LLM_MODEL` → 缺省 https://api.deepseek.com / deepseek-chat）。
+serve(enable) 解析 ws_root → `assemble_server_runtime(&host, ws_root, base, model)`（编排：
+M4 jobs(now=system_now_ms)/schedule(ScheduleHost)/todo(TodoWriteHost bind "default") +
+M5Host::assemble + m6_llm::server_llm_runtime + assemble_server_loop(共享 store)）→
+`boot.agent_loop = Some(loop_host)`；装配失败 → `serve` fail-loud（诚实，不默默回退 WASM）。
+main.rs：`--agent-loop`/`--workspace-root`/`--llm-base-url`/`--llm-model`  flags + `mut boot`
++ cfg 字段。测试：`assemble_server_runtime` 真装配（M4+M5+deepseek + 共享 store 断言 +
+M4+M5 工具面；bash 缺失 → 诚实跳过打印）。
+**拒绝**：① enable_agent_loop 缺省 true（默认开启会让无 bash 环境 `dsh web` 启动失败——
+默认关闭 + 显式 opt-in，既存 cordis 语义零变化）；② serve 装配失败吞掉继续（默默降级到
+WASM/无 loop，违反诚实——fail-loud）。
+**证据**：dsh-cli 97 测全绿 + clippy 零告警 + check 绿。回滚 = 撤本提交。
+**待办**：step2 M5Host::shutdown + disposer（宿主生命周期清理，验收 #3）→ step3 tick 注入
+serve → step4 sandbox 投影 → step6 前端最小闭环 → 穿插篮 → M6-ACCEPTANCE（真实端点门控冒烟）。
+
+---
+
 
 

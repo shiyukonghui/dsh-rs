@@ -253,6 +253,11 @@ fn web_main(args: &[String]) {
     let mut overlays: Vec<PathBuf> = Vec::new();
     let mut wasm_base = PathBuf::from("wasm-plugins");
     let mut session_dir: Option<PathBuf> = None;
+    // M6（step1b）：服务器执行闭环装配参数。
+    let mut enable_agent_loop = false;
+    let mut workspace_root: Option<PathBuf> = None;
+    let mut llm_base_url: Option<String> = None;
+    let mut llm_model: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -280,6 +285,21 @@ fn web_main(args: &[String]) {
                 i += 1;
                 session_dir = Some(PathBuf::from(&args[i]));
             }
+            "--agent-loop" => {
+                enable_agent_loop = true;
+            }
+            "--workspace-root" => {
+                i += 1;
+                workspace_root = Some(PathBuf::from(&args[i]));
+            }
+            "--llm-base-url" => {
+                i += 1;
+                llm_base_url = Some(args[i].clone());
+            }
+            "--llm-model" => {
+                i += 1;
+                llm_model = Some(args[i].clone());
+            }
             other if other.starts_with("--") => {
                 eprintln!("dsh web: unknown arg {other}");
                 std::process::exit(2);
@@ -303,7 +323,7 @@ fn web_main(args: &[String]) {
     // 前端 dist 根（默认搜索）
     let web_root = web_root.unwrap_or_else(default_web_root);
 
-    let boot = match dsh_cli::boot(&config_path, &overlays, &wasm_base) {
+    let mut boot = match dsh_cli::boot(&config_path, &overlays, &wasm_base) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("boot failed: {e}");
@@ -325,8 +345,12 @@ fn web_main(args: &[String]) {
         host: host.clone(),
         port,
         session_dir,
+        workspace_root,
+        enable_agent_loop,
+        llm_base_url,
+        llm_model,
     };
-    match dsh_cli::web::serve(&boot, cfg) {
+    match dsh_cli::web::serve(&mut boot, cfg) {
         Ok(server) => {
             println!("dsh web serving at {}", server.addr);
         }

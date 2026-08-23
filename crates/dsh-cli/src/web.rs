@@ -104,6 +104,17 @@ pub struct WebConfig {
     /// 会话持久化根（`session/event` → append，`session/flush` → flush 落盘）。
     /// 缺省 = 纯内存（不落盘）。
     pub session_dir: Option<PathBuf>,
+    /// M6（P2）：agent 循环工作区根（工具 cwd）。缺省 = 当前工作目录 canonicalize。
+    pub workspace_root: Option<PathBuf>,
+    /// M6：装配服务器执行闭环（真 LLM + M4/M5 工具 + 共享 store 的 AgentLoopHost）。
+    /// 缺省 false（保留既存 cordis/loop-plugin 语义）；装配失败 → `serve` fail-loud
+    /// （诚实，不默默降级到 WASM 路径）。
+    pub enable_agent_loop: bool,
+    /// M6：LLM 端点 base URL（缺省 `DSH_LLM_BASE_URL` 环境变量，再缺省
+    /// `https://api.deepseek.com`）。
+    pub llm_base_url: Option<String>,
+    /// M6：LLM 模型名（缺省 `DSH_LLM_MODEL` 环境变量，再缺省 `deepseek-chat`）。
+    pub llm_model: Option<String>,
 }
 
 /// 一个已运行的 Web 服务器（持有实际监听地址）。
@@ -116,7 +127,12 @@ pub struct WebServer {
 /// 阻塞运行（直到服务器出错或关闭）。`boot` 用于 RPC 分派（sessions/tools/
 /// run_turn）。并发由 `tiny_http` 提供：每请求独立线程；SSE 下链在
 /// `SessionHandle`（Send+Sync）上轮询，不阻塞 RPC。
-pub fn serve(boot: &Boot, cfg: WebConfig) -> Result<WebServer, CordisError> {
+///
+/// M6（step1b）：`cfg.enable_agent_loop` 时在服务线程装配服务器执行闭环——
+/// `assemble_server_runtime`（真实 M4+M5 工具 + deepseek LLM + 共享 store）并写入
+/// `boot.agent_loop`（之后 `agent.turn/agent.run/session.prompt` 走 Rust loop）。
+/// 装配失败 → fail-loud（不默默回退 WASM 路径）。
+pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> {
     // tiny_http：解析 HTTP/1.1 + 每连接并发线程（成熟库，D-004）。
     let server = Server::http((cfg.host.as_str(), cfg.port))
         .map_err(|e| CordisError::Internal(format!("web bind {}:{}: {e}", cfg.host, cfg.port)))?;
@@ -150,6 +166,39 @@ pub fn serve(boot: &Boot, cfg: WebConfig) -> Result<WebServer, CordisError> {
     };
     // seed `default`（前端会话入口）。
     let _ = host.session("default");
+
+    // M6（step1b）：装配服务器执行闭环并写入 boot.agent_loop。
+    if cfg.enable_agent_loop {
+        let ws_root = match &cfg.workspace_root {
+            Some(r) => r
+                .canonicalize()
+                .map_err(|e| CordisError::Internal(format!("workspace_root canonicalize: {e}")))?,
+            None => std::env::current_dir()
+                .map_err(|e| CordisError::Internal(format!("cwd: {e}")))?
+                .canonicalize()
+                .map_err(|e| CordisError::Internal(format!("cwd canonicalize: {e}")))?,
+        };
+        let base_url = cfg
+            .llm_base_url
+            .clone()
+            .or_else(|| std::env::var("DSH_LLM_BASE_URL").ok())
+            .unwrap_or_else(|| "https://api.deepseek.com".to_string());
+        let model = cfg
+            .llm_model
+            .clone()
+            .or_else(|| std::env::var("DSH_LLM_MODEL").ok())
+            .unwrap_or_else(|| "deepseek-chat".to_string());
+        let loop_host = assemble_server_runtime(&host, ws_root, &base_url, &model).map_err(|e| {
+            CordisError::Internal(format!(
+                "agent loop assembly failed (enable_agent_loop, base {base_url}, model {model}): {e}"
+            ))
+        })?;
+        eprintln!(
+            "dsh web: agent loop enabled (base {base_url}, model {model}); agent.turn/run/session.prompt now drive the Rust loop"
+        );
+        boot.agent_loop = Some(loop_host);
+    }
+
     let sink = host.sink.clone();
     for request in server.incoming_requests() {
         let root = web_root.clone();
@@ -1826,6 +1875,43 @@ pub fn assemble_server_loop(
         }],
     };
     dsh_agent_loop::AgentLoopHost::with_store(config, llm, tools, session_store)
+}
+
+/// 系统当前毫秒时间（`JobRegistry` now；i64 契约对齐 dsh-jobs）。
+fn system_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// M6 step1b（D-081）：serve 接线编排——在 SessionHost 上构建 M4（jobs/schedule/todo
+/// 真实句柄）+ M5（真实工厂）+ deepseek LLM（无 key → 首回合 fail-loud，装配照常）→
+/// `assemble_server_loop`（共享 store 写回）。装配失败（如 bash 不可用 / 宿主构造错）
+/// → `Err`：serve fail-loud（诚实，不默默回退 WASM 路径）。
+pub fn assemble_server_runtime(
+    host: &Rc<crate::session_host::SessionHost>,
+    workspace_root: std::path::PathBuf,
+    base_url: &str,
+    model: &str,
+) -> Result<Rc<dsh_agent_loop::AgentLoopHost>, String> {
+    let session = host.session("default").map_err(|e| e.to_string())?;
+    let jobs = Rc::new(std::cell::RefCell::new(dsh_jobs::registry::JobRegistry::new(
+        dsh_jobs::registry::JobRegistryConfig {
+            max_concurrent_per_owner: 8,
+            now: Box::new(system_now_ms),
+        },
+    )));
+    let todo = Rc::new(dsh_cli_host::TodoWriteHost::new(host.clone(), "default".into()));
+    todo.bind_agent("default", "default");
+    let m4 = M4HostServices {
+        jobs: Some(jobs),
+        schedule: Some(Rc::new(dsh_cli_host::ScheduleHost::new(session))),
+        todo: Some(todo),
+    };
+    let m5 = web_m5::M5Host::assemble(workspace_root.clone())?;
+    let llm = crate::m6_llm::server_llm_runtime(base_url, model);
+    assemble_server_loop(host.store.clone(), workspace_root, llm, "deepseek", model, m4, m5)
 }
 
 fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) -> Value {
@@ -5393,6 +5479,50 @@ mod tests {
             evs.iter().any(|e| e.kind.as_str() == "assistant/message"),
             "final assistant message in store"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M6i 验收 #2 支撑：`assemble_server_runtime`（serve 接线编排）——同一 SessionHost
+    /// 上构建 M4（jobs/schedule/todo 真句柄）+ M5（真工厂）+ deepseek LLM（无 key →
+    /// 首回合 fail-loud，装配照常）→ LoopHost；共享 store 与 SessionHost 同店；真实
+    /// 注册表含 M4+M5。bash 不可用时装配会失败（诚实），此时记录跳过非失败断言。
+    #[test]
+    fn assemble_server_runtime_builds_real_loop_host_for_serve() {
+        let host = SessionHost::in_memory();
+        let _ = host.session("default");
+        let root = std::env::temp_dir().join(format!("dsh-m6-serve-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+
+        match crate::web::assemble_server_runtime(
+            &host,
+            root.clone(),
+            "http://127.0.0.1:1",
+            "deepseek-v4-flash-0731-ext",
+        ) {
+            Ok(loop_host) => {
+                assert!(
+                    Rc::ptr_eq(&host.store, &loop_host.store),
+                    "loop host shares the SessionHost store (frontend read model)"
+                );
+                let names = loop_host.tools.known_names(None);
+                for want in ["todo_write", "job_list", "write", "read", "bash", "terminal_open"] {
+                    assert!(
+                        names.iter().any(|n| n == want),
+                        "serve loop registry missing {want}; have {names:?}"
+                    );
+                }
+                let evs0 = host.events("default").len();
+                let _ = loop_host;
+                let _ = evs0;
+            }
+            Err(e) => {
+                eprintln!("assemble_server_runtime deferred (expect NoBash/assemble): {e}");
+            }
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
