@@ -2520,5 +2520,53 @@ validate 层拦截 `-0.0`。serde_json `Number` 无法承载非有限（`from_f6
 
 ---
 
+## D-066（M5 编码·dsh-subprocess Pipe 端原语扩展）：Pipe 三态端在句柄上真正可见
+
+**日期**：2026（M5 round 14）。
+**触发问题**：code-runtime python 后端需要「spawn 后持续写 stdin + 裸读 stdout」的协议式
+交互，而 `SubprocessHandle` 的 `StdinMode::Pipe`/`StdoutMode::Pipe` 注释已预告「宿主保留
+句柄」却从未暴露端——收集模式才有读。这是设计语义与本体的缺口，不是新需求。
+**考虑的选项**：1. **补齐 handle 端暴露（采用）**：`stdin_writer()`/`take_stdin()` +
+`take_stdout_reader()`/`take_stderr_reader()`；spawn 后单点 take（`child` 每字段至多 take
+一次，避免跨 match 条件移动被借检器拒绝；stderr 端类型是 `ChildStderr` 非 `ChildStdout`）。
+2. python 后端自建 `std::process`：失去 job-object 树杀（timeout/abort 只杀直系）→ 违反
+§7.3「树级 terminate()」。
+**最终选择**：选项 1。`tests/pipe_ends.rs` 2 用例（写→取走 stdin→EOF→退出→裸读回显；
+非 Pipe 无写端）。`Cmd /c more`（Windows）与 `cat`（Unix）做回显子进程。
+**选择理由**：协议式后端是 dsh-subprocess 面向的一等使用形态；复用树杀/有界收集/scrub，
+不为临时后端开旁路。**预期影响**：dsh-subprocess 24+ 测试全绿；回滚 = 撤本提交。
+
+---
+
+## D-067（M5 编码·dsh-code-runtime python 后端）：std 无法在 Windows 建额外 fd → 协议走
+stdin/stdout JSON-lines，用户输出经 `log` 帧回流；顶层 null = 无完成值
+
+**日期**：2026（M5 round 14）。
+**触发问题**：§7.3 指定 `PROTOCOL_FD=3` JSON-lines，但 `std::process` 在 Windows **无法给
+子进程创建额外 fd**（无 STARTUPINFOEX 句柄注入；Unix 也缺 pre_exec 公开稳定面）。参考仓
+又无 python worker 可抄（`WIRE_FRAME_FIELDS` §7.3 只署名未成文）。
+**考虑的选项**：1. **协议走 stdin/stdout（fd 0/1），用户 print() 在进程内捕获、按行回流
+`log` 帧（采用）**；stderr 只承载引导级诊断。帧：host→child `boot|run|reply`，
+child→host `boot_ack|call|log|done`——六帧名逐字但传输入口因平台约束重定义。2. 自研
+Win32 句柄注入（CreatePipe+STARTUPINFOEX+bHandleInherit）建 fd3：违背「环境问题不改架构
+意图也无必要给平台四处加成本」，且不安全面大。
+**最终选择**：选项 1 + 核心决定：**宿主视入站为敌**——`validate_child_frame` 字段校验 +
+REBUILD（未知/畸形帧 → WorkerExit）；`lossless` 三层（D-065）+ 完成值
+`classify_admission`（over-budget / non-lossless 独立分类）；python None → 顶层 null →
+**无完成值**（worker 无法区分 `return None` 与函数落到尾，统一按缺省，D 文档化）；
+worker 自检非序列化完成值（`return float("nan")`）→ done error invalid-output；超时/中止 →
+dsh-subprocess 树级 terminate；命名空间 boot 前 `validate_binding_namespace` 预检（契约
+误用 → 诚实 WorkerExit，不伪装）。
+**选择理由**：单条有序协议流（`log` 帧保序）比 fd3+stdout 双流还要稳；worker 单线程
+多路复用 stdin（call 阻塞等 reply）自然支持绑定往返；python 真实执行（D:\Anaconda 可
+定位）兑现「TS 桩 + python 真后端」的 DIV-3 设计。
+**预期影响与回滚点**：`python_worker/worker.py`（stdlib 自含、编译期打包）+ `src/python_backend.rs`
+（`PythonCodeRuntime` + `locate_python` + `validate_child_frame`）+ `tests/python_backend.rs`
+11 集成用例（回显/大整数 2^60/日志/异常/binding 往返与拒绝/超时 500ms/中止/output-limit/
+nan→invalid-output/契约误用）全绿 + clippy 零告警；`run()` 总值返回（错误是结果字段）。
+回滚 = 撤本提交。
+
+---
+
 
 

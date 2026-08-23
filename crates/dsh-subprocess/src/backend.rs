@@ -200,7 +200,16 @@ pub fn spawn(spec: &SubprocessSpawnSpec) -> Result<SubprocessHandle, ProcessErro
         }
     }
 
-    // 收集线程句柄
+    // 单点取端：每个 child 字段至多 take 一次，避免跨 match 的条件移动被拒。
+    let mut stdin_end: Option<std::process::ChildStdin> = None;
+    let mut stdout_end: Option<std::process::ChildStdout> = None;
+    let mut stderr_end: Option<std::process::ChildStderr> = None;
+
+    if matches!(spec.stdio.stdin, StdinMode::Pipe) {
+        stdin_end = child.stdin.take();
+    }
+
+    // 收集线程句柄 + Pipe 裸读端
     let stdout_slot = match &spec.stdio.stdout {
         StdoutMode::Collect(cfg) => {
             let rd = child.stdout.take().expect("collect stdout piped");
@@ -208,7 +217,11 @@ pub fn spawn(spec: &SubprocessSpawnSpec) -> Result<SubprocessHandle, ProcessErro
             pending_joins.push(join);
             Some(slot)
         }
-        _ => None,
+        StdoutMode::Pipe => {
+            stdout_end = child.stdout.take();
+            None
+        }
+        StdoutMode::Inherit => None,
     };
     let stderr_slot = match &spec.stdio.stderr {
         StdoutMode::Collect(cfg) => {
@@ -217,12 +230,19 @@ pub fn spawn(spec: &SubprocessSpawnSpec) -> Result<SubprocessHandle, ProcessErro
             pending_joins.push(join);
             Some(slot)
         }
-        _ => None,
+        StdoutMode::Pipe => {
+            stderr_end = child.stderr.take();
+            None
+        }
+        StdoutMode::Inherit => None,
     };
 
     Ok(SubprocessHandle {
         child: Some(child),
         pid,
+        stdin_end,
+        stdout_end,
+        stderr_end,
         stdout_slot,
         stderr_slot,
         joins: pending_joins,
@@ -244,6 +264,12 @@ pub fn spawn(spec: &SubprocessSpawnSpec) -> Result<SubprocessHandle, ProcessErro
 pub struct SubprocessHandle {
     child: Option<Child>,
     pub pid: u32,
+    /// StdinMode::Pipe 保留的写端（后续可写；WriteBytes 后为 None）。
+    stdin_end: Option<std::process::ChildStdin>,
+    /// StdoutMode::Pipe 保留的裸读端（宿主自读；Collect 后为 None）。
+    stdout_end: Option<std::process::ChildStdout>,
+    /// StdoutMode::Pipe 保留的裸读端（stderr 侧）。
+    stderr_end: Option<std::process::ChildStderr>,
     stdout_slot: Option<Arc<Mutex<CollectedOutput>>>,
     stderr_slot: Option<Arc<Mutex<CollectedOutput>>>,
     joins: Vec<thread::JoinHandle<()>>,
@@ -254,6 +280,26 @@ pub struct SubprocessHandle {
 }
 
 impl SubprocessHandle {
+    /// `StdinMode::Pipe` 的写端（协议式交互后端持续写入）。None = 非 Pipe 或已消费。
+    pub fn stdin_writer(&mut self) -> Option<&mut std::process::ChildStdin> {
+        self.stdin_end.as_mut()
+    }
+
+    /// 取走 `StdinMode::Pipe` 写端（调用方 drop → 关闭 → 子进程 stdin EOF）。
+    pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.stdin_end.take()
+    }
+
+    /// `StdoutMode::Pipe` 的裸读端（取走后由宿主负责读至 EOF；Collect 模式为 None）。
+    pub fn take_stdout_reader(&mut self) -> Option<std::process::ChildStdout> {
+        self.stdout_end.take()
+    }
+
+    /// `StdoutMode::Pipe` 的裸读端（stderr 侧）。
+    pub fn take_stderr_reader(&mut self) -> Option<std::process::ChildStderr> {
+        self.stderr_end.take()
+    }
+
     /// 等待运行结束；settle 一次（首次后缓存），从不 reject。
     /// 返回前 join 收集线程：进程退出后管道关闭 → 收集器到 EOF → 结果落槽，
     /// 保证「流排干后再读」不丢尾（镜像参考 done 在 stdio 关闭后 resolve）。
