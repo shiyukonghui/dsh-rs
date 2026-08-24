@@ -4285,5 +4285,67 @@ dsh-agent-presets（P1-a 独立提交可保留）。
   C）；per-agent `{{cwd}}`（C）；C 段收敛未动。
 - **回滚**：`git revert` P3-e 提交——回退 pwsh 工具/终端后端/忠实门控与测试，其余保留。
 
+## D-104（C 收官里程碑定稿：C 全量收敛 + F-05 WASM 组合引擎；用户拍板）：进入 C-B 分段
+
+**日期**：2026（round-20 用户拍板。前置：B 全段 + P3-c/d/e + win32-A 全部完成验收；
+C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方法论四「先跳出来看全局，权衡
+显式报告再下单」。）
+
+**第一性原理（自上而下 + 自下而上）**：
+- 自上而下：C 是「组合权威归位 dsh-core」的收官——preset 组合不再是 web 壳的桥接层，
+  而是 dsh-core 中按 agent scope 以 fiber 挂载的组合子树；loop 真正消费它；每阶段独立
+  提交=回滚点，TDD 红绿 + live 验证与 B 同纪律。
+- 自下而上（源证据核证）：
+  - `deepseek-harness/packages/preset/agent-presets/src/mount.ts` = 我们 standing 的权威
+    上游：join 键就是 dsh-scope 的 **ScopeKey**（agent key → `scopeParentOf` → standing
+    key）；子树只读（preset 是输入，永不回写给文件）；**root-realm 泄漏守卫**
+    （`leakedServices`：行把 service 发布进 ROOT 域 → 整挂载失败）+ **unusable-rows
+    拒绝**（行停在不可用态 → 挂载否决）+ 挂载树随 agent fiber 展开。后三条我们 standing
+    **还没有**。
+  - `vendor/loader/src/config/utils.ts:5`：组合表达式求值 = `new Function(...)…
+    return eval(expr)`——**harness 组合求值全程原生 JS，无任何 WASM**。
+  - 我们的 `dsh-core`（fiber/registry/service/events/reflect）已存在 = 「开进」落点；
+    `dsh-wasmrt` = WASM **插件**后端（适配 `dsh_core::Plugin`，另有可替换 loop），非组合
+    引擎；`dsh-eval` = native 求值的忠实移植。
+
+**考虑过的选项**：
+1. **C-loop 完成（A）**：standing 留 dsh-cli，只做 loop 级内容桥（planMode 段注入 +
+   compaction guarded）。成本 1 轮；但不动「组合权威归位」，架构归位不彻底。
+2. **C 全量收敛（B，用户采纳）**：standing 机制整体搬进 dsh-core（PresetRuntime 服务按
+   agent scope 以 fiber 挂载组合子树；移植 leakedServices root-realm 泄漏检测 + 挂载
+   否决 + 随 fiber 展开），standing.rs 收成薄适配层。约 2-3 轮；触承重墙（fiber/
+   registry），但达成目标文本「组合权威归位 dsh-core」。
+3. C 收尾维护（否决：与目标文本相悖，用户未采纳）。
+
+**★ 逐项决议**：
+- **C 范围 = B 全量收敛**：新增 dsh-core 层组合子树挂载（PresetRuntime），root-realm
+  泄漏守卫（真移植 leakedServices）+ unusable-rows 挂载否决 + 随 agent fiber 展开；
+  standing.rs 收成薄适配层；loop 级内容桥（会话模式状态驱动 `dsh-plan-mode` 段注入；
+  compaction 保持诚实 guarded——需 token 计量器/折叠管线，当前 prompt 从不折叠，做了
+  无真实效用）。
+- **F-05 = 仍要 WASM 组合引擎（用户明示，尽管源证据为原生求值）**：组合/disabled_expr
+  求值另建 WASM 面（走 dsh-wasmrt，native 求值兜底/回退）。无上游先例——以 spike +
+  TDD 先行压低不确定性；fidelity 主口径仍以 dsh-eval（原生）为准，WASM 面与其以结果
+  一致性测试锚定。**客户已拍板，尊重明示选择，不默改。**
+- **F-06 = 参照 harness 源码定案**：join 键 = dsh-scope **ScopeKey**（单身份轴
+  agent==session，值比/不透明键，`mount.ts` 即此）；**无第二键空间**；ScopeId 留作品牌/
+  展示（对齐 client 的 branded SessionId 是 wire 面、非另造键）。
+
+**C-B 分段计划**（各阶段独立提交=回滚点；TDD 红绿 + live 复验）：
+1. **K1 键/生命周期**：dsh-core 侧组合挂载原语（agent scope → fiber 子树 + scope-join +
+   disposer），保留 ScopeKey 单键。
+2. **K2 泄漏守卫**：root-realm `leakedServices` 检测（dsh-core reflect）+ 负例测试
+   （root 注册 → 挂载失败）。
+3. **K3 挂载否决**：unusable-rows 审计（显式 broken 集除外，D-103 兼容）→ 挂载失败。
+4. **K4 薄适配**：web select 走新 runtime；standing.rs 收缩；旧测试迁移；live 复验
+   （standard/cordis join 不回归）。
+5. **F-05（并行/随后）**：WASM 组合引擎 spike → 结果一致性测试（WASM == dsh-eval）
+   → 接入（native 兜底）。
+6. C 段测试报告（相对当前 438 基线只增不减）+ clippy `-D warnings` + DECISIONS 逐段补记。
+
+**回滚**：D-104 本身仅文档；K1..K5 以阶段为粒度 `git revert` 独立提交。**key 纪律不变**。
+
+### D-104 实施补记预留
+
 
 
