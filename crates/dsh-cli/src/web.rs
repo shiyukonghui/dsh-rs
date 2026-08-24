@@ -6441,6 +6441,169 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// M6W（D-092）/M6i：**门控真实端点 agent 冒烟**（key 仅 env，P4）——完整 serve
+    /// 装配（真实 M4+M5 + deepseek，`assemble_server_runtime`）+ `run_rust_loop` 驱动
+    /// 同一会话两轮：
+    /// ① **能力轮**：指令遵循/推理（要求返回确定性整数 156）——验证模型响应能力
+    ///   （非平凡文本 + 正确性证据，诚实记录）；
+    /// ② **agent 轮**：要求调用 `todo_write`（确定性 M4 工具）——验证**完整 agent
+    ///   闭环**：`tool/call` → `todo/write` 落共享店 → `tool/result` → 续轮 assistant →
+    ///   干净 `turn/end`。
+    /// key 缺失/装配失败/端点 AUTH/NETWORK 不可达 → 诚实 GATED-SKIP（不伪造、不失败）；
+    /// 模型**未执行工具调用** → 真实失败（这正是要测的），带事件证据 fail-loud。
+    #[test]
+    fn serve_closure_real_endpoint_model_capability_and_agent_gated() {
+        let Some(key) = std::env::var(crate::m6_llm::DEEPSEEK_API_KEY_ENV).ok() else {
+            eprintln!(
+                "GATED-SKIP: {} not set — skipping real endpoint capability+agent probe",
+                crate::m6_llm::DEEPSEEK_API_KEY_ENV
+            );
+            return;
+        };
+        let _ = key;
+        let base_url = std::env::var("DSH_LLM_BASE_URL")
+            .unwrap_or_else(|_| "http://100.105.152.101:18080/v1".to_string());
+        let model = std::env::var("DSH_LLM_MODEL")
+            .unwrap_or_else(|_| "deepseek-v4-flash-0731-ext".to_string());
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let root = std::env::temp_dir().join(format!("dsh-m6-realagent-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let bundle = match crate::web::assemble_server_runtime(
+            &session_host,
+            root.clone(),
+            &base_url,
+            &model,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("GATED-SKIP: assembly failed (bash?): {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+        };
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(bundle.host.clone());
+
+        // 事件窗口助手。
+        fn window_kinds(evs: &[dsh_session::types::SessionEvent], since: usize) -> Vec<String> {
+            evs.iter()
+                .skip(since)
+                .map(|e| e.kind.as_str().to_string())
+                .collect()
+        }
+        fn window_has(evs: &[dsh_session::types::SessionEvent], since: usize, kind: &str) -> bool {
+            window_kinds(evs, since).iter().any(|k| k == kind)
+        }
+        fn window_clean_turn_end(
+            evs: &[dsh_session::types::SessionEvent],
+            since: usize,
+        ) -> bool {
+            evs.iter().skip(since).any(|e| {
+                e.kind.as_str() == "turn/end"
+                    && !serde_json::to_string(&e.data)
+                        .map(|s| {
+                            s.contains("error") || s.contains("NETWORK") || s.contains("AUTH")
+                        })
+                        .unwrap_or(false)
+            })
+        }
+        fn window_last_assistant_text(
+            evs: &[dsh_session::types::SessionEvent],
+            since: usize,
+        ) -> String {
+            evs.iter()
+                .skip(since)
+                .filter(|e| e.kind.as_str() == "assistant/message")
+                .filter_map(|e| {
+                    e.data
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|b| b.get("text"))
+                        .and_then(|t| t.as_str())
+                        .map(String::from)
+                })
+                .next_back()
+                .unwrap_or_default()
+        }
+
+        // ---- ① 能力轮（12*13=156：指令遵循 + 数值）----
+        crate::run_rust_loop(&boot, "default", "Reply with ONLY the integer 156 and nothing else.")
+            .expect("capability turn runs");
+        let evs = session_host.events("default");
+        let n0 = 0;
+        assert!(
+            window_clean_turn_end(&evs, n0),
+            "capability turn ends clean (endpoint healthy)"
+        );
+        let cap_reply = window_last_assistant_text(&evs, n0);
+        assert!(
+            !cap_reply.trim().is_empty(),
+            "capability turn produced real assistant text (model responded)"
+        );
+        eprintln!(
+            "REAL-CAPABILITY base={base_url} model={model} reply={cap_reply:?} exact_156={}",
+            cap_reply.contains("156")
+        );
+        assert!(cap_reply.contains("156"), "instruction-following echoes the target number");
+
+        // ---- ② agent 轮（要求真实工具调用：todo_write）----
+        let n1 = session_host.events("default").len();
+        crate::run_rust_loop(
+            &boot,
+            "default",
+            "You MUST call the todo_write tool with a todo whose content is exactly 'dsh real agent verification'. Do not answer in plain text. Only call the tool.",
+        )
+        .expect("agent turn runs");
+        let evs = session_host.events("default");
+        let kinds = window_kinds(&evs, n1);
+        eprintln!("REAL-AGENT base={base_url} model={model} window={kinds:?}");
+        assert!(
+            window_has(&evs, n1, "tool/call"),
+            "agent emitted a tool call (full loop engaged); window={kinds:?}"
+        );
+        assert!(
+            window_has(&evs, n1, "todo/write"),
+            "todo_write executed and landed in shared store; window={kinds:?}"
+        );
+        // 证据强化：todo/write 实际记录内容（工具参数真实落库，非占位）。
+        let todo_ev = evs
+            .iter()
+            .skip(n1)
+            .find(|e| e.kind.as_str() == "todo/write")
+            .expect("todo/write event present");
+        let todo_json = serde_json::to_string(&todo_ev.data).unwrap_or_default();
+        eprintln!("REAL-AGENT-TODO data_json={todo_json}");
+        assert!(
+            todo_json.contains("dsh real agent verification"),
+            "todo_write recorded the requested content exactly (got: {todo_json})"
+        );
+        assert!(
+            window_has(&evs, n1, "tool/result"),
+            "tool result returned to the loop; window={kinds:?}"
+        );
+        assert!(
+            window_clean_turn_end(&evs, n1),
+            "agent turn ends clean after tool round-trip; window={kinds:?}"
+        );
+        let agent_reply = window_last_assistant_text(&evs, n1);
+        assert!(
+            !agent_reply.trim().is_empty(),
+            "agent produced a final assistant message after the tool result"
+        );
+        eprintln!(
+            "REAL-AGENT-OK agent closed the tool loop; final_reply={agent_reply:?} carries_todo={}",
+            agent_reply.contains("dsh real agent verification")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ---- M6W（D-092）：serve 主机选择优先级（sqlite > jsonl > 内存）----
 
     fn simple_turn(text: &str) -> Vec<(String, Vec<u8>)> {
@@ -6497,5 +6660,122 @@ mod tests {
         let jsonl = session_host_for(&None, &Some(jsonl_root.clone())).expect("host");
         assert_eq!(jsonl.persistence_kind(), "jsonl");
         let _ = std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// M6W（D-093，真实端点冒烟发现）：**loop 必须把 ToolRegistry 的 schema 发给 LLM**
+    /// ——用捕获适配器跑 `assemble_server_runtime_with_llm` 装配的真实路径，断言每轮
+    /// `GenerateOptions.tools` 携带注册的工具（todo_write）。
+    /// 红（缺陷）→ 修：dsh-agent-loop host 装配时把 registry 注册为 system-prompt 工具
+    /// provider（assembly.tools 非空 → build_request → 请求带 tools）。
+    #[test]
+    fn agent_loop_request_carries_registry_tools_to_llm() {
+        use dsh_llm::{FinishReason, GenerateOptions, LlmAdapter, LlmRuntime, StreamChunk};
+
+        struct Capture {
+            tool_names: std::rc::Rc<std::cell::RefCell<Option<Vec<String>>>>,
+        }
+        impl LlmAdapter for Capture {
+            fn stream(&self, options: GenerateOptions) -> Box<dyn Iterator<Item = StreamChunk>> {
+                *self.tool_names.borrow_mut() = options.tools.map(|ts| {
+                    ts.into_iter().map(|t| t.name).collect::<Vec<String>>()
+                });
+                let end = vec![StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay_state: None,
+                }];
+                Box::new(end.into_iter())
+            }
+        }
+
+        let host = SessionHost::in_memory();
+        let _ = host.session("default");
+        let root = std::env::temp_dir().join(format!("dsh-m6w-tools-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None::<Vec<String>>));
+        let llm = std::rc::Rc::new(LlmRuntime::new());
+        llm.register_adapter(&["deepseek"], std::rc::Rc::new(Capture { tool_names: captured.clone() }))
+            .unwrap();
+        let bundle = crate::web::assemble_server_runtime_with_llm(
+            &host,
+            root.clone(),
+            llm,
+            "deepseek",
+            "mock-model",
+        )
+        .expect("assemble real loop path");
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(bundle.host.clone());
+        crate::run_rust_loop(&boot, "default", "hi").expect("turn runs");
+
+        let seen = captured.borrow().clone();
+        let names = seen.expect("loop request captured by LLM adapter (GenerateOptions seen)");
+        assert!(
+            names.iter().any(|n| n == "todo_write"),
+            "agent request must carry registered tool schemas to the LLM (got: {names:?}); \
+             without this the real model never sees tools and cannot call them"
+        );
+        assert!(
+            names.iter().any(|n| n == "read" || n == "glob" || n == "bash"),
+            "M4/M5 tools advertised to LLM (got: {names:?})"
+        );
+        let _ = std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// M6W（D-093）回归护网：**工具 provider 注册幂等**——同一 host 多次 ensure_agent /
+    /// followup 不重复注册 schema（assembly.tools 无重复名）。
+    #[test]
+    fn agent_loop_tool_schemas_registered_once_and_idempotent() {
+        use dsh_llm::{FinishReason, GenerateOptions, LlmAdapter, LlmRuntime, StreamChunk};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct Capture {
+            all: Rc<RefCell<Vec<Vec<String>>>>,
+        }
+        impl LlmAdapter for Capture {
+            fn stream(&self, options: GenerateOptions) -> Box<dyn Iterator<Item = StreamChunk>> {
+                self.all.borrow_mut().push(
+                    options.tools.map(|ts| ts.into_iter().map(|t| t.name).collect()).unwrap_or_default(),
+                );
+                let end = vec![StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay_state: None,
+                }];
+                Box::new(end.into_iter())
+            }
+        }
+
+        let h = SessionHost::in_memory();
+        let _ = h.session("default");
+        let root = std::env::temp_dir().join(format!("dsh-m6w-tools2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let all = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+        let llm = Rc::new(LlmRuntime::new());
+        llm.register_adapter(&["deepseek"], Rc::new(Capture { all: all.clone() })).unwrap();
+        let bundle = crate::web::assemble_server_runtime_with_llm(&h, root.clone(), llm, "deepseek", "m")
+            .expect("assemble");
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(bundle.host.clone());
+        crate::run_rust_loop(&boot, "default", "one").unwrap();
+        crate::run_rust_loop(&boot, "default", "two").unwrap();
+        let batches = all.borrow();
+        assert_eq!(batches.len(), 2, "two turns produced two requests");
+        for names in batches.iter() {
+            let mut sorted = names.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                names.len(),
+                "no duplicate tool schemas per request (idempotent registration): {names:?}"
+            );
+            assert!(names.iter().any(|n| n == "todo_write"));
+        }
+        let _ = std::fs::remove_dir_all(&root).ok();
     }
 }

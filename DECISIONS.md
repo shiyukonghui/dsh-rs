@@ -3465,5 +3465,48 @@ D-089→D-092 与提交 `2e23c85`/`1655cdc` 互查。
 
 ---
 
+## D-093（真实端点 agent 冒烟）：AgentLoopHost 从不把工具 schema 发给 LLM（装配缺口）
+
+**日期**：2026（用户指令：真实 API 测模型响应能力 + 测 agent 能否工作）。
+**触发问题**：门控真实端点测试 `serve_closure_real_endpoint_model_capability_and_agent_gated`
+初测：能力轮模型**精确遵循**（"Reply with ONLY the integer 156" → 回复正好 `"156"`，
+exact_156=true）——模型响应能力无问题；但 agent 轮强制要求调用 `todo_write` 时，事件窗口
+只有 `assistant/chunk+message → turn/end`，**无 tool/call/tool/result**。
+**根因分析（诚实黑盒，层层排除，不伪造）**：
+- 直连 chat 探针（带 `tools` 载荷 + MUST-call 提示）：端点/模型**完全支持**工具调用——返回
+  `message.tool_calls:[todo_write, {todos:[...]}]` + `finish_reason:"tool_calls"`；
+- 流式探针（`stream:true`）：SSE 正确发出 `delta.tool_calls[{function:{name, arguments}}]`
+  + `finish_reason:"tool_calls"`——恰是 `dsh-llm-deepseek` translate 单测覆盖的形状；
+- 定位装配缺口：`dsh-agent-loop` 生产代码**从未把 `ToolRegistry` 注册为 system-prompt 工具
+  provider**（`sp.tools()` 仅 dsh-system-prompt 自测用过）→ `assembly.tools` 恒空 →
+  `GenerateOptions.tools=None` → 真实请求**不带 `tools` 参数** → 模型看不到任何工具定义、
+  无从发起 tool call。既有 mock 测试只证明「能执行已发出的 tool/call」，从不证明「tools
+  被发给模型」——真实冒烟补齐了这一盲区。
+**最终选择**：修在架构正确位——`dsh-agent-loop/src/host.rs::with_store` 一次性注册
+`ToolProvider`（host 级恰一次；provider 按组装 `AssembleContext.scope` 投影 registry
+`tools.schemas(ctx.scope)` + `known_names`，与 dsh-tools 作用域/restrict 语义一致）。
+**被否决**：仅在 web.rs 装配处补注册（治标，其他 AgentLoopHost 消费方仍缺）；在每 agent
+注册（重复/时序风险）。
+**TDD 证据**：
+- 红：`agent_loop_request_carries_registry_tools_to_llm`（捕获适配器断言请求 tools 含
+  todo_write）——修前 tools=None 失败；
+- 绿：修后请求 tools 含 todo_write + M4/M5（read/glob/bash 等）；幂等测
+  `agent_loop_tool_schemas_registered_once_and_idempotent`（两次 followup 无重复 schema）；
+- **真实端点复测**：能力轮 `"156"` exact；agent 轮完整闭环
+  `tool/call → hook/invoked → todo/write → tool/result → 续轮 assistant → 干净 turn/end`，
+  `todo/write` 数据 `{"todos":[{"content":"dsh real agent verification","status":"in_progress"}]}`
+  精确落库；test passed；
+- 回归：dsh-agent-loop 全量 + dsh-cli lib 全量 + workspace 全量 test 零失败，clippy
+  `-D warnings` 零告警，check 绿。
+**诚实边界**：初测软提示词下模型选择文本不调工具（属模型行为，非缺陷）；`final_closing_text`
+可极简（"Done."，不回显 todo 文案）——工具已如实记录，循环正常关闭；本次结论基于
+deepseek-v4-flash-0731-ext 单端点实测，跨模型提示敏感性如实不入断言。key 仅进程环境
+注入测试后清除，未落盘/入 git（P4）；探针 body 文件放 target/ 已删除。
+**回滚**：撤本提交即回「不发送 tools」旧态（并保持 mock-执行路径不受影响）。
+**预期影响**：真实模型现可发起工具调用；所有 AgentLoopHost 消费方（serve agent-loop/
+headless）受益。
+
+---
+
 
 

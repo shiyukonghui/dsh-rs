@@ -23,7 +23,9 @@ use dsh_llm::{LlmRuntime, Message};
 use dsh_scope::ScopeKey;
 use dsh_session::store::SessionStore;
 use dsh_session::types::{CreateSessionOptions, SessionId};
-use dsh_system_prompt::{Config as PromptConfig, SystemPrompt};
+use dsh_system_prompt::{
+    AssembleContext, Config as PromptConfig, SystemPrompt, ToolProvider, ToolProviderResult,
+};
 use dsh_tools::ToolRegistry;
 
 use crate::constants::CONFIGURED_AGENT_IDENTITIES_KEY;
@@ -158,6 +160,20 @@ impl AgentLoopHost {
             SystemPrompt::new(&PromptConfig::default(), Rc::new(|| {}))
                 .map_err(|e| e.to_string())?,
         );
+        // M6W（D-093，真实端点 agent 冒烟发现）：把 ToolRegistry 注册为 system-prompt
+        // 工具 provider——否则 `assembly.tools` 恒空 → `GenerateOptions.tools=None` →
+        // 真实请求不带 `tools` 参数，模型**看不到任何工具定义**、无法发起 tool call
+        // （此前只有 mock-适配器驱动「能执行已发出的 tool/call」，从未真发 tools）。
+        // 一次性（with_store 每 host 恰一次）：provider 按组装 scope 投影 registry
+        // （`ctx.scope`），受 restrict/作用域过滤，与 dsh-tools 注册语义一致。
+        {
+            let tools = tools.clone();
+            let provider: ToolProvider = Rc::new(move |ctx: &AssembleContext| ToolProviderResult {
+                schemas: tools.schemas(ctx.scope.as_ref()),
+                known_names: Some(tools.known_names(ctx.scope.as_ref())),
+            });
+            prompt.tools(None, provider);
+        }
         let bus = AgentBus::new();
         let registry = Rc::new(AgentRegistry::new(bus.clone()));
         Ok(Rc::new(AgentLoopHost {
