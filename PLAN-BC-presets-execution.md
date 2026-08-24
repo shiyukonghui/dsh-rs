@@ -35,7 +35,7 @@
 | A-02 | 决策 | **组合权威与 loop 消费的桥形态**（双键空间）：dsh-core `ScopeId`（组合/服务侧）↔ dsh-agent `ScopeKey`（loop/工具/提示词侧）怎么接？ | dsh-core/dsh-agent/dsh-tools | ①双轨：dsh-core 管组合+isolate 服务实例，**投影**成 ScopeKey 层给 loop（快，保留第二织物）；②全迁 ScopeKey→ScopeId（彻底收敛，归 C）；**建议 P2 用①，C 用②** | A-01 |
 | A-03 | 决策 | **窄服务桥的服务子集**：shipped 预设 service 行 = planMode / compaction+toolResultPruner / workflowEngine / terminals / fs-shadow 等；哪些桥接、哪些先 `broken` | 桥接层 | 需先**盘点 shipped 四预设全部 service 行 → Rust 侧现有句柄**（见 1.3）；建议先桥接 loop 真要用到的（plan-mode、compaction、fs-shadow、terminals），其余 `broken` 诚实展示 | B-11 |
 | A-04 | 验证 | **dsh-scope `ScopeKey` 父链是否支持运行时断链/重绑**（会话 join 撤销/`recompose`=父链重载）？不支持则以「会话层置空+不解析」兜底 | dsh-scope | spike-2：bind/rebind/断链能力确认，无则补最小 API | A-02 |
-| A-05 | 决策 | **代（generation）与 HMR**：组合文件变化→新代（TS）是否本期做？还是进程级 standing + 版本靠重启 | dsh-loader hmr | 建议 **P2 先不做代**（进程级 standing + 重启），代作为 C/后续；诚实记录差异 | A-01 |
+| A-05 | 决策 | **代（generation）与 HMR**：组合文件变化→新代（TS）是否本期做？还是进程级 standing + 版本靠重启 | dsh-loader hmr | **建议 P2/此后（round-6 已核实）**：`Loader::create/update/remove/sync`（loader.rs:416-606）都是公开流程 → standing 用自己的 Loader（spike-1 单 Cordis）即可**原地换代**（新代事务 + 旧 fiber teardown），不必重启；HMR 文件监听可后置（先手动/事件触发 regeneration）。进程级 standing + 重启只是兜底开关，不作主路径 | A-01 |
 | A-06 | 决策 | **挂载守卫在 Rust 的判据**：inactiveRows（行未激活/缺注入）与 leakedServices（行注册未带 scope→root 泄漏）如何建模 | 组合层 | dsh-loader 已有事务+回滚；泄漏判据=「该行注册未带 scope」；归纳到 §0 D-C 的 fail-loud | A-02 |
 
 ### 1.2 解析 / 发现 / 元数据（P1）
@@ -186,15 +186,17 @@ C 收敛（独立架构里程碑，P5 之后）    F-01..F-06
 
 ## 5. 待您深入分析后定夺的集中点（★）
 
-1. **A-01** standing 组合挂载形态（独立 Cordis vs 共享 boot Cordis+ScopeId 隔离）——spike-1 后决定。
+1. **A-01** standing 组合挂载形态——**spike-1 已定方向**：路径 B = 每 standing 一个 Cordis（独立
+   组合引擎 + isolate 私有服务）；共享单树留给 C。待你确认采纳。
 2. **A-03 + B-11** 窄服务桥**子集**：全表已在 §6；§6.1 把 shipped 行分为**必须桥**
    （planMode/compaction+pruner/terminals/fs）、**必须先决 win32 shell**（§6.1-2 方向 A 新增
    pwsh vs 方向 B 自持改写、**E-03 前必选**）、**先 broken**（skill/web/tool-cordis/command-compact）
    ——请拍板 broken 集与技术面大小。
-2b. **win32 shell 方向**（§6.1-2）：**A** 立即新增 pwsh（忠实 TS 门控，P3 前置立项）｜
-   **B** 无 pwsh 前按 Rust 能力改写门控（win32 用 bash，诚实差异、零新增）——推荐 **B 作直通
-   P4 的先行 + A 随 P3**，避免 win32 空 shell 阻塞 live 验收。
-3. **A-05** 组合文件变动是否本期做「代（generation）」还是进程级 standing + 重启归位。
+2b. **win32 shell 方向**（§6.1-2）：**A** 立即新增 pwsh（round-6 已核实尺寸：PTY 侧已参数化只需
+   注册 "pwsh" 后端，dsh-shell 需平行 pwsh executor，量=中，P3）｜**B** 无 pwsh 前按 Rust 能力改写
+   门控（win32 用 bash，诚实差异、零新增）——推荐 **B 作直通 P4 的先行 + A 随 P3**。
+3. **A-05** 组合文件变动：**round-6 已核实** `Loader::create/update/remove/sync` 均为公开流程 →
+   推荐**原地换代（generation-based，无需重启）**为 P2 起主路径；HMR 文件监听后置；进程级重启仅兜底。
 4. **B-04** 自定义根位置（cwd 默认 vs 显式根叠加）。
 5. **C-04** 默认会话与预设关系（不 join 保持现状 vs default 也 join standard）。
 6. **F-05/F-06** 收敛后 WASM/native 双驱动与 ScopeId/ScopeKey 键空间去留（C 阶段决策，可后置）。
@@ -239,9 +241,12 @@ C 收敛（独立架构里程碑，P5 之后）    F-01..F-06
    工具在 win32 也**可用**（dsh-shell/resolve.rs:100-105 解析到 Git Bash `C:\Program Files\Git\bin\
    bash.exe`，spike-8 ✅），但**无 pwsh**。TS 在 win32 上 bash 禁、pwsh 开；照搬该门控 →
    win32 空 shell。**两个互斥方向（请拍板）**：
-   - **A · 立即新增 pwsh 工具**（one-shot + persistent，dsh-shell/dsh-terminal 扩展，spike-7）——
-     忠实于 TS 门控，standard 在 win32 用 pwsh；需 P3 前置立项，量=中。
-   - **B · 自持预设的 win32 门控按 Rust 能力改写（诚实差异）**：无 pwsh 前，win32 的
+   - **A · 立即新增 pwsh 工具**（round-6 **已核实尺寸**）：`PtyBackend::new(label, program)`
+     已参数化（dsh-terminal/backend.rs:77，types.rs:140 已注「未来可扩 pwsh」）→ PTY 侧只需
+     注册 `"pwsh"` 后端类型 = powershell.exe；`dsh-shell` 为 bash 形（BashConfig/`bash -c`）→
+     需平行 `pwsh` executor（one-shot + start）或把 shell 参数化（后者回归面大，不推荐）+
+     m5 注册 tool-pwsh。**量=中（P3 立项）**。
+   - **B · 自持预设的 win32 门控按 Rust 能力改写（诚实差异，零新增）**：无 pwsh 前，win32 的
      standard/code/cordis 把 bash 行改为**启用**（复制期把 `process.platform === 'win32'` 门控
      按 Rust 能力矩阵重写，并注释差异）——绝不空 shell、零新增；待 pwsh 落地后再切回忠实门控。
    > E-03 直通 P4 live 验收在 win32 开发机跑——**A 或 B 必选其一**，否则 standard 在 win32 空 shell。
