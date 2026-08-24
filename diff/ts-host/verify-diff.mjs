@@ -28,7 +28,8 @@ for (const file of scenarios) {
   const scenarioPath = join(dir, file)
   const isLoader = base.startsWith('loader-')
   const isInclude = base.startsWith('include-')
-  const host = isInclude ? 'include-host.mjs' : (isLoader ? 'loader-host.mjs' : 'scenario-host.mjs')
+  const isSession = base.startsWith('session-')
+  const host = isSession ? 'session-host.mjs' : (isInclude ? 'include-host.mjs' : (isLoader ? 'loader-host.mjs' : 'scenario-host.mjs'))
   const ts = spawnSync(process.execPath, [host, scenarioPath], {
     encoding: 'utf8',
     cwd: here,

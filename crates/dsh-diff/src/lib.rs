@@ -126,6 +126,20 @@ pub enum Step {
     LoaderUpdate { id: String, options: LoaderEntry },
     /// loader 场景：移除入口（对应 TS `ctx.loader.remove(id)`）。
     LoaderRemove { id: String },
+    /// session 场景：创建会话（`SessionStore::create`；TS session-host 镜像）。
+    SessionCreate { id: String },
+    /// session 场景：追加事件（`Session.append`；seq=log 长度；kind 为事件 kind 名）。
+    /// `surface: Some("append")` → 携带 `SurfaceIntent{Append}`（surface-eligible 事件
+    /// 必需；与 dsh-session 契约一致），其余 None。
+    SessionAppend {
+        id: String,
+        kind: String,
+        #[serde(default)]
+        surface: Option<String>,
+        data: serde_json::Value,
+    },
+    /// session 场景：回读事件（`Session.events`；逐条 `session-event-read` 行，canonical JSON）。
+    SessionEvents { id: String },
 }
 
 /// 场景解释器（Rust 侧）。
@@ -135,6 +149,10 @@ pub struct Runner {
     fibers: HashMap<String, FiberId>,
     /// loader 场景专用（懒初始化；Loader 插件挂载在 ctx 上）。
     loader: Option<dsh_loader::Loader>,
+    /// session 场景专用（懒初始化；真实 dsh-session store——会话事件模型的权威侧）。
+    session_store: Option<Rc<dsh_session::store::SessionStore>>,
+    /// session 场景已创建会话（id → store 会话）。
+    sessions: HashMap<String, Rc<dsh_session::Session>>,
 }
 
 impl Runner {
@@ -144,6 +162,8 @@ impl Runner {
             plugins: Rc::new(RefCell::new(HashMap::new())),
             fibers: HashMap::new(),
             loader: None,
+            session_store: None,
+            sessions: HashMap::new(),
         }
     }
 
@@ -248,8 +268,86 @@ impl Runner {
                     "loader scenario steps require --async".into(),
                 ))
             }
+            // ---- M6 step10（D-090）：session 场景（同步；真实 dsh-session store） ----
+            Step::SessionCreate { id } => {
+                let store = self.ensure_session_store()?;
+                let session = store
+                    .create(
+                        Some(dsh_session::types::SessionId::from_raw(id.clone())),
+                        &dsh_session::CreateSessionOptions { seed: None, meta: None },
+                    )
+                    .map_err(|e| CordisError::Internal(format!("session create: {e}")))?;
+                self.sessions.insert(id.clone(), session);
+                self.trace_line(&format!("session-create:{id}"));
+            }
+            Step::SessionAppend { id, kind, surface, data } => {
+                let session = self.session_of(id)?;
+                let ev_kind = kind
+                    .parse::<dsh_session::types::EventKind>()
+                    .map_err(|_| CordisError::Internal(format!("session append: unknown kind {kind}")))?;
+                use dsh_session::types::SurfaceIntent;
+                // dsh-session 表面契约（SURFACE_EVENT_TYPES）：surface-eligible 事件
+                // 必须携带 surfaceOp；非 surface 事件不得携带。两侧 fail-loud 对称。
+                let surface_eligible = matches!(kind.as_str(), "user/message" | "assistant/message" | "tool/result");
+                let wants_surface = surface.as_deref() == Some("append");
+                match (surface_eligible, wants_surface) {
+                    (true, false) => {
+                        return Err(CordisError::Internal(format!(
+                            "session append: surface-eligible kind {kind} requires surface: \"append\""
+                        )))
+                    }
+                    (false, true) => {
+                        return Err(CordisError::Internal(format!(
+                            "session append: surface marker on non-surface kind {kind}"
+                        )))
+                    }
+                    _ => {}
+                }
+                let surface = wants_surface.then_some(SurfaceIntent {
+                    surface_op: dsh_session::types::SurfaceOp::Append,
+                    source_event_seqs: None,
+                });
+                let ev = session
+                    .append(ev_kind, data.clone(), surface.as_ref())
+                    .map_err(|e| CordisError::Internal(format!("session append: {e}")))?;
+                self.trace_line(&format!(
+                    "session-append:{id}:{}:{}",
+                    ev.seq,
+                    ev.kind.as_str()
+                ));
+            }
+            Step::SessionEvents { id } => {
+                let session = self.session_of(id)?;
+                for ev in session.events() {
+                    self.trace_line(&format!(
+                        "session-event-read:{id}:{}:{}:{}",
+                        ev.seq,
+                        ev.kind.as_str(),
+                        sorted_json(&ev.data)
+                    ));
+                }
+            }
         }
         Ok(())
+    }
+
+    /// 懒初始化 session store（session 场景专用）。
+    fn ensure_session_store(&mut self) -> Result<Rc<dsh_session::store::SessionStore>, CordisError> {
+        if self.session_store.is_none() {
+            self.session_store = Some(Rc::new(dsh_session::store::SessionStore::new()));
+        }
+        Ok(self.session_store.clone().expect("just set"))
+    }
+
+    /// 取已创建会话；缺失 → fail-loud。
+    fn session_of(
+        &self,
+        id: &str,
+    ) -> Result<Rc<dsh_session::Session>, CordisError> {
+        self.sessions
+            .get(id)
+            .cloned()
+            .ok_or_else(|| CordisError::Internal(format!("session {id} not created")))
     }
 
     /// M7：异步执行步骤（`plugin_arc_async` 真实微任务让出；深嵌套场景用）。
@@ -640,4 +738,42 @@ pub fn run_include(text: &str) -> Result<Vec<String>, String> {
     }
     lines.push(format!("include-result:{}", sorted_json(&out)));
     Ok(lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SESSION_01_JSON: &str = r#"{
+      "name": "session-01-simple",
+      "plugins": {},
+      "steps": [
+        { "op": "session-create", "id": "default" },
+        { "op": "session-append", "id": "default", "kind": "user/message", "surface": "append", "data": {"text": "hello", "role": "user"} },
+        { "op": "session-append", "id": "default", "kind": "tool/call", "data": {"tool": "todo_write", "arguments": {"content": "x"}} },
+        { "op": "session-append", "id": "default", "kind": "assistant/message", "surface": "append", "data": { "role": "assistant", "text": "done"} },
+        { "op": "session-events", "id": "default" }
+      ]
+    }"#;
+
+    /// M6 step10（D-090）：session 差分对齐——dsh-session 真实 store 的事件模型
+    /// （create / append seq=log 长度 / 事件回读）与共享参考契约逐字节一致（TS
+    /// session-host.mjs 镜像同契约；golden 冻结）。canonical 键序：serde_json 默认
+    /// BTreeMap（与 `sorted_json` 一致）。红：Step 无 session 变体 → 解析失败。
+    #[test]
+    fn session_scenario_trace_aligns_contract() {
+        let scenario: Scenario = serde_json::from_str(SESSION_01_JSON).expect("scenario parses");
+        let mut runner = Runner::new();
+        let trace = runner.run(&scenario).expect("session scenario runs");
+        let expected = [
+            "session-create:default",
+            "session-append:default:0:user/message",
+            "session-append:default:1:tool/call",
+            "session-append:default:2:assistant/message",
+            "session-event-read:default:0:user/message:{\"role\":\"user\",\"text\":\"hello\"}",
+            "session-event-read:default:1:tool/call:{\"arguments\":{\"content\":\"x\"},\"tool\":\"todo_write\"}",
+            "session-event-read:default:2:assistant/message:{\"role\":\"assistant\",\"text\":\"done\"}",
+        ];
+        assert_eq!(trace, expected.to_vec());
+    }
 }

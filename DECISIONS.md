@@ -3309,5 +3309,38 @@ GATED-SMOKE-SKIP（诚实记录，不伪造、不失败）。用户设 key 后�
 
 ---
 
+## D-090（step10 复活·ts-host 差分）：session-host.mjs 编排 + 差分对齐测试
+
+**日期**：2026（M6 后续轮，用户裁定复活 D-089 范围外项）。
+**触发问题**：`ts-host diff` 复活——M6-REQ step10「ts-host 差分编排（M5R §5 ⑤）」；用户选定
+范围 =「补 session-host.mjs 差分编排 + 对齐测试」。
+**自下而上实测定案**：
+- 已有差分基建：`diff/ts-host` 的 scenario/loader/include-host + `verify-diff.mjs`（TS stdout →
+  `.golden` → `dsh-diff --golden` 逐字节校验）+ 16 场景全绿；Rust `dsh-diff` `Step` 为
+  kebab-case tagged 枚举，`Runner` 懒加载子毛（loader/include 先例）。
+- 会话事件 diff 的契约约束：dsh-session 事件 **seq=log 长度**（首 append=0）+ **surface-eligible
+  事件（user/message、assistant/message、tool/result）必须携带 `SurfaceIntent{Append}`**
+  （append 带 None 会 fail-loud）；序化对齐 = **canonical（键字典序）** JSON（serde_json 默认
+  BTreeMap 序）；数值限定整数（serde_json/JSON.stringify 浮点格式不对称，不做对齐面）。
+- 真实度选择：Rust 侧用 **dsh-session 真实 `SessionStore`**（权威事件引擎）；TS host 手写镜像
+  会话事件契约（无 @deepseek-ai session 生产包可 vendored——真实面在 Rust 侧）。
+**实现**：
+- `crates/dsh-diff`：`dsh-session` 依赖 + `Step::SessionCreate/Append/Events`（surface 字段驱动
+  SurfaceIntent；双向 fail-loud 守卫：surface-eligible 必须带 marker、非 surface 禁带——两侧
+  对称）+ `Runner.sessions/session_store` + 同步步骤执行；`sorted_json`（已有）做 readback 序列化。
+- `diff/ts-host/session-host.mjs`：镜像同契约；`canonicalStringify` 递归排序键（对齐 BTreeMap）；
+  整数限定 + surface 双向校验。
+- `scenarios/session-01-simple.json` + `verify-diff.mjs` 路由 `session-` → session-host。
+**红测（绿）**：`session_scenario_trace_aligns_contract`（内联契约 trace；红=无 session 变体
+解析失败→绿）。真实差分：`node verify-diff.mjs` **17 场景 ALL PASS**（新 session-01 7 行 golden
+由 TS 生成、Rust 逐字节对齐 + 既有 16 场景零回归）。
+**诚实边界**：TS 侧无 session 生产包可 vendored → session-host 为契约镜像（Rust dsh-session
+为权威）；数值整数限定；surface marker 不进 trace（操作前提，非被测产出）。
+**证据**：dsh-diff 单测全绿 + clippy `-D warnings` 零告警 + workspace check 绿 + verify-diff 17
+场景全绿。回滚 = 撤本提交。
+**待办**：SQLite 后端（D-089 复活的另一半）→ M6-ACCEPTANCE 复跑。
+
+---
+
 
 

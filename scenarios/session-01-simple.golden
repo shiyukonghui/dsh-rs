@@ -1,0 +1,7 @@
+session-create:default
+session-append:default:0:user/message
+session-append:default:1:tool/call
+session-append:default:2:assistant/message
+session-event-read:default:0:user/message:{"role":"user","text":"hello"}
+session-event-read:default:1:tool/call:{"arguments":{"content":"x"},"tool":"todo_write"}
+session-event-read:default:2:assistant/message:{"role":"assistant","text":"done"}

@@ -1,0 +1,11 @@
+{
+  "name": "session-01-simple",
+  "plugins": {},
+  "steps": [
+    { "op": "session-create", "id": "default" },
+    { "op": "session-append", "id": "default", "kind": "user/message", "surface": "append", "data": {"text": "hello", "role": "user"} },
+    { "op": "session-append", "id": "default", "kind": "tool/call", "data": {"tool": "todo_write", "arguments": {"content": "x"}} },
+    { "op": "session-append", "id": "default", "kind": "assistant/message", "surface": "append", "data": { "role": "assistant", "text": "done"} },
+    { "op": "session-events", "id": "default" }
+  ]
+}
