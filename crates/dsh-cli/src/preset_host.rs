@@ -1,4 +1,5 @@
-//! P1-b：preset 发现宿主——web RPC `agentPreset.list/read` 的 domain 侧。
+//! P1-b/P5：preset 发现宿主 + **作者流**——web RPC `agentPreset.list/read/copy/remove`
+//! 的 domain 侧。
 //!
 //! 语义镜像 `@deepseek-ai/dsh-agent-presets` 的**发现**部分（mount/guard 是 P2）：
 //! 发现**不缓存**（TS 亦不缓存——每次 list/resolve 重读根，文件改动立即可见）；
@@ -6,6 +7,10 @@
 //! + 用户根 `<dshHome>/.agent-presets`（无条件追加，align `includeUserRoot:true`；
 //! 目录不存在 discover 天然跳过）。default 会话不隐式 join（D-103/C-04）：`isDefault`
 //! 只标「新会话未选时的初始选择」，来自 settings `agent-presets.default`（base=工程默认）。
+//!
+//! **作者流（P5）**：`copy_preset` 任意源 → 新 user 预设（组合逐字 + 元数据显式
+//! 覆盖 > 源 > 无）；`remove_preset` 仅删 user 预设（system 拒绝）；判定全部 fail-loud
+//!（`AuthoringError`），fs 失败绝不当成功。
 
 use std::path::{Path, PathBuf};
 
@@ -49,6 +54,87 @@ impl PresetHost {
             None => false,
         }
     }
+
+    /// P5：从任意源 preset 复制为新 **user** 预设（写 `<user_root>/<new_id>/`：
+    /// 组合逐字 + preset.yml 元数据 = 显式覆盖 > 源元数据 > 无）。fail-loud 校验：
+    /// 非法 id / 源不存在 / 目标 id 已存在（任一 root，首根胜出遮蔽）/ 用户根不可写。
+    pub fn copy_preset(
+        &self,
+        from_id: &str,
+        new_id: &str,
+        with_name: Option<&str>,
+        with_description: Option<&str>,
+    ) -> Result<String, AuthoringError> {
+        use std::fs;
+        if !dsh_agent_presets::is_valid_preset_id(new_id) {
+            return Err(AuthoringError::InvalidId(new_id.to_string()));
+        }
+        let roster = self.roster();
+        let roster_ref = &roster;
+        let src = roster_ref
+            .iter()
+            .find(|p| p.id == from_id)
+            .ok_or_else(|| AuthoringError::NotFound(from_id.to_string()))?;
+        if roster_ref.iter().any(|p| p.id == new_id) {
+            return Err(AuthoringError::AlreadyExists(new_id.to_string()));
+        }
+        let user_root = self
+            .user_root
+            .as_ref()
+            .filter(|p| p.is_dir())
+            .ok_or(AuthoringError::NotAuthorable)?;
+        let composition = fs::read_to_string(&src.path).map_err(|e| {
+            AuthoringError::Io(format!(
+                "cannot read source composition {}: {e}",
+                src.path.display()
+            ))
+        })?;
+        let target_dir = user_root.join(new_id);
+        fs::create_dir_all(&target_dir)
+            .map_err(|e| AuthoringError::Io(format!("create {}: {e}", target_dir.display())))?;
+        let comp_path = target_dir.join(dsh_agent_presets::COMPOSITION_FILE);
+        fs::write(&comp_path, composition)
+            .map_err(|e| AuthoringError::Io(format!("write {}: {e}", comp_path.display())))?;
+        let name = with_name.map(String::from).or_else(|| src.name.clone());
+        let description = with_description
+            .map(String::from)
+            .or_else(|| src.description.clone());
+        let mut meta = serde_json::Map::new();
+        if let Some(n) = name {
+            meta.insert("name".to_string(), serde_json::json!(n));
+        }
+        if let Some(d) = description {
+            meta.insert("description".to_string(), serde_json::json!(d));
+        }
+        if !meta.is_empty() {
+            let meta_yml = serde_yaml::to_string(&serde_json::Value::Object(meta))
+                .map_err(|e| AuthoringError::Io(format!("serialize preset.yml: {e}")))?;
+            let meta_path = target_dir.join("preset.yml");
+            fs::write(&meta_path, meta_yml)
+                .map_err(|e| AuthoringError::Io(format!("write {}: {e}", meta_path.display())))?;
+        }
+        Ok(new_id.to_string())
+    }
+
+    /// P5：删除 **user** 预设（仅用户根下的可由作者删除；system 资产拒绝删除）。
+    /// fs 失败 fail-loud（绝不假装删除成功）。
+    pub fn remove_preset(&self, id: &str) -> Result<String, AuthoringError> {
+        let found = self
+            .roster()
+            .into_iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| AuthoringError::NotFound(id.to_string()))?;
+        if found.trust != PresetTrust::User {
+            return Err(AuthoringError::ReadOnly(id.to_string()));
+        }
+        let dir = found
+            .path
+            .parent()
+            .ok_or_else(|| AuthoringError::Io(format!("preset \"{id}\" has no directory")))?;
+        std::fs::remove_dir_all(dir)
+            .map_err(|e| AuthoringError::Io(format!("remove {}: {e}", dir.display())))?;
+        Ok(id.to_string())
+    }
 }
 
 impl Default for PresetHost {
@@ -57,6 +143,55 @@ impl Default for PresetHost {
         PresetHost {
             roots: default_roots(),
             user_root: user_root_path(),
+        }
+    }
+}
+
+/// P5 作者流错误：wire error envelope 用 `code()`（统一 `agent-preset-*` 前缀）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum AuthoringError {
+    /// 目标 id 非法（`PRESET_ID`）。
+    InvalidId(String),
+    /// 源/待删预设不存在。
+    NotFound(String),
+    /// 目标 id 已存在（任一 root——首根胜出会遮蔽）。
+    AlreadyExists(String),
+    /// 无用户根 / 不可写（authorable=false）。
+    NotAuthorable,
+    /// system 预设不可删除。
+    ReadOnly(String),
+    /// 文件系统失败（fail-loud，不假装成功）。
+    Io(String),
+}
+
+impl AuthoringError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            AuthoringError::InvalidId(_) => "agent-preset-invalid-id",
+            AuthoringError::NotFound(_) => "agent-preset-not-found",
+            AuthoringError::AlreadyExists(_) => "agent-preset-exists",
+            AuthoringError::NotAuthorable => "agent-presets-not-authorable",
+            AuthoringError::ReadOnly(_) => "agent-preset-readonly",
+            AuthoringError::Io(_) => "agent-preset-io",
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            AuthoringError::InvalidId(id) => {
+                format!("preset id \"{id}\" must match /^[a-z0-9][a-z0-9-]*$/")
+            }
+            AuthoringError::NotFound(id) => format!("no preset \"{id}\" in the roster"),
+            AuthoringError::AlreadyExists(id) => {
+                format!("preset \"{id}\" already exists — remove it first or pick another id")
+            }
+            AuthoringError::NotAuthorable => {
+                "no authorable user preset root (user root missing)".to_string()
+            }
+            AuthoringError::ReadOnly(id) => {
+                format!("preset \"{id}\" is a system preset and cannot be removed")
+            }
+            AuthoringError::Io(m) => m.clone(),
         }
     }
 }
@@ -311,5 +446,122 @@ mod tests {
             v.get("order").is_none(),
             "order is internal, not on the wire"
         );
+    }
+
+    // —— P5：作者流（copy/remove 写 user root，fail-loud 校验）——
+
+    #[test]
+    fn copy_preset_creates_user_preset_with_composition_and_meta() {
+        let sys = tmp_dir("cpysys");
+        let usr = tmp_dir("cpyusr");
+        let src = sys.join("standard");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("agent.cordis.yml"),
+            "- id: p\n  name: 'plugin-x'\n",
+        )
+        .unwrap();
+        fs::write(src.join("preset.yml"), "name: 标准\n").unwrap();
+        let mut roots = roots_of(&sys, PresetTrust::System);
+        roots.push(PresetRoot {
+            path: usr.clone(),
+            trust: PresetTrust::User,
+        });
+        let host = PresetHost::with_user_root(roots, Some(usr.clone()));
+
+        let id = host
+            .copy_preset(
+                "standard",
+                "my-standard",
+                Some("我的标准"),
+                Some("from standard"),
+            )
+            .expect("copy");
+        assert_eq!(id, "my-standard");
+        // 文件落地：组合逐字 + preset.yml 用显式覆盖元数据。
+        assert_eq!(
+            fs::read_to_string(usr.join("my-standard/agent.cordis.yml")).unwrap(),
+            "- id: p\n  name: 'plugin-x'\n"
+        );
+        let meta = fs::read_to_string(usr.join("my-standard/preset.yml")).unwrap();
+        assert!(meta.contains("我的标准") && meta.contains("from standard"));
+        // roster 即见（发现不缓存）：trust=user。
+        let found = host.find("my-standard").expect("discovered after copy");
+        assert_eq!(found.trust, PresetTrust::User);
+        assert_eq!(found.name.as_deref(), Some("我的标准"));
+        let _ = fs::remove_dir_all(&sys);
+        let _ = fs::remove_dir_all(&usr);
+    }
+
+    #[test]
+    fn copy_preset_fails_loud_on_bad_ids_and_collisions() {
+        let sys = tmp_dir("cpybad");
+        let usr = tmp_dir("cpybadusr");
+        make_preset(&sys, "standard", Some(1), None);
+        let mut roots = roots_of(&sys, PresetTrust::System);
+        roots.push(PresetRoot {
+            path: usr.clone(),
+            trust: PresetTrust::User,
+        });
+        let host = PresetHost::with_user_root(roots.clone(), Some(usr.clone()));
+
+        assert_eq!(
+            host.copy_preset("standard", "Bad_Id", None, None),
+            Err(AuthoringError::InvalidId("Bad_Id".into()))
+        );
+        assert_eq!(
+            host.copy_preset("nope", "fresh", None, None),
+            Err(AuthoringError::NotFound("nope".into()))
+        );
+        // 目标 id 与既有（system）撞 → 拒绝（首根胜出遮蔽）。
+        assert_eq!(
+            host.copy_preset("standard", "standard", None, None),
+            Err(AuthoringError::AlreadyExists("standard".into()))
+        );
+        // 用户根缺失 → NotAuthorable。
+        let missing = std::env::temp_dir().join(format!("dsh-cpy-nousr-{}", std::process::id()));
+        let host2 = PresetHost::with_user_root(roots.clone(), Some(missing));
+        assert_eq!(
+            host2.copy_preset("standard", "fresh", None, None),
+            Err(AuthoringError::NotAuthorable),
+            "no user root dir => cannot author"
+        );
+        let _ = fs::remove_dir_all(&sys);
+        let _ = fs::remove_dir_all(&usr);
+    }
+
+    #[test]
+    fn remove_preset_deletes_user_only_and_refuses_system() {
+        let sys = tmp_dir("rmsys");
+        let usr = tmp_dir("rmusr");
+        make_preset(&sys, "standard", Some(1), None);
+        make_preset(&usr, "mine", None, Some("我的"));
+        let mut roots = roots_of(&sys, PresetTrust::System);
+        roots.push(PresetRoot {
+            path: usr.clone(),
+            trust: PresetTrust::User,
+        });
+        let host = PresetHost::with_user_root(roots, Some(usr.clone()));
+
+        // 未知 → NotFound。
+        assert_eq!(
+            host.remove_preset("nope"),
+            Err(AuthoringError::NotFound("nope".into()))
+        );
+        // system → ReadOnly（不删部署资产）。
+        assert_eq!(
+            host.remove_preset("standard"),
+            Err(AuthoringError::ReadOnly("standard".into()))
+        );
+        assert!(
+            sys.join("standard/agent.cordis.yml").exists(),
+            "system preset intact"
+        );
+        // user → 删除目录、roster 即去。
+        assert_eq!(host.remove_preset("mine"), Ok("mine".to_string()));
+        assert!(!usr.join("mine").exists(), "user preset dir removed");
+        assert!(host.find("mine").is_none(), "roster reflects removal");
+        let _ = fs::remove_dir_all(&sys);
+        let _ = fs::remove_dir_all(&usr);
     }
 }

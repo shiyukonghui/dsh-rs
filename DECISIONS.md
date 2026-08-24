@@ -4163,5 +4163,33 @@ dsh-agent-presets（P1-a 独立提交可保留）。
   authoring RPC（copy/remove/P5）未做；C 段未动。
 - **回滚**：`git revert` E-03 提交——撤销 serve 变量注册与测试，其余阶段保留。
 
+### D-103 实施补记（P5：作者流实装——copy/remove 写用户根，live 验证，round 16）——决策 + 验收
+
+- 触发：B 路径组合能力已 live 实跑（P1-P4），但 `agentPreset.copy/remove` 是
+  P1-b 时代的诚实占位（`agent-preset-unsupported`）——用户无法用 RPC 创建/删除
+  自定义 preset，authoring RPC（P5）欠账。
+- 关键事实（自下而上核实）：`PresetHost` 已持 `user_root`（authorable 探测）+ 不
+  缓存发现；copy = 在 `<user_root>/<new_id>/` 写下「组合逐字 + preset.yml」即被
+  下一次 list 发现；wire 错误信封沿用 `{ok:false,error:{code,message}}`。
+- 裁决：
+  1. `AuthoringError` 枚举（`agent-preset-*` 前缀）：invalid-id / not-found /
+     exists / not-authorable / readonly(system 拒删) / io(fail-loud)。**copy 目标 id
+     去重按全 roster**——首根胜出下 system 同名会遮蔽 user 拷贝，故 reject（先删后建）。
+  2. 元数据优先级：显式 name/description > 源 preset.yml > 无（不写 preset.yml）。
+  3. RPC `copy {from, agentPreset, name?, description?}` → `{agentPreset:id}`；
+     `remove {agentPreset}` 仅删 user（system → `agent-preset-readonly`）。
+- 验收（TDD 红→绿）：preset_host 新 3 测试（复制写盘+roster 即见+逐字；非法 id/撞
+  id/源未知/无用户根 fail-loud；system 拒删+user 删除目录即去）先红（E0599 缺方法）
+  后绿；web E2E `rpc_agent_presets_list_read_real_discovery` 改为真实 authoring 循环
+  （copy→list 见 user→read 逐字+显式 name→撞 id/not-found/invalid-id→system
+  readonly→remover成功→目录去）。dsh-cli **169/169** + agent-loop 1（**170**）；
+  clippy `-D warnings` 零告警；rustfmt 仅新独立文件 preset_host.rs。
+- **live 验证（真机，net-zero 不碰真实预设）**：重建重启 60165 后——baseline 9 预设；
+  copy `standard → p5-live-check-33040`（ok，trust=user，name 覆盖，read 首行=standard
+  组合注释头逐字）；remove ok；**444444总量回 9**，用户真实 preset 分毫未动 ✅。
+- **已知未接（诚实列表，对照前一轮收窄）**：web/tool-cordis/command-compact 保持
+  broken；pwsh A 并行执行器；skill 最小只读；per-agent `{{cwd}}`（C 段）；C 段收敛未动。
+- **回滚**：`git revert` P5 提交——回退 copy/remove 实装与测试，其余阶段保留。
+
 
 

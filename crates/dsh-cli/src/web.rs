@@ -2948,17 +2948,53 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             }
         }
         "agentPreset.copy" => {
-            // P1：copy/remove 作者流并入 P5（诚实拒绝，不假装成功）。
-            serde_json::json!({"ok": false, "error": {
-                "code": "agent-preset-unsupported",
-                "message": "agentPreset.copy (authoring) lands in P5, not implemented yet",
-            }})
+            // P5（作者流）：任意源 → 新 user 预设（写用户根；fail-loud 校验）。
+            let from = payload
+                .get("from")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let preset = payload
+                .get("agentPreset")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = payload.get("name").and_then(|v| v.as_str()).map(String::from);
+            let description = payload
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            match boot.presets.borrow().copy_preset(
+                &from,
+                &preset,
+                name.as_deref(),
+                description.as_deref(),
+            ) {
+                Ok(id) => serde_json::json!({"ok": true, "value": {"agentPreset": id}}),
+                Err(e) => serde_json::json!({
+                    "ok": false, "error": {
+                        "code": e.code(),
+                        "message": e.message(),
+                    }
+                }),
+            }
         }
         "agentPreset.remove" => {
-            serde_json::json!({"ok": false, "error": {
-                "code": "agent-preset-unsupported",
-                "message": "agentPreset.remove (authoring) lands in P5, not implemented yet",
-            }})
+            // P5（作者流）：删 user 预设（system 拒绝、fs 失败 fail-loud）。
+            let preset = payload
+                .get("agentPreset")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            match boot.presets.borrow().remove_preset(&preset) {
+                Ok(id) => serde_json::json!({"ok": true, "value": {"agentPreset": id}}),
+                Err(e) => serde_json::json!({
+                    "ok": false, "error": {
+                        "code": e.code(),
+                        "message": e.message(),
+                    }
+                }),
+            }
         }
         "agentPreset.openDocument" => {
             let preset = payload
@@ -4599,8 +4635,9 @@ mod tests {
         assert_eq!(res["result"]["value"]["opened"], true);
     }
 
-    /// P1-b：agentPreset list/read 经 handle_rpc_host 真实发现语义（注入 temp 根）。
-    /// select 诚实 P2 门、copy/remove 诚实 P5 门、openDocument 诚实降级 opened:false。
+    /// P1-b/P5：agentPreset list/read 经 handle_rpc_host 真实发现语义（注入 temp 根）；
+    /// copy/remove 作者流真实（写 user root，fail-loud 校验）；select 诚实 P4 门
+    /// （boot_with_sessions 无 loop → unsupported）；openDocument 诚实降级 opened:false。
     #[test]
     fn rpc_agent_presets_list_read_real_discovery() {
         use dsh_agent_presets::{PresetRoot, PresetTrust};
@@ -4678,11 +4715,50 @@ mod tests {
         let res = call("agentPreset.select", serde_json::json!({"sessionId": "default", "agentPreset": "code"}));
         assert_eq!(res["result"]["ok"], false);
         assert_eq!(res["result"]["error"]["code"], "agent-preset-unsupported");
-        // copy/remove：诚实 P5 门。
-        let res = call("agentPreset.copy", serde_json::json!({"from": "standard", "agentPreset": "copy1"}));
+        // —— P5 作者流：真实 copy/remove（写 user root；fail-loud 校验）——
+        let res = call(
+            "agentPreset.copy",
+            serde_json::json!({"from": "standard", "agentPreset": "copy1", "name": "副本"}),
+        );
+        assert_eq!(res["result"]["ok"], true, "copy success: {res}");
+        assert_eq!(res["result"]["value"]["agentPreset"], "copy1");
+        // list 即见新 user 预设（发现不缓存）；read 内容逐字 + 显式 name。
+        let res = call("agentPreset.list", serde_json::json!({}));
+        let copy1 = res["result"]["value"]["presets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "copy1")
+            .expect("copied preset discovered");
+        assert_eq!(copy1["trust"], "user");
+        let res = call("agentPreset.read", serde_json::json!({"agentPreset": "copy1"}));
+        assert_eq!(
+            res["result"]["value"]["content"],
+            "- id: p\n  name: 'plugin-x'\n"
+        );
+        assert_eq!(res["result"]["value"]["name"], "副本");
+        // copy fail-loud：撞 id / 源未知 / 非法 id。
+        let res = call(
+            "agentPreset.copy",
+            serde_json::json!({"from": "standard", "agentPreset": "copy1"}),
+        );
+        assert_eq!(res["result"]["error"]["code"], "agent-preset-exists");
+        let res = call(
+            "agentPreset.copy",
+            serde_json::json!({"from": "nope", "agentPreset": "copy2"}),
+        );
+        assert_eq!(res["result"]["error"]["code"], "agent-preset-not-found");
+        let res = call(
+            "agentPreset.copy",
+            serde_json::json!({"from": "standard", "agentPreset": "Bad_Id"}),
+        );
+        assert_eq!(res["result"]["error"]["code"], "agent-preset-invalid-id");
+        // remove fail-loud：system → readonly、未知 → not-found。
+        let res = call("agentPreset.remove", serde_json::json!({"agentPreset": "standard"}));
         assert_eq!(res["result"]["ok"], false);
-        let res = call("agentPreset.remove", serde_json::json!({"agentPreset": "mine"}));
-        assert_eq!(res["result"]["ok"], false);
+        assert_eq!(res["result"]["error"]["code"], "agent-preset-readonly");
+        let res = call("agentPreset.remove", serde_json::json!({"agentPreset": "nope"}));
+        assert_eq!(res["result"]["error"]["code"], "agent-preset-not-found");
         // openDocument：诚实降级 {opened:false, path}（无原生打开器）。
         let res = call("agentPreset.openDocument", serde_json::json!({"agentPreset": "mine"}));
         assert_eq!(res["result"]["ok"], true);
@@ -4691,6 +4767,10 @@ mod tests {
         // openDocument 未知 → agent-preset-not-found。
         let res = call("agentPreset.openDocument", serde_json::json!({"agentPreset": "nope"}));
         assert_eq!(res["result"]["ok"], false);
+        // remove 成功：user 可删、目录即去（mine 留到最后——openDocument 已验）。
+        let res = call("agentPreset.remove", serde_json::json!({"agentPreset": "mine"}));
+        assert_eq!(res["result"]["ok"], true, "remove user: {res}");
+        assert!(!usr.join("mine").exists(), "user preset dir removed");
         let _ = std::fs::remove_dir_all(&base);
     }
 
