@@ -3403,5 +3403,36 @@ dsh-diff 单测绿；提交链 D-077→D-091 与 `88a327b`..`d91688d` 互查无�
 
 ---
 
+## D-092（M6W：SQLite 接入 dsh web）：config 面 + with_sqlite + materialize 契约修正
+
+**日期**：2026（用户指令：按瀑布流完成 SQLite 接进 dsh web 完整开发）。
+**触发问题**：dsh web 的会话持久化只有 JSONL（`--session-dir`）；D-091 SqliteBackend 已
+backend 级验证但未接线。需求分析（M6W-REQUIREMENTS）双视角校验时**越级发现**：seam.rs
+文档「重复 materialize 拒绝」从未被 JSONL 执行（JSONL materialize = `write_tmp_then_publish`
+原子覆盖 create-or-replace）；而 `SessionHost::restore_one` 恢复后 `coord.append(id,&full)`
+重灌游标、首 append 走 materialize_batch。D-091 SQLite「重复拒绝」会导致恢复后游标错位、
+**该会话后续 append 永久失败**。回到早期工件修正，不静默打补丁。
+**考虑过的选项**：
+- (A) 在 restore_one 特判 SQLite（跳过回灌）——被否决：治标，隐藏后端契约裂痕，两条路径行为漂移；
+- (B) SQLite materialize 改 create-or-replace（镜像 JSONL 原子覆盖）——**采纳**：单一语义，
+  恢复重灌幂等，coordinator/restore 全链路不变；同步修 seam.rs 文档措辞与 D-091 测试。
+**config 面决策**：(C) 独立 flag `--sqlite-store <file>`，另议 (D) 复用 `--session-dir`
+加 `sqlite:` scheme 前缀——被否决（scheme 与路径歧义、污染既有语义）；(E) 统一 flag
+`--persist <mode>:<path>`——被否决（破坏既有 flag）。采纳 C：`WebConfig.sqlite_store`，
+优先级 sqlite > jsonl > 内存；同给 → `eprintln!` 显式警告（fail-loud，绝不清零静默）。
+**实现要点**（设计 M6W-DESIGN）：`SessionHost::with_sqlite(path)`（父目录 create_dir_all +
+`SqliteBackend::open` fail-loud + coordinator + 观察者 + restore_all）；观察者接线提取为
+`new_from_backend(Option<Box<dyn PersistenceBackend>>)` 单一来源；serve 提 `session_host_for(cfg)`
+选择主机 + 冲突警告；`--sqlite-store` 解析入 WebConfig；诊断 `persistence_kind()`
+（"mem"/"jsonl"/"sqlite"）供测试断言。
+**预期影响**：web 可得事务性单文件后端；JSONL/内存行为零回归；SQLite 无 per-session
+artifact 差异保留。
+**回滚点**：撤本提交（及 D-091 修正）即回既有 JSONL/内存；删 db 文件回全新存储。
+**证据**（A1–A6）：with_sqlite 冷重启恢复（7 事件含 end-seed）、恢复后 adopt seq 连续
+（13 事件/seq 12）、优先级（sqlite 落盘 jsonl 根空）、materialize 幂等覆盖、
+workspace 全量 test 绿 + clippy `-D warnings` 零告警 + check 绿。
+
+---
+
 
 
