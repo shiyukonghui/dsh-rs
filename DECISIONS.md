@@ -4105,5 +4105,32 @@ dsh-agent-presets（P1-a 独立提交可保留）。
 - **回滚**：`git revert` P3-a 提交——撤销 dsh-tools view 修复/Clone derives +
   standing 桥面 + win32-B；P4/P2/P1 均独立提交可保留。
 
+### D-103 实施补记（P3-b：组行解析——fs-local/terminal 不再「留 P3-b」，round 16）——决策 + 验收
+
+- 触发：P3-a 后 joined 预设仍缺 fs/terminal 工具（fs-local/terminal 行 guarded），
+  live select「standard/minimal」会让 agent **工具退化**（只剩 bash+editor）。
+- 关键事实（自下而上核实）：单工作区宿主下，standing 链本就继承全局工具基——
+  joined agent 的 `schemas/get` 从全局基看到 fs/terminal 工具；组行的「shadow」
+  与宿主共享同一 provider，**组行 = 解析确认而非逐工具重呈现**（重呈现相同 def
+  是行为无差别的仪式）。
+- 裁决：
+  1. **组表**：`@deepseek-ai/dsh-fs-local` → `read/write/edit/read_image/glob/grep`；
+     `@deepseek-ai/dsh-terminal` → M5h 终端六工具（open/send/read/signal/close/list）。
+     全部存在 → `bridged (host toolset: …; chain-visible, single-workspace)`；部分
+     缺失 → guarded（诚实列出缺失）。
+  2. **terminal 后端行**（`dsh-terminal-bash/-pwsh`，组覆盖其工具）：组已解析 →
+     `bridged (terminal backend; host default shell)`（win32 = Git Bash，满足
+     win32-B）；组未解析 → guarded。
+  3. `tool_guard_reason` 删去 fs/terminal 死分支（已被前置解析收入）——只留
+     pwsh A-parallel 与 D-103 broken 集。
+- 验收：standing 9/9（新组行解析测试：minimal+win32-B+全工具集 → fs/terminal/
+  bash/editor 全 bridged、pwsh 系 disabled 不伪装、joined 模型面见整组工具）；
+  守卫测试更新（fs 缺工具 → `host tool group missing …`）。dsh-cli **165/165** +
+  agent-loop 1；clippy `-D warnings` 零告警。
+- **已知未接（诚实列表，参照 P3-a 收窄）**：pwsh 执行器（A 并行）；web/tool-cordis/
+  command-compact 保持 broken；单元/集成验证后 live 二进制未重建（P4 随 E-03）；
+  C 段未动。
+- **回滚**：`git revert` P3-b 提交——回退组行解析与后端行处理，P3-a 保留即可。
+
 
 

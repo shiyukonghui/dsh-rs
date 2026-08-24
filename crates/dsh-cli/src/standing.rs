@@ -194,8 +194,10 @@ impl StandingRegistry {
                 .push(format!("@deepseek-ai/dsh-agent-instructions ({marker})"));
         }
 
-        // —— 工具行桥：宿主全局已有单工具 → 按行 config 重呈现（description /
-        //    timeoutMs）注册进 standing scope（joined agent 的 schemas 走链即见）。
+        // —— 工具行桥：单工具行按行 config 重呈现（description/timeoutMs）注册进
+        //    standing scope（joined agent 的 schemas 走链即见）；**多工具组行**解析
+        //    宿主工具集——单工作区宿主下 standing 链本就从全局基继承工具，故组行为
+        //    「解析确认」而非逐工具重呈现（诚实标注 single-workspace）。
         for row in leaves
             .iter()
             .filter(|r| r.name != PERSONA_ROW && r.name != INSTRUCTIONS_ROW)
@@ -207,6 +209,54 @@ impl StandingRegistry {
                 ));
                 continue;
             };
+            // 多工具组行解析（fs-local / terminal）。
+            if let Some(group) = host_tool_group_for_row(row) {
+                let missing: Vec<&str> = group
+                    .iter()
+                    .copied()
+                    .filter(|t| home.get(t, None).is_none())
+                    .collect();
+                if missing.is_empty() {
+                    report.bridged.push(format!(
+                        "{} (host toolset: {}; chain-visible, single-workspace)",
+                        row.name,
+                        group.join("/")
+                    ));
+                    continue;
+                }
+                report.guarded.push((
+                    row.name.clone(),
+                    format!(
+                        "host tool group missing {} of {} ({} missing: {})",
+                        missing.len(),
+                        group.len(),
+                        row.name,
+                        missing.join(", ")
+                    ),
+                ));
+                continue;
+            }
+            // terminal 后端行（dsh-terminal-bash/-pwsh）：由宿主默认 shell 充当
+            // （win32 = Git Bash，满足 win32-B）。组行已解析 → 标 bridged 后端。
+            if row.name.contains("dsh-terminal") {
+                let terminal_resolved = leaves.iter().any(|r| {
+                    r.name != row.name
+                        && host_tool_group_for_row(r).is_some()
+                        && home.get("terminal_open", None).is_some()
+                });
+                if terminal_resolved {
+                    report.bridged.push(format!(
+                        "{} (terminal backend; host default shell)",
+                        row.name
+                    ));
+                } else {
+                    report.guarded.push((
+                        row.name.clone(),
+                        "terminal backend without a resolved terminal group (P3-b)".to_string(),
+                    ));
+                }
+                continue;
+            }
             match host_tool_for_row(row) {
                 Some(tool) => match home.get(tool, None) {
                     Some(base) => {
@@ -330,7 +380,8 @@ fn is_pwsh_family(row: &CompositionRow) -> bool {
     n.contains("dsh-tool-pwsh") || (n.contains("dsh-terminal-bash") && dialect == Some("pwsh"))
 }
 
-/// 单工具行 → 宿主工具名（P3-a 桥表）。多工具行（fs-local/terminal/…）留 P3-b。
+/// 单工具行 → 宿主工具名（P3-a 桥表）。多工具行（fs-local/terminal/…）见
+/// `host_tool_group_for_row`。
 fn host_tool_for_row(row: &CompositionRow) -> Option<&'static str> {
     match row.name.as_str() {
         "@deepseek-ai/dsh-tool-bash" => Some("bash"),
@@ -340,15 +391,33 @@ fn host_tool_for_row(row: &CompositionRow) -> Option<&'static str> {
     }
 }
 
-/// 未桥工具行的守卫原因（D-103 broken 集显式标记，不伪装）。
+/// M5h 宿主注册的终端工具组（web_m5）。
+const TERMINAL_TOOLS: &[&str] = &[
+    "terminal_open",
+    "terminal_send",
+    "terminal_read",
+    "terminal_signal",
+    "terminal_close",
+    "terminal_list",
+];
+
+/// 多工具组行 → 宿主工具集（P3-b 解析确认；单工作区宿主 = standing 链继承全局基）。
+fn host_tool_group_for_row(row: &CompositionRow) -> Option<&'static [&'static str]> {
+    match row.name.as_str() {
+        "@deepseek-ai/dsh-fs-local" => {
+            Some(&["read", "write", "edit", "read_image", "glob", "grep"])
+        }
+        "@deepseek-ai/dsh-terminal" => Some(TERMINAL_TOOLS),
+        _ => None,
+    }
+}
+
+/// 未桥工具行的守卫原因（D-103 broken 集显式标记，不伪装）。fs-local/terminal
+/// 组与后端行在桥内已被前置解析，不落此函数。
 fn tool_guard_reason(row: &CompositionRow) -> String {
     let n = row.name.as_str();
     if is_pwsh_family(row) || n.contains("pwsh") {
         "no host pwsh executor (D-103 A-parallel lands in P3)".to_string()
-    } else if n.contains("fs-local") {
-        "expands to multiple host fs tools (P3-b bridge)".to_string()
-    } else if n.contains("terminal") {
-        "terminal bridge pending (P3-b)".to_string()
     } else if n.contains("tool-cordis") || n.contains("command-compact") || n.contains("web") {
         "broken per D-103 (unbridged surface)".to_string()
     } else {
@@ -741,13 +810,93 @@ mod tests {
             "pwsh A-parallel reason"
         );
         assert!(
-            reason_of("@deepseek-ai/dsh-fs-local").contains("multiple host fs tools"),
-            "fs multi-tool reason"
+            reason_of("@deepseek-ai/dsh-fs-local").contains("host tool group missing"),
+            "fs group missing-host-tools reason"
         );
         assert!(
             reason_of("@deepseek-ai/dsh-tool-web-fetch").contains("broken per D-103"),
             "web broken reason"
         );
+    }
+
+    /// —— P3-b —— fs-local / terminal **组行**解析宿主工具集（单工作区宿主：standing
+    /// 链继承全局基）；minimal 在 win32-B + 全工具集下 fs/terminal/bash/editor 全
+    /// bridged、pwsh 系 disabled，joined agent 模型面见整组工具。
+    #[test]
+    fn fs_and_terminal_groups_resolve_when_host_toolset_present() {
+        let sp = new_sp();
+        let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+        for name in [
+            "read",
+            "write",
+            "edit",
+            "read_image",
+            "glob",
+            "grep",
+            "terminal_open",
+            "terminal_send",
+            "terminal_read",
+            "terminal_signal",
+            "terminal_close",
+            "terminal_list",
+            "bash",
+            "str_replace_editor",
+        ] {
+            tools.register_global(tool_def(name, name, 1000.0)).unwrap();
+        }
+        let mut reg = StandingRegistry::new(sp.clone(), Some(tools.clone()));
+        reg.mount("minimal", &preset_rows("minimal"), &win32_facade())
+            .unwrap();
+        let r = reg.report("minimal").unwrap();
+        let bridged = |s: &str| r.bridged.iter().any(|b| b.starts_with(s));
+        assert!(
+            bridged("@deepseek-ai/dsh-fs-local"),
+            "fs group bridged: {:?}",
+            r.bridged
+        );
+        assert!(
+            bridged("@deepseek-ai/dsh-terminal"),
+            "terminal group bridged: {:?}",
+            r.bridged
+        );
+        assert!(
+            bridged("@deepseek-ai/dsh-tool-bash-persistent"),
+            "bash single-tool bridged"
+        );
+        assert!(
+            bridged("@deepseek-ai/dsh-tool-str-replace-editor"),
+            "editor bridged"
+        );
+        // win32-B：pwsh 系 → disabled（不进 guarded、不 bridged）。
+        assert!(
+            r.disabled
+                .iter()
+                .any(|s| s == "@deepseek-ai/dsh-tool-pwsh-persistent"),
+            "pwsh-persistent disabled"
+        );
+        assert!(
+            !r.bridged
+                .iter()
+                .any(|b| b.starts_with("@deepseek-ai/dsh-tool-pwsh-persistent")),
+            "pwsh not bridged"
+        );
+        // joined agent 模型面整组工具可见（全局基 + standing 链）。
+        let joined = ScopeKey::new();
+        reg.join("minimal", &joined).unwrap();
+        let names = tools.known_names(Some(&joined));
+        for t in [
+            "read",
+            "write",
+            "edit",
+            "glob",
+            "grep",
+            "terminal_open",
+            "terminal_send",
+            "bash",
+            "str_replace_editor",
+        ] {
+            assert!(names.iter().any(|n| n == t), "joined model sees {t}");
+        }
     }
 
     /// —— P3-a：agent-instructions 内容桥 —— `<cwd>/AGENTS.md` → joined 视图 scoped
