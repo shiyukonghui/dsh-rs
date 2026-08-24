@@ -6657,9 +6657,6 @@ mod tests {
         fn window_kinds(evs: &[dsh_session::types::SessionEvent], since: usize) -> Vec<String> {
             evs.iter().skip(since).map(|e| e.kind.as_str().to_string()).collect()
         }
-        fn window_has(evs: &[dsh_session::types::SessionEvent], since: usize, kind: &str) -> bool {
-            window_kinds(evs, since).iter().any(|k| k == kind)
-        }
         fn window_clean_turn_end(evs: &[dsh_session::types::SessionEvent], since: usize) -> bool {
             evs.iter().skip(since).any(|e| {
                 e.kind.as_str() == "turn/end"
@@ -6753,7 +6750,6 @@ mod tests {
         );
         eprintln!("REAL-TASK-OK agent completed a real non-destructive repo task end-to-end");
     }
-
 
     fn simple_turn(text: &str) -> Vec<(String, Vec<u8>)> {
         vec![
