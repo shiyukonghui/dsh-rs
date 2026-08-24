@@ -1210,6 +1210,21 @@ fn credentials_error_response(ref_name: &str, e: dsh_credentials::CredentialsErr
     })
 }
 
+/// P1-b：settings `agent-presets.default` 解析——新会话未选时的初始预设
+/// （D-103/C-04：default 会话不隐式 join，此字段只决定初始选择）。
+fn agent_presets_default(boot: &Boot) -> String {
+    let mut sp = boot.settings.borrow_mut();
+    match sp.describe("agent-presets") {
+        Ok(view) => view
+            .value
+            .get("default")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::preset_host::DEPLOYMENT_DEFAULT_PRESET.to_string()),
+        Err(_) => crate::preset_host::DEPLOYMENT_DEFAULT_PRESET.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // M4h：goal / subagent web RPC —— 把 M4 纯域服务接到 handle_rpc_host。
 // ---------------------------------------------------------------------------
@@ -2766,31 +2781,102 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             serde_json::json!({"ok": true, "value": {"skills": []}})
         }
         "agentPreset.list" => {
+            // P1-b：真实发现（不缓存）；isDefault = settings agent-presets.default 解析值。
+            let presets: Vec<Value> = {
+                let host = boot.presets.borrow();
+                let default = agent_presets_default(boot);
+                host.roster().iter().map(|p| crate::preset_host::to_entry(p, p.id == default)).collect()
+            };
+            let authorable = boot.presets.borrow().authorable();
             serde_json::json!({"ok": true, "value": {
-                "presets": [],
-                "authorable": false,
+                "presets": presets,
+                "authorable": authorable,
                 "hasDocument": false,
             }})
         }
         "agentPreset.select" => {
-            let preset = payload.get("agentPreset").and_then(|v| v.as_str()).unwrap_or("default");
-            serde_json::json!({"ok": true, "value": {"agentPreset": preset}})
-        }
-        "agentPreset.read" => {
-            let preset = payload.get("agentPreset").and_then(|v| v.as_str()).unwrap_or("default");
-            serde_json::json!({"ok": true, "value": {
-                "agentPreset": preset, "trust": "user", "content": "",
+            let preset = payload.get("agentPreset").and_then(|v| v.as_str()).unwrap_or("");
+            // P1：join standing 是 P2（mount+guard）；未落地前显式拒绝，不假装切换（诚实）。
+            serde_json::json!({"ok": false, "error": {
+                "code": "agent-preset-unsupported",
+                "message": format!(
+                    "agentPreset.select ({preset}): joining a standing mount lands in P2, not implemented yet"
+                ),
             }})
         }
+        "agentPreset.read" => {
+            let preset = payload
+                .get("agentPreset")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            match boot.presets.borrow().find(&preset) {
+                Some(p) => match std::fs::read_to_string(&p.path) {
+                    Ok(content) => {
+                        let mut v = serde_json::Map::new();
+                        v.insert("agentPreset".into(), serde_json::json!(p.id));
+                        v.insert(
+                            "trust".into(),
+                            serde_json::json!(match p.trust {
+                                dsh_agent_presets::PresetTrust::System => "system",
+                                dsh_agent_presets::PresetTrust::User => "user",
+                            }),
+                        );
+                        v.insert("content".into(), serde_json::json!(content));
+                        // 可选字段只在存在时出现（wire schema 不允许 null）。
+                        if let Some(n) = &p.name {
+                            v.insert("name".into(), serde_json::json!(n));
+                        }
+                        if let Some(d) = &p.description {
+                            v.insert("description".into(), serde_json::json!(d));
+                        }
+                        serde_json::json!({"ok": true, "value": serde_json::Value::Object(v)})
+                    }
+                    Err(e) => serde_json::json!({"ok": false, "error": {
+                        "code": "agent-preset-not-found",
+                        "message": format!("agentPreset.read {preset}: cannot read {}: {e}", p.path.display()),
+                    }}),
+                },
+                None => serde_json::json!({"ok": false, "error": {
+                    "code": "agent-preset-not-found",
+                    "message": format!("agentPreset.read: no preset \"{preset}\""),
+                }}),
+            }
+        }
         "agentPreset.copy" => {
-            let preset = payload.get("agentPreset").and_then(|v| v.as_str()).unwrap_or("default");
-            serde_json::json!({"ok": true, "value": {"agentPreset": preset}})
+            // P1：copy/remove 作者流并入 P5（诚实拒绝，不假装成功）。
+            serde_json::json!({"ok": false, "error": {
+                "code": "agent-preset-unsupported",
+                "message": "agentPreset.copy (authoring) lands in P5, not implemented yet",
+            }})
         }
         "agentPreset.remove" => {
-            serde_json::json!({"ok": true, "value": {}})
+            serde_json::json!({"ok": false, "error": {
+                "code": "agent-preset-unsupported",
+                "message": "agentPreset.remove (authoring) lands in P5, not implemented yet",
+            }})
         }
         "agentPreset.openDocument" => {
-            serde_json::json!({"ok": true, "value": {"opened": true}})
+            let preset = payload
+                .get("agentPreset")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            match boot.presets.borrow().find(&preset) {
+                Some(p) => {
+                    // 诚实：Rust 侧未接原生打开器 → {opened:false, path=预设目录}（align TS 无 opener 降级）。
+                    let dir = p
+                        .path
+                        .parent()
+                        .map(|d| d.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    serde_json::json!({"ok": true, "value": {"opened": false, "path": dir}})
+                }
+                None => serde_json::json!({"ok": false, "error": {
+                    "code": "agent-preset-not-found",
+                    "message": format!("agentPreset.openDocument: no preset \"{preset}\""),
+                }}),
+            }
         }
         "settings.describe" => {
             // M3b：真实 service 驱动——列出已注册 namespace（分层 resolve + redact）。
@@ -3032,6 +3118,9 @@ mod tests {
                 crate::workspace_host::WorkspaceRegistry::new(),
             )),
             host_events: None,
+            presets: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::preset_host::PresetHost::default(),
+            )),
         }
     }
 
@@ -3724,10 +3813,9 @@ mod tests {
             ("goal.clear", "cleared", "bool"),
             ("subagent.list", "entries", "arr"),
             ("subagent.interrupt", "accepted", "bool"),
-            ("agentPreset.select", "agentPreset", "str"),
-            ("agentPreset.read", "content", "str"),
-            ("agentPreset.copy", "agentPreset", "str"),
-            ("agentPreset.remove", "x", "miss"),
+            // P1-b：agentPreset.* 已离去 ok-冒烟——真实语义（list/read 实数据、
+            // select/copy/remove 诚实 unsupported、openDocument 降级）全由
+            // rpc_agent_presets_list_read_real_discovery 覆盖。
         ];
         let cases2: &[(&str, &str, &str)] = &[
             ("session.attachment", "attachment", "obj"),
@@ -3743,7 +3831,8 @@ mod tests {
             ("workspace.insertBefore", "workspaceIds", "arr"),
             ("workspace.insertSessionBefore", "workspace", "obj"),
             ("workspace.archiveSession", "archivedSessionIds", "arr"),
-            ("agentPreset.openDocument", "opened", "bool"),
+            // P1-b：agentPreset.openDocument 已做实（支配 opened:false+path），
+            // 移出 ok-冒烟（空 payload 走 not-found），由 RPC 专用测试覆盖。
         ];
         // 方法 → 冒烟 payload（缺省空对象；需要入参的方法给最小合法 payload）。
         fn surface_payload(m: &str) -> Value {
@@ -4401,6 +4490,101 @@ mod tests {
         let res = call("settings.openDocument", serde_json::json!({}));
         assert_eq!(res["result"]["ok"], true);
         assert_eq!(res["result"]["value"]["opened"], true);
+    }
+
+    /// P1-b：agentPreset list/read 经 handle_rpc_host 真实发现语义（注入 temp 根）。
+    /// select 诚实 P2 门、copy/remove 诚实 P5 门、openDocument 诚实降级 opened:false。
+    #[test]
+    fn rpc_agent_presets_list_read_real_discovery() {
+        use dsh_agent_presets::{PresetRoot, PresetTrust};
+        let boot = boot_with_sessions();
+        {
+            let mut sp = boot.settings.borrow_mut();
+            crate::preset_host::register_agent_presets_settings(&mut sp);
+        }
+        // 注入 temp 根：system standard/code + user mine（authorable=true）。
+        let base = std::env::temp_dir().join(format!("dsh-cli-presets-rpc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sys = base.join("sys");
+        let usr = base.join("usr");
+        for (dir, id, meta) in [
+            (&sys, "standard", "order: 1\nname: 标准\n"),
+            (&sys, "code", "order: 2\n"),
+            (&usr, "mine", "name: 我的\n"),
+        ] {
+            let preset_dir = dir.join(id);
+            std::fs::create_dir_all(&preset_dir).unwrap();
+            std::fs::write(preset_dir.join("agent.cordis.yml"), "- id: p\n  name: 'plugin-x'\n").unwrap();
+            std::fs::write(preset_dir.join("preset.yml"), meta).unwrap();
+        }
+        let roots = vec![
+            PresetRoot { path: sys.clone(), trust: PresetTrust::System },
+            PresetRoot { path: usr.clone(), trust: PresetTrust::User },
+        ];
+        *boot.presets.borrow_mut() = crate::preset_host::PresetHost::with_user_root(roots, Some(usr.clone()));
+
+        let session_host = SessionHost::in_memory();
+        let call = |method: &str, payload: serde_json::Value| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": method, "payload": payload,
+            })).unwrap();
+            handle_rpc_host(&boot, method, &body, &session_host).1
+        };
+        // list：3 预设、order-else-id 排序、isDefault=standard（settings base）、
+        // authorable=true、hasDocument=false（无原生打开器，诚实）。
+        let res = call("agentPreset.list", serde_json::json!({}));
+        assert_eq!(res["result"]["ok"], true);
+        let presets = res["result"]["value"]["presets"].as_array().unwrap();
+        let ids: Vec<&str> = presets.iter().map(|p| p["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["standard", "code", "mine"], "order: standard(1) code(2) mine(∞)");
+        assert_eq!(res["result"]["value"]["authorable"], true);
+        assert_eq!(res["result"]["value"]["hasDocument"], false);
+        let mk = |id: &str| presets.iter().find(|p| p["id"] == id).unwrap();
+        assert_eq!(mk("standard")["isDefault"], true);
+        assert_eq!(mk("standard")["trust"], "system");
+        assert_eq!(mk("standard")["name"], "标准");
+        assert!(mk("standard").get("description").is_none(), "absent fields omitted");
+        assert!(mk("standard").get("broken").is_none());
+        assert_eq!(mk("mine")["isDefault"], false);
+        assert_eq!(mk("mine")["trust"], "user");
+        // settings 更新 default=mine → list 重读 isDefault 翻转（发现不缓存）。
+        let res = call("settings.update", serde_json::json!({
+            "ns": "agent-presets", "patch": {"default": "mine"}, "expectedRevision": 0,
+        }));
+        assert_eq!(res["result"]["ok"], true);
+        let res = call("agentPreset.list", serde_json::json!({}));
+        let presets = res["result"]["value"]["presets"].as_array().unwrap();
+        assert_eq!(presets.iter().find(|p| p["id"] == "mine").unwrap()["isDefault"], true);
+        assert_eq!(presets.iter().find(|p| p["id"] == "standard").unwrap()["isDefault"], false);
+        // read：真实内容 + trust + metadata；缺字段省略（不 null）。
+        let res = call("agentPreset.read", serde_json::json!({"agentPreset": "standard"}));
+        assert_eq!(res["result"]["ok"], true);
+        assert_eq!(res["result"]["value"]["content"], "- id: p\n  name: 'plugin-x'\n");
+        assert_eq!(res["result"]["value"]["trust"], "system");
+        assert_eq!(res["result"]["value"]["name"], "标准");
+        assert!(res["result"]["value"].get("description").is_none());
+        // read 未知 → agent-preset-not-found。
+        let res = call("agentPreset.read", serde_json::json!({"agentPreset": "nope"}));
+        assert_eq!(res["result"]["ok"], false);
+        assert_eq!(res["result"]["error"]["code"], "agent-preset-not-found");
+        // select：诚实 P2 门（join 未落地）。
+        let res = call("agentPreset.select", serde_json::json!({"sessionId": "default", "agentPreset": "code"}));
+        assert_eq!(res["result"]["ok"], false);
+        assert_eq!(res["result"]["error"]["code"], "agent-preset-unsupported");
+        // copy/remove：诚实 P5 门。
+        let res = call("agentPreset.copy", serde_json::json!({"from": "standard", "agentPreset": "copy1"}));
+        assert_eq!(res["result"]["ok"], false);
+        let res = call("agentPreset.remove", serde_json::json!({"agentPreset": "mine"}));
+        assert_eq!(res["result"]["ok"], false);
+        // openDocument：诚实降级 {opened:false, path}（无原生打开器）。
+        let res = call("agentPreset.openDocument", serde_json::json!({"agentPreset": "mine"}));
+        assert_eq!(res["result"]["ok"], true);
+        assert_eq!(res["result"]["value"]["opened"], false);
+        assert!(res["result"]["value"]["path"].as_str().unwrap().ends_with("mine"));
+        // openDocument 未知 → agent-preset-not-found。
+        let res = call("agentPreset.openDocument", serde_json::json!({"agentPreset": "nope"}));
+        assert_eq!(res["result"]["ok"], false);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// M3c：credentials 全方法面经 handle_rpc_host 真实服务驱动。

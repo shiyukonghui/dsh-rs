@@ -3959,5 +3959,34 @@ E-02 基线 149 全绿、REQUIREMENTS 需求结论文档定稿。）
 **回滚**：以阶段为粒度 `git revert` 独立提交；D-103 本身仅文档（阶段规划/决议），撤提交即回
 到「用户定稿前」状态，不损任何 crate。
 
+### D-103 实施补记（P1 落地实况，2026）
+
+**P1-a**（17ea2f5）：`crates/dsh-agent-presets` 发现 crate（scan/discover/形状检查/home/
+metadata），13 单测绿；D-102 的 12 个转译节点端到端通过形状检查（4 内置 preset 全部
+broken=None）。
+
+**P1-b**（本提交）：`dsh-cli` 接入——`PresetHost`（preset_host.rs，发现/read/authorable 的
+domain 侧）+ `Boot.presets` 字段 + wire 接线：
+- `agentPreset.list`：真实 roster（不缓存）+ `isDefault` 来自 settings `agent-presets.default`
+  （namespace 已注册，base=工程默认 `standard`，Applies::Live）；`authorable`=用户根目录存在；
+  `hasDocument:false`（Rust 侧无原生打开器，诚实）。
+- `agentPreset.read`：真实组合文本 + trust + 可选 name/description（缺字段省略、不 null）；
+  未知 id → `agent-preset-not-found`。
+- **诚实门**（不装作能，D-103 预授权）：`select`=P2（join standing）→ `agent-preset-unsupported`
+  显式拒绝；`copy`/`remove`=P5 作者流 → 同门；`openDocument` = `{opened:false, path=预设目录}`
+  （无原生打开器的诚实降级，align TS）。
+- 桩根解析：`DSH_PRESET_ROOT` env > cwd 相对 `resources/agent-presets`；用户根
+  `<dshHome>/.agent-presets` 无条件追加（authorable=存在即真，D-103/B-04）。
+
+验收：P1 条款「4 内置 + 1 自定义发现 roster 绿；list/read 可用」达成——RPC 层
+`rpc_agent_presets_list_read_real_discovery`（注入 temp 根）断言完整 wire；全库
+**155/155 绿**（E-02 基线 149 + 6），rustfmt（仅新文件）+ clippy `-D warnings` 零告警。
+
+**已知未接（诚实列表）**：select 未 join（P2）；copy/remove 未作者化（P5）；`hasDocument=false`
+（原生打开器未接）；live 服务二进制尚未重建（P4 阶段随 E-03 重启）。
+
+**回滚**：`git revert` P1-b 提交——撤销 Boot.presets/接线/挂 handler，不触 crates/
+dsh-agent-presets（P1-a 独立提交可保留）。
+
 
 

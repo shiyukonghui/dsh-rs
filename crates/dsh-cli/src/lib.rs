@@ -36,6 +36,9 @@ pub mod hmr_events;
 /// attach、归档；web RPC 用；持久化域另行立项）。
 pub mod workspace_host;
 
+/// P1-b：preset 发现宿主（roster/read/authorable 的 domain 侧；mount/guard 是 P2）。
+pub mod preset_host;
+
 /// D-098：Windows 原生目录选择绑定（IFileDialog/COM via 新版 windows crate）。
 #[cfg(windows)]
 pub mod host_picker_windows;
@@ -98,6 +101,9 @@ pub struct Boot {
     /// `Arc<Mutex<Vec<Value>>>` 供 `events.host` SSE/WS 线程各自持游标增量下推；None
     /// （非 web boot/测试口）→ RPC 不推帧（注册表语义仍生效，事件面由 serve 级测试覆盖）。
     pub host_events: Option<Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
+    /// P1-b：preset 发现宿主（roster/read/authorable + settings default 解析的 domain 侧；
+    /// mount/guard 是 P2）。`Rc<RefCell>`——web RPC 只持 `&Boot`，跨请求共享（serve 单线程）。
+    pub presets: Rc<std::cell::RefCell<crate::preset_host::PresetHost>>,
 }
 
 /// M56：转储生效配置（对齐生产 `dsh --dump-config`）——读主配置 + overlays
@@ -283,6 +289,7 @@ pub fn boot(
             crate::workspace_host::WorkspaceRegistry::new(),
         )),
         host_events: None,
+        presets: Rc::new(std::cell::RefCell::new(crate::preset_host::PresetHost::default())),
     })
 }
 
@@ -369,6 +376,10 @@ pub fn register_host_settings(sp: &mut dsh_settings::SettingsProvider) {
         Some(serde_json::json!({"defaultPreset": "read-only"})),
         dsh_settings::Applies::Live,
     );
+
+    // P1-b（D-103/C-04）：agent-presets settings namespace {default}——新会话未选时的
+    // 初始预设（base=工程默认；default 会话不隐式 join）。
+    crate::preset_host::register_agent_presets_settings(sp);
 }
 
 /// 读取 YAML 入口列表。
