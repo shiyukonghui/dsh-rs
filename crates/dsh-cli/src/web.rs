@@ -271,6 +271,13 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
     }
 
     let sink = host.sink.clone();
+
+    // D-100：宿主事件日志（`host/*` 帧内层 payload 的 append-only 队列）。RPC 处理器经
+    // `push_host_frame` 写入；`events.host` SSE/WS 线程各自持游标包装成 server-request
+    // 后下推。Only serve 装配（非 web boot/测试口 None → RPC 不推帧，注册表语义仍生效）。
+    let host_events: Arc<std::sync::Mutex<Vec<Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    boot.host_events = Some(host_events.clone());
     loop {
         let request = match server.recv_timeout(std::time::Duration::from_millis(M6_SERVE_TICK_INTERVAL_MS)) {
             Ok(Some(request)) => Some(request),
@@ -429,6 +436,9 @@ fn dispatch_request(
             }
             (Method::Get, "events.mux") | (Method::Get, "events.host") => {
                 let is_host = method == "events.host";
+                // D-100：host 通道独有下推 `host/*` 帧（Arc 共享宿主事件日志；None →
+                // 测试口/非 web boot 走空日志，等价于旧行为）。
+                let host_events = boot.host_events.clone();
                 // 浏览器经 `new WebSocket` 下链：检测 `Upgrade: websocket` 头。
                 // 有 → tiny_http `upgrade()` 完成 101 握手，tungstenite 包帧推
                 // WebSocket；无 → 回落 SSE（兼容 curl/node 测试，对齐 M71）。
@@ -451,11 +461,11 @@ fn dispatch_request(
                         );
                     let stream = request.upgrade("websocket", resp);
                     let sink = sink.clone();
-                    std::thread::spawn(move || stream_ws_events(stream, &sink, is_host));
+                    std::thread::spawn(move || stream_ws_events(stream, &sink, is_host, host_events));
                 } else {
                     let writer = request.into_writer();
                     let sink = sink.clone();
-                    std::thread::spawn(move || stream_sse_events(writer, &sink));
+                    std::thread::spawn(move || stream_sse_events(writer, &sink, is_host, host_events));
                 }
             }
             _ => {
@@ -694,8 +704,15 @@ fn json_response(status: u16, value: &Value) -> Response<std::io::Cursor<Vec<u8>
 /// SSE 事件下链（M71/M1e）：轮询 SessionHost 下链日志（EventSink），把**新事件**
 /// 推成 `session/event` mux 帧（对齐 `muxFrameSchema`；每帧带真实 sessionId +
 /// 真实 `time`）。运行在独立线程（`EventSink` Send+Sync）。握手后发
-/// `session/subscribed`，随后增量推帧 + keepalive；连接关闭即退出。
-fn stream_sse_events(mut writer: Box<dyn std::io::Write + Send>, sink: &EventSink) {
+/// `session/subscribed`（mux）或 `host/session-added`（host，D-100 修 SSE 无 host
+/// 语义缺口），随后增量推帧 + keepalive；host 通道再独有地推宿主事件日志
+/// （`HostEventsLog`）里累积的 `host/*` 帧；连接关闭即退出。
+fn stream_sse_events(
+    mut writer: Box<dyn std::io::Write + Send>,
+    sink: &EventSink,
+    is_host: bool,
+    host_events: Option<Arc<std::sync::Mutex<Vec<Value>>>>,
+) {
     // SSE 响应头（tiny_http 的 into_writer 是原始 socket 写；手写头 + data 帧）。
     if write_err(
         &mut writer,
@@ -706,16 +723,27 @@ fn stream_sse_events(mut writer: Box<dyn std::io::Write + Send>, sink: &EventSin
     // 每连接独立游标：从当前下链日志末尾起读，只推连接建立后的新事件。
     let mut cursor = sink_len(sink);
     let last_seq = cursor as u64;
-    // 握手：session/subscribed（对齐 muxFrameSchema）
-    let subscribed = serde_json::json!({
-        "type": "server-request",
-        "rpcId": format!("sub-{last_seq}"),
-        "method": "session/subscribed",
-        "payload": {"type": "session/subscribed", "sessionId": "default", "lastSeq": last_seq},
-    });
-    if write_sse(&mut writer, &subscribed).is_none() {
+    // 握手帧：mux → session/subscribed；host → host/session-added（真实 seed 会话）。
+    let hello = if is_host {
+        serde_json::json!({
+            "type": "server-request",
+            "rpcId": format!("host-{last_seq}"),
+            "method": "host/event",
+            "payload": {"type": "host/session-added", "sessionId": "default", "blank": true},
+        })
+    } else {
+        serde_json::json!({
+            "type": "server-request",
+            "rpcId": format!("sub-{last_seq}"),
+            "method": "session/subscribed",
+            "payload": {"type": "session/subscribed", "sessionId": "default", "lastSeq": last_seq},
+        })
+    };
+    if write_sse(&mut writer, &hello).is_none() {
         return;
     }
+    // host 帧游标（`events.host` 通道独有；每连接独立，append-only 日志安全）。
+    let mut host_cursor = 0usize;
     loop {
         // 增量推送：cursor 之后的新事件逐个推成 session/event 帧（真实 time）。
         let (new_cursor, frames) = {
@@ -732,6 +760,26 @@ fn stream_sse_events(mut writer: Box<dyn std::io::Write + Send>, sink: &EventSin
             }
         }
         cursor = new_cursor;
+        if is_host {
+            // D-100：host 通道独有下推 `host/*` 帧（server-request host/event 信封）。
+            let host_frames = {
+                let mut out = Vec::new();
+                if let Some(log) = &host_events {
+                    if let Ok(guard) = log.lock() {
+                        for index in host_cursor..guard.len() {
+                            out.push(host_frame_envelope(index, &guard[index]));
+                        }
+                        host_cursor = guard.len();
+                    }
+                }
+                out
+            };
+            for frame in &host_frames {
+                if write_sse(&mut writer, frame).is_none() {
+                    return;
+                }
+            }
+        }
         // keepalive 注释行（SSE 心跳；防止代理/浏览器断开空闲连接）
         if write_sse(&mut writer, &Value::Null).is_none() {
             return;
@@ -755,11 +803,12 @@ fn websocket_accept(key: &str) -> String {
 /// WebSocket 事件下链（阶段2）：tiny_http `upgrade()` 已完成 101 握手并返回
 /// 双工流；这里用 tungstenite 包成 WebSocket（成熟协议库，不手写帧），把
 /// SessionHost 下链日志（EventSink）的新事件推成 `session/subscribed` +
-/// `session/event`（mux）或 `host/session-added`（host）server-request 帧。
+/// `session/event`（mux）或 `host/session-added` + `host/*`（host，D-100）帧。
 fn stream_ws_events(
     stream: Box<dyn tiny_http::ReadWrite + Send>,
     sink: &EventSink,
     is_host: bool,
+    host_events: Option<Arc<std::sync::Mutex<Vec<Value>>>>,
 ) {
     use tungstenite::protocol::{Role, WebSocket, WebSocketConfig};
     let mut ws = WebSocket::from_raw_socket(stream, Role::Server, Some(WebSocketConfig::default()));
@@ -788,6 +837,8 @@ fn stream_ws_events(
     if ws_send(&mut ws, &hello).is_none() {
         return;
     }
+    // host 帧游标（`events.host` 通道独有；每连接独立，append-only 日志安全）。
+    let mut host_cursor = 0usize;
     loop {
         let (new_cursor, frames) = {
             let log = sink.lock().unwrap();
@@ -803,6 +854,26 @@ fn stream_ws_events(
             }
         }
         cursor = new_cursor;
+        if is_host {
+            // D-100：host 通道独有下推 `host/*` 帧（server-request host/event 信封）。
+            let host_frames = {
+                let mut out = Vec::new();
+                if let Some(log) = &host_events {
+                    if let Ok(guard) = log.lock() {
+                        for index in host_cursor..guard.len() {
+                            out.push(host_frame_envelope(index, &guard[index]));
+                        }
+                        host_cursor = guard.len();
+                    }
+                }
+                out
+            };
+            for frame in &host_frames {
+                if ws_send(&mut ws, frame).is_none() {
+                    return;
+                }
+            }
+        }
         std::thread::sleep(Duration::from_millis(300));
     }
 }
@@ -837,6 +908,18 @@ fn write_sse<W: std::io::Write + ?Sized>(w: &mut W, value: &Value) -> Option<()>
 /// 下链日志当前长度（Send+Sync 读；避免在调用处引入竞态）。
 fn sink_len(sink: &EventSink) -> usize {
     sink.lock().unwrap().len()
+}
+
+/// D-100：把宿主事件日志里的一条 `host/*` **内层 payload**（如
+/// `{type:"host/workspace-changed", workspace:{...}}`）包装成 `events.host` 下链信封
+/// （server-request `host/event`；rpcId 用日志游标序号，进程内稳定单调）。
+fn host_frame_envelope(index: usize, payload: &Value) -> Value {
+    serde_json::json!({
+        "type": "server-request",
+        "rpcId": format!("host-{index}"),
+        "method": "host/event",
+        "payload": payload,
+    })
 }
 
 /// 构造一个 `session/event` mux 帧（对齐 `muxFrameSchema`：
@@ -913,6 +996,20 @@ fn rpc_response(rpc_id: &str, result: Value) -> Value {
     })
 }
 
+/// D-100：把一条 `host/*` 帧的**内层 payload**（如
+/// `{type:"host/workspace-changed", workspace:{...}}`）压入宿主事件日志。`events.host`
+/// 的 SSE/WS 流各自持游标把它包装成 `server-request {method:"host/event"}` 后下推。
+/// 未装配（`boot.host_events` 为 None，如测试口）→ no-op（注册表语义仍生效，事件面由
+/// serve 级测试覆盖）。
+pub fn push_host_frame(boot: &Boot, payload: serde_json::Value) {
+    if let Some(log) = &boot.host_events {
+        if let Ok(mut log) = log.lock() {
+            log.push(payload);
+        }
+    }
+}
+
+/// RPC 分派是 handle_rpc_host 的纯函数核心：把方法 + payload → `{ok,value|error}`。
 pub fn handle_rpc_host(
     boot: &Boot,
     method: &str,
@@ -2319,7 +2416,36 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
         "session.create" => {
             // M1e：SessionHost mint 唯一 sessionId 并创建空会话。
             let id = host.create_new().unwrap_or_else(|_| "s1".to_string());
-            serde_json::json!({"ok": true, "value": {"sessionId": id}})
+            // D-100：`{workspaceId}` 时把新会话 attach 进该工作区（对齐 TS
+            // session.create{workspaceId} 的归属语义）并推 host 增量帧
+            // （host/workspace-changed + host/session-added）；未知工作区 → 诚实报错。
+            if let Some(ws_id) = payload.get("workspaceId").and_then(|v| v.as_str()) {
+                let attached = {
+                    let mut reg = boot.workspaces.borrow_mut();
+                    reg.attach_session(ws_id, &id)
+                };
+                match attached {
+                    Some(record) => {
+                        push_host_frame(
+                            boot,
+                            serde_json::json!({"type": "host/workspace-changed",
+                                "workspace": crate::workspace_host::workspace_view(&record)}),
+                        );
+                        push_host_frame(
+                            boot,
+                            serde_json::json!({"type": "host/session-added",
+                                "sessionId": id, "blank": true}),
+                        );
+                        serde_json::json!({"ok": true, "value": {"sessionId": id}})
+                    }
+                    None => serde_json::json!({"ok": false, "error": {
+                        "code": "workspace-not-found",
+                        "message": format!("unknown workspace '{}'", ws_id),
+                    }}),
+                }
+            } else {
+                serde_json::json!({"ok": true, "value": {"sessionId": id}})
+            }
         }
         "session.history" => {
             // M1e：SessionStore 的历史（strict-envelope 事件直接 wire）。
@@ -2466,62 +2592,150 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             serde_json::json!({"ok": true, "value": {"accepted": true}})
         }
         "workspace.list" => {
-            let cwd = std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let now = now_ms().to_string();
+            // D-100：真实注册表（registry order + 全局归档集），不再 canned stub。
+            let reg = boot.workspaces.borrow();
+            let items: Vec<Value> = reg
+                .list()
+                .iter()
+                .map(crate::workspace_host::workspace_view)
+                .collect();
+            let archived = reg.archived_session_ids();
             serde_json::json!({"ok": true, "value": {
-                "items": [{
-                    "workspaceId": "default",
-                    "path": cwd,
-                    "title": "default",
-                    "sessionIds": ["default"],
-                    "createdAt": now,
-                    "updatedAt": now,
-                }],
-                "archivedSessionIds": [],
+                "items": items,
+                "archivedSessionIds": archived,
             }})
         }
         "workspace.create" => {
+            // D-100：canonicalize → 同 path 幂等（created:false，不改 title）/
+            // 新 path 铸全新 id + title=basename（created:true）；随后推
+            // host/workspace-changed 增量帧（客户端 upsert + 其它 tab 同步）。
             let path = payload.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let now = now_ms().to_string();
-            serde_json::json!({"ok": true, "value": {
-                "workspace": {
-                    "workspaceId": "default", "path": path, "title": "default",
-                    "sessionIds": [], "createdAt": now, "updatedAt": now,
-                },
-                "created": false,
-            }})
+            let outcome = {
+                let mut reg = boot.workspaces.borrow_mut();
+                reg.create(&path)
+            };
+            match outcome {
+                Ok(oc) => {
+                    let view = boot
+                        .workspaces
+                        .borrow()
+                        .get(&oc.id)
+                        .map(|r| crate::workspace_host::workspace_view(&r));
+                    match view {
+                        Some(view) => {
+                            push_host_frame(
+                                boot,
+                                serde_json::json!({"type": "host/workspace-changed", "workspace": view}),
+                            );
+                            serde_json::json!({"ok": true, "value": {"workspace": view, "created": oc.created}})
+                        }
+                        None => serde_json::json!({"ok": false, "error": {
+                            "code": "bad-request",
+                            "message": "workspace.create: record vanished",
+                        }}),
+                    }
+                }
+                Err(message) => serde_json::json!({"ok": false, "error": {
+                    "code": "workspace-path-invalid",
+                    "message": message,
+                }}),
+            }
         }
         "workspace.rename" => {
-            let path = std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let now = now_ms().to_string();
-            serde_json::json!({"ok": true, "value": {
-                "workspace": {
-                    "workspaceId": "default", "path": path, "title": "default",
-                    "sessionIds": ["default"], "createdAt": now, "updatedAt": now,
-                },
-            }})
+            let ws_id = payload.get("workspaceId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let title = payload.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let renamed = {
+                let mut reg = boot.workspaces.borrow_mut();
+                reg.rename(&ws_id, &title)
+            };
+            match renamed {
+                Some(record) => {
+                    let view = crate::workspace_host::workspace_view(&record);
+                    push_host_frame(
+                        boot,
+                        serde_json::json!({"type": "host/workspace-changed", "workspace": view}),
+                    );
+                    serde_json::json!({"ok": true, "value": {"workspace": view}})
+                }
+                None => serde_json::json!({"ok": false, "error": {
+                    "code": "workspace-not-found",
+                    "message": format!("unknown workspace '{}'", ws_id),
+                }}),
+            }
         }
         "workspace.delete" => {
-            serde_json::json!({"ok": true, "value": {"deleted": true}})
+            let ws_id = payload.get("workspaceId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let deleted = {
+                let mut reg = boot.workspaces.borrow_mut();
+                reg.delete(&ws_id)
+            };
+            push_host_frame(
+                boot,
+                serde_json::json!({"type": "host/workspace-removed", "workspaceId": ws_id}),
+            );
+            serde_json::json!({"ok": true, "value": {"deleted": deleted}})
         }
         "workspace.insertBefore" => {
-            serde_json::json!({"ok": true, "value": {"workspaceIds": ["default"]}})
+            let ws_id = payload.get("workspaceId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let before = payload
+                .get("beforeWorkspaceId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let order = {
+                let mut reg = boot.workspaces.borrow_mut();
+                reg.insert_before(&ws_id, before.as_deref())
+            };
+            match order {
+                Ok(ids) => {
+                    push_host_frame(
+                        boot,
+                        serde_json::json!({"type": "host/workspace-order-changed", "workspaceIds": ids}),
+                    );
+                    serde_json::json!({"ok": true, "value": {"workspaceIds": ids}})
+                }
+                Err(message) => serde_json::json!({"ok": false, "error": {
+                    "code": "workspace-order-invalid",
+                    "message": message,
+                }}),
+            }
         }
-        "workspace.insertSessionBefore" | "workspace.archiveSession" => {
-            let path = std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let now = now_ms().to_string();
-            serde_json::json!({"ok": true, "value": {
-                "workspace": {
-                    "workspaceId": "default", "path": path, "title": "default",
-                    "sessionIds": ["default"], "createdAt": now, "updatedAt": now,
-                },
-            }})
+        "workspace.insertSessionBefore" => {
+            let ws_id = payload.get("workspaceId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let sid = payload.get("sessionId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let before = payload
+                .get("beforeSessionId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let moved = {
+                let mut reg = boot.workspaces.borrow_mut();
+                reg.insert_session_before(&ws_id, &sid, before.as_deref())
+            };
+            match moved {
+                Some(record) => {
+                    let view = crate::workspace_host::workspace_view(&record);
+                    push_host_frame(
+                        boot,
+                        serde_json::json!({"type": "host/workspace-changed", "workspace": view}),
+                    );
+                    serde_json::json!({"ok": true, "value": {"workspace": view}})
+                }
+                None => serde_json::json!({"ok": false, "error": {
+                    "code": "workspace-not-found",
+                    "message": format!("cannot move session '{}' in workspace '{}'", sid, ws_id),
+                }}),
+            }
+        }
+        "workspace.archiveSession" => {
+            let sid = payload.get("sessionId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let archived = {
+                let mut reg = boot.workspaces.borrow_mut();
+                reg.archive_session(&sid)
+            };
+            push_host_frame(
+                boot,
+                serde_json::json!({"type": "host/archived-sessions-changed", "archivedSessionIds": archived}),
+            );
+            serde_json::json!({"ok": true, "value": {"archivedSessionIds": archived}})
         }
         "skill.list" => {
             serde_json::json!({"ok": true, "value": {"skills": []}})
@@ -2789,6 +3003,10 @@ mod tests {
             )),
             projections: assembled_projection_registry(),
             host_picker: None,
+            workspaces: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::workspace_host::WorkspaceRegistry::new(),
+            )),
+            host_events: None,
         }
     }
 
@@ -3118,6 +3336,146 @@ mod tests {
         assert!(item["sessionIds"].is_array());
     }
 
+    /// D-100：workspace.create 走真实注册表——新路径铸独立 id + title=basename +
+    /// created:true，推 host/workspace-changed；同路径幂等（created:false 同 id）；
+    /// workspace.list 反映真实注册表（新工作区 prepend）。
+    #[test]
+    fn rpc_workspace_create_real_semantics() {
+        let mut boot = boot_with_sessions();
+        boot.host_events = Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let host = seeded_host();
+        let dir = std::env::temp_dir().join(format!("dsh-ws-rpc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_string_lossy().to_string();
+
+        let call = |boot: &crate::Boot, method: &str, payload: Value, host: &Rc<SessionHost>| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": method, "payload": payload,
+            })).unwrap();
+            let (_, v) = handle_rpc_host(boot, method, &body, host);
+            v
+        };
+
+        // 新路径 → 独立 id、created:true、title=basename、sessionIds 空。
+        let v = call(
+            &boot,
+            "workspace.create",
+            serde_json::json!({"path": path}),
+            &host,
+        );
+        assert_eq!(v["result"]["ok"], true);
+        let view = &v["result"]["value"]["workspace"];
+        let id = view["workspaceId"].as_str().unwrap().to_string();
+        assert_ne!(id, "default", "new workspace id must not collide with boot default");
+        assert_eq!(v["result"]["value"]["created"], true);
+        assert_eq!(
+            view["title"],
+            dir.file_name().unwrap().to_string_lossy().to_string(),
+            "title must be the path basename"
+        );
+        assert_eq!(view["sessionIds"], serde_json::json!([]));
+        // 推了 host/workspace-changed 帧（payload 同 create 返回值）。
+        {
+            let log = boot.host_events.as_ref().unwrap().lock().unwrap();
+            assert_eq!(log.len(), 1, "one host frame after create");
+            assert_eq!(log[0]["type"], "host/workspace-changed");
+            assert_eq!(log[0]["workspace"]["workspaceId"], id);
+        }
+
+        // 同路径幂等 → created:false、同 id、不重复注册。
+        let v2 = call(
+            &boot,
+            "workspace.create",
+            serde_json::json!({"path": path}),
+            &host,
+        );
+        assert_eq!(v2["result"]["ok"], true);
+        assert_eq!(v2["result"]["value"]["created"], false);
+        assert_eq!(v2["result"]["value"]["workspace"]["workspaceId"], id);
+
+        // workspace.list 反映真实注册表：新工作区 prepend 在 default 前，sessionIds 为空。
+        let v3 = call(&boot, "workspace.list", serde_json::json!({}), &host);
+        let items = v3["result"]["value"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["workspaceId"], id, "new workspace prepended");
+        assert_eq!(items[1]["workspaceId"], "default");
+        assert_eq!(v3["result"]["value"]["archivedSessionIds"], serde_json::json!([]));
+
+        // 不存在的路径 → 诚实错误（workspace-path-invalid），非假成功。
+        let missing = format!("Z:\\dsh-no-such-{}", std::process::id());
+        let v4 = call(&boot, "workspace.create", serde_json::json!({"path": missing}), &host);
+        assert_eq!(v4["result"]["ok"], false);
+        assert_eq!(v4["result"]["error"]["code"], "workspace-path-invalid");
+    }
+
+    /// D-100：session.create{workspaceId} 把新会话 attach 进工作区 sessionIds 并推
+    /// host/workspace-changed + host/session-added；未知工作区 → workspace-not-found。
+    #[test]
+    fn rpc_session_create_attaches_to_workspace_and_host_frames() {
+        let mut boot = boot_with_sessions();
+        boot.host_events = Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let host = seeded_host();
+
+        let call = |boot: &crate::Boot, method: &str, payload: Value, host: &Rc<SessionHost>| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": method, "payload": payload,
+            })).unwrap();
+            let (_, v) = handle_rpc_host(boot, method, &body, host);
+            v
+        };
+
+        // 建一个工作区。
+        let dir = std::env::temp_dir().join(format!("dsh-ws-rpc-attach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = call(
+            &boot,
+            "workspace.create",
+            serde_json::json!({"path": dir.to_string_lossy().to_string()}),
+            &host,
+        );
+        let ws_id = v["result"]["value"]["workspace"]["workspaceId"].as_str().unwrap().to_string();
+
+        // session.create{workspaceId} → attach，返回新 sessionId。
+        let v2 = call(
+            &boot,
+            "session.create",
+            serde_json::json!({"workspaceId": ws_id}),
+            &host,
+        );
+        assert_eq!(v2["result"]["ok"], true);
+        let sid = v2["result"]["value"]["sessionId"].as_str().unwrap().to_string();
+
+        // workspace.list 里该工作区 sessionIds 已含新会话（客户端分组面可见）。
+        let v3 = call(&boot, "workspace.list", serde_json::json!({}), &host);
+        for item in v3["result"]["value"]["items"].as_array().unwrap() {
+            if item["workspaceId"] == serde_json::json!(ws_id) {
+                assert_eq!(item["sessionIds"], serde_json::json!([sid]));
+            }
+        }
+
+        // host 帧：create → workspace-changed；attach → workspace-changed + session-added。
+        {
+            let log = boot.host_events.as_ref().unwrap().lock().unwrap();
+            let kinds: Vec<&str> = log.iter().map(|f| f["type"].as_str().unwrap()).collect();
+            assert_eq!(
+                kinds,
+                vec!["host/workspace-changed", "host/workspace-changed", "host/session-added"]
+            );
+            assert_eq!(log[2]["sessionId"], sid);
+            assert_eq!(log[2]["blank"], true);
+        }
+
+        // 未知工作区 → 诚实报错（不假成功、不 attach）。
+        let v4 = call(
+            &boot,
+            "session.create",
+            serde_json::json!({"workspaceId": "no-such-ws"}),
+            &host,
+        );
+        assert_eq!(v4["result"]["ok"], false);
+        assert_eq!(v4["result"]["error"]["code"], "workspace-not-found");
+    }
+
     /// 阶段2：commands/list 返回命令数组（{name, description, input?}）。
     #[test]
     fn rpc_commands_list_shape() {
@@ -3190,7 +3548,7 @@ mod tests {
             ("workspace.delete", "deleted", "bool"),
             ("workspace.insertBefore", "workspaceIds", "arr"),
             ("workspace.insertSessionBefore", "workspace", "obj"),
-            ("workspace.archiveSession", "workspace", "obj"),
+            ("workspace.archiveSession", "archivedSessionIds", "arr"),
             ("agentPreset.openDocument", "opened", "bool"),
         ];
         // 方法 → 冒烟 payload（缺省空对象；需要入参的方法给最小合法 payload）。
@@ -3206,6 +3564,20 @@ mod tests {
                     "parentSessionId": "default",
                     "childSessionId": "c-1",
                     "mode": "continuable",
+                }),
+                // D-100：workspace.* 走真实注册表——需合法 payload 才 ok（空 path/未知
+                // id 会诚实报错，不再返回假 stub 成功）。
+                "workspace.create" => serde_json::json!({
+                    "path": std::env::temp_dir().to_string_lossy().to_string(),
+                }),
+                "workspace.rename" => serde_json::json!({
+                    "workspaceId": "default", "title": "renamed",
+                }),
+                "workspace.insertBefore" => serde_json::json!({
+                    "workspaceId": "default",
+                }),
+                "workspace.insertSessionBefore" => serde_json::json!({
+                    "workspaceId": "default", "sessionId": "default",
                 }),
                 _ => serde_json::json!({}),
             }
@@ -3434,6 +3806,27 @@ mod tests {
         buf.clear();
         write_sse(&mut buf, &Value::Null).unwrap();
         assert_eq!(String::from_utf8(buf).unwrap(), ": keepalive\n\n");
+    }
+
+    /// D-100：events.host 下链信封形状（server-request host/event；payload 原样内层）。
+    #[test]
+    fn host_frame_envelope_wire_shape() {
+        let frame = host_frame_envelope(
+            3,
+            &serde_json::json!({"type": "host/workspace-changed", "workspace": {"workspaceId": "w1"}}),
+        );
+        assert_eq!(frame["type"], "server-request");
+        assert_eq!(frame["rpcId"], "host-3");
+        assert_eq!(frame["method"], "host/event");
+        assert_eq!(frame["payload"]["type"], "host/workspace-changed");
+        assert_eq!(frame["payload"]["workspace"]["workspaceId"], "w1");
+        // 序列化后经 write_sse 可下推。
+        let mut buf = Vec::new();
+        assert!(write_sse(&mut buf, &frame).is_some());
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.starts_with("data: {"));
+        assert!(text.ends_with("\n\n"));
+        assert!(text.contains("\"method\":\"host/event\""));
     }
 
     /// 构造一个最小 plugin_root（`@deepseek-ai` 目录，含一个 web 插件）用于阶段1测试。

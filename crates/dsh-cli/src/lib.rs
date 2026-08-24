@@ -32,6 +32,10 @@ pub mod host_picker;
 /// D-099：`/plugins/events` HMR SSE 通道（客户端插件热重载，对齐 TS `client/hmr`）。
 pub mod hmr_events;
 
+/// D-100：工作区注册表（对齐 TS workspace 域本会话语义：create 幂等/新铸 id、list、
+/// attach、归档；web RPC 用；持久化域另行立项）。
+pub mod workspace_host;
+
 /// D-098：Windows 原生目录选择绑定（IFileDialog/COM via 新版 windows crate）。
 #[cfg(windows)]
 pub mod host_picker_windows;
@@ -87,6 +91,13 @@ pub struct Boot {
     /// M3a+（D-098）：`host.pickDirectory` 后端（None → wire `directory-picker-unavailable`，
     /// 诚实上报而非 `{path:null}` 冒充取消）。web serve 装配为进程内原生选择器；测试注入 stub。
     pub host_picker: Option<crate::HostPicker>,
+    /// D-100：真实工作区注册表（`workspace.*` RPC 语义来源）。`Rc<RefCell>`——web RPC
+    /// 只持 `&Boot`，跨请求共享可变状态（serve 单线程 accept 循环，无锁纪律）。
+    pub workspaces: Rc<std::cell::RefCell<crate::workspace_host::WorkspaceRegistry>>,
+    /// D-100：宿主事件日志（`host/*` 帧内层 payload 的 append-only 队列）。serve 装配
+    /// `Arc<Mutex<Vec<Value>>>` 供 `events.host` SSE/WS 线程各自持游标增量下推；None
+    /// （非 web boot/测试口）→ RPC 不推帧（注册表语义仍生效，事件面由 serve 级测试覆盖）。
+    pub host_events: Option<Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
 }
 
 /// M56：转储生效配置（对齐生产 `dsh --dump-config`）——读主配置 + overlays
@@ -268,6 +279,10 @@ pub fn boot(
         ))),
         projections: crate::web::assembled_projection_registry(),
         host_picker: None,
+        workspaces: Rc::new(std::cell::RefCell::new(
+            crate::workspace_host::WorkspaceRegistry::new(),
+        )),
+        host_events: None,
     })
 }
 

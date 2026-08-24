@@ -3735,5 +3735,89 @@ prefetch→refresh 热换单插件（`entry.refresh()` 按 `?rev=` 重拉我们�
 
 ---
 
+## D-100（使用测试发现：打开工作区不生效）：真实 workspace registry + host 事件流
+
+**日期**：2026（用户反馈：前端「打开工作区」→ `host.pickDirectory` 选中
+`F:\RustProjects\deepseek-harness` → `/api/workspace.create` 返回
+`{"ok":true,"value":{"created":false,"workspace":{"workspaceId":"default","path":"F:\\RustProjects\\deepseek-harness","sessionIds":[],"title":"default",...}}}`，
+但页面没有打开刚选的工作区）。
+**触发问题**：Rust serve 的 `workspace.*` RPC 全是 canned stub（`workspace.list` 恒返回
+单一 `default`（path=cwd）；`workspace.create` 恒返回 `workspaceId:"default"` +
+`created:false` + `title:"default"`；`rename/delete/insertBefore/insertSessionBefore/archiveSession`
+全是假响应；`session.create` 忽略 `workspaceId`、不把新会话挂到工作区），且 serve 的
+`events.host` 通道从不推 `host/*` 帧（hello 之后只流 mux 形式的 session/event），
+`events.host` 的 SSE 回落连 host hello 都没有（见 D-099 事件）。
+**第一性原理（自下而上，前端对象层事实）**：
+- `WorkspacePicker.adoptDirectory` → `createWorkspace({path})` → `manager.create` →
+  `Workspace.materialize()` → `api.workspace.create` → **成功即 `upsert` 返回值进 list
+  store**（TS `workspaces/manager.ts`），随后 `onPick(workspaceId)` →
+  `startSession` → `connectWorkspace(id)`（**要求 id 已在 workspace.list store**，否则
+  throw `unknown workspace`）→ 无可复用 blank 会话 → `sessions.create({workspaceId})` →
+  `sessions.open(id)`。所以「能否打开」取决于 workspace.create **返回值**是否是一个
+  list 里可寻址的**独立**工作区，以及 session.create 是否返回可 open 的会话。
+- 核心缺陷：`workspace.create` 恒返回**碰撞的** `workspaceId:"default"` → manager 的
+  `upsert(view, identity)` 按 id **替换** boot 基线里那个 `path=cwd` 的 `default` 工作区
+  （clobber 基线），且 `created:false` + `sessionIds:[]` → 分组全乱、选中的工作区永远
+  不是“新”的。另外 serve 从不推 `host/workspace-changed`，所以任何其它 tab /
+  reconcile 都看不到创建工作区；`session.create` 也不 attach，`workspace.sessionIds`
+  在客户端永远空 → 会话以 Ungrouped 出现。
+- TS 权威语义（`packages/workspace/workspace/src/index.ts` + apiproxy 测试）：create
+  对**既有 canonical path** 幂等返回（`created:false`，不改 title）；对**新 path** 铸
+  **全新 id**（randomUUID，绝不复用——注：同 path 重新注册也会新铸 id）+ `title=basename`
+  + `created:true` + prepend 到 durable order；path 不存在/非目录 → reject；
+  `session.create{workspaceId}` 把新会话 attach 进该 workspace 的 sessionIds 并推
+  `host/workspace-changed` + `host/session-added`。客户端只经「create 回显 upsert +
+  host/workspace-changed 帧」两条路得知 workspace.sessionIds 变化。
+**考虑过的选项**：A）只把 `workspace.create` 做成「返回不同 id + created:true」的
+局部补丁，其余 stub 不动——治标不治本：list 基线仍不含新建工作区、session 仍不 attach、
+无事件流，任何「刷新/其它 tab/重连」都会再次打回原形（违背方法论四：不为快改小坑）。
+B）**实现真实 in-process 工作区注册表 + 重启 host/workspace-* 事件流 + session.create
+attach（本次采用）**——对齐 TS workspace 域的**本会话**语义：create 幂等/新铸 id、
+list 反映真实注册表、session attach、`host/workspace-changed/workspace-removed/
+workspace-order-changed/archived-sessions-changed/session-added` 沿 `events.host`
+下链（SSE 与 WS 同时，SSE 补 host hello）。C）完整移植 TS 的**持久化** workspace 域
+（SQLite workspaces 表 + pending-mutation 恢复 + 从 session 日志 bootstrap 分组）——
+超出本问题所需（web serve 的 workspace 注册表跨进程重启持久化不是当前需求），记为
+**已知限制**另行立项。**采纳 B**。
+**最终选择**：
+1. `workspace_host.rs`（新）：`WorkspaceRegistry`（单线程 `Rc<RefCell>` 纪律，对齐
+   M4h settings/goal）——`order: Vec<String>` + `by_id: HashMap<String, Record>` +
+   `archived: Vec<String>`；`Record{workspace_id, path(canonical), title, session_ids,
+   created_at, updated_at}`。`new()` 注册 boot `default`（id `default`、path=cwd、
+   sessionIds `["default"]`，保持既有 UI 基线不变）。方法 `create/rename/delete/
+   insert_before/insert_session_before/archive_session/attach_session/list/get` +
+   `view()`（对齐 `workspaceViewSchema`）。**create**：`fs::canonicalize`（失败/非目录
+   → err）；按 canonical path 幂等去重（`created:false` 不改 title）；新 path 铸新 id
+   （std：纳秒时间戳 XOR 进程级原子计数器 → 进程内绝不复用）+ `title=basename` +
+   `created:true` + prepend order。**id 不复用**不变量在进程内成立（注册表 in-memory；
+   若后续引入持久化，id 生成须升级——如实记录）。
+2. `lib.rs`：Boot 增 `pub workspaces: Rc<RefCell<WorkspaceRegistry>>`（`boot()` 构造，
+   用 process cwd）与 `pub host_events: Option<Arc<Mutex<Vec<Value>>>>`（serve 装配）；
+   `pub mod workspace_host;`。
+3. web.rs 重接：`workspace.list/create/rename/delete/insertBefore/insertSessionBefore/
+   archiveSession` 全走真实注册表 + 正确错误码；`session.create` 带 `workspaceId` 时
+   attach（未知 workspace → `workspace-not-found` 错误）+ 推变更帧；RPC 变更后把
+   `{type:"host/workspace-changed", workspace: view}` 等**内层 payload** 压入
+   `boot.host_events`。`events.host`（SSE + WS）除既有 mux 帧外在 host 通道追加流
+   host 帧（server-request `host/event` 信封包裹，rpcId `host-<n>` 自增），hello 的
+   `host/session-added` 用真实 blank 状态；SSE 回落补 host hello（修 events.host SSE
+   无 host 语义的缺口）。
+**被否决**：选项 A（局部补丁、list/事件/attach 三处仍假、刷新即打回原形）；完整持久化
+workspace 域（选项 C，超出本问题、列为已知限制）。
+**TDD + 验收**：workspace_host 单测（create 幂等去重/新铸 id 唯一/title=basename、
+list 顺序含 boot default、rename/delete/insert_before/insert_session_before/archive
+/attach 语义、view 字段对齐）→ web RPC 用真实注册表响应断言 → 既有 128+ 回归全绿 →
+clippy `-D warnings` 零告警。实战：重启 60165 后驱动「pick→create→session.create」RPC
+序列验证返回值（独立 workspaceId/created:true/title=basename、sessionIds 含新会话），
+`events.host` 流收到真实 `host/workspace-changed` 帧；浏览器刷新后「打开工作区」在
+侧栏出现新工作区并打开其会话。
+**已知限制（如实）**：① 注册表 in-memory，跨进程重启不持久化（TS 为持久域；另行立项）；
+② workspaceId 为进程内唯一（非 UUID 规范）；③ events.host 通道同时保留历史 mux 帧
+下推（客户端 `onHostEnvelope` 按 type 过滤，无害）；④ id「绝不复用」不变量仅限进程内，
+持久化引入时须重新评估。
+**回滚**：撤本提交；workspace RPC 回到 canned stub（打开工作区再次失效但其余功能不受影响）。
+
+---
+
 
 
