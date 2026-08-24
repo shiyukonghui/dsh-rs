@@ -53,6 +53,19 @@ pub struct StandingRegistry {
     standings: HashMap<String, Standing>,
 }
 
+impl Default for StandingRegistry {
+    /// 占位注册表（Bootstrap 期/无真实 loop 时）：持有一个独立占位 SystemPrompt。
+    /// web serve 装配 agent-loop 后以 `host.prompt` 重建（见 web.rs `boot.standings`），
+    /// 保证 standing 贡献落进 loop 实际组装的注册面。
+    fn default() -> Self {
+        let placeholder = Rc::new(
+            SystemPrompt::new(&dsh_system_prompt::Config::default(), Rc::new(|| {}))
+                .expect("standing placeholder system prompt"),
+        );
+        StandingRegistry::new(placeholder)
+    }
+}
+
 impl StandingRegistry {
     pub fn new(system_prompt: Rc<SystemPrompt>) -> Self {
         StandingRegistry {
@@ -60,7 +73,6 @@ impl StandingRegistry {
             standings: HashMap::new(),
         }
     }
-
     /// 挂载 preset：行审计 + 铸 standing scope + persona 桥贡献。同 id 换代：
     /// 先 unmount（撤销 scoped 贡献）再建新。
     pub fn mount(

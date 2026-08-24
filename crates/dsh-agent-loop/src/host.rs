@@ -20,7 +20,7 @@ use std::rc::Rc;
 
 use dsh_agent::{Agent, AgentBus, AgentOptions, AgentRegistry};
 use dsh_llm::{LlmRuntime, Message};
-use dsh_scope::ScopeKey;
+use dsh_scope::{bind_scope_parent, ScopeKey, ScopeParentBinding};
 use dsh_session::store::SessionStore;
 use dsh_session::types::{CreateSessionOptions, SessionId};
 use dsh_system_prompt::{
@@ -149,6 +149,9 @@ pub struct AgentLoopHost {
     runtime_agents: RefCell<Vec<ConfiguredAgent>>,
     /// 宿主持有的 disposer（工具注册/守卫等；teardown 时按序执行）。
     disposers: RefCell<Vec<Rc<dyn Fn()>>>,
+    /// P4：每 agent 的 standing 父绑定（agent scope → preset standing scope）。
+    /// select 回调 join/rebind；随 agent 生命周期（host 持有）。
+    joins: RefCell<HashMap<String, ScopeParentBinding>>,
 }
 
 impl AgentLoopHost {
@@ -201,6 +204,7 @@ impl AgentLoopHost {
             agents: RefCell::new(HashMap::new()),
             runtime_agents: RefCell::new(Vec::new()),
             disposers: RefCell::new(Vec::new()),
+            joins: RefCell::new(HashMap::new()),
         }))
     }
 
@@ -325,6 +329,33 @@ impl AgentLoopHost {
         driver.followup(message).map_err(|e| e.to_string())
     }
 
+    /// P4（直通 accept）：把 agent 作用域链到 preset 的 standing scope（join）。
+    /// - 首次 = `bind_scope_parent(agent.scope → standing)`，绑定存入宿主 `joins`；
+    /// - 再次（换 preset）= 原绑定 `rebind`（沿用装配期 scope）；
+    /// - agent 必须已装配（懒装配会话须先 `ensure_agent`/`register_session_agent`）；
+    ///   未知 id → fail loud（不静默）。
+    ///
+    /// 生效即时性：loop 每 turn 以 `AssembleContext{scope: agent.scope}` 组装（走
+    /// `scope_chain_of` 父链），故 join 后**下一 turn 的 assemble 即含 standing 视图**，
+    /// 无需重建 host/loop。
+    pub fn join_standing(&self, agent_id: &str, standing: &ScopeKey) -> Result<(), String> {
+        let agent = self
+            .agent(agent_id)
+            .ok_or_else(|| format!("host: no agent \"{agent_id}\""))?;
+        let scope = agent.agent.scope.clone();
+        let mut joins = self.joins.borrow_mut();
+        if let Some(binding) = joins.get(agent_id) {
+            binding
+                .rebind(standing.clone())
+                .map_err(|e| format!("host: rebind {}: {e}", agent_id))
+        } else {
+            let binding = bind_scope_parent(scope, standing.clone())
+                .map_err(|e| format!("host: join {}: {e}", agent_id))?;
+            joins.insert(agent_id.to_string(), binding);
+            Ok(())
+        }
+    }
+
     /// 会话事件（前端历史读模型；未知 → 空）。
     pub fn events(&self, session_id: &str) -> Vec<dsh_session::types::SessionEvent> {
         let sid = SessionId::from_raw(session_id.to_string());
@@ -347,4 +378,57 @@ impl AgentLoopHost {
 /// 便捷：把设置/身份 key 暴露给宿主（web RPC settings.describe 用）。
 pub fn configured_agent_identities_key() -> &'static str {
     CONFIGURED_AGENT_IDENTITIES_KEY
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dsh_scope::scope_chain_of;
+
+    fn host() -> Rc<AgentLoopHost> {
+        let config = AgentLoopConfig {
+            max_parallel_tool_calls: None,
+            agents: vec![ConfiguredAgent {
+                id: "main".into(),
+                provider: Some("mock".into()),
+                model: Some("mock-model".into()),
+                session_id: Some("default".into()),
+                max_tokens: None,
+                cwd: None,
+                resume_session_id: None,
+            }],
+        };
+        AgentLoopHost::with_store(
+            config,
+            Rc::new(dsh_llm::LlmRuntime::new()),
+            Rc::new(dsh_tools::ToolRegistry::new(dsh_tools::ToolExecutionMode::Native)),
+            Rc::new(SessionStore::new()),
+        )
+        .unwrap()
+    }
+
+    /// P4 join_standing：链上 standing scope；换 preset = rebind（agent scope 不变、
+    /// 父换）；未知 agent → fail loud。
+    #[test]
+    fn join_standing_links_scope_and_rebounds() {
+        let h = host();
+        h.ensure_agent(&h.config.agents[0]).unwrap();
+        let a = h.agent("main").unwrap();
+        let standing1 = ScopeKey::new();
+        let standing2 = ScopeKey::new();
+
+        h.join_standing("main", &standing1).unwrap();
+        let chain = scope_chain_of(Some(&a.agent.scope));
+        assert!(chain.contains(&standing1), "joined scope present: {chain:?}");
+        assert!(!chain.contains(&standing2));
+
+        // 换 preset → rebind。
+        h.join_standing("main", &standing2).unwrap();
+        let chain2 = scope_chain_of(Some(&a.agent.scope));
+        assert!(chain2.contains(&standing2), "rebound scope present: {chain2:?}");
+        assert!(!chain2.contains(&standing1));
+
+        // 未知 agent → fail loud。
+        assert!(h.join_standing("nope", &standing1).is_err());
+    }
 }

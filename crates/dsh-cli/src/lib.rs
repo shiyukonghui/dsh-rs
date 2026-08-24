@@ -104,7 +104,11 @@ pub struct Boot {
     pub host_events: Option<Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
     /// P1-b：preset 发现宿主（roster/read/authorable + settings default 解析的 domain 侧；
     /// mount/guard 是 P2）。`Rc<RefCell>`——web RPC 只持 `&Boot`，跨请求共享（serve 单线程）。
+    /// P1-b：复制自持 + 自定义 agent 预设发现宿主。
     pub presets: Rc<std::cell::RefCell<crate::preset_host::PresetHost>>,
+    /// P4：standing 注册表（共享 SystemPrompt 的 scoped 贡献 + join 报告）。web
+    /// serve 装配 agent-loop 后以 `host.prompt` 重建（否则为占位）。
+    pub standings: Rc<std::cell::RefCell<crate::standing::StandingRegistry>>,
 }
 
 /// M56：转储生效配置（对齐生产 `dsh --dump-config`）——读主配置 + overlays
@@ -291,6 +295,7 @@ pub fn boot(
         )),
         host_events: None,
         presets: Rc::new(std::cell::RefCell::new(crate::preset_host::PresetHost::default())),
+        standings: Rc::new(std::cell::RefCell::new(crate::standing::StandingRegistry::default())),
     })
 }
 

@@ -598,6 +598,7 @@ dependencies = [
  "dsh-code-runtime",
  "dsh-core",
  "dsh-credentials",
+ "dsh-eval",
  "dsh-fs",
  "dsh-goal",
  "dsh-jobs",

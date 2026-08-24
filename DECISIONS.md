@@ -4029,5 +4029,42 @@ dsh-agent-presets（P1-a 独立提交可保留）。
   editor/web/skill 等）P3；C 段 en-route。
 - **回滚**：`git revert` P2-b 提交；P2-a 另可独立 revert（不互依赖）。
 
+### D-103 实施补记（P4：loop 消费 scope——直通 accept 的第一块，round 14）——决策 + 验收
+
+- 触发：P1/P2 造好了 standing（每 preset 一 standing scope + join）+ 行审计与守卫，
+  但 `agentPreset.select` 仍诚实返回 `agent-preset-unsupported`——要让「选中组合」真实
+  改变会话行为（B 段直通的验收核心），必须把 join 接进 loop 的组装路径。
+- 关键事实（自下而上核实）：loop 每 turn 以 `assemble_context_for(agent)` 组装 =
+  `AssembleContext{scope: Some(agent.scope)}`；`SystemPrompt::assemble` 经
+  `scope_chain_of` 走父链（dsh-scope `bind_scope_parent` 后即含 standing scope）。故
+  **只要 select 把 agent.scope → standing.scope 链上，下一 turn 的 assemble 自动含
+  preset 视图，无需重建 host/loop**。这使 P4 的改动最小化且即时生效。
+- 选型与裁决：
+  1. `AgentLoopHost::join_standing(agent_id, standing_scope)`：join/rebind 幂等；
+     绑定存宿主 `joins`（随 agent 生命周期）；agent 未装配 → fail loud。**否决**
+     在 dsh-cli 侧自持绑定（每 agent 的 binding 生命周期应随宿主，且 web handler
+     是每请求无状态——无法持有跨请求绑定）。
+  2. `Boot.standings: Rc<RefCell<StandingRegistry>>`：`StandingRegistry::default()`
+     为占位（独立 SystemPrompt）；web serve 装配 agent-loop 后**以 host.prompt 重建**
+     ——保证 standing scoped 贡献落进 loop 实际组装的注册面（否则挂进另一个
+     SystemPrompt，永不生效，就是悄悄降级）。
+  3. select 处理：解析 preset（P1-b 发现）→ 读并 parse 组合 → mount（换代幂等）→
+     会话→agent（懒装配会话先 ensure；完全未知会话 fail loud）→ `join_standing` →
+     `{agentPreset}`。错误信封：`agent-preset-not-found` / `agent-preset-broken` /
+     `agent-preset-unsupported`（无 loop/无会话），全部显式，不假装切换。
+- 验收：E2E `rpc_agent_preset_select_joins_standing_into_loop_assembly`（注入 temp
+  根，自含标记文本）——未 select 无标记 → select code 后 assemble 含 CODE 标记 →
+  重选 standard rebind 后含 STANDARD（不含 CODE）→ 未知 not-found → 不可解析组合
+  broken；宿主 `join_standing_links_scope_and_rebounds`（链上/rebind/未知 fail
+  loud）；dsh-cli **160/160** 全绿；clippy `-D warnings` 零告警；既有
+  `rpc_agent_presets_list_read_real_discovery` 的 select 门（无 loop → unsupported）
+  不变仍绿。
+- **已知未接（诚实列表）**：桥面行（shell/fs/editor/web/skill 等）仍是 P3——
+  persona 是唯一真实贡献，其余活化叶行 guarded；C-04 的 default 初始选择未隐式 join
+  （settings default 只标 isDefault）；live 服务二进制需重建才有 E-03 真机验收
+  （P4 段后随重启）；C 段（组合权威开进 dsh-core、isolate/事件/fiber）未动。
+- **回滚**：`git revert` P4-core 提交——撤销 host.join_standing/Boot.standings/select
+  接线；P2/P1 均已独立提交可保留。
+
 
 

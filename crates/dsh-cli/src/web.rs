@@ -264,6 +264,11 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
             M6_SERVE_TICK_INTERVAL_MS
         );
         boot.agent_loop = Some(bundle.host.clone());
+        // P4：standing 注册表改用 **host 的 SystemPrompt**（standings 默认是占位），
+        // 使 standing scoped 贡献落进 loop 每 turn 实际组装的注册面。
+        boot.standings = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::standing::StandingRegistry::new(bundle.host.prompt.clone()),
+        ));
         // M6 step8（D-087）：真实 provider catalog 视图注入 Boot（llm.models caps）。
         boot.agent_catalog = Some(crate::m6_llm::server_catalog_view(&base_url, &model));
         tick_schedule = Some(bundle.schedule.clone());
@@ -2795,14 +2800,98 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             }})
         }
         "agentPreset.select" => {
-            let preset = payload.get("agentPreset").and_then(|v| v.as_str()).unwrap_or("");
-            // P1：join standing 是 P2（mount+guard）；未落地前显式拒绝，不假装切换（诚实）。
-            serde_json::json!({"ok": false, "error": {
-                "code": "agent-preset-unsupported",
-                "message": format!(
-                    "agentPreset.select ({preset}): joining a standing mount lands in P2, not implemented yet"
-                ),
-            }})
+            // P4（直通 accept）：解析 preset → 挂载 standing（换代幂等）→ 该会话
+            // agent 的 scope join/rebind 到 standing scope → **下一 turn 的 assemble
+            // 即含 preset 视图**（loop 每 turn 以 `AssembleContext{scope: agent.scope}`
+            // 组装、走 scope 父链）。无 Rust agent-loop → 诚实拒绝（不假装切换）。
+            // 错误信封沿用 wire：`{ok:false, error:{code,message}}`。
+            let preset = payload
+                .get("agentPreset")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let session = payload
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let err = |code: &str, message: String| {
+                serde_json::json!({"ok": false, "error": {
+                    "code": code, "message": message,
+                }})
+            };
+            let host = match &boot.agent_loop {
+                Some(h) => h.clone(),
+                None => {
+                    return err(
+                        "agent-preset-unsupported",
+                        "agentPreset.select needs a Rust agent loop to join a standing (no boot.agent_loop)".into(),
+                    )
+                }
+            };
+            // 解析 preset（P1-b 发现；缺字段省略 not-found）。
+            let entry = match boot.presets.borrow().find(&preset) {
+                Some(e) => e,
+                None => {
+                    return err(
+                        "agent-preset-not-found",
+                        format!("no preset \"{preset}\" in the roster"),
+                    )
+                }
+            };
+            let content = match std::fs::read_to_string(&entry.path) {
+                Ok(c) => c,
+                Err(e) => {
+                    return err(
+                        "agent-preset-broken",
+                        format!("preset \"{preset}\": cannot read composition: {e}"),
+                    )
+                }
+            };
+            let rows = match dsh_agent_presets::parse::parse_composition(&content) {
+                Ok(r) => r,
+                Err(e) => {
+                    return err(
+                        "agent-preset-broken",
+                        format!("preset \"{preset}\": composition unparseable: {e}"),
+                    )
+                }
+            };
+            // 挂载 standing（换代幂等）+ 取 standing scope（守卫报告挂 reg.report）。
+            let standing_scope = {
+                let mut reg = boot.standings.borrow_mut();
+                if let Err(e) = reg.mount(&preset, &rows, &dsh_eval::process_facade()) {
+                    return err("agent-preset-broken", format!("preset \"{preset}\" mount: {e}"));
+                }
+                match reg.scope_of(&preset) {
+                    Some(s) => s.clone(),
+                    None => unreachable!("just-mounted preset must have a scope"),
+                }
+            };
+            // 会话 → agent（懒装配会话先 ensure；完全未知会话 fail loud）。
+            if host.configured_for_session(&session).is_none() {
+                let sid = dsh_session::types::SessionId::from_raw(session.clone());
+                if host.store.get(&sid).is_none() {
+                    return err(
+                        "agent-preset-unsupported",
+                        format!("no session \"{session}\" to join a preset onto"),
+                    );
+                }
+                let _ = crate::ensure_session_agent(boot, &session, None);
+            }
+            let agent_id = match host.configured_for_session(&session) {
+                Some(c) => c.id,
+                None => {
+                    return err(
+                        "agent-preset-unsupported",
+                        format!("no agent maps to session \"{session}\""),
+                    )
+                }
+            };
+            if let Err(e) = host.join_standing(&agent_id, &standing_scope) {
+                return err("agent-preset-broken", format!("preset \"{preset}\" join: {e}"));
+            }
+            serde_json::json!({"ok": true, "value": {"agentPreset": preset, "agent": agent_id}})
         }
         "agentPreset.read" => {
             let preset = payload
@@ -3120,6 +3209,9 @@ mod tests {
             host_events: None,
             presets: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::preset_host::PresetHost::default(),
+            )),
+            standings: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::standing::StandingRegistry::default(),
             )),
         }
     }
@@ -4584,6 +4676,150 @@ mod tests {
         // openDocument 未知 → agent-preset-not-found。
         let res = call("agentPreset.openDocument", serde_json::json!({"agentPreset": "nope"}));
         assert_eq!(res["result"]["ok"], false);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// P4（直通 accept）：`agentPreset.select` 真实 join —— 解析 preset → 挂载
+    /// standing → 该会话 agent 的 scope join 到 standing → **下一 turn 的 assemble
+    /// 即含 preset 视图**（loop 每 turn 以 agent.scope 组装、走 scope 父链）。重选
+    /// = rebind 切换视图；未知 preset → not-found；不可解析组合 → broken。
+    #[test]
+    fn rpc_agent_preset_select_joins_standing_into_loop_assembly() {
+        use dsh_agent_loop::{AgentLoopConfig, AgentLoopHost, ConfiguredAgent};
+        use dsh_agent_presets::{PresetRoot, PresetTrust};
+        let mut boot = boot_with_sessions();
+        {
+            let mut sp = boot.settings.borrow_mut();
+            crate::preset_host::register_agent_presets_settings(&mut sp);
+        }
+        // 注入 temp 根：code/standard 各带一份 persona 组合（标记文本可断言）。
+        let base = std::env::temp_dir().join(format!("dsh-cli-presets-select-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sys = base.join("sys");
+        let usr = base.join("usr");
+        for (dir, id, meta, comp) in [
+            (
+                &sys,
+                "code",
+                "order: 1\n",
+                "- id: persona\n  name: '@deepseek-ai/dsh-persona'\n  config:\n    text: CODE-PERSONA-MARKER\n",
+            ),
+            (
+                &sys,
+                "standard",
+                "order: 2\n",
+                "- id: persona\n  name: '@deepseek-ai/dsh-persona'\n  config:\n    text: STANDARD-PERSONA-MARKER\n",
+            ),
+        ] {
+            let preset_dir = dir.join(id);
+            std::fs::create_dir_all(&preset_dir).unwrap();
+            std::fs::write(preset_dir.join("agent.cordis.yml"), comp).unwrap();
+            std::fs::write(preset_dir.join("preset.yml"), meta).unwrap();
+        }
+        // 一个真正坏的预设：组合根本不可解析（行缺 name → parse err → broken 门）。
+        let bad_dir = usr.join("malformed");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(bad_dir.join("agent.cordis.yml"), "- id: x\n").unwrap();
+        std::fs::write(bad_dir.join("preset.yml"), "").unwrap();
+        *boot.presets.borrow_mut() = crate::preset_host::PresetHost::with_user_root(
+            vec![
+                PresetRoot { path: sys.clone(), trust: PresetTrust::System },
+                PresetRoot { path: usr.clone(), trust: PresetTrust::User },
+            ],
+            Some(usr.clone()),
+        );
+
+        // 真实共享 store + "default" 会话 + host（空 llm/tools：select→join→assemble
+        // 不走 llm 流）。
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let config = AgentLoopConfig {
+            max_parallel_tool_calls: None,
+            agents: vec![ConfiguredAgent {
+                id: "a-main".into(),
+                provider: Some("mock".into()),
+                model: Some("mock-model".into()),
+                session_id: Some("default".into()),
+                max_tokens: None,
+                cwd: None,
+                resume_session_id: None,
+            }],
+        };
+        let loop_host = AgentLoopHost::with_store(
+            config,
+            std::rc::Rc::new(dsh_llm::LlmRuntime::new()),
+            std::rc::Rc::new(dsh_tools::ToolRegistry::new(dsh_tools::ToolExecutionMode::Native)),
+            session_host.store.clone(),
+        )
+        .unwrap();
+        loop_host.ensure_agent(&loop_host.config.agents[0]).unwrap();
+        boot.agent_loop = Some(loop_host.clone());
+        boot.standings = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::standing::StandingRegistry::new(loop_host.prompt.clone()),
+        ));
+
+        let call = |method: &str, payload: serde_json::Value| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": method, "payload": payload,
+            }))
+            .unwrap();
+            handle_rpc_host(&boot, method, &body, &session_host).1
+        };
+        let assemble_now = || {
+            let scope = loop_host.agent("a-main").unwrap().agent.scope.clone();
+            let a = loop_host
+                .prompt
+                .assemble(&dsh_system_prompt::AssembleContext { scope: Some(scope) })
+                .unwrap();
+            a.sections.into_iter().map(|s| s.text).collect::<Vec<_>>()
+        };
+
+        // 未 select：无任何 preset 标记。
+        let texts = assemble_now();
+        assert!(
+            !texts.iter().any(|t| t.contains("PERSONA-MARKER")),
+            "no preset joined yet: {texts:?}"
+        );
+        // select code → ok + join 后 assemble 含 CODE 标记。
+        let res = call(
+            "agentPreset.select",
+            serde_json::json!({"sessionId": "default", "agentPreset": "code"}),
+        );
+        assert_eq!(res["result"]["ok"], true, "select code: {res}");
+        assert_eq!(res["result"]["value"]["agentPreset"], "code");
+        let texts = assemble_now();
+        assert!(
+            texts.iter().any(|t| t.contains("CODE-PERSONA-MARKER")),
+            "joined agent sees code persona: {texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t.contains("STANDARD")));
+        // 重选 standard → rebind → 视图切换。
+        let res = call(
+            "agentPreset.select",
+            serde_json::json!({"sessionId": "default", "agentPreset": "standard"}),
+        );
+        assert_eq!(res["result"]["ok"], true, "select standard: {res}");
+        let texts = assemble_now();
+        assert!(
+            texts.iter().any(|t| t.contains("STANDARD-PERSONA-MARKER")),
+            "rebound agent sees standard persona: {texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t.contains("CODE")));
+        // 未知 preset → not-found。
+        let res = call(
+            "agentPreset.select",
+            serde_json::json!({"sessionId": "default", "agentPreset": "nope"}),
+        );
+        assert_eq!(res["result"]["ok"], false);
+        assert_eq!(res["result"]["error"]["code"], "agent-preset-not-found");
+        // 不可解析组合 → broken。
+        let res = call(
+            "agentPreset.select",
+            serde_json::json!({"sessionId": "default", "agentPreset": "malformed"}),
+        );
+        assert_eq!(res["result"]["ok"], false);
+        assert_eq!(res["result"]["error"]["code"], "agent-preset-broken");
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
