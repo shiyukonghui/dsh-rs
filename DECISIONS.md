@@ -3536,5 +3536,37 @@ headless）受益。
 
 ---
 
+## D-095（web 使用验证发现）：注册产品偏好 settings namespace（前端必读写）
+
+**日期**：2026（用户打开 dsh web 使用测试，进页面即报错）。
+**触发问题**：前端一进页面 `settings.mutate`（ns=`ui-onboarding`）即
+`settings-rejected: settings namespace "ui-onboarding" is not registered`。使用阶段（部署/
+维护）发现的真实集成缺口。
+**根因**：Web Boot 的 settings provider 只注册了 `llm` namespace；而宿主侧**产品偏好
+namespace 集从未注册**。TS Host 在 apiproxy 层注册完整产品偏好面（
+`deepseek-harness/packages/host/apiproxy/tests/api-proxy-config.spec.ts`：
+ui-onboarding{ welcomeNoticeVersion:string }、ui-theme{ preference:'light'|'dark'|'system' }
+、locale{ preference:'zh'|'en' }、ui-conversation{ busyEnter }、shell{ timeoutMs }、
+agent-loop{ maxParallelToolCalls }、permission{ defaultPreset } + base）。Rust 侧
+`agent-loop` 的 maxParallelToolCalls 只在 AgentLoop.Config 级校验（settings.rs），
+不注册 provider namespace；grep 确认无任何产品偏好注册点。
+**最终选择**：提取 `register_host_settings(sp)` 注册上述 7 个产品偏好 namespace，
+在 `boot()` 的 llm 注册块后调用；schema 逐字照搬 TS Host（union/with_default/required；
+`permission` 带 base `{defaultPreset:'read-only'}`）；`register` 幂等（同 ns 早退），
+对 AgentLoop/permission 等可能的注册方零冲突。
+**被否决**：只修 ui-onboarding 一个（下一进页面步骤大概率继续撞 ui-theme/locale/agent-loop
+——证据：TS Host 同测试段枚举整套）；放宽"未注册即拒"守卫（那是持久化安全边界，不弱化）。
+**TDD + 验收**：`register_host_settings_exposes_product_preference_namespaces`（红 = 线上
+真实 settings-rejected；绿 = 7 ns 全注册 + ui-onboarding/ui-theme mutate Ok + 未注册 ns
+仍被拒）；dsh-cli lib 全绿、clippy `-D warnings` 零告警。**服务重启后 HTTP 复现用户原场景**：
+`settings.mutate ui-onboarding {welcomeNoticeVersion:v7}` → `ok:true` revision 1；
+`settings.describe` 列出 llm + ui-onboarding/ui-theme/locale/ui-conversation/shell/
+agent-loop/permission 共 8 个。
+**回滚**：撤本提交；服务仍可用（仅前端偏好持久化回原报错）。
+**预期影响**：Web 前端进页面/设置流不再 settings-rejected；后续如再遇未注册 ns，按同法
+对照 TS Host 注册面补齐（本例已覆盖规范全集）。
+
+---
+
 
 

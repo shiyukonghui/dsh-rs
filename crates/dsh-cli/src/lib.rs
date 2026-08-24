@@ -225,6 +225,10 @@ pub fn boot(
             dsh_schema::Schema::secret(&dsh_schema::Schema::string()),
         );
         sp.register("llm", &dsh_schema::Schema::object(dict), None, dsh_settings::Applies::Restart);
+        // M3d+（D-095）：Web 前端产品偏好 namespace 集（ui-onboarding/ui-theme/locale/
+        // ui-conversation/shell/agent-loop/permission）——使用阶段发现前端必读写，
+        // 缺注册即 settings-rejected。
+        register_host_settings(&mut sp);
     }
 
     Ok(Boot {
@@ -244,6 +248,91 @@ pub fn boot(
         ))),
         projections: crate::web::assembled_projection_registry(),
     })
+}
+
+/// M3d+（D-095 使用验证发现）：注册宿主侧**产品偏好 namespace 集**——对齐 TS Host
+/// apiproxy 注册面（`deepseek-harness/packages/host/apiproxy/tests/api-proxy-config.spec.ts`
+/// 的 `serves product preference namespaces` 等用例）。web 前端会经 `settings.describe/
+/// update/replace/mutate` 读写这些 namespace（onboarding/主题/语言/会话/agent-loop/
+/// permission/shell）；此前只注册了 `llm`，前端一进页面就 `settings.mutate` 撞上
+/// `namespace … is not registered`（settings-rejected，使用测试阶段实测发现）。
+/// 全部 schema 照搬 TS Host；`register` 幂等（同名重复注册先行返回）。
+pub fn register_host_settings(sp: &mut dsh_settings::SettingsProvider) {
+    use dsh_schema::Schema;
+    let mut on = std::collections::HashMap::new();
+    on.insert("welcomeNoticeVersion".into(), Schema::string());
+    sp.register("ui-onboarding", &Schema::object(on), None, dsh_settings::Applies::Live);
+
+    let mut theme = std::collections::HashMap::new();
+    theme.insert(
+        "preference".into(),
+        Schema::with_default(
+            &Schema::union(vec![
+                Schema::const_value(serde_json::json!("light")),
+                Schema::const_value(serde_json::json!("dark")),
+                Schema::const_value(serde_json::json!("system")),
+            ]),
+            serde_json::json!("system"),
+        ),
+    );
+    sp.register("ui-theme", &Schema::object(theme), None, dsh_settings::Applies::Live);
+
+    let mut locale = std::collections::HashMap::new();
+    locale.insert(
+        "preference".into(),
+        Schema::union(vec![
+            Schema::const_value(serde_json::json!("zh")),
+            Schema::const_value(serde_json::json!("en")),
+        ]),
+    );
+    sp.register("locale", &Schema::object(locale), None, dsh_settings::Applies::Live);
+
+    let mut conversation = std::collections::HashMap::new();
+    conversation.insert(
+        "busyEnter".into(),
+        Schema::with_default(
+            &Schema::union(vec![
+                Schema::const_value(serde_json::json!("queue")),
+                Schema::const_value(serde_json::json!("steer")),
+            ]),
+            serde_json::json!("queue"),
+        ),
+    );
+    sp.register(
+        "ui-conversation",
+        &Schema::object(conversation),
+        None,
+        dsh_settings::Applies::Live,
+    );
+
+    let mut shell = std::collections::HashMap::new();
+    shell.insert(
+        "timeoutMs".into(),
+        Schema::with_default(&Schema::number(), serde_json::json!(120_000)),
+    );
+    sp.register("shell", &Schema::object(shell), None, dsh_settings::Applies::Live);
+
+    let mut agent_loop = std::collections::HashMap::new();
+    agent_loop.insert(
+        "maxParallelToolCalls".into(),
+        Schema::with_default(&Schema::number(), serde_json::json!(10)),
+    );
+    sp.register("agent-loop", &Schema::object(agent_loop), None, dsh_settings::Applies::Live);
+
+    let mut permission = std::collections::HashMap::new();
+    permission.insert(
+        "defaultPreset".into(),
+        Schema::required(&Schema::union(vec![
+            Schema::const_value(serde_json::json!("read-only")),
+            Schema::const_value(serde_json::json!("workspace-write")),
+        ])),
+    );
+    sp.register(
+        "permission",
+        &Schema::object(permission),
+        Some(serde_json::json!({"defaultPreset": "read-only"})),
+        dsh_settings::Applies::Live,
+    );
 }
 
 /// 读取 YAML 入口列表。
@@ -530,5 +619,52 @@ mod tests {
         assert!(merged.iter().any(|e| e.id == "extra"), "new id appended");
         // 未命中的 services 保留
         assert!(merged.iter().any(|e| e.id == "services" && e.config == json!({"services": ["sessions"]})));
+    }
+
+    /// D-095（使用验证发现）：`register_host_settings` 注册 Web 前端必读写产品偏好
+    /// namespace——此前只注册 `llm`，前端一进页面 `settings.mutate` 撞
+    /// `namespace "ui-onboarding" is not registered`（settings-rejected）。红 = 缺
+    /// 注册（NotRegistered）；绿 = 全套可读写（对齐 TS Host apiproxy 注册面）。
+    #[test]
+    fn register_host_settings_exposes_product_preference_namespaces() {
+        let mut sp = dsh_settings::SettingsProvider::memory();
+        crate::register_host_settings(&mut sp);
+
+        let names = sp
+            .describe_all()
+            .into_iter()
+            .map(|d| d.ns)
+            .collect::<Vec<_>>();
+        for want in ["ui-onboarding", "ui-theme", "locale", "ui-conversation", "shell", "agent-loop", "permission"] {
+            assert!(names.contains(&want.to_string()), "namespace {want} registered (got {names:?})");
+        }
+
+        // 前端 onboarding 的缺省读写路径：settings.mutate 写 welcomeNoticeVersion。
+        let v = sp
+            .mutate(
+                "ui-onboarding",
+                &serde_json::json!([{"op": "set", "path": ["welcomeNoticeVersion"], "value": "v1"}]),
+                None,
+            )
+            .expect("ui-onboarding mutate accepted (not settings-rejected)");
+        assert_eq!(
+            v.value["welcomeNoticeVersion"],
+            serde_json::json!("v1"),
+            "onboarding version persisted"
+        );
+        // ui-theme 同样可写（前端主题切换）。
+        let theme = sp
+            .mutate(
+                "ui-theme",
+                &serde_json::json!([{"op": "set", "path": ["preference"], "value": "dark"}]),
+                None,
+            )
+            .expect("ui-theme mutate accepted");
+        assert_eq!(theme.value["preference"], serde_json::json!("dark"));
+        // 未注册 namespace（如持久化侵入探测）仍被拒（守卫不被弱化）。
+        let err = sp
+            .mutate("ui-evil", &serde_json::json!([{"op":"set","path":["x"],"value":1}]), None)
+            .unwrap_err();
+        assert!(matches!(err, dsh_settings::SettingsError::NotRegistered(_)), "guard holds: {err:?}");
     }
 }
