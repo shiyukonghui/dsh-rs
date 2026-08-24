@@ -2873,9 +2873,15 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
                 }
             };
             // 挂载 standing（换代幂等）+ 取 standing scope（守卫报告挂 reg.report）。
+            // P3-c：base_dir = 组合所在目录（skill 目录解析用）。
             let standing_scope = {
                 let mut reg = boot.standings.borrow_mut();
-                if let Err(e) = reg.mount(&preset, &rows, &dsh_eval::process_facade()) {
+                if let Err(e) = reg.mount_at(
+                    &preset,
+                    &rows,
+                    entry.path.parent(),
+                    &dsh_eval::process_facade(),
+                ) {
                     return err("agent-preset-broken", format!("preset \"{preset}\" mount: {e}"));
                 }
                 match reg.scope_of(&preset) {

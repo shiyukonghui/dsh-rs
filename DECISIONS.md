@@ -4191,5 +4191,30 @@ dsh-agent-presets（P1-a 独立提交可保留）。
   broken；pwsh A 并行执行器；skill 最小只读；per-agent `{{cwd}}`（C 段）；C 段收敛未动。
 - **回滚**：`git revert` P5 提交——回退 copy/remove 实装与测试，其余阶段保留。
 
+### D-103 实施补记（P3-c：skill 最小只读目录桥——A-03 必须桥子集补齐，round 17）——决策 + 验收
+
+- 触发：A-03 必须桥子集（fs/terminals 已桥、planMode/compaction 属 loop 级置 C）仅剩
+  **skill = 最小只读**未落——`@deepseek-ai/dsh-skill-filesystem` 行仍落
+  tool_guard_reason「no Rust bridge yet」；cordis preset 自带
+  `skills/{editing-cordis-compositions, cordis-plugin-development}/SKILL.md`（真实资产）。
+- 关键事实（自下而上核实）：composition 注释明示「baseUrl = 组合所在目录；customSkillDirs
+  指向 `skills/`」→ skills 目录 = `<preset_dir>/skills/`；skill 文件在盘上（模型本可经 fs
+  工具 read）。A-03 授权「复用现有 directives 装载」。
+- 裁决：**skill = 目录段内容桥**（非加载器工具）——`mount` 新增 `mount_at(id, rows,
+  base_dir, process)`（`mount` 委托 base_dir=None，向后兼容）；skill 行以
+  `<base_dir>/skills/` 扫 `*/SKILL.md`，落 scoped 段 `preset:{id}:skills`（order 30：
+  各 skill 名 + 摘要行 + 绝对 SKILL.md 路径，模型用 fs read 即用）。空目录仍 bridged
+  （none found，诚实）；无 base_dir → guarded。`@deepseek-ai/dsh-tool-skill`（真加载器）→
+  guarded「minimal read-only … loader tool 需宿主 skill service（C）」。web select 改
+  `mount_at(entry.path.parent())`（真 base_dir）。
+- 验收：新测试 skill_catalog_bridge_via_preset_base_dir（目录桥+joined 视图摘要/路径、
+  空目录 none found、无 base_dir guarded——修复前行为=guarded「no Rust bridge yet」即红）
+  绿；guard 测试 +tool-skill 断言。standing **10/10**，dsh-cli **170/170** + agent-loop 1
+  （**171**）；clippy `-D warnings` 零告警；rustfmt 仅新 standing.rs。
+- **已知未接（诚实列表，对照 P5 收窄）**：planMode/compaction 行桥属 loop 级（C）；
+  web/tool-cordis/command-compact 保持 broken；pwsh A 并行执行器；skill 加载器工具
+  （host skill service，C）；per-agent `{{cwd}}`（C）；C 段收敛未动。
+- **回滚**：`git revert` P3-c 提交——回退 mount_at/skill 桥与测试，其余阶段保留。
+
 
 

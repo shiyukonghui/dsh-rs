@@ -32,6 +32,8 @@ use serde_json::Value;
 pub const PERSONA_ROW: &str = "@deepseek-ai/dsh-persona";
 /// agent-instructions 行名（P3-a 内容桥）。
 pub const INSTRUCTIONS_ROW: &str = "@deepseek-ai/dsh-agent-instructions";
+/// skill-filesystem 行名（P3-c 最小只读目录桥）。
+pub const SKILLS_ROW: &str = "@deepseek-ai/dsh-skill-filesystem";
 
 /// 挂载行审计报告（守卫面；诚实）。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -87,11 +89,23 @@ impl StandingRegistry {
         }
     }
     /// 挂载 preset：行审计 + 铸 standing scope + 桥贡献（persona / instructions /
-    /// 单工具行重呈现）。同 id 换代：先 unmount（撤销 scoped 贡献）再建新。
+    /// 单工具行重呈现 / skill 目录清单）。无 base_dir（占位/测试口）。
     pub fn mount(
         &mut self,
         id: &str,
         rows: &[CompositionRow],
+        process: &Value,
+    ) -> Result<(), String> {
+        self.mount_at(id, rows, None, process)
+    }
+
+    /// 挂载（带 base_dir）：skill 目录解析等需要「组合所在目录」的桥用此口。同 id
+    /// 换代：先 unmount（撤销 scoped 贡献）再建新。
+    pub fn mount_at(
+        &mut self,
+        id: &str,
+        rows: &[CompositionRow],
+        base_dir: Option<&std::path::Path>,
         process: &Value,
     ) -> Result<(), String> {
         if self.standings.contains_key(id) {
@@ -194,13 +208,90 @@ impl StandingRegistry {
                 .push(format!("@deepseek-ai/dsh-agent-instructions ({marker})"));
         }
 
+        // —— 内容桥：skill 最小只读（D-103/A-03：复用 directives 装载）——
+        //    `@deepseek-ai/dsh-skill-filesystem` 行解析 preset 自带 `skills/` 目录
+        //    （baseUrl = 组合所在目录，composition 注释即此语义），扫 SKILL.md 子目录，
+        //    落一个 scoped **目录段**（directives 风格：各 skill 名 + 摘要 + 绝对路径，
+        //    模型用 fs read 工具打开 SKILL.md 即用——无写、无加载器工具，诚实）。
+        for row in leaves.iter().filter(|r| r.name == SKILLS_ROW) {
+            let Some(dir) = base_dir else {
+                report.guarded.push((
+                    row.name.clone(),
+                    "no base dir — skill catalog cannot resolve (P3-c)".to_string(),
+                ));
+                continue;
+            };
+            let skills_dir = dir.join("skills");
+            let mut catalog: Vec<(String, String)> = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&skills_dir) {
+                for entry in rd.flatten() {
+                    let Ok(ft) = entry.file_type() else {
+                        continue;
+                    };
+                    if !ft.is_dir() {
+                        continue;
+                    }
+                    let id = entry.file_name().to_string_lossy().into_owned();
+                    let md = entry.path().join("SKILL.md");
+                    let summary = std::fs::read_to_string(&md).ok().map(|text| {
+                        text.lines()
+                            .find(|l| {
+                                let t = l.trim();
+                                !t.is_empty() && !t.starts_with('#') && !t.starts_with("---")
+                            })
+                            .map(|l| l.trim().chars().take(120).collect::<String>())
+                            .unwrap_or_default()
+                    });
+                    catalog.push((id, summary.unwrap_or_default()));
+                }
+            }
+            catalog.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut catalog_text = String::new();
+            if catalog.is_empty() {
+                catalog_text = format!("(no SKILL.md files under {})", skills_dir.display());
+            } else {
+                catalog_text.push_str("## Skills in this agent preset\n");
+                for (id, summary) in &catalog {
+                    let when = if summary.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {summary}")
+                    };
+                    catalog_text.push_str(&format!(
+                        "- `{id}`{when} — read `{}/skills/{id}/SKILL.md` with the read tool to load it\n",
+                        dir.display()
+                    ));
+                }
+            }
+            let section = PromptSection {
+                name: format!("preset:{id}:skills"),
+                order: 30.0,
+                text: PromptSectionText::Static(catalog_text),
+                complete: false,
+            };
+            let undo = self
+                .system_prompt
+                .section(Some(&scope), &section)
+                .map_err(|e| format!("preset {id}: skills section: {e}"))?;
+            undos.push(undo);
+            let ids: Vec<&str> = catalog.iter().map(|(i, _)| i.as_str()).collect();
+            report.bridged.push(format!(
+                "@deepseek-ai/dsh-skill-filesystem (skill catalog: {}; minimal read-only per A-03)",
+                if ids.is_empty() {
+                    "none found".to_string()
+                } else {
+                    ids.join(", ")
+                }
+            ));
+        }
+
         // —— 工具行桥：单工具行按行 config 重呈现（description/timeoutMs）注册进
         //    standing scope（joined agent 的 schemas 走链即见）；**多工具组行**解析
         //    宿主工具集——单工作区宿主下 standing 链本就从全局基继承工具，故组行为
         //    「解析确认」而非逐工具重呈现（诚实标注 single-workspace）。
         for row in leaves
             .iter()
-            .filter(|r| r.name != PERSONA_ROW && r.name != INSTRUCTIONS_ROW)
+            .filter(|r| r.name != PERSONA_ROW && r.name != INSTRUCTIONS_ROW && r.name != SKILLS_ROW)
         {
             let Some(home) = self.tools.as_ref() else {
                 report.guarded.push((
@@ -418,6 +509,9 @@ fn tool_guard_reason(row: &CompositionRow) -> String {
     let n = row.name.as_str();
     if is_pwsh_family(row) || n.contains("pwsh") {
         "no host pwsh executor (D-103 A-parallel lands in P3)".to_string()
+    } else if n.contains("tool-skill") {
+        "minimal read-only per A-03: SKILL.md files are readable via fs tools; a skill loader tool needs the host skill service (C)"
+            .to_string()
     } else if n.contains("tool-cordis") || n.contains("command-compact") || n.contains("web") {
         "broken per D-103 (unbridged surface)".to_string()
     } else {
@@ -782,6 +876,8 @@ mod tests {
   name: '@deepseek-ai/dsh-fs-local'
 - id: web
   name: '@deepseek-ai/dsh-tool-web-fetch'
+- id: tskill
+  name: '@deepseek-ai/dsh-tool-skill'
 ";
         // 无门控行 + linux 门面（win32-B 会让 pwsh 进 disabled，故用 linux 让所有
         // 无门控行都活化 → 走守卫）。
@@ -816,6 +912,10 @@ mod tests {
         assert!(
             reason_of("@deepseek-ai/dsh-tool-web-fetch").contains("broken per D-103"),
             "web broken reason"
+        );
+        assert!(
+            reason_of("@deepseek-ai/dsh-tool-skill").contains("minimal read-only per A-03"),
+            "tool-skill minimal-readonly reason"
         );
     }
 
@@ -965,5 +1065,90 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&cwd);
         let _ = std::fs::remove_dir_all(&cwd2);
+    }
+
+    /// —— P3-c —— skill 最小只读目录桥（D-103/A-03）：`@deepseek-ai/dsh-skill-filesystem`
+    /// 行经 base_dir 解析 `<dir>/skills/*/SKILL.md` → scoped 目录段（joined 视图见
+    /// 摘要 + 绝对路径）；无 base_dir → guarded；空目录 → 仍 bridged（诚实 none found）。
+    /// 修复前该行落 tool_guard_reason「no Rust bridge yet」= 红。
+    #[test]
+    fn skill_catalog_bridge_via_preset_base_dir() {
+        let sp = new_sp();
+        let mut reg = StandingRegistry::new(sp.clone(), None);
+        let base = std::env::temp_dir().join(format!("dsh-standing-skills-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("skills/editing-cordis-compositions")).unwrap();
+        std::fs::create_dir_all(base.join("skills/cordis-plugin-development")).unwrap();
+        std::fs::write(
+            base.join("skills/editing-cordis-compositions/SKILL.md"),
+            "# Editing Cordis\nLoad this before authoring.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("skills/cordis-plugin-development/SKILL.md"),
+            "# Cordis Plugin Dev\n",
+        )
+        .unwrap();
+        let proc: Value =
+            serde_json::from_str(r#"{"platform":"linux","env":{},"cwd":"/repo"}"#).unwrap();
+        let comp = "- id: skillfs\n  name: '@deepseek-ai/dsh-skill-filesystem'\n";
+        let rows = dsh_agent_presets::parse::parse_composition(comp).unwrap();
+
+        // base_dir 存在 → 目录桥 + joined 视图见摘要与路径。
+        reg.mount_at("p7", &rows, Some(&base), &proc).unwrap();
+        let r = reg.report("p7").unwrap();
+        assert!(
+            r.bridged.iter().any(|s| s.starts_with(
+                "@deepseek-ai/dsh-skill-filesystem (skill catalog: cordis-plugin-development, editing-cordis-compositions"
+            )),
+            "skill catalog bridged (sorted): {:?}",
+            r.bridged
+        );
+        let joined = ScopeKey::new();
+        reg.join("p7", &joined).unwrap();
+        let texts = sect_texts(&sp, &joined);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("editing-cordis-compositions")
+                    && t.contains("Load this before authoring")
+                    && t.contains("SKILL.md")),
+            "catalog summary + read path inline: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("cordis-plugin-development")),
+            "second skill listed"
+        );
+
+        // 空 skills 目录 → 仍 bridged（none found，诚实不假装有目录）。
+        let empty =
+            std::env::temp_dir().join(format!("dsh-standing-skills-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        reg.mount_at("p8", &rows, Some(&empty), &proc).unwrap();
+        let r8 = reg.report("p8").unwrap();
+        assert!(
+            r8.bridged
+                .iter()
+                .any(|s| s
+                    .starts_with("@deepseek-ai/dsh-skill-filesystem (skill catalog: none found")),
+            "empty catalog still bridged: {:?}",
+            r8.bridged
+        );
+
+        // 无 base_dir（占位口）→ guarded（诚实，不假装解析）。
+        reg.mount("p9", &rows, &proc).unwrap();
+        let r9 = reg.report("p9").unwrap();
+        assert!(
+            r9.guarded.iter().any(|(n, why)| {
+                n == "@deepseek-ai/dsh-skill-filesystem" && why.contains("no base dir")
+            }),
+            "no-base-dir guarded: {:?}",
+            r9.guarded
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 }
