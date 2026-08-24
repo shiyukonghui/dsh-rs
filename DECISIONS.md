@@ -3869,5 +3869,47 @@ store 中**已存在**会话生效（重启恢复），未知 id 仍 fail loud�
 
 ---
 
+## D-102（preset 组合路径 B 的前置资产）：内置 agent 预设「复制自持 + 忠实转译」落地
+
+**日期**：2026（延续 D-101 之后的分析轮：用户拍板 preset 组合决策 **A = 复制 vendored
+预设进 Rust 项目自持**、并明示「先产出问题清单文档供深入分析、再定稿分阶段规划」；
+spike-4 结论：`!!js`→`__jsExpr`/`disabled_expr` 转译机械可做、共 12 处仅 3 种语法形态。）
+
+**第一性原理（自上而下 + 自下而上）**：
+- 自上而下：组合要「真实改变会话行为（直通 P4）」，第一步必须是**自持的可装载预设资产**——
+  与 vendored 参考树断开、不依赖其运行；TS 特有的 `!!js` YAML 标签在 Rust 有既定替代
+  （loader `disabled_expr` 字段 + `dsh_eval::interpolate` 的 `{"__jsExpr": expr}` 节点），
+  故复制必须是**语义忠实**而非求值落值。
+- 自下而上（现有实现）：`EntryOptions.disabled_expr: Option<String>`（entry.rs:25-28）、
+  include.rs:6 注明 `{"__jsExpr": "..."}` 约定、`dsh-eval::interpolate`（lib.rs:522）递归替换
+  `__jsExpr` 节点——三条约定都已在位；4 个 vendored 预设 `!!js` 恰好 12 处、只 3 种形态
+  （`disabled:` 行 10×、config 值 `cwd:` 1×、config 数组项 skills 1×）。
+
+**考虑过的选项**：
+1. **忠实语法转译 + 自持资源 + 可复跑工具（采用）**：`!!js` 只做键约定转译
+   （`disabled: !!js X`→`disabled_expr: "X"`；配置值/数组项→`{"__jsExpr": "X"}`），
+   preset.yml 字节级复制；落 `resources/agent-presets/<id>/`；`tools/translate-agent-presets.ps1`
+   可复跑、`tools/verify-agent-presets.py` 结构校验。
+2. 复制期静态求值落字面值（如 `cwd` 直接写死绝对路径）——不忠实，破坏 `DSH_CWD` 语义且
+   与生态约定脱钩，否决。
+3. 顺带做 win32 能力改写（bash/pwsh 按 Rust 能力矩阵重写）——属 §6.1-2 的 A/B 决策范畴，
+   留待用户拍板，不在此混入，否决（记录为已知限制）。
+
+**最终选择**：选项 1。语法转译不改变语义；行级文本替换保证可审计；脚本可复跑供扩展
+（用户自定义 preset 走同样转译）。
+
+**TDD + 验收**：`yaml.safe_load` ×4（顶层数组、结构完好）+ 节点计数精确（code 2、cordis 3、
+minimal 5、standard 2 = **12/12**）；转译前后 `disabled` 门控表达式逐字不变。过程中先修掉
+「PowerShell 5.1 读无 BOM 的 UTF-8 脚本把中文注释误按 GBK 解析」的环境坑（脚本改纯 ASCII）。
+
+**已知限制（如实）**：① minimal 的 `cwd: {__jsExpr: process.env.DSH_CWD ?? process.cwd()}`
+与 cordis 的 skills `new URL('skills/', baseUrl)` 之一的求值**超出当前 dsh-eval 作用域**
+（`eval_scope` 无 `process`、`env` 空、无 `baseUrl`/URL 语义）→ 相关行在 P1 装载期将
+fail-loud，直到 spike-6（`process` 门面）/后续 baseUrl 注入落地；② win32 shell A/B
+（§6.1-2）待用户拍板，**本转译未改门控语义**；③ 此资产尚未接线（P1 发现/解析消费）。
+
+**回滚**：`git revert` 本提交即可——删除 `resources/agent-presets/` 与 `tools/*` 两个脚本，
+其余 crate/服务不受影响（未接线）。
+
 
 
