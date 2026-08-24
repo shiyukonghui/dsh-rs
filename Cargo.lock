@@ -667,6 +667,7 @@ version = "0.1.0"
 dependencies = [
  "dsh-core",
  "dsh-loader",
+ "dsh-session",
  "serde",
  "serde_json",
  "tokio",
