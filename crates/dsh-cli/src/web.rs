@@ -206,6 +206,11 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
     // seed `default`（前端会话入口）。
     let _ = host.session("default");
 
+    // M3a+（D-096）：装配原生目录选择器（`host.pickDirectory`）。Windows 桌面经
+    // FolderBrowserDialog 弹系统目录框；无桌面/失败 → wire `directory-picker-unavailable`
+    // （诚实，不冒充取消）。测试 Boot 不装配（None）→ 同一错误路径，由 stub 测试覆盖。
+    boot.host_picker = Some(Rc::new(crate::host_picker::pick_directory_native));
+
     // M6（step3，D-083）：serve 主循环 tick 上下文（enable_agent_loop 装配时填充）。
     // 主循环 `recv_timeout` 自驱节拍——每 tick 间隔刺探请求（有则派发），超时（无请求）
     // 则纯推进：主线程 `m5g_tick_once`（调度到期 + jobs 合作泵）。推进点唯一收敛到
@@ -2108,8 +2113,27 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             serde_json::json!({"ok": true, "value": value})
         }
         "host.pickDirectory" => {
-            // M3a：无 native dialog 的诚实降级——`{path:null}` 对齐「用户取消」语义。
-            serde_json::json!({"ok": true, "value": {"path": null}})
+            // M3a+（D-096）：真实现——原生选择器（Windows）→ 选中路径；取消 → {path:null}
+            // （对齐 TS seam「native 下取消为 null」）；未装配/失败 → 诚实
+            // `directory-picker-unavailable`（修复前这里退化返回 {path:null}，前端无弹窗）。
+            let picked = match &boot.host_picker {
+                Some(pick) => match pick() {
+                    Ok(path) => path,
+                    Err(msg) => {
+                        return serde_json::json!({"ok": false, "error": {
+                            "code": "directory-picker-unavailable",
+                            "message": msg,
+                        }});
+                    }
+                },
+                None => {
+                    return serde_json::json!({"ok": false, "error": {
+                        "code": "directory-picker-unavailable",
+                        "message": "native directory picker is not assembled",
+                    }});
+                }
+            };
+            serde_json::json!({"ok": true, "value": {"path": picked}})
         }
         "host.listDirectory" => {
             // M3a：真实 fs 列目录（browse capability；默认列 home）。
@@ -2646,6 +2670,7 @@ mod tests {
                 dsh_goal::GoalService::new(dsh_goal::ServiceOptions::default()),
             )),
             projections: assembled_projection_registry(),
+            host_picker: None,
         }
     }
 
@@ -3037,7 +3062,8 @@ mod tests {
         let cases2: &[(&str, &str, &str)] = &[
             ("session.attachment", "attachment", "obj"),
             ("session.updateQueue", "accepted", "bool"),
-            ("host.pickDirectory", "path", "null"),
+            // host.pickDirectory 移出 ok-冒烟：行为由专用 seam 测试覆盖
+            // （未装配 → directory-picker-unavailable，非 {path:null} 冒充取消，D-096）。
             ("host.listDirectory", "entries", "arr"),
             // M3a：host.createDirectory/host.openPath 已做实，空 payload 不再是
             // 合法 ok 响应（create 需 path+name、openPath 需 path）→ 由专用测试覆盖。
@@ -3083,6 +3109,50 @@ mod tests {
                 _ => assert_eq!(val[*key], Value::Null, "{m}.{key} absent"),
             }
         }
+    }
+
+    /// M3a+（D-096）：`host.pickDirectory` 三态 wire（native seam 经注入 stub 可测；
+    /// 不触发真实弹框）。选中→{path}；取消→{path:null}；失败/未装配→
+    /// `directory-picker-unavailable`（**不再**拿 null 冒充取消——修复前的降级行为）。
+    #[test]
+    fn rpc_host_pick_directory_seam_three_state() {
+        use std::rc::Rc;
+
+        fn call(boot: &crate::Boot) -> Value {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": "host.pickDirectory",
+                "payload": {},
+            })).unwrap();
+            let (_, v) = handle_rpc_host(boot, "host.pickDirectory", &body, &SessionHost::in_memory());
+            v
+        }
+
+        // 选中。
+        let mut b = boot_with_sessions();
+        b.host_picker = Some(Rc::new(|| Ok(Some("C:\\selected".to_string()))));
+        let v = call(&b);
+        assert_eq!(v["result"]["ok"], true);
+        assert_eq!(v["result"]["value"]["path"], "C:\\selected");
+
+        // 取消 → null（合法语义，不是错误）。
+        let mut b = boot_with_sessions();
+        b.host_picker = Some(Rc::new(|| Ok(None)));
+        let v = call(&b);
+        assert_eq!(v["result"]["ok"], true);
+        assert!(v["result"]["value"]["path"].is_null());
+
+        // 原生不可用 → 诚实错误（修复前这里是 {path:null}，前端无弹窗）。
+        let mut b = boot_with_sessions();
+        b.host_picker = Some(Rc::new(|| Err("no desktop session".to_string())));
+        let v = call(&b);
+        assert_eq!(v["result"]["ok"], false);
+        assert_eq!(v["result"]["error"]["code"], "directory-picker-unavailable");
+
+        // 未装配（默认 Boot）→ 同一错误，绝不返回 null 冒充取消。
+        let b = boot_with_sessions();
+        let v = call(&b);
+        assert_eq!(v["result"]["ok"], false);
+        assert_eq!(v["result"]["error"]["code"], "directory-picker-unavailable");
     }
 
     /// 阶段2：session.prompt 驱动 turn 后 accepted:true，且 session 事件增长。

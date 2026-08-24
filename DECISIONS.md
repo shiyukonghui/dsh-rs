@@ -3568,5 +3568,37 @@ agent-loop/permission 共 8 个。
 
 ---
 
+## D-096（web 使用验证发现）：`host.pickDirectory` 真实现（原生目录选择器）
+
+**日期**：2026（用户点「打开工作区」无弹窗）。
+**触发问题**：前端调 `host.pickDirectory`，响应 `{ok:true, value:{path:null}}` 但无目录
+选择框。修复前该 RPC 是诚实降级占位（`{path:null}` 对齐「用户取消」语义），前端据此认为
+用户取消 → 无任何交互。
+**语义梳理（TS seam）**：`host.pickDirectory` 属 **native** 能力——打开原生选择器、选中
+返回路径、**取消才为 null**；非组合能力的方法应报 `directory-picker-unavailable`。用 null
+冒充「不可用」是错的（不可达 vs 取消在客户端语义不同）。TS Windows 实现是 IFileDialog/COM
+后台 worker；Linux 是 zenity/kdialog。
+**最终选择**：真实现 tri-state——`crates/dsh-cli/src/host_picker.rs`：
+`powershell.exe -STA` + `System.Windows.Forms.FolderBrowserDialog` 弹系统目录框
+（Win10/11 桌面稳定；务实等价，非 IFileDialog 现代外观）。三态：
+`Ok(Some(path))` 选中 / `Ok(None)` 取消（wire `{path:null}`）/ `Err` 失败
+（wire `directory-picker-unavailable`，**绝不**冒充取消）。装配经 `Boot.host_picker`
+接缝（`serve()` 注入真实现；测试注入 stub 不弹框）；未装配（None）→ 同一错误。
+
+**被否决**：① 保持 null 退化（不可用≠取消，客户 端语义错）；② 直接改前端用 browse 流程
+（`host.listDirectory` 已实现，但前端 native 流程已挂载、browse 需运行时重组，动前端装配
+面大且非重启即得）；③ 在 Rust 内进程内做 Win32 COM IFileDialog（工作量大，成本/收益不成
+比例——记录为后续改进，见「预期影响」）。
+**TDD + 验收**：`host_picker::` 单测 3 项（interpret：选中/取消/失败；不触发真实弹框）；
+`rpc_host_pick_directory_seam_three_state`（注入 stub：选中 path/取消 null/失败与未装配
+均 `directory-picker-unavailable`）；`host.pickDirectory` 移出 ok-冒烟表（行为由专用测试
+覆盖）。dsh-cli lib 全绿、clippy `-D warnings` 零告警、新文件 rustfmt canonical。
+**回滚**：撤本提交。
+**预期影响**：点「打开工作区」弹出真实系统目录选择框（选中/取消正确 wire）；后续可把
+powershell FolderBrowserDialog 升级为 IFileDialog 现代对话框（同一 HostPicker 接缝，零
+业务改动）。
+
+---
+
 
 
