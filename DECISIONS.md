@@ -3434,5 +3434,36 @@ workspace 全量 test 绿 + clippy `-D warnings` 零告警 + check 绿。
 
 ---
 
+## M6W-ACCEPTANCE（SQLite 接入 dsh web 验收）
+
+**需求→设计→编码→测试→部署链**：M6W-REQUIREMENTS（阶段①，A1–A6 验收）→
+M6W-DESIGN（阶段②，组件/路径/测试矩阵/部署回滚）→ D-091 契约修正 + D-092 实现
+（阶段③④，TDD 红→绿）→ 本验收（阶段⑤）。
+**越级处理记录**：需求分析双视角发现 seam 文档「拒绝」与 JSONL 实际（原子覆盖）不符、
+D-091 重复拒绝会破坏 SessionHost 恢复回灌游标——**显式回到早期工件修正**（sqlite.rs
+materialize → create-or-replace + seam.rs 措辞 + D-091 测试改向），非当前阶段打补丁。
+**交付**：`--sqlite-store <file>`（main.rs 解析 → WebConfig.sqlite_store）；serve
+`session_host_for` 优先级 sqlite > jsonl > 内存 + 冲突 `eprintln!` 显式警告（fail-loud，
+绝不清零）；`SessionHost::with_sqlite(path)->Result`（父目录 create_dir_all、open
+fail-loud、观察者单一来源 `new_from_backend`、restore_all）；诊断 `persistence_kind()`。
+**验证证据**：
+- A1/A2：`with_sqlite` 落盘 → 冷重启同文件 → 恢复快照（7 事件含 end-seed）；恢复后
+  adopt → seq 12 连续（无游标错位，materialize 幂等回灌成立）。
+- A3：sqlite+jsonl 同给 → sqlite 生效（写落 sqlite 文件、jsonl 根零 artifact）；仅
+  jsonl → "jsonl"；仅内存 → "mem"。
+- A4：sqlite materialize create-or-replace 幂等覆盖（header+事件替换，非 Err）+ seq 缺口
+  仍 reject。
+- 回归：dsh-persistence 14 测绿、dsh-cli session_host 15 测绿、workspace 全量 test 零失败、
+  clippy `-D warnings` 零告警、check 绿、新代码 rustfmt canonical（既有 fmt 漂移为基线，
+  未越权重排无关文件——如实归档）。
+- 部署探针：`dsh web --sqlite-store <file> <cfg>` 参数解析被接受（非 unknown-arg），随后
+  进 boot（缺 config 失败为预期——与 JSONL 同路径）。
+**部署**：`dsh web <cordis.yml> [--agent-loop …] --sqlite-store <file>`；单文件便于备份。
+**回滚**：撤 D-091 改 + D-092 提交即回 JSONL/内存；删 db 回全新存储；事务无 torn。
+**结论**：SQLite 接入 dsh web 完整功能开发达成，各阶段工件可验收、决策链
+D-089→D-092 与提交 `2e23c85`/`1655cdc` 互查。
+
+---
+
 
 
