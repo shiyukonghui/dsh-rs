@@ -3342,5 +3342,40 @@ GATED-SMOKE-SKIP（诚实记录，不伪造、不失败）。用户设 key 后�
 
 ---
 
+## D-091（step10 复活·SQLite 后端）：PersistenceBackend 缝上的 SQLite 落盘/回读
+
+**日期**：2026（M6 后续轮，用户裁定复活 D-089 范围外项 + M5R 项5「Q6 裁决：M5 用 JSONL 过渡」）。
+**触发问题**：SQLite backlog 落地——M6-REQ step10「SQLite 落盘/回读（持久化面）」。既有
+JSONL 后端 + `PersistenceCoordinator`（`SessionPersistence` seam 消费 `PersistenceBackend`）。
+**依赖引入评估（方法论四）**：rusqlite 0.40.2（`bundled`，内编 SQLite3）——成熟/活跃/MIT-
+Apache-2.0、栈（Rust）契合、`bundled` 免系统 sqlite 依赖；网络经 rsproxy 镜像可用（离线缓存
+原无 rusqlite → 显式拉取成功，非静默绕过）。
+**自下而上实测定案**：
+- rusqlite 0.40 `transaction(&mut self)` → `PersistenceBackend` 仅 `&self` → 单线程纪律
+  （D-006）下 `RefCell<Connection>` 内部可变性（与 coordinator 持有 backend 的方式一致）。
+- `SessionEvent` 有完整 serde（type/seq/time/data/surfaceOp/sourceEventSeqs/ignorable）→
+  事件以 full-JSON 落盘至 `events(id, seq, json)`；`SessionHeader` camelCase serde → `sessions
+  (id, header, revision)`。surface 字段保真（访问器 `surface_op()/source_event_seqs()`）。
+- revision = 会话写入计数 `sqlite:<path>:<rev>`（写入间变更即可被观察）。
+- **事务原子 → 无 torn 尾**：与 JSONL 物理 torn 语义差异如实记录（后端按契约返回
+  `torn:false` + `truncate_offset:None`）；`commit_repair` 的 torn_offset 以 **seq 阈**表达
+  截断面（JSONL 是字节偏移——差异如实记录，不假装等价）。
+**实现**：`crates/dsh-persistence/src/sqlite.rs`（`SqliteBackend: PersistenceBackend`：
+locate/supports_raw=false/read_raw=None/load_stored/read_stored_revision/append_batch
+（续接校验+未物化兜底）/materialize_batch（重复拒绝）/commit_repair/list_snapshots）+ lib.rs
+模块导出 + rusqlite(bundled) 依赖。
+**红测（绿，7 测）**：materialize+append+load 往返（header/事件/kinds/seq/torn=false/locate/
+raw 契约/list_snapshots）；**跨 reopen 持久**（真实文件落盘/回读）；重复 materialize + seq 缺口
+fail-loud；revision 写入间变更；commit_repair 截断+closing；**surface 字段保真**；coordinator
+无缝（create/append/load/read_from/list）。红=SqliteBackend::open 缺失（E0599）。
+**诚实边界**：SessionHost/`dsh web` 的 SQLite 接线未做（`SessionHost::with_root` 走 JSONL；
+后端已与 `SessionPersistence` seam 即插兼容，web 接线是后续集成面——记录不静默）；torn/revision
+语义与 JSONL 的差异如实记录。
+**证据**：dsh-persistence 全测绿（JSONL 既有面零回归）+ clippy `-D warnings` 零告警 +
+workspace check 绿。回滚 = 撤本提交（含 Cargo.lock）。
+**待办**：M6-ACCEPTANCE 复跑（含真实 API 冒烟 GATED-SMOKE-OK 证据 + 17 场景差分）。
+
+---
+
 
 

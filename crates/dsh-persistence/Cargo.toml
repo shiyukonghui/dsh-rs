@@ -9,6 +9,7 @@ description = "M1d (dsh-persistence)：SessionPersistence seam + format/zstd/jso
 [dependencies]
 dsh-brand = { path = "../dsh-brand" }
 dsh-session = { path = "../dsh-session" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zstd = "0.13.3"

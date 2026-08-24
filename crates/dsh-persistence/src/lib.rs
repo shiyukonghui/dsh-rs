@@ -10,6 +10,7 @@ pub mod fs_atomic;
 pub mod import;
 pub mod jsonl;
 pub mod seam;
+pub mod sqlite;
 pub mod write_behind;
 pub mod zstd;
 
@@ -19,5 +20,6 @@ pub use fs_atomic::*;
 pub use import::*;
 pub use jsonl::*;
 pub use seam::*;
+pub use sqlite::*;
 pub use write_behind::*;
 pub use zstd::*;
