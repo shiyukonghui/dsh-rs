@@ -20,6 +20,8 @@ members = [
   # M5 执行引擎与沙箱（PLAN §7 + M5-DESIGN.md §1）：subprocess/sandbox/fs/shell/terminal/code-runtime
   "crates/dsh-subprocess", "crates/dsh-sandbox", "crates/dsh-fs",
   "crates/dsh-shell", "crates/dsh-terminal", "crates/dsh-code-runtime",
+  # presets（B+C）：per-session agent preset 组合（发现/挂载/服务桥，路径 B）
+  "crates/dsh-agent-presets",
 ]
 
 [workspace.package]

@@ -560,6 +560,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-agent-presets"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
 name = "dsh-api"
 version = "0.1.0"
 dependencies = [
