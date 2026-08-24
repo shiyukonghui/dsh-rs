@@ -4132,5 +4132,36 @@ dsh-agent-presets（P1-a 独立提交可保留）。
   C 段未动。
 - **回滚**：`git revert` P3-b 提交——回退组行解析与后端行处理，P3-a 保留即可。
 
+### D-103 实施补记（P4 剩余/E-03：宿主运行时 prompt 变量——live 首红修复，round 16）——决策 + 验收
+
+- 触发：P1-P3 全部落地后重建 live 二进制做 E-03 真机验收——`session.create` +
+  `agentPreset.select{standard}` join 成功，但**首轮 turn fail-loud 即红**：
+  `unknown prompt variable "{{model}}" in section "preset:standard:persona:0";
+  registered variables: (none)`。守护机制如设计工作（组合被注入、失败大声），
+  缺口是**宿主运行时事实未喂给 prompt 模板**。
+- 关键事实（自下而上核实）：vendored personas（standard/code/cordis）明文引用
+  `{{model}}`/`{{cwd}}`（`agent.cordis.yml` 注释「resolve from the agent's own
+  route and workspace」）；`SystemPrompt` 的 `assemble()` 采样 layers 里的
+  `variables: VariableProvider`，`render_prompt()` 插值，未知变量 → Err；
+  而 `assemble_server_runtime_with_llm` 此前从未注册任何变量。
+- 裁决：**运行时变量归 host，不归 standing**（standing 只桥组合内容；变量是 host
+  运行环境事实）→ 在 `assemble_server_runtime_with_llm`（serve 与测试共用装配路径）
+  把 `model`（--llm-model）与 `cwd`（workspace-root）以 global layer `variable`
+  注册。`{{cwd}}` 对单工作区宿主 = workspace root（真实近似：预设注释所言 per-agent
+  route/workspace 在 C 段收敛前即此）。
+- 验收（TDD 红→绿）：新测试 `server_runtime_variables_interpolate_into_standard_
+  persona`（挂**真实** standard 预设 + join + render_prompt）先红复现 live 错误，
+  修后绿（渲染含 model 与 workspace root）。dsh-cli **166/166** + agent-loop 1（167）；
+  clippy `-D warnings` 零告警。
+- **live E-03 验收（真机）**：重建 + 重启 60165（key 仅环境变量注入，不入库）——
+  `agentPreset.list` 11 预设真实发现（含 A 决策的自定义 user presets）；select 后
+  prompt 首轮成功，assistant 以 standard persona 陈述身份并列出**全部桥接工具类目**
+  （文件/Shell/检索/终端/子代理/jobs/schedule/todo/图像）——组合真实改变会话行为 ✅。
+  对照修复前：同一 prompt 首轮 turn/end error 即亡。
+- **已知未接（诚实列表，P3-b 基础上收窄）**：web/tool-cordis/command-compact 保持
+  broken；`{{cwd}}` 为单工作区近似（per-agent route C 段）；service/skill 相关行未桥；
+  authoring RPC（copy/remove/P5）未做；C 段未动。
+- **回滚**：`git revert` E-03 提交——撤销 serve 变量注册与测试，其余阶段保留。
+
 
 

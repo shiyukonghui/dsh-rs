@@ -2319,6 +2319,11 @@ pub fn assemble_server_runtime_with_llm(
     };
     let m5 = web_m5::M5Host::assemble(workspace_root.clone())?;
     let bash_jobs = m5.services.bash_jobs.clone();
+    // E-03（D-103/P4 补）：宿主运行时 prompt 变量——vendored personas
+    // （standard/code/cordis）引用 `{{model}}`/`{{cwd}}`。缺注册时
+    // render_prompt 首轮即报 `unknown prompt variable`（live 真机 fail-loud
+    // 首红，entry `preset:*:persona:0`）；此处把 host runtime 事实注入全局注册面。
+    let cwd_var = workspace_root.to_string_lossy().into_owned();
     let loop_host = assemble_server_loop(
         host.store.clone(),
         workspace_root,
@@ -2328,6 +2333,13 @@ pub fn assemble_server_runtime_with_llm(
         m4,
         m5,
     )?;
+    for (name, value) in [("model", model.to_string()), ("cwd", cwd_var)] {
+        let v = value.clone();
+        loop_host
+            .prompt
+            .variable(None, name, Rc::new(move |_| Some(v.clone())))
+            .map_err(|e| format!("serve runtime prompt variable {name}: {e}"))?;
+    }
     Ok(ServerLoopBundle {
         host: loop_host,
         schedule,
@@ -6945,6 +6957,77 @@ mod tests {
             }
         }
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// E-03（D-103/P4 补）：serve 装配把宿主运行时 prompt 变量 `model`/`cwd` 注册进
+    /// prompt 注册面——vendored personas（standard/code/cordis）引用 `{{model}}`/
+    /// `{{cwd}}`，缺注册时 render_prompt 报 `unknown prompt variable`（live 首轮即红，
+    /// fail-loud 捕获）。挂真实 standard 预设 + join + render 全路径断言。
+    #[test]
+    fn server_runtime_variables_interpolate_into_standard_persona() {
+        use dsh_scope::ScopeKey;
+        use dsh_system_prompt::{render_prompt, AssembleContext};
+        let host = SessionHost::in_memory();
+        let _ = host.session("default");
+        let root = std::env::temp_dir().join(format!("dsh-e3-vars-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let bundle = match crate::web::assemble_server_runtime(
+            &host,
+            root.clone(),
+            "http://127.0.0.1:1",
+            "e3-model-xyz",
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("assemble_server_runtime deferred (bash/assemble): {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+        };
+        let mut reg = crate::standing::StandingRegistry::new(
+            bundle.host.prompt.clone(),
+            Some(bundle.host.tools.clone()),
+        );
+        let preset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("resources")
+            .join("agent-presets")
+            .join("standard")
+            .join("agent.cordis.yml");
+        let rows = dsh_agent_presets::parse::parse_composition(
+            &std::fs::read_to_string(preset_path).unwrap(),
+        )
+        .unwrap();
+        reg.mount(
+            "standard",
+            &rows,
+            &serde_json::json!({"platform": "win32", "env": {}, "cwd": "C:\\repo"}),
+        )
+        .unwrap();
+        let scope = ScopeKey::new();
+        reg.join("standard", &scope).unwrap();
+        let asm = bundle
+            .host
+            .prompt
+            .assemble(&AssembleContext {
+                scope: Some(scope),
+            })
+            .unwrap();
+        // 修复前：render_prompt 报 `unknown prompt variable "{{model}}"`（live 已现）。
+        let rendered =
+            render_prompt(&asm).expect("standard persona interpolates {{model}}/{{cwd}}");
+        assert!(
+            rendered.contains("e3-model-xyz"),
+            "{{model}} resolved from host runtime: {rendered}"
+        );
+        assert!(
+            rendered.contains(&root.to_string_lossy().to_string()),
+            "{{cwd}} resolved to workspace root: {rendered}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
