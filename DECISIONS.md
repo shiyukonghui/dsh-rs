@@ -3911,5 +3911,53 @@ fail-loud，直到 spike-6（`process` 门面）/后续 baseUrl 注入落地；�
 **回滚**：`git revert` 本提交即可——删除 `resources/agent-presets/` 与 `tools/*` 两个脚本，
 其余 crate/服务不受影响（未接线）。
 
+---
+
+## D-103（preset 插件组合阶段规划 + ★ 决策点定稿）：进入 TDD 分段实现
+
+**日期**：2026（round-9 用户拍板：**采纳 PLAN-BC §5 全部推荐**；win32 shell = **B 先直通 P4、
+A(pwsh) 随 P3**；broken 集 = **skill 最小只读 + web/tool-cordis/command-compact 显式 broken**。
+前置：D-101（per-session agent 注册）、D-102（复制自持 + 忠实转译）、spike-1..6/8 全闭环、
+E-02 基线 149 全绿、REQUIREMENTS 需求结论文档定稿。）
+
+**第一性原理（自上而下 + 自下而上）**：
+- 自上而下：组合要「真实改变会话行为（直通 P4）」，实现必须以**最小可验收增量**推进——
+  每个阶段的工件（发现 roster → 挂载守卫 → 行映射 → loop 生效 → 全 RPC）都能独立验收，
+  前一关卡不过不进下一阶段；核心不变量（组合权威归位 dsh-core/loader、key 纪律、fail-loud、
+  诚实差异、default 基线不动）贯穿全程。
+- 自下而上：已核证的全部可行性事实（spike-1..6/8 + D-102 资产）构成实现的前置契约——
+  dsh-scope 父链/rebind 已具备、SystemPrompt/工具作用域已按 agent scope 决议、loader
+  create/update/remove/sync 公开、eval_scope 需补 `process` 门面 +1 白名单项。两者相遇结论：
+  **各阶段的技术路径已无未知，只剩按 TDD 落地**。
+
+**考虑过的选项**：
+1. **阶段规划定稿（采用）**：P0 收口 → P1 解析/发现/根 → P2 组合挂载+守卫 → P3 插件行+服务桥
+   （含 pwsh 并行立项）→ P4 loop 消费 scope（直通 P4 达标关）→ P5 RPC 全语义+作者流+live 验收
+   → C 收敛（独立里程碑）。每阶段独立提交 = 安全回滚点。
+2. 一次性大爆炸实现——违背瀑布流 + TDD 纪律、无法阶段验收，否决。
+
+**★ 逐项决议**（依据 = PLAN-BC §5，均为「已推荐 → 用户确认」）：
+- **A-01**：路径 B 每 standing 一个 Cordis（独立组合引擎 + isolate 私有服务），共享单树留 C。
+- **A-03/B-11 桥子集**：必须桥 = planMode/compaction+pruner/terminals/fs；**先 broken** =
+  web/tool-cordis/command-compact；**skill = 最小只读（复用现有 directives 装载）**。
+- **win32 shell**：**B 先行**（自持预设 win32 门控按 Rust 能力改写为启用 bash，零新增，live
+  验收不空 shell；P4 前落地）→ **A 随 P3**（pwsh 工具：dsh-shell 平行 pwsh executor + dsh-terminal
+  "pwsh" 后端注册 + m5 tool-pwsh，落地后切回忠实门控）。
+- **A-05**：generation-based 原地换代（loader create/update/remove/sync）为主路径；HMR 文件
+  监听后置；进程级重启仅兜底。
+- **B-04**：用户根照 TS 约定——`dsh_home()`（`$DSH_HOME`→空白忽略→`home_dir()/.dsh`）+
+  用户根 `<dsh_home>/.agent-presets`（trust=user，authorable=存在即真）+ 系统根
+  `resources/agent-presets`（trust=system）+ roots 数组首根胜出 + `includeUserRoot` 开关。
+- **C-04**：default 会话不隐式 join（E-02 安全基线、向后兼容）；`agent-presets.default` 设置只
+  决定新会话初始预设选择。
+- **F-05/F-06**：C 阶段再决（WASM/native 双驱动与 ScopeId/ScopeKey 键空间去留）。
+
+**TDD + 验收**：每阶段交付可运行代码+测试+测试报告；`cargo test --lib -p dsh-cli` 149+ 全绿
+（相对 E-02 基线只增不减）+ clippy `-D warnings`；AC1..AC7（REQUIREMENTS §6）逐条挂牌；
+关键决策落 DECISIONS 并与 git 提交互查；key 永不落盘/入 git。
+
+**回滚**：以阶段为粒度 `git revert` 独立提交；D-103 本身仅文档（阶段规划/决议），撤提交即回
+到「用户定稿前」状态，不损任何 crate。
+
 
 

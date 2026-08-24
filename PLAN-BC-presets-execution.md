@@ -138,12 +138,14 @@
 
 ---
 
-## 3. 阶段规划草案（**待用户分析后定稿**）
+## 3. 阶段规划（**已定稿，2026，用户确认全部 ★ 推荐**）
+
+> 定稿决议（round-9 用户拍板）：**采纳 §5 全部推荐** → 进入 TDD 实现；
+> **win32 shell = B 先直通 P4、A(pwsh) 随 P3**；**broken 集 = skill 最小只读 + web/
+> tool-cordis/command-compact 显式 broken**。对应 **DECISIONS D-103**。
 
 ```
-P0 需求/设计收口（本文档 + DESIGN 定稿 → DECISIONS D-103 + git）
- ├─ 用户就 ★ 决策点（1.1/1.2/1.5 待定项）给方向；spike-1..5 出结论；问题清单定稿
- ├─ 产出：需求结论文档 + D-103（决策+回滚）+ 内置预设复制自持（D-A）
+P0 需求/设计收口 ✅（PLAN+DESIGN+REQUIREMENTS 定稿 → D-102/D-103 + git；D-A 已落地）
  │
 P1 解析·发现·根（小/低险）          B-01..B-05, D-03
  ├─ agent.cordis.yml 解析复用 + !!js 转译 + preset.yml + 健康检查 + 自定义根发现
@@ -151,12 +153,13 @@ P1 解析·发现·根（小/低险）          B-01..B-05, D-03
  ├─ 通过：4 内置 + 1 自定义发现的 roster 单测绿；agentPreset.list/read（D-01 前半）可用
  │
 P2 组合挂载 + 守卫（中/中险）        A-01..A-06, spike-1/2/4
- ├─ standing mount（挂钩 dsh-core/loader）+ join（父链）+ 守卫（inactive/leaked→broken）
+ ├─ standing mount（挂钩 dsh-core/loader，每 standing 一 Cordis）+ join（父链）+ 守卫（inactive/leaked→broken）
  ├─ 通过：两 standing 隔离单测；守卫拒绝泄漏行；join 后视图正确
  │
 P3 插件行实现 + 服务桥（中/中险）    B-11..B-15, spike-3
- ├─ persona/instructions/工具行/disabled 求值/presentAs(code)
- ├─ 窄服务桥 subset（plan-mode/compaction/fs-shadow/terminals…，其余 broken 诚实）
+ ├─ persona/instructions/工具行/disabled 求值(process 门面)/presentAs(code)/skill 最小只读
+ ├─ 窄服务桥 subset（plan-mode/compaction/fs-shadow/terminals…，web/tool-cordis/command-compact broken 诚实）
+ ├─ pwsh（方向 A）**并行立项**（P3 内；未落地前 win32 走 B 门控=bash）
  ├─ 通过：四 shipped 预设全行映射表落地；每行单测；未桥接行 broken 有据
  │
 P4 loop 消费 scope（中/高险）        C-01..C-04, spike-3/5
@@ -185,10 +188,12 @@ C 收敛（独立架构里程碑，P5 之后）    F-01..F-06
 
 ---
 
-## 5. 待您深入分析后定夺的集中点（★）
+## 5. 待您深入分析后定夺的集中点（★）—— **2026 全部已决，见 DECISIONS D-103**
 
-1. **A-01** standing 组合挂载形态——**spike-1 已定方向**：路径 B = 每 standing 一个 Cordis（独立
-   组合引擎 + isolate 私有服务）；共享单树留给 C。待你确认采纳。
+> 用户 round-9 拍板：**全部采纳本节省推荐**（含 win32 B→A、broken 集=skill 最小只读 +
+> web/tool-cordis/command-compact broken）。下方各项保留为「决议依据」存档。
+
+1. **A-01** standing 组合挂载形态——✅ 采纳 spike-1 方向：每 standing 一个 Cordis。
 2. **A-03 + B-11** 窄服务桥**子集**：全表已在 §6；§6.1 把 shipped 行分为**必须桥**
    （planMode/compaction+pruner/terminals/fs）、**必须先决 win32 shell**（§6.1-2 方向 A 新增
    pwsh vs 方向 B 自持改写、**E-03 前必选**）、**先 broken**（skill/web/tool-cordis/command-compact）
