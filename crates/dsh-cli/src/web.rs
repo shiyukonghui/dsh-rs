@@ -6604,7 +6604,156 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ---- M6W（D-092）：serve 主机选择优先级（sqlite > jsonl > 内存）----
+    /// M6W（D-093）：**门控真实端点 agent 真实任务**（key 仅 env，P4）——完整 serve 装配
+    /// （真实 M4+M5 + deepseek），工作区根 = **本仓库根**，把仓库地址交给 agent，分配一个
+    /// **非破坏性真实任务**：分析 SQLite 后端 + 接入 `dsh web` 的迁移完整性并产出 markdown
+    /// 报告。验证 agent 可用性三个面：① 拿到真实仓库路径后真的用工具调查（read/glob/grep/
+    /// bash 至少一次）；② 把报告写成 gitignored 的新工件（`target/agent-verification/…`）；
+    /// ③ **非破坏**：任务结束后 `git status --porcelain` 工作树仍干净（只允许 target/ 产物，
+    /// 已 gitignore）。
+    /// 端点不可达/装配失败 → 诚实 GATED-SKIP；模型未动手/越界改源 → fail-loud。
+    #[test]
+    fn serve_closure_real_endpoint_agent_nondestructive_repo_task_gated() {
+        use std::process::Command;
+
+        let Some(_key) = std::env::var(crate::m6_llm::DEEPSEEK_API_KEY_ENV).ok() else {
+            eprintln!(
+                "GATED-SKIP: {} not set — skipping real endpoint agent real-task probe",
+                crate::m6_llm::DEEPSEEK_API_KEY_ENV
+            );
+            return;
+        };
+        let base_url = std::env::var("DSH_LLM_BASE_URL")
+            .unwrap_or_else(|_| "http://100.105.152.101:18080/v1".to_string());
+        let model = std::env::var("DSH_LLM_MODEL")
+            .unwrap_or_else(|_| "deepseek-v4-flash-0731-ext".to_string());
+
+        // 工作区根 = 本仓库根（含 DECISIONS.md 的祖先目录）。
+        let cwd = std::env::current_dir().expect("cwd");
+        let repo = cwd
+            .ancestors()
+            .find(|p| p.join("DECISIONS.md").exists() && p.join("Cargo.toml").exists())
+            .unwrap_or(cwd.as_path())
+            .to_path_buf();
+
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let bundle = match crate::web::assemble_server_runtime(
+            &session_host,
+            repo.clone(),
+            &base_url,
+            &model,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("GATED-SKIP: assembly failed (bash?): {e}");
+                return;
+            }
+        };
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(bundle.host.clone());
+
+        // 事件窗口助手（与能力+agent 测试同构）。
+        fn window_kinds(evs: &[dsh_session::types::SessionEvent], since: usize) -> Vec<String> {
+            evs.iter().skip(since).map(|e| e.kind.as_str().to_string()).collect()
+        }
+        fn window_has(evs: &[dsh_session::types::SessionEvent], since: usize, kind: &str) -> bool {
+            window_kinds(evs, since).iter().any(|k| k == kind)
+        }
+        fn window_clean_turn_end(evs: &[dsh_session::types::SessionEvent], since: usize) -> bool {
+            evs.iter().skip(since).any(|e| {
+                e.kind.as_str() == "turn/end"
+                    && !serde_json::to_string(&e.data)
+                        .map(|s| s.contains("error") || s.contains("NETWORK") || s.contains("AUTH"))
+                        .unwrap_or(false)
+            })
+        }
+
+        let report = repo.join("target/agent-verification/migration-completeness.md");
+        let _ = std::fs::remove_file(&report);
+        // 预建 gitignored 报告目录（`write` 工具不自动建父目录；此目录非 tracked、非破坏）。
+        std::fs::create_dir_all(repo.join("target/agent-verification")).unwrap();
+        let repo_s = repo.to_string_lossy().to_string();
+        let task = format!(
+            "You operate in the repository workspace root: {repo_s}\n\
+             Task (NON-DESTRUCTIVE audit + one new artifact):\n\
+             1. Analyze migration completeness: how complete is the SQLite persistence backend and its \
+             integration into `dsh web` in this Rust port? Primary sources: DECISIONS.md (entries \
+             D-089..D-093 and the M6-ACCEPTANCE / M6W-ACCEPTANCE sections), M6W-REQUIREMENTS.md, \
+             M6W-DESIGN.md; implementation: crates/dsh-persistence/src/sqlite.rs, \
+             crates/dsh-cli/src/session_host.rs, crates/dsh-cli/src/web.rs, crates/dsh-cli/src/m6_llm.rs.\n\
+             2. State in a concise markdown report: what is COMPLETE, what is INCOMPLETE or UNCERTAIN, \
+             and your EVIDENCE (file paths + what you saw).\n\
+             3. Use the read / glob / grep / bash (read-only; e.g. `git ls-files`, `ls`) tools to \
+             investigate. DO NOT create, modify, or delete any existing file except the single report.\n\
+             4. Write the finished report ONLY to this exact file: target/agent-verification/migration-completeness.md \
+             (relative to the workspace root). The directory target/agent-verification already exists; \
+             just write the file.\n\
+             5. Keep your investigation to a few steps. Finish by replying with a one-line summary."
+        );
+        let n0 = session_host.events("default").len();
+        if let Err(e) = crate::run_rust_loop(&boot, "default", &task) {
+            eprintln!("GATED-SKIP: run_rust_loop failed (bash/sandbox env?): {e}");
+            return;
+        }
+        let evs = session_host.events("default");
+        let kinds = window_kinds(&evs, n0);
+        // 端点不可达（turn/end 带 error/NETWORK/AUTH）→ 诚实 skip。
+        if evs.iter().skip(n0).any(|e| {
+            e.kind.as_str() == "turn/end"
+                && serde_json::to_string(&e.data)
+                    .map(|s| s.contains("error") || s.contains("NETWORK") || s.contains("AUTH"))
+                    .unwrap_or(false)
+        }) {
+            eprintln!("GATED-SKIP: real endpoint {base_url} errored mid-task; window={kinds:?}");
+            return;
+        }
+        eprintln!(
+            "REAL-TASK-CLEAN base={base_url} model={model} window_len={} tool_calls={} tool_results={}",
+            kinds.len(),
+            kinds.iter().filter(|k| *k == "tool/call").count(),
+            kinds.iter().filter(|k| *k == "tool/result").count(),
+        );
+        assert!(
+            window_clean_turn_end(&evs, n0),
+            "agent task turn ends clean; window={kinds:?}"
+        );
+        // ① agent 真的用工具在仓库里调查（read/glob/grep/bash 至少一种 tool/call）。
+        // tool/call 载荷 = ToolCallPayload{ turn, step, callId, name, arguments } → data["name"]。
+        let investigated = ["read", "glob", "grep", "bash"].iter().any(|t| {
+            evs.iter().skip(n0).any(|e| {
+                e.kind.as_str() == "tool/call" && e.data.get("name").and_then(Value::as_str) == Some(*t)
+            })
+        });
+        assert!(investigated, "agent used read/glob/grep/bash to investigate the repo; window={kinds:?}");
+        // ② 报告真实写成（新工件非空）。
+        let contents = std::fs::read_to_string(&report).unwrap_or_default();
+        eprintln!(
+            "REAL-TASK-REPORT path={} bytes={} head={:?}",
+            report.display(),
+            contents.len(),
+            contents.lines().take(2).collect::<Vec<_>>()
+        );
+        assert!(!contents.trim().is_empty(), "agent wrote a non-empty report");
+        assert!(
+            contents.contains("SQLite") || contents.contains("sqlite"),
+            "report actually discusses the SQLite migration (got head: {:?})",
+            contents.lines().take(3).collect::<Vec<_>>()
+        );
+        // ③ 非破坏：工作树干净（target/ 已 gitignore，产物不出现在 status）。
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&repo)
+            .output()
+            .expect("git available in repo");
+        let dirty = String::from_utf8_lossy(&status.stdout).trim().to_string();
+        assert!(
+            dirty.is_empty(),
+            "agent task did not modify any tracked file (non-destructive); git status:\n{dirty}"
+        );
+        eprintln!("REAL-TASK-OK agent completed a real non-destructive repo task end-to-end");
+    }
+
 
     fn simple_turn(text: &str) -> Vec<(String, Vec<u8>)> {
         vec![

@@ -3508,5 +3508,33 @@ headless）受益。
 
 ---
 
+## D-094（真实 agent 可用性实测：把仓库交给 agent 跑非破坏任务）
+
+**日期**：2026（用户指令：把本仓库地址交给 agent，分配非破坏真实任务（迁移完整性分析 /
+写文档）实测可用性）。
+**触发问题**：工具闭环已通（D-093），但 agent 的「真实可用性」尚未在真实端点 + 真实仓库
+背景下实测——即「给它真实任务它能否自己用工具完成」。
+**方法**：新增门控测试 `serve_closure_real_endpoint_agent_nondestructive_repo_task_gated`：
+工作区根 = **本仓库根**（找含 DECISIONS.md+Cargo.toml 的祖先目录），装配完整 serve runtime
+（真实 M4+M5 + deepseek），把仓库路径交给 agent，要求：只读调查（read/glob/grep/只读 bash），
+分析 SQLite 后端接入 `dsh web` 的迁移完整性（D-089..D-093 + M6W 文档 + 实现文件），把报告
+**只写到 gitignored** `target/agent-verification/migration-completeness.md`（测试预建目录——
+`write` 工具不自动建父目录），完成后一行总结。
+**实测结果（真实端点 deepseek-v4-flash-0731-ext）**：agent 自主调查 23 次工具调用
+（23 tool/result），事件窗口 559 条；写出 8.7KB markdown 报告（含 SQLite 迁移完整性结论 +
+证据）；`git status --porcelain` 全程干净（**未改动任何 tracked 文件**，非破坏 ✅）。
+**断言**：干净 turn/end；read/glob/grep/bash 至少一次 tool/call（tool/call 载荷是
+`ToolCallPayload{.., name, ..}` → 取 `data["name"]`，首次断言误取 `data["tool"]["name"]`
+已修）；报告非空且含 SQLite；git 工作树干净。
+**被否决**：不把 agent 输出精确断言（LLM 内容是模型自由产出，重约束即假肯定）；不在固定
+仓库外跑（路径即要测的对象，必须真仓库）。
+**边界（诚实）**：报告准确性以 agent 述为准（本测试验证「能亲自用工具完成真实任务 + 非破坏」，
+不是审稿校验其结论）；任务耗时 ~137s（多步工具），门控测试可接受；报告写 target/（gitignored）。
+**回滚**：撤本提交即删测试，无生产影响。
+**预期影响**：agent 可用性在「真实仓库 + 真实端点」上可重复验证；后续真实任务类门控测试
+以此为模板。
+
+---
+
 
 
