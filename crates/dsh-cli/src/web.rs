@@ -206,6 +206,14 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
     // seed `default`（前端会话入口）。
     let _ = host.session("default");
 
+    // M3a+（D-098）：装配进程内原生目录选择器（`host.pickDirectory`）。Windows 桌面经
+    // IFileDialog/COM（零子进程）弹系统目录框；无桌面/失败 → wire `directory-picker-unavailable`
+    // （诚实，不冒充取消）。测试 Boot 不装配（None）→ 同一错误路径，由 stub 测试覆盖。
+    // Arc（+Send+Sync）：该模态对话框由独立线程驱动（见 dispatch_request 特判），不饿死
+    // 单线程 accept 循环。
+    boot.host_picker = Some(std::sync::Arc::new(crate::host_picker::pick_directory_native)
+        as crate::HostPicker);
+
     // M6（step3，D-083）：serve 主循环 tick 上下文（enable_agent_loop 装配时填充）。
     // 主循环 `recv_timeout` 自驱节拍——每 tick 间隔刺探请求（有则派发），超时（无请求）
     // 则纯推进：主线程 `m5g_tick_once`（调度到期 + jobs 合作泵）。推进点唯一收敛到
@@ -329,6 +337,29 @@ fn dispatch_request(
     if path.starts_with("/api") {
         let method = path.trim_start_matches("/api/").to_string();
         match (request.method(), method.as_str()) {
+            // D-098：`host.pickDirectory` 是 user-paced 模态对话框（可能挂很久）。
+            // serve 的 accept 循环单线程内联处理 RPC——若在此阻塞会饿死整个服务
+            // （SSE/静态/其他 RPC 全部排队）。对齐 TS（对话框跑 Worker）：整个请求
+            // 派到独立线程，accept 循环保持响应。
+            (Method::Post, "host.pickDirectory") => {
+                let picker = boot.host_picker.clone();
+                let m = method.clone();
+                std::thread::spawn(move || {
+                    let mut body = Vec::new();
+                    let _ = std::io::Read::read_to_end(&mut request.as_reader(), &mut body);
+                    let rpc_id = rpc_id_of(&body);
+                    let result = if !rpc_envelope_ok(&body, &m) {
+                        serde_json::json!({"ok": false, "error": {
+                            "code": "bad-request",
+                            "message": "invalid client-request message",
+                        }})
+                    } else {
+                        pick_directory_result(&picker)
+                    };
+                    let resp = json_response(200, &rpc_response(&rpc_id, result));
+                    let _ = request.respond(resp);
+                });
+            }
             (Method::Post, m) if !m.is_empty() => {
                 // 读 body → RPC 分派 → JSON 响应
                 let mut body = Vec::new();
@@ -450,11 +481,10 @@ pub struct BootEntry {
 
 /// 宿主组合决定（对齐 TS bundle-graph 组合期「按已组合后端能力挂对应 flow 客户端」，
 /// 见 `deepseek-harness/packages/host/apiproxy/README.md` 目录选择 seam）：目录选择我们
-/// 只组合 **browse** 后端（`host_dir.rs` 的 host.listDirectory/createDirectory——纯 fs、
-/// 零子进程），不组合 native 子进程后端（杀软对脚本唤醒敏感 + 与 browse 组合不一致）。
-/// 因此从 boot 图排除 native 流程客户端，只让 browse 流程客户端占据 ui-workspace 的
-/// single directory-flow 洞（页内目录浏览）。
-const HOST_COMPOSITION_EXCLUDED_CLIENTS: &[&str] = &["@deepseek-ai/dsh-client-ui-directory-picker-native"];
+/// 组合 **native** 后端（`host_picker_windows`：进程内 IFileDialog/COM，零子进程），
+/// 页内 browse 流程不挂载。因此从 boot 图排除 browse 流程客户端，只让 native 客户端
+/// 占据 ui-workspace 的 single directory-flow 洞（系统原生目录对话框）。
+const HOST_COMPOSITION_EXCLUDED_CLIENTS: &[&str] = &["@deepseek-ai/dsh-client-ui-directory-picker-browse"];
 
 /// 组装 `__DSH_BOOT__`：扫描 `plugin_root` 下声明 `dsh.client.platform == "web"`
 /// 的包，每个生成一个 entry。
@@ -496,8 +526,8 @@ pub fn build_boot_manifest(plugin_root: &Path) -> Result<BootManifest, CordisErr
             if id.is_empty() {
                 continue;
             }
-            // D-097：宿主组合只提供 browse 目录选择后端 → 排除 native 流程客户端
-            // （否则浏览器挂载它 → 调 host.pickDirectory 子进程对话框，杀软敏感）。
+            // D-098：宿主组合只提供 native 目录选择后端 → 排除 browse 流程客户端
+            // （否则同时挂载会让 browse/native 竞争 single directory-flow 洞）。
             if HOST_COMPOSITION_EXCLUDED_CLIENTS.contains(&id.as_str()) {
                 continue;
             }
@@ -775,44 +805,77 @@ pub fn handle_rpc(boot: &Boot, method: &str, body: &[u8]) -> (u16, Value) {
 }
 
 /// 带 SessionHost 版本（M1e 多会话；serve 用同一共享 host）。
+/// `host.pickDirectory` 三态 wire 结果（native 能力）：选中 `{ok,value:{path}}` /
+/// 取消 `{ok,value:{path:null}}`（合法语义） / 失败或未装配
+/// `directory-picker-unavailable`（绝不拿 null 冒充取消）。
+fn pick_directory_result(picker: &Option<crate::HostPicker>) -> Value {
+    match picker.as_ref() {
+        Some(pick) => match pick() {
+            Ok(Some(path)) => serde_json::json!({"ok": true, "value": {"path": path}}),
+            Ok(None) => serde_json::json!({"ok": true, "value": {"path": null}}),
+            Err(msg) => serde_json::json!({"ok": false, "error": {
+                "code": "directory-picker-unavailable", "message": msg,
+            }}),
+        },
+        None => serde_json::json!({"ok": false, "error": {
+            "code": "directory-picker-unavailable",
+            "message": "native directory picker is not assembled",
+        }}),
+    }
+}
+
+/// 从 client-request body 取 rpcId（缺省空串）。
+fn rpc_id_of(body: &[u8]) -> String {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("rpcId").and_then(|r| r.as_str()).map(String::from))
+        .unwrap_or_default()
+}
+
+/// client-request 信封校验（对齐 clientRequestSchema：type + method 一致）。
+fn rpc_envelope_ok(body: &[u8], method: &str) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .map(|v| {
+            v.get("type").and_then(|t| t.as_str()) == Some("client-request")
+                && v.get("method").and_then(|m| m.as_str()) == Some(method)
+        })
+        .unwrap_or(false)
+}
+
+/// server-response 信封。
+fn rpc_response(rpc_id: &str, result: Value) -> Value {
+    serde_json::json!({
+        "type": "server-response",
+        "rpcId": rpc_id,
+        "result": result,
+    })
+}
+
 pub fn handle_rpc_host(
     boot: &Boot,
     method: &str,
     body: &[u8],
     host: &Rc<SessionHost>,
 ) -> (u16, Value) {
-    let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-    let rpc_id = parsed
-        .get("rpcId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let payload = parsed.get("payload").cloned().unwrap_or(Value::Null);
-    // 信封校验（对齐 clientRequestSchema：type=client-request, method 一致）
-    let envelope_ok = parsed.get("type").and_then(|t| t.as_str()) == Some("client-request")
-        && parsed.get("method").and_then(|m| m.as_str()) == Some(method);
-    if !envelope_ok {
+    let rpc_id = rpc_id_of(body);
+    if !rpc_envelope_ok(body, method) {
         return (
             400,
-            serde_json::json!({
-                "type": "server-response",
-                "rpcId": rpc_id,
-                "result": {"ok": false, "error": {
+            rpc_response(
+                &rpc_id,
+                serde_json::json!({"ok": false, "error": {
                     "code": "bad-request",
                     "message": "invalid client-request message",
-                }},
-            }),
+                }}),
+            ),
         );
     }
+    let payload = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("payload").cloned())
+        .unwrap_or(Value::Null);
     let result = dispatch(boot, method, &payload, host);
-    (
-        200,
-        serde_json::json!({
-            "type": "server-response",
-            "rpcId": rpc_id,
-            "result": result,
-        }),
-    )
+    (200, rpc_response(&rpc_id, result))
 }
 
 /// RPC 分派：把前端方法映射到 dsh 运行时。
@@ -2121,14 +2184,12 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             serde_json::json!({"ok": true, "value": value})
         }
         "host.pickDirectory" => {
-            // D-097：宿主组合 **browse** 目录选择后端（host.listDirectory/createDirectory，
-            // 页内浏览、纯 fs、零子进程）。native 能力不组合（避免子进程对话框——
-            // 杀软敏感）→ 按 TS seam 恒报 `directory-picker-unavailable`，绝不返回 null
-            // 冒充取消、也不 spawn 子进程。UI 走 browse 流程（`dsh-client-ui-directory-picker-browse`）。
-            serde_json::json!({"ok": false, "error": {
-                "code": "directory-picker-unavailable",
-                "message": "directory picker composes the browse backend; host.pickDirectory (native) is not composed — use host.listDirectory/host.createDirectory",
-            }})
+            // M3a+（D-098）：进程内原生选择器（Windows IFileDialog/COM，零子进程）→
+            // 选中路径；取消 → {path:null}（对齐 TS seam「native 下取消为 null」，合法语义）；
+            // 未装配/失败 → 诚实 `directory-picker-unavailable`（绝不拿 null 冒充取消）。
+            // 生产上该 RPC 由 dispatch_request 优先派到独立线程（user-paced 模态不饿死
+            // accept 循环）；这里保留完整语义供 handle_rpc_host 直调（测试/程序内）用。
+            pick_directory_result(&boot.host_picker)
         }
         "host.listDirectory" => {
             // M3a：真实 fs 列目录（browse capability；默认列 home）。
@@ -2665,6 +2726,7 @@ mod tests {
                 dsh_goal::GoalService::new(dsh_goal::ServiceOptions::default()),
             )),
             projections: assembled_projection_registry(),
+            host_picker: None,
         }
     }
 
@@ -3105,21 +3167,48 @@ mod tests {
         }
     }
 
-    /// D-097：宿主组合 browse 目录选择 → `host.pickDirectory`（native）恒报
-    /// `directory-picker-unavailable`（不 spawn 子进程——杀软敏感面清零；不返回 null
-    /// 冒充取消）。UI 目录选择走 `host.listDirectory/createDirectory` 的页内浏览流程。
+    /// M3a+（D-098）：`host.pickDirectory` 三态 wire（native seam 经注入 stub 可测；
+    /// 不触发真实弹框）。选中→{path}；取消→{path:null}；失败/未装配→
+    /// `directory-picker-unavailable`（**不再**拿 null 冒充取消）。
     #[test]
-    fn rpc_host_pick_directory_unavailable_when_browse_composed() {
-        let boot = boot_with_sessions();
-        let body = serde_json::to_vec(&serde_json::json!({
-            "type": "client-request", "rpcId": "r", "method": "host.pickDirectory",
-            "payload": {},
-        })).unwrap();
-        let (_, v) = handle_rpc_host(&boot, "host.pickDirectory", &body, &SessionHost::in_memory());
+    fn rpc_host_pick_directory_seam_three_state() {
+        use std::sync::Arc;
+
+        fn call(boot: &crate::Boot) -> Value {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": "host.pickDirectory",
+                "payload": {},
+            })).unwrap();
+            let (_, v) = handle_rpc_host(boot, "host.pickDirectory", &body, &SessionHost::in_memory());
+            v
+        }
+
+        // 选中。
+        let mut b = boot_with_sessions();
+        b.host_picker = Some(Arc::new(|| Ok(Some("C:\\selected".to_string()))) as crate::HostPicker);
+        let v = call(&b);
+        assert_eq!(v["result"]["ok"], true);
+        assert_eq!(v["result"]["value"]["path"], "C:\\selected");
+
+        // 取消 → null（合法语义，不是错误）。
+        let mut b = boot_with_sessions();
+        b.host_picker = Some(Arc::new(|| Ok(None)) as crate::HostPicker);
+        let v = call(&b);
+        assert_eq!(v["result"]["ok"], true);
+        assert!(v["result"]["value"]["path"].is_null());
+
+        // 原生不可用 → 诚实错误。
+        let mut b = boot_with_sessions();
+        b.host_picker = Some(Arc::new(|| Err("no desktop session".to_string())) as crate::HostPicker);
+        let v = call(&b);
         assert_eq!(v["result"]["ok"], false);
         assert_eq!(v["result"]["error"]["code"], "directory-picker-unavailable");
-        // 绝不出现 {path:null} 冒充取消。
-        assert!(v["result"]["value"].is_null());
+
+        // 未装配（默认 Boot）→ 同一错误，绝不返回 null 冒充取消。
+        let b = boot_with_sessions();
+        let v = call(&b);
+        assert_eq!(v["result"]["ok"], false);
+        assert_eq!(v["result"]["error"]["code"], "directory-picker-unavailable");
     }
 
     /// 阶段2：session.prompt 驱动 turn 后 accepted:true，且 session 事件增长。
@@ -3312,11 +3401,9 @@ mod tests {
         root
     }
 
-    /// 阶段1：服务端只选择与已组合 host 后端匹配的目录选择流程——组合 **browse**
-    /// 后端（host.listDirectory/createDirectory，纯 fs、零子进程）时，native 流程
-    /// 客户端必须从 boot 图排除（否则它占据 ui-workspace 的 single directory-flow 洞，
-    /// 页面点「打开工作区」就调 `host.pickDirectory` 走子进程对话框——杀软敏感；且与
-    /// TS「组合期按后端能力挂对应客户端」不一致）。
+    /// 阶段1：服务端只选择与已组合 host 后端匹配的目录选择流程——组合 **native**
+    /// 后端（进程内 IFileDialog/COM）时，browse 流程客户端必须从 boot 图排除（否则
+    /// 两者竞争 ui-workspace 的 single directory-flow 洞，流程不确定）。
     #[test]
     fn build_boot_manifest_composes_only_one_directory_picker_flow() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -3342,14 +3429,14 @@ mod tests {
         let m = build_boot_manifest(&scope).unwrap();
         let ids: Vec<&str> = m.entries.iter().map(|e| e.id.as_str()).collect();
         assert!(
-            ids.contains(&"@deepseek-ai/dsh-client-ui-directory-picker-browse"),
-            "browse flow stays composed: {ids:?}"
+            ids.contains(&"@deepseek-ai/dsh-client-ui-directory-picker-native"),
+            "native flow stays composed: {ids:?}"
         );
         assert!(
-            !ids.contains(&"@deepseek-ai/dsh-client-ui-directory-picker-native"),
-            "native flow must be excluded from boot graph: {ids:?}"
+            !ids.contains(&"@deepseek-ai/dsh-client-ui-directory-picker-browse"),
+            "browse flow must be excluded from boot graph: {ids:?}"
         );
-        assert_eq!(ids.len(), 1, "exactly the browse flow remains: {ids:?}");
+        assert_eq!(ids.len(), 1, "exactly the native flow remains: {ids:?}");
         std::fs::remove_dir_all(&root).ok();
     }
 

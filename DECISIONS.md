@@ -3641,5 +3641,46 @@ exclusion 后通过。`rpc_host_pick_directory_unavailable_when_browse_composed`
 
 ---
 
+## D-098（用户指定：做 native 版，覆盖 D-097 的 browse 组合）：进程内 IFileDialog 原生选择器
+
+**日期**：2026（用户：「按照流程规划做这个原生版调用」——希望点「打开工作区」出系统目录框）。
+**触发问题**：D-097 组合了 browse（页内浏览）以避开 D-096 的 powershell 子进程（杀软告警）；
+但用户要的是**原生系统对话框**。TS 正解是进程内 IFileDialog/COM（无子进程）——D-096 只是
+偷懒用了 powershell，该方案本身不该被否定。
+**依赖评估（先调查后引入，规则四）**：可选路径 A）新版 `windows` crate（0.62.2，离线缓存
+中成熟可用，`IFileOpenDialog`/`IShellItem` 经 `define_interface!` 全量提供）——**采纳**：
+维护方微软、被广泛采用、类型化安全（免自搓 vtable 风险）；B）`windows-sys` 0.48（仍含
+接口但旧、裸 HRESULT/裸指针）；C）自搓 COM vtable（TS 在 Node 用 koffi 是迫不得已，Rust
+能引成熟绑定就该引）。离线依赖链 windows-core/implement/interface/link/result/strings/
+collections/future/numerics 对应版本全在缓存，`--offline` 可解析。
+**最终选择**（三段式，对齐 TS `directory-picker-native` 的「纯时序 + 平台绑定」拆分）：
+1. `host_picker.rs`：`run_folder_dialog(bindings, title)` 纯时序（init→create→show→
+   收尾，`co_uninitialize` 每条路径恰一次）＋ `DialogBindings`/`FolderDialog` trait——
+   全假后端单测（选中/取消/失败/清理配对）；`decode_wstring`（NUL 结尾 UTF-16，32k 上限）。
+2. `host_picker_windows.rs`（cfg(windows)）：真实 COM——`CoCreateInstance(&FileOpenDialog,
+   None, CLSCTX_INPROC_SERVER)` → `SetOptions(FOS_PICKFOLDERS|FOS_FORCEFILESYSTEM|
+   FOS_NOCHANGEDIR)` → `SetTitle` → `Show(None)`（取消 HRESULT 0x800704c7 → Ok(None)）→
+   `GetResult` → `IShellItem::GetDisplayName(SIGDN_FILESYSPATH)` → 解码 + `CoTaskMemFree`。
+   **零子进程**：对话框由本进程 COM 创建，杀软针对的外部程序唤醒面为零。
+3. web：`Boot.host_picker`（`Arc<dyn Fn+Send+Sync>`）接缝，`serve()` 装配真实 picker，
+   dispatch 三态（path/null/`directory-picker-unavailable`，绝不用 null 冒充不可用）；
+   manifest 组合 **native**（排除 `dsh-client-ui-directory-picker-browse` 客户端）。
+**并发化洞（真实使用发现，二级修复）**：serve 的 accept 循环单线程内联 RPC；模态对话框
+阻塞该线程 → 全服务饿死（实测 homepage/listDirectory 全 HTTP 000）。修复：`host.pickDirectory`
+在 `dispatch_request` **派到独立线程**（Arc picker 跨线程；信封/三态 helper 单一事实源），
+accept 循环保持响应。实测对话框开启期间 homepage 200 + listDirectory 正常。
+**被否决**：windows-sys 0.48（依赖旧）；自搓 vtable（Rust 无需）；线程化所有 RPC（Boot 非
+Send，改动面大且不必要——只有 user-paced 的 pickDirectory 需要隔离）。
+**TDD + 验收**：`host_picker` 单测 6 项（三态 + 清理配对 + 常量防漂移 + decode）+ seam 测试
+4 场景 + manifest 组合测试（native 在、browse 排除）+ 回归 128 项全绿 + clippy `-D warnings`
+零告警。实测：boot 图仅 native 客户端；`host.pickDirectory` 弹**系统原生目录框**；对话框
+开启期间服务器不卡死；`host.listDirectory`（browse 后端）仍可用（两者并存服务）。
+**已知限制（如实）**：① 连接中断/页面关闭不中止已开启的对话框（TS 用 WM_CLOSE 中止，我们
+未接；后续可加）；② 未做 DPI 感知（TS 最佳努力，普遍不影响）；③ 对话框标题固定英文
+"Select a folder"。
+**回滚**：撤本提交；boot 图回 browse-only。
+
+---
+
 
 
