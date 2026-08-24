@@ -347,9 +347,12 @@ impl ToolRegistry {
         let admits_all = |name: &str| {
             self.layers.global().admits(name) && full_chain.iter().all(|l| l.admits(name))
         };
-        // 祖先链（远→近；不含自有 scope）。
+        // 祖先链（远→近；不含自有 scope）。**注意**：chain_layers 只含「有层」的
+        // scope——当查询 scope 自身无层时（如 agent scope 无工具、父 standing scope
+        // 有），不得 pop 掉祖先（P3-a 回归：standing 工具遮蔽曾因此丢失）。
+        let own_layer = self.layers.peek(scope);
         let mut ancestors = full_chain.clone();
-        if scope.is_some() {
+        if own_layer.is_some() {
             ancestors.pop();
         }
 

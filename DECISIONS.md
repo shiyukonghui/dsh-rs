@@ -4066,5 +4066,44 @@ dsh-agent-presets（P1-a 独立提交可保留）。
 - **回滚**：`git revert` P4-core 提交——撤销 host.join_standing/Boot.standings/select
   接线；P2/P1 均已独立提交可保留。
 
+### D-103 实施补记（P3-a：桥面初代——instructions 内容桥 + 工具行重呈现 + win32-B 平台策略，round 15）——决策 + 验收
+
+- 触发：P4 让 select 真能 join，但此刻桥面只有 persona——shipped 预设选进 joined
+  agent 后**工具全缺失**（多动态降级）。要让 live E-03 有意义，需把行桥面做实。
+- 关键事实（自下而上核实）：
+  1. `ToolRegistry::register(def, Some(&scope))` 支持 scoped 注册，`schemas(scope)`/
+     `get(name, scope)` 走 `chain_layers`（全局基 + 祖先链遮蔽）——**工具行桥 = 把
+     宿主全局工具按行 config 重呈现注册进 standing scope**，joined agent 的模型面
+     即见组合的 description/timeout；
+  2. **dsh-tools `view()` 潜在 bug（P3-a 回归发现并修复）**：`ancestors.pop()` 假设
+     「查询 scope 自己有层」才去掉自有层；当 agent scope 无层、父 standing scope 有
+     工具时，pop 误删祖先 → standing 工具遮蔽丢失。修复：仅当 `peek(scope)` 有自有
+     层才 pop。
+- 选型与裁决：
+  1. **win32-B 平台策略**（D-103 落地）：`row_disabled_for_platform` —— win32 上
+     bash 系行**强制可用**（Rust 经 Git Bash 可跑 bash；覆盖忠实门控的「bash 禁用/
+     pwsh 可用」），pwsh 系行**判禁**（无 pwsh 执行器；A 并行落地后移除此覆盖）；
+     非 win32 回落忠实求值。**否决**照忠实门控做（那会让 win32 joined agent 零 shell）。
+  2. 工具桥表（P3-a 单工具行）：`dsh-tool-bash(-persistent)`→`bash`、
+     `dsh-tool-str-replace-editor`→`str_replace_editor`；多工具行（fs-local/terminal）
+     留 P3-b；无宿主工具 → guarded(`no host tool …`)。
+  3. 内容桥 `dsh-agent-instructions`：`<facade.cwd>/AGENTS.md` → standing scope
+     section（order 40，`maxBytes` cap）；文件缺失 = 桥解析但无贡献（report 标
+     `no AGENTS.md`，诚实不假装）。
+  4. `StandingRegistry` 增持 `tools: Option<Rc<ToolRegistry>>`（None = 未装配 →
+     工具行一律 guarded）；`ToolDefinition`/`ToolOutputDefinition` 增 `Clone`
+     （重新呈现需要克隆宿主定义——通用、API 安全）。
+- 验收：standing 8 测试全绿——win32-B（bash 保持可用/pwsh 判禁）+ linux 对照忠实
+  门控；工具行重呈现（joined 见行 description/timeoutMs、未 join 见全局原值 =
+  组合呈现隔离）；守卫原因细分（无宿主工具/pwsh A-parallel/fs 多工具/D-103 broken）；
+  instructions 桥（AGENTS.md 可见、maxBytes 截断、缺失不贡献仍 bridged）；P2-b 隔离
+  测试不回归。dsh-cli **164/164**、dsh-agent-loop host 1、dsh-tools 全部集成套件照常；
+  clippy `-D warnings` 零告警；rustfmt 仅新 standing.rs。
+- **已知未接（诚实列表）**：多工具行桥（fs-local/terminal，P3-b）；pwsh 执行器
+  （A 并行，P3）；web/tool-cordis/command-compact 保持 broken；live 服务二进制待
+  重建（P4 随 E-03 重启）；C 段未动。
+- **回滚**：`git revert` P3-a 提交——撤销 dsh-tools view 修复/Clone derives +
+  standing 桥面 + win32-B；P4/P2/P1 均独立提交可保留。
+
 
 

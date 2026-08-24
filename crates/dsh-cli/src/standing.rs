@@ -1,17 +1,23 @@
-//! P2-b：standing 注册表——每个 preset 一个 standing scope，贡献挂在共享
-//! dsh-scope / dsh-system-prompt 注册面内；agent 经 **scope 父链** join；守卫报告
-//! 行审计（bridged/disabled/guarded）。
+//! P2-b/P3-a：standing 注册表——每个 preset 一个 standing scope，贡献挂在共享
+//! dsh-scope / dsh-system-prompt / dsh-tools 注册面内；agent 经 **scope 父链** join；
+//! 守卫报告行审计（bridged/disabled/guarded）。
 //!
-//! 路径 B 组合权威（D-103/A-01/P2）：
+//! 路径 B 组合权威（D-103/A-01/P2/P3-a）：
 //! - 行审计 = `dsh-agent-presets::parse`（typed 行 + `disabled_expr` × process 门面）；
-//! - 贡献 = `dsh-system-prompt` 的 **scoped section**（P2 桥：`@deepseek-ai/dsh-persona`
-//!   行 → standing scope 的 complete/persona section + `includeRuntimeContext:false`
-//!   抑制）——joined agent 的 `assemble(scope)` 经 `scope_chain_of` 看到它；
+//! - 内容桥 = `dsh-system-prompt` scoped section：`@deepseek-ai/dsh-persona`
+//!   （complete/persona + `includeRuntimeContext:false` 抑制）与
+//!   `@deepseek-ai/dsh-agent-instructions`（`<cwd>/AGENTS.md`，maxBytes cap）——
+//!   joined agent 的 `assemble(scope)` 经 `scope_chain_of` 看到它们；
+//! - 工具行桥 = `dsh-tools` **scoped register**：宿主全局已有工具按行 config 重呈现
+//!   （description/timeoutMs）注册进 standing scope——joined agent 的 `schemas(scope)`
+//!   走链即见（未 join 不可见），这正是组合的 presentAs 机制；
+//! - D-103 win32-B：Rust 无 pwsh 执行器（A 并行未落地）→ **win32 上 bash 系强制可用、
+//!   pwsh 系判禁**（取代忠实门控的「bash 禁用/pwsh 可用」），对照 A 落地回滚；
 //! - join = `dsh-scope::bind_scope_parent`（换 preset 用绑定 `.rebind`）。
 //!
-//! **诚实边界**：P2 只桥 persona；其余生效叶行一律列 `guarded`（P3/P5 缩小，D-103
-//! 「先 broken」）。standing 是注册面里的一个作用域子树；真实 isolate 服务隔离是
-//! C 段收敛目标——P2 不伪装 release。
+//! **诚实边界**：P3-a 已桥 persona + agent-instructions + 单工具行（bash /
+//! str_replace_editor）；多工具行（fs-local/terminal）与 pwsh 执行器留 P3-b/A。
+//! standing 是注册面里的一个作用域子树；真实 isolate 服务隔离是 C 段收敛目标。
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -19,10 +25,13 @@ use std::rc::Rc;
 use dsh_agent_presets::parse::{row_disabled, CompositionRow};
 use dsh_scope::{bind_scope_parent, store::Undo, ScopeKey, ScopeParentBinding};
 use dsh_system_prompt::{PromptSection, PromptSectionText, SystemPrompt};
+use dsh_tools::ToolRegistry;
 use serde_json::Value;
 
-/// persona 行名（P2 唯一实现的桥）。
+/// persona 行名（P2-b 桥）。
 pub const PERSONA_ROW: &str = "@deepseek-ai/dsh-persona";
+/// agent-instructions 行名（P3-a 内容桥）。
+pub const INSTRUCTIONS_ROW: &str = "@deepseek-ai/dsh-agent-instructions";
 
 /// 挂载行审计报告（守卫面；诚实）。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -50,31 +59,35 @@ pub struct Standing {
 pub struct StandingRegistry {
     /// 共享的 SystemPrompt 注册面（**同一实例** —— join 后 agent 的 assemble 走它）。
     system_prompt: Rc<SystemPrompt>,
+    /// 共享的 ToolRegistry（P3-a 工具行桥用；None = 该 host 未装配工具注册面 →
+    /// 工具行一律 guarded，诚实）。
+    tools: Option<Rc<ToolRegistry>>,
     standings: HashMap<String, Standing>,
 }
 
 impl Default for StandingRegistry {
-    /// 占位注册表（Bootstrap 期/无真实 loop 时）：持有一个独立占位 SystemPrompt。
-    /// web serve 装配 agent-loop 后以 `host.prompt` 重建（见 web.rs `boot.standings`），
-    /// 保证 standing 贡献落进 loop 实际组装的注册面。
+    /// 占位注册表（Bootstrap 期/无真实 loop 时）：持有独立占位 SystemPrompt、无
+    /// 工具注册面。web serve 装配 agent-loop 后以 `host.prompt` + `host.tools` 重建
+    /// （见 web.rs `boot.standings`），保证 standing 贡献落进 loop 实际组装的注册面。
     fn default() -> Self {
         let placeholder = Rc::new(
             SystemPrompt::new(&dsh_system_prompt::Config::default(), Rc::new(|| {}))
                 .expect("standing placeholder system prompt"),
         );
-        StandingRegistry::new(placeholder)
+        StandingRegistry::new(placeholder, None)
     }
 }
 
 impl StandingRegistry {
-    pub fn new(system_prompt: Rc<SystemPrompt>) -> Self {
+    pub fn new(system_prompt: Rc<SystemPrompt>, tools: Option<Rc<ToolRegistry>>) -> Self {
         StandingRegistry {
             system_prompt,
+            tools,
             standings: HashMap::new(),
         }
     }
-    /// 挂载 preset：行审计 + 铸 standing scope + persona 桥贡献。同 id 换代：
-    /// 先 unmount（撤销 scoped 贡献）再建新。
+    /// 挂载 preset：行审计 + 铸 standing scope + 桥贡献（persona / instructions /
+    /// 单工具行重呈现）。同 id 换代：先 unmount（撤销 scoped 贡献）再建新。
     pub fn mount(
         &mut self,
         id: &str,
@@ -92,6 +105,8 @@ impl StandingRegistry {
         let mut undos: Vec<Undo> = Vec::new();
 
         // 行审计：走 tree（组递归；组容器自身不列），叶子 → disabled/活化。
+        // D-103 win32-B：禁用判定先过平台策略（bash 系 win32 强制可用、pwsh 系
+        // win32 判禁——Rust 暂无 pwsh 执行器，见 A 并行），再回落忠实 `row_disabled`。
         fn walk<'a>(
             rows: &'a [CompositionRow],
             process: &Value,
@@ -103,7 +118,7 @@ impl StandingRegistry {
                     leaves.extend(walk(&row.children, process, report));
                     continue;
                 }
-                if row_disabled(row, process) {
+                if row_disabled_for_platform(row, process) {
                     report.disabled.push(row.name.clone());
                     continue;
                 }
@@ -113,7 +128,7 @@ impl StandingRegistry {
         }
         let leaves = walk(rows, process, &mut report);
 
-        // 桥（P2：persona 行 → standing scope section + runtime-context 抑制）。
+        // —— 内容桥：persona 行 → standing scope section + runtime-context 抑制。
         for (i, row) in leaves.iter().filter(|r| r.name == PERSONA_ROW).enumerate() {
             let cfg = row.config.clone().unwrap_or(Value::Null);
             let text = cfg
@@ -148,11 +163,76 @@ impl StandingRegistry {
                 .push(format!("@deepseek-ai/dsh-persona (complete={complete})"));
         }
 
-        // 守卫：其余活化叶行未桥 → guarded（P3/P5 缩小；D-103「先 broken」）。
-        for row in leaves.iter().filter(|r| r.name != PERSONA_ROW) {
+        // —— 内容桥：agent-instructions 行 → `<facade.cwd>/AGENTS.md` scoped section
+        //    （maxBytes cap；文件缺失 = 桥解析但因无文件不贡献，仍诚实标 bridged）。
+        for row in leaves.iter().filter(|r| r.name == INSTRUCTIONS_ROW) {
+            let cfg = row.config.clone().unwrap_or(Value::Null);
+            let max_bytes = cfg.get("maxBytes").and_then(Value::as_u64).unwrap_or(65536) as usize;
+            let cwd = process.get("cwd").and_then(Value::as_str).unwrap_or("");
+            let path = std::path::Path::new(cwd).join("AGENTS.md");
+            let marker = match std::fs::read(&path) {
+                Ok(raw) => {
+                    let capped = &raw[..raw.len().min(max_bytes)];
+                    let text = String::from_utf8_lossy(capped).into_owned();
+                    let section = PromptSection {
+                        name: format!("preset:{id}:agent-instructions"),
+                        order: 40.0,
+                        text: PromptSectionText::Static(text),
+                        complete: false,
+                    };
+                    let undo = self
+                        .system_prompt
+                        .section(Some(&scope), &section)
+                        .map_err(|e| format!("preset {id}: instructions section: {e}"))?;
+                    undos.push(undo);
+                    "AGENTS.md"
+                }
+                Err(_) => "no AGENTS.md",
+            };
             report
-                .guarded
-                .push((row.name.clone(), "no Rust bridge yet (P3/P5)".to_string()));
+                .bridged
+                .push(format!("@deepseek-ai/dsh-agent-instructions ({marker})"));
+        }
+
+        // —— 工具行桥：宿主全局已有单工具 → 按行 config 重呈现（description /
+        //    timeoutMs）注册进 standing scope（joined agent 的 schemas 走链即见）。
+        for row in leaves
+            .iter()
+            .filter(|r| r.name != PERSONA_ROW && r.name != INSTRUCTIONS_ROW)
+        {
+            let Some(home) = self.tools.as_ref() else {
+                report.guarded.push((
+                    row.name.clone(),
+                    "no shared tool registry in this host".to_string(),
+                ));
+                continue;
+            };
+            match host_tool_for_row(row) {
+                Some(tool) => match home.get(tool, None) {
+                    Some(base) => {
+                        let mut def = (*base).clone();
+                        let cfg = row.config.clone().unwrap_or(Value::Null);
+                        if let Some(desc) = cfg.get("description").and_then(Value::as_str) {
+                            def.description = desc.to_string();
+                        }
+                        if let Some(t) = cfg.get("timeoutMs").and_then(Value::as_f64) {
+                            def.timeout_ms = Some(t);
+                        }
+                        let undo = home
+                            .register(Rc::new(def), Some(&scope))
+                            .map_err(|e| format!("preset {id}: tool {}: {e}", row.name))?;
+                        undos.push(undo);
+                        report.bridged.push(format!("{} (tool {tool})", row.name));
+                    }
+                    None => report.guarded.push((
+                        row.name.clone(),
+                        format!("no host tool \"{tool}\" in the shared registry"),
+                    )),
+                },
+                None => report
+                    .guarded
+                    .push((row.name.clone(), tool_guard_reason(row))),
+            }
         }
 
         self.standings.insert(
@@ -208,6 +288,74 @@ impl StandingRegistry {
     }
 }
 
+/// D-103 win32-B 平台策略：bash 系行在 win32 **强制可用**（Rust 经 Git Bash 可跑
+/// bash），pwsh 系行在 win32 **判禁**（无 pwsh 执行器，A 并行落地后移除此覆盖）。
+/// 非 win32 回落忠实 `disabled_expr` 求值。
+fn row_disabled_for_platform(row: &CompositionRow, process: &Value) -> bool {
+    let platform = process.get("platform").and_then(Value::as_str);
+    match platform {
+        Some("win32") => {
+            if is_bash_family(row) {
+                return false;
+            }
+            if is_pwsh_family(row) {
+                return true;
+            }
+            row_disabled(row, process)
+        }
+        _ => row_disabled(row, process),
+    }
+}
+
+/// bash 系：`dsh-tool-bash(-persistent)`；或 `dsh-terminal-bash` 的 **bash 方言**
+/// 变体（`shellDialect` 非 pwsh、或未标注 = 默认 bash）。
+fn is_bash_family(row: &CompositionRow) -> bool {
+    let n = row.name.as_str();
+    let dialect = row
+        .config
+        .as_ref()
+        .and_then(|c| c.get("shellDialect"))
+        .and_then(Value::as_str);
+    n.contains("dsh-tool-bash") || (n.contains("dsh-terminal-bash") && dialect != Some("pwsh"))
+}
+
+/// pwsh 系：`dsh-tool-pwsh(-persistent)`；或 `dsh-terminal-bash` 的 pwsh 方言变体。
+fn is_pwsh_family(row: &CompositionRow) -> bool {
+    let n = row.name.as_str();
+    let dialect = row
+        .config
+        .as_ref()
+        .and_then(|c| c.get("shellDialect"))
+        .and_then(Value::as_str);
+    n.contains("dsh-tool-pwsh") || (n.contains("dsh-terminal-bash") && dialect == Some("pwsh"))
+}
+
+/// 单工具行 → 宿主工具名（P3-a 桥表）。多工具行（fs-local/terminal/…）留 P3-b。
+fn host_tool_for_row(row: &CompositionRow) -> Option<&'static str> {
+    match row.name.as_str() {
+        "@deepseek-ai/dsh-tool-bash" => Some("bash"),
+        "@deepseek-ai/dsh-tool-bash-persistent" => Some("bash"),
+        "@deepseek-ai/dsh-tool-str-replace-editor" => Some("str_replace_editor"),
+        _ => None,
+    }
+}
+
+/// 未桥工具行的守卫原因（D-103 broken 集显式标记，不伪装）。
+fn tool_guard_reason(row: &CompositionRow) -> String {
+    let n = row.name.as_str();
+    if is_pwsh_family(row) || n.contains("pwsh") {
+        "no host pwsh executor (D-103 A-parallel lands in P3)".to_string()
+    } else if n.contains("fs-local") {
+        "expands to multiple host fs tools (P3-b bridge)".to_string()
+    } else if n.contains("terminal") {
+        "terminal bridge pending (P3-b)".to_string()
+    } else if n.contains("tool-cordis") || n.contains("command-compact") || n.contains("web") {
+        "broken per D-103 (unbridged surface)".to_string()
+    } else {
+        "no Rust bridge yet (P3/P5)".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +391,31 @@ mod tests {
         dsh_agent_presets::parse::parse_composition(&text).unwrap()
     }
 
+    /// 测试用最小工具定义（object-rooted schema，register 的 schema 断言可过）。
+    fn tool_def(name: &str, description: &str, timeout: f64) -> Rc<dsh_tools::ToolDefinition> {
+        Rc::new(dsh_tools::ToolDefinition {
+            name: name.to_string(),
+            description: description.to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+            output: dsh_tools::ToolOutputDefinition {
+                schema: dsh_tools::json_schema::JsonSchemaNode {
+                    r#type: Some(dsh_tools::json_schema::JsonSchemaType::Object),
+                    ..Default::default()
+                },
+                render: Rc::new(|_: &Value, _: &Value| Vec::new()),
+                presentation_meta: None,
+            },
+            timeout_ms: Some(timeout),
+            execute: Rc::new(|_: &Value, _: &dsh_tools::ToolRunContext| {
+                Err(dsh_tools::ToolFailureData::new("stub", "stub", "stub"))
+            }),
+            finalize_content: None,
+            is_concurrency_safe: None,
+            present_call: None,
+            present_result: None,
+        })
+    }
+
     fn new_sp() -> Rc<SystemPrompt> {
         Rc::new(
             SystemPrompt::new(
@@ -274,7 +447,7 @@ mod tests {
     #[test]
     fn two_standings_isolated_and_join_visible() {
         let sp = new_sp();
-        let mut reg = StandingRegistry::new(sp.clone());
+        let mut reg = StandingRegistry::new(sp.clone(), None);
         let proc = win32_facade();
         reg.mount("minimal", &preset_rows("minimal"), &proc)
             .unwrap();
@@ -332,7 +505,7 @@ mod tests {
     #[test]
     fn guard_report_splits_bridged_disabled_guarded() {
         let sp = new_sp();
-        let mut reg = StandingRegistry::new(sp.clone());
+        let mut reg = StandingRegistry::new(sp.clone(), None);
         reg.mount("minimal", &preset_rows("minimal"), &win32_facade())
             .unwrap();
         let r = reg.report("minimal").unwrap();
@@ -343,16 +516,23 @@ mod tests {
             "bridged: {:?}",
             r.bridged
         );
+        // D-103 win32-B：win32 上 bash 系**保持可用**（Rust 可跑 bash），pwsh 系判禁
+        // （无 pwsh 执行器）。
+        assert!(
+            !r.disabled
+                .iter()
+                .any(|s| s == "@deepseek-ai/dsh-tool-bash-persistent"),
+            "win32-B keeps bash active: {:?}",
+            r.disabled
+        );
         assert!(
             r.disabled
                 .iter()
-                .any(|s| s == "@deepseek-ai/dsh-terminal-bash")
-                && r.disabled
-                    .iter()
-                    .any(|s| s == "@deepseek-ai/dsh-tool-bash-persistent"),
-            "win32-gated bash rows disabled: {:?}",
+                .any(|s| s == "@deepseek-ai/dsh-tool-pwsh-persistent"),
+            "win32-B blocks pwsh: {:?}",
             r.disabled
         );
+        // 无工具注册面（boot_with_sessions 占位）→ 工具行 guarded（诚实）。
         assert!(
             r.guarded
                 .iter()
@@ -369,11 +549,36 @@ mod tests {
         );
     }
 
+    /// Linux 对照：忠实门控（win32-B 只在 win32 生效）——bash 可用、pwsh 禁用。
+    #[test]
+    fn guard_report_linux_uses_faithful_gates() {
+        let sp = new_sp();
+        let mut reg = StandingRegistry::new(sp.clone(), None);
+        let proc = serde_json::from_str(r#"{"platform":"linux","env":{},"cwd":"/repo"}"#).unwrap();
+        reg.mount("minimal", &preset_rows("minimal"), &proc)
+            .unwrap();
+        let r = reg.report("minimal").unwrap();
+        assert!(
+            !r.disabled
+                .iter()
+                .any(|s| s == "@deepseek-ai/dsh-tool-bash-persistent"),
+            "linux: bash faithful-active = not disabled: {:?}",
+            r.disabled
+        );
+        assert!(
+            r.disabled
+                .iter()
+                .any(|s| s == "@deepseek-ai/dsh-tool-pwsh-persistent"),
+            "linux: pwsh disabled: {:?}",
+            r.disabled
+        );
+    }
+
     /// 换 preset = 原有绑定 rebind 到另一 standing scope；agent 视图随之切换。
     #[test]
     fn rejoin_rebinds_parent_and_switches_view() {
         let sp = new_sp();
-        let mut reg = StandingRegistry::new(sp.clone());
+        let mut reg = StandingRegistry::new(sp.clone(), None);
         let proc = win32_facade();
         reg.mount("minimal", &preset_rows("minimal"), &proc)
             .unwrap();
@@ -403,7 +608,7 @@ mod tests {
     #[test]
     fn remount_same_id_replaces_cleanly() {
         let sp = new_sp();
-        let mut reg = StandingRegistry::new(sp.clone());
+        let mut reg = StandingRegistry::new(sp.clone(), None);
         let proc = win32_facade();
         let rows = preset_rows("minimal");
         reg.mount("minimal", &rows, &proc).unwrap();
@@ -426,5 +631,190 @@ mod tests {
                 .any(|t| t.contains("helpful software engineer")),
             "old standing contribution undone after remount: {x_texts:?}"
         );
+    }
+
+    /// —— P3-a：工具行桥 —— 宿主全局工具按行 config 重呈现注册进 standing scope：**
+    /// joined** agent 的 schemas/get 见覆盖后 presentation（description/timeoutMs）；
+    /// **未 join** agent 仍是全局原值（组合呈现隔离）。
+    #[test]
+    fn tool_rows_re_present_into_standing_scope_for_joined_only() {
+        let sp = new_sp();
+        let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+        tools
+            .register_global(tool_def("bash", "GLOBAL-BASH-DESC", 111.0))
+            .unwrap();
+        tools
+            .register_global(tool_def("str_replace_editor", "GLOBAL-EDIT-DESC", 5000.0))
+            .unwrap();
+        let mut reg = StandingRegistry::new(sp.clone(), Some(tools.clone()));
+        let comp = "
+- id: sh
+  name: '@deepseek-ai/dsh-tool-bash'
+  config:
+    description: |-
+      ROW-BASH-LONG-DESC
+    timeoutMs: 222
+- id: ed
+  name: '@deepseek-ai/dsh-tool-str-replace-editor'
+  config:
+    maxOutputChars: 16000
+";
+        let proc = win32_facade();
+        reg.mount(
+            "p1",
+            &dsh_agent_presets::parse::parse_composition(comp).unwrap(),
+            &proc,
+        )
+        .unwrap();
+        let r = reg.report("p1").unwrap();
+        assert!(
+            r.bridged
+                .iter()
+                .any(|s| s.starts_with("@deepseek-ai/dsh-tool-bash ")),
+            "bash row bridged: {:?}",
+            r.bridged
+        );
+        assert!(
+            r.bridged
+                .iter()
+                .any(|s| s.starts_with("@deepseek-ai/dsh-tool-str-replace-editor ")),
+            "editor row bridged: {:?}",
+            r.bridged
+        );
+        // joined agent 见重呈现。
+        let joined = ScopeKey::new();
+        reg.join("p1", &joined).unwrap();
+        let bash_def = tools.get("bash", Some(&joined)).unwrap();
+        assert_eq!(bash_def.description.trim_end(), "ROW-BASH-LONG-DESC");
+        assert_eq!(bash_def.timeout_ms, Some(222.0));
+        // 未 join agent scope：全局原值（无 parent → 不走 standing）。
+        let alone = ScopeKey::new();
+        let alone_def = tools.get("bash", Some(&alone)).unwrap();
+        assert_eq!(alone_def.description, "GLOBAL-BASH-DESC");
+        assert_eq!(alone_def.timeout_ms, Some(111.0));
+    }
+
+    /// 工具行守卫原因：无宿主工具 / pwsh 执行器 / fs 多工具展开 / D-103 broken 集。
+    #[test]
+    fn unbridged_tool_rows_guarded_with_specific_reasons() {
+        let sp = new_sp();
+        let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+        // 只注册 str_replace_editor（无 bash）。
+        tools
+            .register_global(tool_def("str_replace_editor", "EDIT", 1.0))
+            .unwrap();
+        let mut reg = StandingRegistry::new(sp.clone(), Some(tools.clone()));
+        let comp = "
+- id: sh
+  name: '@deepseek-ai/dsh-tool-bash'
+- id: psh
+  name: '@deepseek-ai/dsh-tool-pwsh-persistent'
+- id: fs
+  name: '@deepseek-ai/dsh-fs-local'
+- id: web
+  name: '@deepseek-ai/dsh-tool-web-fetch'
+";
+        // 无门控行 + linux 门面（win32-B 会让 pwsh 进 disabled，故用 linux 让所有
+        // 无门控行都活化 → 走守卫）。
+        let proc: Value =
+            serde_json::from_str(r#"{"platform":"linux","env":{},"cwd":"/repo"}"#).unwrap();
+        reg.mount(
+            "p2",
+            &dsh_agent_presets::parse::parse_composition(comp).unwrap(),
+            &proc,
+        )
+        .unwrap();
+        let r = reg.report("p2").unwrap();
+        let reason_of = |n: &str| {
+            r.guarded
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, why)| why.as_str())
+                .unwrap_or("<missing>")
+        };
+        assert!(
+            reason_of("@deepseek-ai/dsh-tool-bash").contains("no host tool \"bash\""),
+            "missing host tool reason"
+        );
+        assert!(
+            reason_of("@deepseek-ai/dsh-tool-pwsh-persistent").contains("pwsh"),
+            "pwsh A-parallel reason"
+        );
+        assert!(
+            reason_of("@deepseek-ai/dsh-fs-local").contains("multiple host fs tools"),
+            "fs multi-tool reason"
+        );
+        assert!(
+            reason_of("@deepseek-ai/dsh-tool-web-fetch").contains("broken per D-103"),
+            "web broken reason"
+        );
+    }
+
+    /// —— P3-a：agent-instructions 内容桥 —— `<cwd>/AGENTS.md` → joined 视图 scoped
+    /// section；maxBytes cap；缺失 = 不贡献但仍标 bridged（桥已解析）。
+    #[test]
+    fn agent_instructions_content_bridge_reads_agents_md() {
+        let sp = new_sp();
+        let mut reg = StandingRegistry::new(sp.clone(), None);
+        let cwd = std::env::temp_dir().join(format!("dsh-standing-agents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(cwd.join("AGENTS.md"), "AGENTS-MARKER-0123456789").unwrap();
+        let proc = serde_json::json!({
+            "platform": "linux",
+            "env": {},
+            "cwd": cwd.to_string_lossy().into_owned(),
+        });
+        let comp = "
+- id: ins
+  name: '@deepseek-ai/dsh-agent-instructions'
+  config:
+    maxBytes: 12
+";
+        let rows = dsh_agent_presets::parse::parse_composition(comp).unwrap();
+        reg.mount("p3", &rows, &proc).unwrap();
+        let r = reg.report("p3").unwrap();
+        assert!(
+            r.bridged
+                .iter()
+                .any(|s| s == "@deepseek-ai/dsh-agent-instructions (AGENTS.md)"),
+            "instructions bridged: {:?}",
+            r.bridged
+        );
+        let joined = ScopeKey::new();
+        reg.join("p3", &joined).unwrap();
+        // maxBytes=12，AGENTS.md 内容 22 字节 → 只取前 12 字节（片段仍含 "AGENTS-M"）。
+        let texts = sect_texts(&sp, &joined);
+        let marker = texts
+            .iter()
+            .find(|t| t.contains("AGENTS-M"))
+            .expect("instructions section visible to joined agent");
+        assert_eq!(marker.len(), 12, "capped at maxBytes");
+        // 缺失文件：不贡献但仍 bridged（标 no AGENTS.md）。
+        let cwd2 = std::env::temp_dir().join(format!("dsh-standing-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd2);
+        std::fs::create_dir_all(&cwd2).unwrap();
+        let proc2 = serde_json::json!({
+            "platform": "linux", "env": {}, "cwd": cwd2.to_string_lossy().into_owned(),
+        });
+        reg.mount("p4", &rows, &proc2).unwrap();
+        let r4 = reg.report("p4").unwrap();
+        assert!(
+            r4.bridged
+                .iter()
+                .any(|s| s == "@deepseek-ai/dsh-agent-instructions (no AGENTS.md)"),
+            "absent file still bridged: {:?}",
+            r4.bridged
+        );
+        let joined2 = ScopeKey::new();
+        reg.join("p4", &joined2).unwrap();
+        assert!(
+            !sect_texts(&sp, &joined2)
+                .iter()
+                .any(|t| t.contains("AGENTS-MARKER")),
+            "no instructions section without a file"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+        let _ = std::fs::remove_dir_all(&cwd2);
     }
 }

@@ -267,7 +267,10 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
         // P4：standing 注册表改用 **host 的 SystemPrompt**（standings 默认是占位），
         // 使 standing scoped 贡献落进 loop 每 turn 实际组装的注册面。
         boot.standings = std::rc::Rc::new(std::cell::RefCell::new(
-            crate::standing::StandingRegistry::new(bundle.host.prompt.clone()),
+            crate::standing::StandingRegistry::new(
+                bundle.host.prompt.clone(),
+                Some(bundle.host.tools.clone()),
+            ),
         ));
         // M6 step8（D-087）：真实 provider catalog 视图注入 Boot（llm.models caps）。
         boot.agent_catalog = Some(crate::m6_llm::server_catalog_view(&base_url, &model));
@@ -4755,7 +4758,10 @@ mod tests {
         loop_host.ensure_agent(&loop_host.config.agents[0]).unwrap();
         boot.agent_loop = Some(loop_host.clone());
         boot.standings = std::rc::Rc::new(std::cell::RefCell::new(
-            crate::standing::StandingRegistry::new(loop_host.prompt.clone()),
+            crate::standing::StandingRegistry::new(
+                loop_host.prompt.clone(),
+                Some(loop_host.tools.clone()),
+            ),
         ));
 
         let call = |method: &str, payload: serde_json::Value| {

@@ -163,6 +163,7 @@ pub struct ToolExecutionSnapshot {
 }
 
 /// 输出定义：schema + 纯 render + 可选呈现元数据。
+#[derive(Clone)]
 pub struct ToolOutputDefinition {
     pub schema: crate::json_schema::JsonSchemaNode,
     /// `render(args, canonical value)` → model-facing ContentBlock。
@@ -223,6 +224,9 @@ impl ToolResultView {
 }
 
 /// 完整工具定义（registry-ready；对齐 TS `ToolDefinition`）。
+/// `Clone`（P3-a）：standing 桥按行 config 重呈现（description/timeoutMs 覆盖）
+/// 时需要克隆宿主工具定义。
+#[derive(Clone)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
