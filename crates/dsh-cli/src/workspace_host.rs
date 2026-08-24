@@ -53,12 +53,18 @@ fn now_ms() -> u64 {
 
 fn canonical_path(path: &str) -> Result<String, String> {
     let raw = std::fs::canonicalize(path).map_err(|e| format!("workspace path '{}': {e}", path))?;
-    let canonical = raw.to_string_lossy().to_string();
     if !raw.is_dir() {
         return Err(format!(
             "cannot create a workspace at '{}': path is not a directory",
-            canonical
+            raw.to_string_lossy()
         ));
+    }
+    let mut canonical = raw.to_string_lossy().to_string();
+    // Windows `fs::canonicalize` 输出 `\\?\` 扩展长路径前缀；对齐 Node `fs.realpath`
+    // （驱动盘符形式，不含前缀）——否则与前端/原生选择器返回的普通路径（如
+    // `F:\RustProjects\deepseek-harness`）不一致，幂等去重会失效。
+    if let Some(stripped) = canonical.strip_prefix(r"\\?\") {
+        canonical = stripped.to_string();
     }
     Ok(canonical)
 }
@@ -296,8 +302,17 @@ mod tests {
         assert_eq!(boot.workspace_id, "default");
         assert_eq!(boot.title, "default");
         assert_eq!(boot.session_ids, vec!["default".to_string()]);
-        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
-        assert_eq!(boot.path, cwd.to_string_lossy());
+        let mut cwd = std::fs::canonicalize(std::env::current_dir().unwrap())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        if let Some(stripped) = cwd.strip_prefix(r"\\?\") {
+            cwd = stripped.to_string();
+        }
+        assert_eq!(
+            boot.path, cwd,
+            "boot path = canonical cwd (no Windows \\?\\ prefix)"
+        );
     }
 
     #[test]
