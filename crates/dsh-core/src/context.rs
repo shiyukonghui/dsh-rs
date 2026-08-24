@@ -17,7 +17,7 @@ use crate::reflect::{AccessorGet, AccessorSet, CheckFn, Property};
 use crate::registry::Plugin;
 use crate::runtime::{AsyncTask, DeferredWork, Runtime, RuntimeCell, TimerKind, TimerSlot, Transition};
 use crate::service::Service;
-use crate::types::{FiberId, Value};
+use crate::types::{FiberId, ScopeId, Value};
 
 /// waterfall 的最终内置行为（等价 Cordis 中 `args.pop()` 出的 inner）。
 pub type InnerFn = Box<dyn Fn(&mut Vec<Value>) -> Option<Value>>;
@@ -404,6 +404,77 @@ impl Cordis {
     /// 当前 fiber 是否可注册 effect（assertActive）。
     pub fn is_active(&self) -> bool {
         self.with(|rt| rt.current_active())
+    }
+
+    // ---- 作用域（K1/C：agent-scope 组合挂载原语；对齐 harness mount.ts） ----
+
+    /// 当前 fiber 的作用域标签（root=1；未在 fiber 上下文 → 1）。
+    /// 等同 harness `scopeOf`：untagged（root）监听/提供全局可见，
+    /// agent 打标的只在被挂载的会话作用域内可见。
+    pub fn current_scope(&self) -> ScopeId {
+        self.with(|rt| {
+            rt.current_fiber()
+                .and_then(|fid| rt.fiber(fid).map(|f| f.scope))
+                .unwrap_or(1)
+        })
+    }
+
+    /// 挂载一个新的 agent scope 子树（预设组合挂载点）。排队一个作用域标签：
+    /// 下一次 `plugin`/`plugin_arc` 注册的 fiber 取得该标签，其后代经 parent 链
+    /// 继承——挂载树内的注册（监听器/服务）只在本会话作用域可见，root 的全局
+    /// 可见；root 看不见本会话的。返回 `(scope, unmount)`：unmount 卸载该作用域下
+    /// 整棵子树（随 fiber 展开，等同 harness mount.ts 的 fiber 展开）。
+    /// 保留 ScopeKey 单键：`ScopeId` 即不透明 join 键（值比，无第二键空间）。
+    pub fn mount_scope(&self) -> Result<(ScopeId, Disposer), CordisError> {
+        let scope = self.with(|rt| rt.alloc_scope());
+        self.with(|rt| rt.pending_scope.push_back(scope));
+        Ok((scope, make_disposer(Box::new(move |ctx| ctx.unmount_scope(scope)))))
+    }
+
+    /// 卸载挂载在 `scope` 下的整棵子树（该作用域全部 fiber，含子 fiber）。
+    pub fn unmount_scope(&self, scope: ScopeId) {
+        let fids = self.with(|rt| {
+            rt.fibers
+                .iter()
+                .flatten()
+                .filter(|f| f.scope == scope)
+                .map(|f| f.id)
+                .collect::<Vec<_>>()
+        });
+        for fid in fids {
+            let _ = self.unload(fid);
+        }
+    }
+
+    /// M3 补：把当前 fiber 的 isolate 映射指向 `scope`（Cordis
+    /// `ctx[Context.isolate]`＝本 fiber 子树内对 `name` 的提供/读取落在 `scope`
+    /// realm）。apply 内先调用再 `provide`，服务即进入该 realm（而非 ROOT）——
+    /// 是 `audit_subtree` 判定「未泄漏」的正路（harness：preset 服务须置于
+    /// isolate realm 或迁往宿主组合）。子 fiber 注册时继承该映射。
+    pub fn isolate(&self, name: &str, scope: ScopeId) -> Result<(), CordisError> {
+        let fid = self.with(|rt| rt.current_fiber());
+        let Some(fid) = fid else {
+            return Err(CordisError::InactiveEffect);
+        };
+        let ok = self.with(|rt| match rt.fiber_mut(fid) {
+            Some(f) if f.is_active() => {
+                f.isolate.insert(name.to_string(), scope);
+                true
+            }
+            _ => false,
+        });
+        if ok {
+            Ok(())
+        } else {
+            Err(CordisError::InactiveEffect)
+        }
+    }
+
+    /// K1/C：root-realm 泄漏审计（harness `mount.ts` 的 `leakedServices` 语义）。
+    /// 返回挂载子树 `scope` 下把服务发布进 root realm（或 hook 逃逸）的泄漏描述；
+    /// 空列表 = 干净。宿主在发布/审计时若检测到泄漏应拒绝该挂载。
+    pub fn audit_subtree(&self, scope: ScopeId) -> Vec<String> {
+        self.with(|rt| rt.audit_subtree(scope))
     }
 
     // ---- 插件注册 ----

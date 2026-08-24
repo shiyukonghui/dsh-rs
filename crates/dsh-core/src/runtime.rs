@@ -131,6 +131,10 @@ pub struct Runtime {
     pub pending_entry: Option<String>,
     /// 挂载入口时待注入新 fiber 的服务隔离映射（M3 isolate）。
     pub pending_isolate: HashMap<String, ScopeId>,
+    /// K1/C：待取用的挂载作用域队列（FIFO）。`mount_scope` 压入一个新 agent
+    /// 作用域，下一个 `alloc_fiber` 弹出并设为该 fiber 的 scope 标签；后代经
+    /// parent 链继承该标签（等同 harness `scope.ts` 的 scopeOf 继承）。
+    pub pending_scope: std::collections::VecDeque<ScopeId>,
     /// 挂载入口时待注入新 fiber 的 intercept 条目（M3）。
     pub pending_intercept: Vec<(String, Value)>,
     /// 每服务名的根作用域（Cordis `root.isolate[name] ??= Symbol(name)`）。
@@ -142,6 +146,9 @@ pub struct Runtime {
     pub next_impl: u64,
     pub next_hook: u64,
     pub next_scope: u64,
+    /// K1/C：agent/isolate 作用域的独立高基数计数（避免与 per-name 根作用域及
+    /// root 哨兵=1 冲突）。
+    pub next_isolate_scope: u64,
     pub next_uid: u64,
 }
 
@@ -173,6 +180,7 @@ impl Runtime {
             current: Vec::new(),
             pending_entry: None,
             pending_isolate: HashMap::new(),
+            pending_scope: std::collections::VecDeque::new(),
             pending_intercept: Vec::new(),
             scopes: HashMap::new(),
             trace: Vec::new(),
@@ -180,6 +188,7 @@ impl Runtime {
             next_impl: 0,
             next_hook: 0,
             next_scope: 1,
+            next_isolate_scope: 1_000_000,
             next_uid: 0,
         }
     }
@@ -198,6 +207,13 @@ impl Runtime {
         self.next_fiber += 1;
         self.next_uid += 1;
         let uid = self.next_uid;
+        // K1/C：作用域标签 = 待取用的挂载作用域（FIFO 弹出）→ 否则继承 parent 的
+        // 标签（子树内后代同域）→ 否则 root（=1）。先前恒为 1（M0 限制）。
+        let scope = self
+            .pending_scope
+            .pop_front()
+            .or_else(|| parent.and_then(|p| self.fiber(p)).map(|f| f.scope))
+            .unwrap_or(1);
         self.fibers.push(Some(FiberData {
             id,
             uid: Some(uid),
@@ -216,7 +232,7 @@ impl Runtime {
             config,
             error: None,
             epoch: None,
-            scope: 1,
+            scope,
             effects: Vec::new(),
         }));
         id
@@ -271,10 +287,12 @@ impl Runtime {
             })
     }
 
-    /// 分配一个独立的隔离作用域（LocalRealm/GlobalRealm 用；不注册到 scopes 表）。
+    /// 分配一个独立的隔离作用域（LocalRealm/GlobalRealm / K1 agent 挂载用；
+    /// 不注册到 scopes 表）。与 per-name 根作用域（`scopes`，自 1 起）及 root 哨兵
+    /// （=1）永不冲突：独立高基数计数器。
     pub fn alloc_scope(&mut self) -> ScopeId {
-        let s = self.next_scope;
-        self.next_scope += 1;
+        let s = self.next_isolate_scope;
+        self.next_isolate_scope += 1;
         s
     }
 
@@ -437,17 +455,59 @@ impl Runtime {
         false
     }
 
-    /// 收集命中（global 或作用域匹配）的监听器，保持注册顺序。
+    /// 收集命中（global、root 未打标或作用域匹配）的监听器，保持注册顺序。
+    /// K1/C：对齐 harness `scope.ts` 的 filter——untagged（root scope=1）监听器全局
+    /// 接受；agent 打标的监听器只在本作用域内派发。
     pub fn collect_hooks(&self, name: &str, current_scope: ScopeId) -> Vec<HookCallback> {
         self.hooks
             .get(name)
             .map(|list| {
                 list.iter()
-                    .filter(|h| h.global || h.scope == current_scope)
+                    .filter(|h| h.global || h.scope == 1 || h.scope == current_scope)
                     .map(|h| h.cb.clone())
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// K1/C：root-realm 泄漏守卫（复刻 harness `mount.ts` 的 `leakedServices`）。
+    /// 审计挂在 `scope` 下的整棵子树（全部携带该 scope 标签的 fiber）：
+    /// 服务提供者的 owner 若在子树内、却把服务发布进该服务名的根作用域
+    /// （`scopes[name]`，即未置于 isolate realm），即泄漏（进程级共享、第二个
+    /// 挂载会与之冲突）；钩子（防御）落在 root scope 且非 global 亦然。
+    ///
+    /// 返回泄漏描述列表（空 = 干净）。
+    pub fn audit_subtree(&self, scope: ScopeId) -> Vec<String> {
+        let mut leaks: Vec<String> = Vec::new();
+        let in_sub: std::collections::HashSet<FiberId> = self
+            .fibers
+            .iter()
+            .flatten()
+            .filter(|f| f.scope == scope)
+            .map(|f| f.id)
+            .collect();
+        for imp in self.impls.values() {
+            if in_sub.contains(&imp.owner) {
+                if let Some(root) = self.scopes.get(&imp.name) {
+                    if imp.scope == *root {
+                        leaks.push(format!(
+                            "service '{}' published to root realm (scope {}) by a preset subtree fiber",
+                            imp.name, imp.scope
+                        ));
+                    }
+                }
+            }
+        }
+        for list in self.hooks.values() {
+            for h in list {
+                if in_sub.contains(&h.owner) && h.scope == 1 && !h.global {
+                    leaks.push(
+                        "hook registered at root scope (non-global) by a preset subtree fiber".to_string(),
+                    );
+                }
+            }
+        }
+        leaks
     }
 
     // ---- 插件注册 ----

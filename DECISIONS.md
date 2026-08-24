@@ -4348,6 +4348,34 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
 
 **回滚**：D-104 本身仅文档；K1..K5 以阶段为粒度 `git revert` 独立提交。**key 纪律不变**。
 
+### D-104 实施补记（K1：agent-scope 组合挂载原语，round 21；TDD 红→绿）
+
+- 触发：D-104 计划 K1（dsh-core M1 isolate 作用域 →「组合挂载原语」，ScopeKey 单键）。
+- 事实基底（自下而上）：`FiberData.scope`/`isolate` 字段早已存在但 M0 恒为根（lib.rs
+  自述「isolate/intercept 作用域 M1 引入」）；`collect_hooks` 只按 `scope == current`
+  过滤（无 parent 链、无 root 可见性）；`pending_isolate` 无公开设置者（M3 未完成）；
+  `alloc_scope` 用与 per-name 根作用域共用的 `next_scope`（首枚会= root 哨兵 1）。
+- 实现（红→绿：先写 m70 单测 3 条连 API 都不存在→应按语义走；初跑即暴露
+  alloc_scope=1 把 agent fiber 全变 root 的模型 bug）：
+  - **scope 标签成真**：`Runtime.pending_scope: VecDeque<ScopeId>`（FIFO，多次挂载不
+    互相覆盖）；`alloc_fiber` 弹队头否则继承 parent.scope 否则 1；仅 register_plugin
+    一处调用点，零外部影响。
+  - **独立隔离计数器** `next_isolate_scope`（基数 1e6）：agent/isolate 作用域与
+    per-name root（自 1）及 root 哨兵=1 永不冲突——**首个挂载 scope 恒非 root**。
+  - **hook 可见性 = harness filter**：`collect_hooks` `global || scope==1 ||
+    scope==current`——untagged(root) 全局可见、agent 打标仅本会话；对所有既有 fiber
+    （scope=1）恒真，**既有行为零变化**。
+  - **root-realm 泄漏守卫** `audit_subtree(scope)`：owner∈子树的服务若落在
+    `scopes[name]` 根域（未 isolate）→ 泄漏（复刻 mount.ts leakedServices）；owner∈
+    子树却 root-scope 非 global 的 hook → 泄漏（防御）。
+  - **门面**：`mount_scope()->(ScopeId, Disposer)`（unmount 卸载整棵子树、随 fiber
+    展开）、`unmount_scope`、`current_scope`、`isolate(name, scope)`（M3 补，把当前
+    fiber 的 isolate 指向 agent realm 的正路——抹掉「默认 provide 即 root = 泄漏」）。
+- 验收：dsh-core 全绿（M 系列 + m70 3 条）；clippy `-D warnings` 零；四依赖 crate
+  （tools/loader/wasmrt/cli）全回归 496/496 绿（基准 438 + dsh-core/M70）。live 行为
+  不受影响（生产 loop 不消费 dsh-core 作用域）。回滚：`git revert` K1 提交。
+- **下一步 K2**：unusable-rows 挂载否决（D-103 显式 broken 集除外）→ K3 薄适配。
+
 ### D-104 实施补记预留
 
 
