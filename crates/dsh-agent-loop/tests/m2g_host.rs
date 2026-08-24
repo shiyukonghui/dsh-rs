@@ -224,6 +224,67 @@ fn ensure_agent_is_idempotent_and_uses_given_session_id() {
     assert!(host.store.is_live(&sid), "configured session id used");
 }
 
+// ---------------------------------------------------------------------------
+// D-101：运行时 per-session agent 注册（session.create/fork 挂接真实 agent）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn configured_for_session_matches_static_config_and_convention() {
+    let (host, _) = host_with(&[text_chunks("hello")]);
+    // a1（无显式身份）按约定身份 `agent-a1` 命中。
+    let via_convention = host
+        .configured_for_session("agent-a1")
+        .expect("convention identity resolves");
+    assert_eq!(via_convention.id, "a1");
+    // 无显式 sessionId 的配置 agent 不命中任意精确会话。
+    assert!(host.configured_for_session("some-other").is_none());
+}
+
+#[test]
+fn register_session_agent_is_routable_idempotent_and_drives_turn() {
+    let (host, _) = host_with(&[text_chunks("hello")]);
+    let cfg = ConfiguredAgent {
+        id: "session-s9".into(),
+        provider: Some("mock".into()),
+        model: Some("mock-model".into()),
+        session_id: Some("s9".into()),
+        max_tokens: None,
+        cwd: Some(r"C:\work".into()),
+        resume_session_id: None,
+    };
+    let first = host.register_session_agent(cfg.clone()).unwrap();
+    // 可被 `configured_for_session` 解析（run_rust_loop 的路由查询路径）；cwd 保留。
+    let resolved = host
+        .configured_for_session("s9")
+        .expect("runtime agent visible to routing");
+    assert_eq!(resolved.id, "session-s9");
+    assert_eq!(resolved.cwd.as_deref(), Some(r"C:\work"));
+    // 幂等：重复注册 → 同一装配实例，不重复登记。
+    let second = host.register_session_agent(cfg).unwrap();
+    assert!(Rc::ptr_eq(&first, &second), "register_session_agent is idempotent");
+    // followup 经 agent id 驱动真实 turn；事件落共享 store（会话键 = sessionId）。
+    host.followup("session-s9", user_msg("hi")).unwrap();
+    let evs = host.events("s9");
+    assert!(evs.iter().any(|e| e.kind == EventKind::TurnEnd), "turn/end under session key");
+}
+
+#[test]
+fn register_session_agent_reuses_existing_agent_for_reserved_session() {
+    let (host, _) = host_with(&[text_chunks("x")]);
+    // `agent-a1` 是静态 a1 的约定身份 → 复用 a1，不许新配置重复登记。
+    let cfg = ConfiguredAgent {
+        id: "dup".into(),
+        session_id: Some("agent-a1".into()),
+        ..Default::default()
+    };
+    let agent = host.register_session_agent(cfg).unwrap();
+    assert!(
+        Rc::ptr_eq(&agent, &host.agent("a1").unwrap()),
+        "reserved session reuses existing agent"
+    );
+    assert!(host.configured_for_session("agent-a1").is_some());
+}
+
 #[test]
 fn unknown_agent_followup_fails_loud() {
     let (host, _) = host_with(&[text_chunks("x")]);

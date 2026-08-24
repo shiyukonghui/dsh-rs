@@ -3819,5 +3819,55 @@ clippy `-D warnings` 零告警。实战：重启 60165 后驱动「pick→create
 
 ---
 
+## D-101（使用测试发现：新会话发消息报 `no configured agent maps to session`）：per-session agent 注册
+
+**日期**：2026（用户反馈：工作区流程开出的会话 s4 上 `session.prompt` 报
+`{"code":"internal","message":"no configured agent maps to session \"s4\""}`；设置中
+`agentPreset.list` 返回 `presets:[]`；用户判断是「没加载 agent 预设」。）
+
+**第一性原理（自上而下 + 自下而上）**：
+- 自上而下：前端「打开工作区 → sessions.create → sessions.open → prompt」的会话链里，
+  `session.prompt(sessionId: X)` 必须能把 X 路由到一个真实 agent。TS 里 `session.create`
+  生一个完整 Session+Agent（agent 的 composition 来自预设），所以**任何已创建会话都应有
+  agent**；重启后持久化恢复的会话也应续接 agent。
+- 自下而上（现有实现）：`run_rust_loop` 的会话→agent 路由只查 `host.config.agents`
+  （cordis.yml 装配期静态配置，仅 1 条 `default`）；`session.create`（web RPC）只 mint
+  会话、**不注册 agent**；`session.fork` 同理；`agentPreset.*` 全为 stub。
+  两者在中间相遇的结论：不是「预设没加载」导致发消息失败——是**会话根本没有 agent 可路由**；
+  预设清单为空是另一个独立缺口（后续决策）。
+
+**考虑过的选项**：
+1. **运行时可写 agent 注册表 + 关键点挂接（采用）**：`AgentLoopHost` 增
+   `runtime_agents: RefCell<Vec<ConfiguredAgent>>`（与静态 `config.agents` 并列做会话发现；
+   `config` 保持装配期校验语义不变）、`configured_for_session()`（静态优先，再运行时）、
+   `register_session_agent()`（幂等：会话已被任何 agent 命中则复用）；`run_rust_loop` 改走
+   `configured_for_session`；web `session.create`（cwd=工作区路径，D-100 归属）/
+   `session.fork`（继承源 cwd）调用新 `ensure_session_agent()`；对**存在于共享 store** 的
+   会话（重启恢复）首次 prompt 时懒挂接再路由，未知会话仍 fail loud（不放行任意 id）。
+2. 只把 `session.create` 返回的 `agentPreset` 字段补上/把 stub 改成假成功——治标不治本：
+   prompt 路由仍失败。
+3. 给 AgentLoopHost 的 `config` 整体包 `Rc<RefCell>` 允许运行时改静态 agents——侵入 validate
+   语义，且不必要（运行时注册单独成表更干净）。
+
+**最终选择**：选项 1。静态配置身份不可变、运行时注册独立成表；会话→agent 的**唯一查询
+入口**收敛到 `configured_for_session`（`run_rust_loop` 与 `ensure_session_agent` 幂等判断
+共用同一规则 `ConfiguredAgent::matches_session`：`sessionId` ▸ `resumeSessionId` ▸ `agent-{id}`）。
+
+**TDD + 验收**：dsh-agent-loop 集成测试 ×3（`configured_for_session` 命中静态约定身份；
+`register_session_agent` 可路由/幂等/驱动真实 turn 于 session 键下；预留会话复用既有 agent
+不重复登记）+ dsh-cli web 测试（`session.create{workspaceId}` → 会话可被路由、cwd=工作区路径、
+`session.prompt` accepted 且事件落共享 store；**重启续接**的 store 会话首次 prompt 懒挂接
+accepted；**未知**会话仍 `internal:no configured agent` fail loud）。回归：dsh-cli `--lib`
+149 项全绿 + clippy `-D warnings` 零告警。
+
+**已知限制（如实）**：① per-session agent 的 provider/model/cwd 继承部署默认（模板 =
+装配期 `default`）；`session.selectModel` 仍是 stub，不改变已注册 agent 的模型——逐会话
+选模型另立项；② `agentPreset.*` 仍是 stub（设置里预设清单为空），另决策；③ 懒挂接仅对
+store 中**已存在**会话生效（重启恢复），未知 id 仍 fail loud。
+**回滚**：撤本提交；`session.prompt` 回到「仅配置会话可路由」，新会话发消息再次失败；
+其余功能不受影响。
+
+---
+
 
 

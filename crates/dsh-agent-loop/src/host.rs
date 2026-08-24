@@ -55,6 +55,16 @@ pub struct ConfiguredAgent {
     pub resume_session_id: Option<String>,
 }
 
+impl ConfiguredAgent {
+    /// 会话身份匹配规则（`run_rust_loop` / `register_session_agent` 共用）：
+    /// 精确 `sessionId` ▸ `resumeSessionId` ▸ 约定身份 `agent-{id}`。
+    pub fn matches_session(&self, session_id: &str) -> bool {
+        self.session_id.as_deref() == Some(session_id)
+            || self.resume_session_id.as_deref() == Some(session_id)
+            || format!("agent-{}", self.id) == session_id
+    }
+}
+
 /// `AgentLoop.Config` 组合形态（`maxParallelToolCalls` + `agents`）。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AgentLoopConfig {
@@ -133,6 +143,10 @@ pub struct AgentLoopHost {
     pub tools: Rc<ToolRegistry>,
     pub prompt: Rc<SystemPrompt>,
     agents: RefCell<HashMap<String, Rc<ReactLoopAgent>>>,
+    /// 运行时注册的配置 agent（D-101：`session.create`/`fork` 铸新会话时按需挂接）。
+    /// 与 `config.agents`（静态配置）并列做会话→agent 发现；`config` 保持装配期
+    /// 校验语义不变（validate 只在 with_store 一次）。
+    runtime_agents: RefCell<Vec<ConfiguredAgent>>,
     /// 宿主持有的 disposer（工具注册/守卫等；teardown 时按序执行）。
     disposers: RefCell<Vec<Rc<dyn Fn()>>>,
 }
@@ -185,6 +199,7 @@ impl AgentLoopHost {
             tools,
             prompt,
             agents: RefCell::new(HashMap::new()),
+            runtime_agents: RefCell::new(Vec::new()),
             disposers: RefCell::new(Vec::new()),
         }))
     }
@@ -199,6 +214,43 @@ impl AgentLoopHost {
                 session_id: a.session_id.clone().or_else(|| a.resume_session_id.clone()),
             })
             .collect()
+    }
+
+    /// 按会话身份解析一个配置 agent（D-101）：静态 `config.agents` 优先，其次
+    /// 运行时 `runtime_agents`。静态配置在前，运行时注册不会遮蔽装配期身份。
+    pub fn configured_for_session(&self, session_id: &str) -> Option<ConfiguredAgent> {
+        self.config
+            .agents
+            .iter()
+            .find(|a| a.matches_session(session_id))
+            .cloned()
+            .or_else(|| {
+                self.runtime_agents
+                    .borrow()
+                    .iter()
+                    .find(|a| a.matches_session(session_id))
+                    .cloned()
+            })
+    }
+
+    /// 运行时给一个会话注册 agent（幂等；D-101）。会话已被任一（静态或运行时）
+    /// agent 命中 → 返回其已装配 agent，不重复登记；否则 `ensure_agent` 装配后
+    /// 记入 runtime_agents（装配失败不入册，保持幂等）。
+    pub fn register_session_agent(
+        &self,
+        configured: ConfiguredAgent,
+    ) -> Result<Rc<ReactLoopAgent>, String> {
+        let session_key = configured
+            .session_id
+            .clone()
+            .or_else(|| configured.resume_session_id.clone())
+            .unwrap_or_else(|| format!("agent-{}", configured.id));
+        if let Some(existing) = self.configured_for_session(&session_key) {
+            return self.ensure_agent(&existing);
+        }
+        let agent = self.ensure_agent(&configured)?;
+        self.runtime_agents.borrow_mut().push(configured);
+        Ok(agent)
     }
 
     /// 已装配的 agent（按配置 id）；未知 → None。

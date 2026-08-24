@@ -460,7 +460,8 @@ pub fn run_turn(boot: &Boot, input: &Value) -> Result<Value, CordisError> {
 }
 
 /// M2g：把一条 user 文本驱动进 Rust AgentLoopHost 的配置 agent。
-/// - 目标 agent：配置项中 `sessionId == session_id` 或默认 `agent-{id} == session_id` 者；
+/// - 目标 agent：`configured_for_session` 解析——精确 `sessionId`（含 D-101 运行时
+///   注册的 per-session agent）▸ `resumeSessionId` ▸ 约定 `agent-{id}`；
 /// - agent 懒装配（ensure_agent 幂等）；事件直接写 AgentLoopHost 持有的共享 store
 ///   （web 侧与 SessionHost 同店 → 前端读模型/下链/持久化同一事实源）；
 /// - 无 host 或无可路由 agent → Err（fail loud）。
@@ -468,21 +469,24 @@ pub fn run_rust_loop(boot: &Boot, session_id: &str, content: &str) -> Result<(),
     let host = boot.agent_loop.as_ref().ok_or_else(|| {
         CordisError::Internal("no Rust AgentLoopHost assembled in this boot".into())
     })?;
-    let configured = host
-        .config
-        .agents
-        .iter()
-        .find(|a| {
-            a.session_id.as_deref() == Some(session_id)
-                || a.resume_session_id.as_deref() == Some(session_id)
-                || format!("agent-{}", a.id) == session_id
-        })
-        .cloned()
-        .ok_or_else(|| {
-            CordisError::Internal(format!(
-                "no configured agent maps to session \"{session_id}\""
-            ))
-        })?;
+    let configured = match host.configured_for_session(session_id) {
+        Some(c) => c,
+        None => {
+            // D-101 续接路径：重启后恢复的持久化会话（存在于共享 store，但运行时
+            // agent 按进程登记）→ 首次 prompt 时挂接 agent 再路由；**未知**会话仍
+            // fail loud（修复不放行任意 id）。
+            let sid = dsh_session::types::SessionId::from_raw(session_id.to_string());
+            if host.store.get(&sid).is_some() {
+                ensure_session_agent(boot, session_id, None)?;
+                host.configured_for_session(session_id)
+                    .expect("just-registered session agent must resolve")
+            } else {
+                return Err(CordisError::Internal(format!(
+                    "no configured agent maps to session \"{session_id}\""
+                )));
+            }
+        }
+    };
     host.ensure_agent(&configured)
         .map_err(|e| CordisError::Internal(format!("agent-loop host: {e}")))?;
     let message = dsh_llm::Message::user(
@@ -491,6 +495,41 @@ pub fn run_rust_loop(boot: &Boot, session_id: &str, content: &str) -> Result<(),
     );
     host.followup(&configured.id, message)
         .map_err(|e| CordisError::Internal(format!("agent-loop host: {e}")))
+}
+
+/// D-101：给一个**运行时铸出**的会话（web `session.create`/`fork`）挂接一个真实
+/// agent——否则 `session.prompt` 对非配置会话报 `no configured agent maps to session`。
+/// - 模板 = 装配期 `default` agent（provider/model/cwd 继承部署默认）；
+/// - `cwd`：调用方（web 侧已知工作区路径时）优先，否则模板 cwd；
+/// - 未装配 agent-loop（M1 WASM 路径）→ no-op（该路径不依赖 per-session agent）；
+/// - 幂等（`register_session_agent`：会话已有身份则复用，不重复装配）。
+pub fn ensure_session_agent(boot: &Boot, session_id: &str, cwd: Option<&str>) -> Result<(), CordisError> {
+    let host = match &boot.agent_loop {
+        Some(host) => host.clone(),
+        None => return Ok(()),
+    };
+    // 幂等：会话已被配置命中 → 无需新建。
+    if host.configured_for_session(session_id).is_some() {
+        return Ok(());
+    }
+    let template = host
+        .configured_for_session("default")
+        .or_else(|| host.config.agents.first().cloned())
+        .ok_or_else(|| {
+            CordisError::Internal("agent-loop host: no base agent to clone for new session".into())
+        })?;
+    let configured = dsh_agent_loop::ConfiguredAgent {
+        id: format!("session-{session_id}"),
+        provider: template.provider.clone(),
+        model: template.model.clone(),
+        session_id: Some(session_id.to_string()),
+        max_tokens: template.max_tokens,
+        cwd: cwd.map(str::to_string).or_else(|| template.cwd.clone()),
+        resume_session_id: None,
+    };
+    host.register_session_agent(configured)
+        .map_err(|e| CordisError::Internal(format!("agent-loop host: {e}")))?;
+    Ok(())
 }
 
 /// headless 单发任务的结果（对齐 DSH `dsh --profile headless "job"`：

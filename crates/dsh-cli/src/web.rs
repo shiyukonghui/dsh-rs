@@ -2419,33 +2419,46 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             // D-100：`{workspaceId}` 时把新会话 attach 进该工作区（对齐 TS
             // session.create{workspaceId} 的归属语义）并推 host 增量帧
             // （host/workspace-changed + host/session-added）；未知工作区 → 诚实报错。
-            if let Some(ws_id) = payload.get("workspaceId").and_then(|v| v.as_str()) {
-                let attached = {
-                    let mut reg = boot.workspaces.borrow_mut();
-                    reg.attach_session(ws_id, &id)
-                };
-                match attached {
-                    Some(record) => {
-                        push_host_frame(
-                            boot,
-                            serde_json::json!({"type": "host/workspace-changed",
-                                "workspace": crate::workspace_host::workspace_view(&record)}),
-                        );
-                        push_host_frame(
-                            boot,
-                            serde_json::json!({"type": "host/session-added",
-                                "sessionId": id, "blank": true}),
-                        );
-                        serde_json::json!({"ok": true, "value": {"sessionId": id}})
+            let attached_path: Option<String> =
+                if let Some(ws_id) = payload.get("workspaceId").and_then(|v| v.as_str()) {
+                    let attached = {
+                        let mut reg = boot.workspaces.borrow_mut();
+                        reg.attach_session(ws_id, &id)
+                    };
+                    match attached {
+                        Some(record) => {
+                            push_host_frame(
+                                boot,
+                                serde_json::json!({"type": "host/workspace-changed",
+                                    "workspace": crate::workspace_host::workspace_view(&record)}),
+                            );
+                            push_host_frame(
+                                boot,
+                                serde_json::json!({"type": "host/session-added",
+                                    "sessionId": id, "blank": true}),
+                            );
+                            Some(record.path.clone())
+                        }
+                        None => {
+                            return serde_json::json!({"ok": false, "error": {
+                                "code": "workspace-not-found",
+                                "message": format!("unknown workspace '{}'", ws_id),
+                            }})
+                        }
                     }
-                    None => serde_json::json!({"ok": false, "error": {
-                        "code": "workspace-not-found",
-                        "message": format!("unknown workspace '{}'", ws_id),
-                    }}),
-                }
-            } else {
-                serde_json::json!({"ok": true, "value": {"sessionId": id}})
+                } else {
+                    None
+                };
+            // D-101：给新会话挂接真实 agent——否则 `session.prompt` 对它们报
+            // `no configured agent maps to session`。cwd 沿用工作区路径（D-100 归属），
+            // 无工作区 → 继承部署默认 agent 的 cwd。装配失败 → fail loud。
+            if let Err(e) = crate::ensure_session_agent(boot, &id, attached_path.as_deref()) {
+                return serde_json::json!({"ok": false, "error": {
+                    "code": "internal",
+                    "message": e.to_string(),
+                }});
             }
+            serde_json::json!({"ok": true, "value": {"sessionId": id}})
         }
         "session.history" => {
             // M1e：SessionStore 的历史（strict-envelope 事件直接 wire）。
@@ -2525,6 +2538,18 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
                 Err(e) => (e, false),
             };
             if ok {
+                // D-101：子会话继承源 agent 的 cwd（源无 agent 配置 → None → 部署默认）。
+                let src_cwd = boot
+                    .agent_loop
+                    .as_ref()
+                    .and_then(|h| h.configured_for_session(src))
+                    .and_then(|c| c.cwd.clone());
+                if let Err(e) = crate::ensure_session_agent(boot, &id, src_cwd.as_deref()) {
+                    return serde_json::json!({"ok": false, "error": {
+                        "code": "internal",
+                        "message": e.to_string(),
+                    }});
+                }
                 serde_json::json!({"ok": true, "value": {"sessionId": id}})
             } else {
                 // 源会话不存在 → 按 schema 失败（session-not-found）。
@@ -3474,6 +3499,175 @@ mod tests {
         );
         assert_eq!(v4["result"]["ok"], false);
         assert_eq!(v4["result"]["error"]["code"], "workspace-not-found");
+    }
+
+    /// D-101：`session.create` mint 的会话已挂接真实 agent——`session.prompt` 不再报
+    /// `no configured agent maps to session`，事件落共享 store（agent cwd 沿用工作区
+    /// 路径）；未创建的会话仍诚实报 internal（不因修复而全局放行）。
+    #[test]
+    fn session_create_registers_agent_and_prompt_routes() {
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+        use std::rc::Rc;
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let root = std::env::temp_dir().join(format!("dsh-d101-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+
+        let script = Rc::new(RefCell::new(VecDeque::from_iter([
+            vec![
+                dsh_llm::StreamChunk::BlockStart {
+                    index: 0,
+                    block_type: "text".parse().unwrap(),
+                },
+                dsh_llm::StreamChunk::TextDelta { index: 0, text: "hello from d101".into() },
+                dsh_llm::StreamChunk::BlockEnd {
+                    index: 0,
+                    block: dsh_llm::ContentBlock::text("hello from d101"),
+                },
+                dsh_llm::StreamChunk::Finish {
+                    reason: dsh_llm::FinishReason::Stop,
+                    replay_state: None,
+                },
+            ],
+            vec![
+                dsh_llm::StreamChunk::BlockStart {
+                    index: 0,
+                    block_type: "text".parse().unwrap(),
+                },
+                dsh_llm::StreamChunk::TextDelta { index: 0, text: "hello from restored".into() },
+                dsh_llm::StreamChunk::BlockEnd {
+                    index: 0,
+                    block: dsh_llm::ContentBlock::text("hello from restored"),
+                },
+                dsh_llm::StreamChunk::Finish {
+                    reason: dsh_llm::FinishReason::Stop,
+                    replay_state: None,
+                },
+            ],
+        ])));
+        struct Adapter {
+            script: Rc<RefCell<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
+        }
+        impl dsh_llm::LlmAdapter for Adapter {
+            fn stream(
+                &self,
+                _options: dsh_llm::GenerateOptions,
+            ) -> Box<dyn Iterator<Item = dsh_llm::StreamChunk>> {
+                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                Box::new(next.into_iter())
+            }
+        }
+        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Rc::new(Adapter { script })).unwrap();
+
+        let bundle = match crate::web::assemble_server_runtime_with_llm(
+            &session_host,
+            root.clone(),
+            llm,
+            "mock",
+            "mock-model",
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("assemble deferred (bash unavailable?): {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+        };
+        let mut boot = boot_with_sessions();
+        boot.host_events = Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+
+        let call = |boot: &crate::Boot, method: &str, payload: Value, host: &Rc<SessionHost>| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": method, "payload": payload,
+            })).unwrap();
+            let (_, v) = handle_rpc_host(boot, method, &body, host);
+            v
+        };
+
+        // 打开一个工作区（D-100 真实注册表），再开一个会话（D-101 挂接 agent）。
+        let ws_dir = root.join("ws").to_string_lossy().to_string();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let v = call(
+            &boot,
+            "workspace.create",
+            serde_json::json!({"path": ws_dir}),
+            &session_host,
+        );
+        let ws_id = v["result"]["value"]["workspace"]["workspaceId"].as_str().unwrap().to_string();
+        // 装配 agent-loop 后：session.create 为会话注册 agent。
+        boot.agent_loop = Some(bundle.host.clone());
+        let v2 = call(
+            &boot,
+            "session.create",
+            serde_json::json!({"workspaceId": ws_id}),
+            &session_host,
+        );
+        assert_eq!(v2["result"]["ok"], true, "session.create: {v2}");
+        let sid = v2["result"]["value"]["sessionId"].as_str().unwrap().to_string();
+
+        // 该会话已可被 configured_for_session 解析（run_rust_loop 路由查询路径），
+        // 且 cwd 沿用工作区路径（D-100 归属）。
+        let agent = bundle.host.configured_for_session(&sid);
+        let agent = agent.expect("session.create must register a routable agent");
+        assert_eq!(agent.cwd.as_deref(), Some(ws_dir.as_str()), "agent cwd = workspace path");
+
+        // session.prompt 对全新会话 → accepted（此前报 internal:no configured agent）。
+        let v3 = call(
+            &boot,
+            "session.prompt",
+            serde_json::json!({"sessionId": sid,
+                "content": [{"type": "text", "text": "hi from ui"}]}),
+            &session_host,
+        );
+        assert_eq!(v3["result"]["value"]["accepted"], true, "prompt accepted: {v3}");
+
+        // 共享 store：事件落新会话（user/message + assistant/message）。
+        let evs = session_host.events(&sid);
+        assert!(evs.iter().any(|e| e.kind.as_str() == "user/message"));
+        assert!(evs.iter().any(|e| e.kind.as_str() == "assistant/message"));
+        let assistant = evs.iter().find(|e| e.kind.as_str() == "assistant/message").unwrap();
+        assert_eq!(assistant.data["message"]["content"][0]["text"], "hello from d101");
+
+        // 重启续接路径（D-101 lazy）：共享 store 已有会话但从未 RPC 注册 agent
+        // （如持久化恢复）→ 首次 prompt 时挂接 agent 再路由，非 internal 错误。
+        let restored_sid = session_host.create_new().unwrap();
+        let v5 = call(
+            &boot,
+            "session.prompt",
+            serde_json::json!({"sessionId": restored_sid,
+                "content": [{"type": "text", "text": "hi restored"}]}),
+            &session_host,
+        );
+        assert_eq!(v5["result"]["value"]["accepted"], true, "restored session accepted: {v5}");
+        assert!(
+            bundle.host.configured_for_session(&restored_sid).is_some(),
+            "lazy registration visible to routing"
+        );
+
+        // 未创建的会话仍 fail loud（internal:no configured agent）——修复不放行任意 id。
+        let v4 = call(
+            &boot,
+            "session.prompt",
+            serde_json::json!({"sessionId": "ghost-unknown",
+                "content": [{"type": "text", "text": "hi"}]}),
+            &session_host,
+        );
+        assert_eq!(v4["result"]["ok"], false);
+        assert_eq!(v4["result"]["error"]["code"], "internal");
+        assert!(
+            v4["result"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no configured agent maps to session"),
+            "unknown session still fails loud: {v4}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 阶段2：commands/list 返回命令数组（{name, description, input?}）。
