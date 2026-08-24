@@ -104,6 +104,10 @@ pub struct WebConfig {
     /// 会话持久化根（`session/event` → append，`session/flush` → flush 落盘）。
     /// 缺省 = 纯内存（不落盘）。
     pub session_dir: Option<PathBuf>,
+    /// M6W（D-092）：SQLite 会话存储文件（`SqliteBackend` 持久化后端）。
+    /// 优先级高于 `session_dir`（同时给定 → sqlite 生效 + eprintln 显式警告）；
+    /// 缺省 = None（回落到 session_dir / 内存）。
+    pub sqlite_store: Option<PathBuf>,
     /// M6（P2）：agent 循环工作区根（工具 cwd）。缺省 = 当前工作目录 canonicalize。
     pub workspace_root: Option<PathBuf>,
     /// M6：装配服务器执行闭环（真 LLM + M4/M5 工具 + 共享 store 的 AgentLoopHost）。
@@ -125,6 +129,29 @@ pub struct WebConfig {
 /// 一个已运行的 Web 服务器（持有实际监听地址）。
 pub struct WebServer {
     pub addr: String,
+}
+
+/// M6W（D-092）：按 config 选择 SessionHost 持久化后端。
+/// 优先级：`sqlite_store` > `session_dir` > 纯内存。
+/// 同时给定 `sqlite_store` 与 `session_dir` → sqlite 生效 + `eprintln!` 显式警告
+/// （fail-loud，绝不清零静默降级）。SQLite 打开/建 schema 失败 → `Err`（boot 终止）。
+/// 采用字段级 Option 引用（serve 早前会 move 其他 cfg 字段——避免整体借 `&cfg`）。
+fn session_host_for(
+    sqlite_store: &Option<PathBuf>,
+    session_dir: &Option<PathBuf>,
+) -> Result<std::rc::Rc<crate::session_host::SessionHost>, String> {
+    match (sqlite_store, session_dir) {
+        (Some(file), Some(dir)) => {
+            eprintln!(
+                "dsh web: --sqlite-store overrides --session-dir; ignoring {}",
+                dir.display()
+            );
+            crate::session_host::SessionHost::with_sqlite(file)
+        }
+        (Some(file), None) => crate::session_host::SessionHost::with_sqlite(file),
+        (None, Some(dir)) => Ok(crate::session_host::SessionHost::with_root(dir)),
+        (None, None) => Ok(crate::session_host::SessionHost::in_memory()),
+    }
 }
 
 /// 启动 `dsh web`：服务前端 dist + `/api` RPC，桥接到 boot 运行时。
@@ -174,10 +201,8 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
     // M1e：SessionHost——SessionStore（权威历史）+ 可选持久化挂载 + EventSink
     // 下链。loop 仍写 `boot.sessions`（SessionLog）；`session.prompt` adopt 进
     // 目标会话；`session/event` 下链走 EventSink（Send+Sync 供 SSE/WS 线程）。
-    let host = match &cfg.session_dir {
-        Some(dir) => SessionHost::with_root(dir),
-        None => SessionHost::in_memory(),
-    };
+    let host = session_host_for(&cfg.sqlite_store, &cfg.session_dir)
+        .map_err(|e| CordisError::Internal(format!("session persistence: {e}")))?;
     // seed `default`（前端会话入口）。
     let _ = host.session("default");
 
@@ -6414,5 +6439,63 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- M6W（D-092）：serve 主机选择优先级（sqlite > jsonl > 内存）----
+
+    fn simple_turn(text: &str) -> Vec<(String, Vec<u8>)> {
+        vec![
+            (
+                "user/message".into(),
+                serde_json::to_vec(&serde_json::json!({"text": text, "role": "user"})).unwrap(),
+            ),
+            (
+                "assistant/message".into(),
+                serde_json::to_vec(&serde_json::json!({
+                    "turn": 1, "step": 1,
+                    "message": {"id": "a1", "role": "assistant",
+                                "content": [{"type": "text", "text": format!("echo: {text}")}],
+                                "source": {"kind": "model", "provider": "mock", "model": "mock"}},
+                }))
+                .unwrap(),
+            ),
+            (
+                "turn/end".into(),
+                serde_json::to_vec(&serde_json::json!({"turn": 1, "reason": "completed"})).unwrap(),
+            ),
+        ]
+    }
+
+    /// A3：sqlite_store 优先于 session_dir（写落 sqlite 文件、jsonl 根为空）；无则内存。
+    #[test]
+    fn session_host_precedence_sqlite_over_jsonl() {
+        use dsh_persistence::PersistenceBackend;
+        let dir = std::env::temp_dir().join(format!("dsh-m6w-preced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let jsonl_root = dir.join("jsonl");
+        let sqlite_file = dir.join("store.sqlite");
+
+        // sqlite + jsonl 同给 → sqlite 生效 + eprintln 警告（警告仅诊断，行为是 sqlite）。
+        let both = session_host_for(&Some(sqlite_file.clone()), &Some(jsonl_root.clone()))
+            .expect("host");
+        assert_eq!(both.persistence_kind(), "sqlite");
+        both.adopt("default", &simple_turn("hi")).unwrap();
+        both.flush("default").unwrap();
+        // 写落 sqlite 文件；jsonl 根零 artifact。
+        let backend = dsh_persistence::sqlite::SqliteBackend::open(&sqlite_file).unwrap();
+        let stored = backend
+            .load_stored(&dsh_brand::SessionId::from_raw("default".to_string()))
+            .unwrap();
+        assert!(stored.is_some(), "session persisted to sqlite");
+        let jsonl_entries = std::fs::read_dir(&jsonl_root).map(|rd| rd.count()).unwrap_or(0);
+        assert_eq!(jsonl_entries, 0, "jsonl root untouched when sqlite wins");
+
+        // 仅 jsonl → jsonl；仅内存 → mem。
+        let mem = session_host_for(&None, &None).expect("host");
+        assert_eq!(mem.persistence_kind(), "mem");
+        let jsonl = session_host_for(&None, &Some(jsonl_root.clone())).expect("host");
+        assert_eq!(jsonl.persistence_kind(), "jsonl");
+        let _ = std::fs::remove_dir_all(&dir).ok();
     }
 }

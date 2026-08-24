@@ -240,7 +240,9 @@ fn main() {
 /// M70：`dsh web` 子命令——服务 DeepSeek Harness 前端 + `/api` RPC，桥接运行时。
 ///
 /// `dsh web <cordis.yml> [--web-root <dir>] [--host <h>] [--port <p>]
-/// [--overlay <f>]... [--wasm-base <dir>]`
+/// [--overlay <f>]... [--wasm-base <dir>] [--session-dir <dir>]
+/// [--sqlite-store <file>] [--agent-loop] [--workspace-root <dir>]
+/// [--llm-base-url <url>] [--llm-model <model>] [--env-file <f>]`
 ///
 /// `--web-root`：前端 dist 根目录（含 index.html）。默认依次尝试环境变量
 /// `DSH_WEB_ROOT`、`D:\Program Files\DeepSeek Harness\resources\host\node_modules\@deepseek-ai\dsh-web-frontend\dist`、
@@ -253,6 +255,8 @@ fn web_main(args: &[String]) {
     let mut overlays: Vec<PathBuf> = Vec::new();
     let mut wasm_base = PathBuf::from("wasm-plugins");
     let mut session_dir: Option<PathBuf> = None;
+    // M6W（D-092）：SQLite 会话存储文件（优先级高于 --session-dir）。
+    let mut sqlite_store: Option<PathBuf> = None;
     // M6（step1b）：服务器执行闭环装配参数。
     let mut enable_agent_loop = false;
     let mut workspace_root: Option<PathBuf> = None;
@@ -286,6 +290,10 @@ fn web_main(args: &[String]) {
             "--session-dir" => {
                 i += 1;
                 session_dir = Some(PathBuf::from(&args[i]));
+            }
+            "--sqlite-store" => {
+                i += 1;
+                sqlite_store = Some(PathBuf::from(&args[i]));
             }
             "--agent-loop" => {
                 enable_agent_loop = true;
@@ -351,6 +359,7 @@ fn web_main(args: &[String]) {
         host: host.clone(),
         port,
         session_dir,
+        sqlite_store,
         workspace_root,
         enable_agent_loop,
         llm_base_url,

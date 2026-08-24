@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex};
 use dsh_brand::SessionId;
 use dsh_persistence::coordinator::PersistenceCoordinator;
 use dsh_persistence::jsonl::{JsonlBackend, JsonlConfig};
-use dsh_persistence::SessionPersistence;
+use dsh_persistence::sqlite::SqliteBackend;
+use dsh_persistence::{PersistenceBackend, SessionPersistence};
 use dsh_session::runtime::Session;
 use dsh_session::store::{SessionForkSource, SessionStore};
 use dsh_session::types::{
@@ -39,34 +40,63 @@ pub struct SessionHost {
     pub coord: Option<Rc<PersistenceCoordinator>>,
     /// 事件下链日志（Send+Sync）。
     pub sink: EventSink,
+    /// 持久化后端种类诊断（"mem"/"jsonl"/"sqlite"）。
+    kind: &'static str,
 }
 
 impl SessionHost {
     /// 纯内存 SessionHost（无持久化根；测试 / 未配置 session 根时使用）。
     pub fn in_memory() -> Rc<Self> {
-        Self::new_impl(None)
+        Self::new_from_backend("mem", None)
     }
 
     /// 从持久化根构造：JSONL 后端 + coordinator 挂载 + 恢复既有快照。
     /// 快照恢复失败不阻断构造（返回的 host 仍可用；错误在调用方诊断）。
     pub fn with_root(root: &Path) -> Rc<Self> {
-        let host = Self::new_impl(Some(root.to_path_buf()));
+        let backend = JsonlBackend::new(JsonlConfig {
+            root: root.to_path_buf(),
+            ..Default::default()
+        });
+        let host = Self::new_from_backend("jsonl", Some(Box::new(backend)));
         host.restore_all();
         host
     }
 
-    fn new_impl(root: Option<std::path::PathBuf>) -> Rc<Self> {
-        let coord = root.map(|root| {
-            let backend = JsonlBackend::new(JsonlConfig {
-                root,
-                ..Default::default()
-            });
-            Rc::new(PersistenceCoordinator::new(Box::new(backend)))
-        });
+    /// 从 SQLite 文件构造（M6W，D-092）：SqliteBackend → coordinator → 观察者 →
+    /// restore_all。父目录不存在则 create_dir_all（镜像 JSONL 惰性建根）。
+    /// 打开/建 schema 失败 → `Err`（fail-loud，调用方负责 boot 时终止——绝不静默
+    /// 降级到内存）。
+    pub fn with_sqlite(path: &Path) -> Result<Rc<Self>, String> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create sqlite parent {}: {e}", parent.display()))?;
+            }
+        }
+        let backend = SqliteBackend::open(path)
+            .map_err(|e| format!("sqlite store {}: {e}", path.display()))?;
+        let host = Self::new_from_backend("sqlite", Some(Box::new(backend)));
+        host.restore_all();
+        Ok(host)
+    }
+
+    /// 持久化后端种类（诊断/测试断言）。
+    pub fn persistence_kind(&self) -> &'static str {
+        self.kind
+    }
+
+    /// 观察者接线唯一来源（D-092）：任何后端（jsonl/sqlite/内存）共用同一
+    /// create/append/flush 持久化副作用 + 下链。
+    fn new_from_backend(
+        kind: &'static str,
+        backend: Option<Box<dyn PersistenceBackend>>,
+    ) -> Rc<Self> {
+        let coord = backend.map(|b| Rc::new(PersistenceCoordinator::new(b)));
         let host = Rc::new(SessionHost {
             store: Rc::new(SessionStore::new()),
             coord,
             sink: Arc::new(Mutex::new(Vec::new())),
+            kind,
         });
         // 挂载观察者：append 提交后 → 持久化 + 下链。
         // 注意：闭包不捕获 `host.store`（否则 store→观察者→store 引用环泄漏）。
@@ -417,6 +447,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         dir
+    }
+
+    /// SQLite 文件路径（父目录**不**预创建——验证 with_sqlite 自行建父目录）。
+    fn tmp_sqlite_file(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!("dsh-sqlite-web-{tag}-{}", std::process::id()))
+            .join("store.sqlite")
+    }
+
+    // ---- SQLite 持久化挂载（M6W，D-092）----
+
+    /// A1：with_sqlite 落盘 → 冷重启同文件 → 恢复快照（含 end-seed 边界标记）。
+    #[test]
+    fn with_sqlite_restart_restores_snapshot_into_store() {
+        let file = tmp_sqlite_file("restart");
+        {
+            let host = SessionHost::with_sqlite(&file).expect("sqlite");
+            assert_eq!(host.persistence_kind(), "sqlite");
+            host.adopt("default", &raw_echo_turn("hi")).unwrap();
+            host.flush("default").unwrap();
+        }
+        {
+            let host = SessionHost::with_sqlite(&file).expect("sqlite");
+            assert!(host.is_live("default"));
+            let evs = host.events("default");
+            assert_eq!(evs.len(), 7);
+            assert_eq!(evs[6].kind.as_str(), "session/end-seed");
+            assert_eq!(evs[3].kind.as_str(), "assistant/message");
+            assert_eq!(evs[3].data["message"]["content"][0]["text"], "echo: hi");
+        }
+        let _ = std::fs::remove_dir_all(file.parent().unwrap()).ok();
+    }
+
+    /// A2：恢复后继续 adopt → seq 连续（游标对齐，不被 materialize 回灌打断）。
+    #[test]
+    fn with_sqlite_restore_then_adopt_continues_seq() {
+        let file = tmp_sqlite_file("cont");
+        {
+            let host = SessionHost::with_sqlite(&file).expect("sqlite");
+            host.adopt("default", &raw_echo_turn("hi")).unwrap();
+            host.flush("default").unwrap();
+        }
+        {
+            let host = SessionHost::with_sqlite(&file).expect("sqlite");
+            host.adopt("default", &raw_echo_turn("bye")).unwrap();
+            let evs = host.events("default");
+            assert_eq!(evs.len(), 13);
+            assert_eq!(evs[12].seq, 12);
+            assert_eq!(evs[10].kind.as_str(), "assistant/message");
+            assert_eq!(evs[10].data["message"]["content"][0]["text"], "echo: bye");
+            assert_eq!(evs[12].kind.as_str(), "turn/end");
+            host.flush("default").unwrap();
+        }
+        let _ = std::fs::remove_dir_all(file.parent().unwrap()).ok();
+    }
+
+    /// 诊断：persistence_kind 反映后端装配。
+    #[test]
+    fn persistence_kind_reports_backend() {
+        assert_eq!(SessionHost::in_memory().persistence_kind(), "mem");
+        let root = tmp_root("kind-jsonl");
+        assert_eq!(SessionHost::with_root(&root).persistence_kind(), "jsonl");
+        let file = tmp_sqlite_file("kind-sqlite");
+        assert_eq!(
+            SessionHost::with_sqlite(&file)
+                .expect("sqlite")
+                .persistence_kind(),
+            "sqlite"
+        );
+        let _ = std::fs::remove_dir_all(&root).ok();
+        let _ = std::fs::remove_dir_all(file.parent().unwrap()).ok();
     }
 
     #[test]

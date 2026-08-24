@@ -293,7 +293,9 @@ pub trait PersistenceBackend {
         events: &[SessionEvent],
     ) -> Result<(), PersistenceError>;
 
-    /// 首次物化：header + 首批次原子落盘（重复 materialize 拒绝）。
+    /// 首次物化：header + 首批次原子落盘（D-092：create-or-replace 语义——对已物化
+    /// 会话原子覆盖重写，供恢复路径 `restore_one` 重灌幂等；与 JSONL 实现一致，
+    /// 不再是「重复拒绝」，旧文档措辞已随 D-092 修正）。
     fn materialize_batch(
         &self,
         meta: &SessionHeader,

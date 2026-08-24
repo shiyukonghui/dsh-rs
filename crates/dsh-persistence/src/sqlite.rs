@@ -274,18 +274,17 @@ impl PersistenceBackend for SqliteBackend {
         let id = &meta.id;
         let header_text = serde_json::to_string(meta)
             .map_err(|e| PersistenceError::Other(format!("sqlite header serialize: {e}")))?;
-        let inserted = tx
-            .execute(
-                "INSERT OR IGNORE INTO sessions (id, header, revision) VALUES (?1, ?2, 0)",
-                rusqlite::params![id.raw(), header_text],
-            )
-            .map_err(|e| PersistenceError::Other(format!("sqlite materialize: {e}")))?;
-        if inserted == 0 {
-            return Err(PersistenceError::Other(format!(
-                "sqlite materialize {}: duplicate session (already materialized)",
-                id.raw()
-            )));
-        }
+        // D-092：create-or-replace（镜像 JSONL 原子覆盖）。coordinator/restore_one
+        // 恢复后经 coord.append 重灌同一会话 → 首 append 走 materialize_batch；
+        // 「重复拒绝」会让恢复游标错位、后续写失败（M6W-REQUIREMENTS §3 越级发现）。
+        // 覆盖为同一会话重写 header + events，事务原子。
+        tx.execute(
+            "INSERT OR REPLACE INTO sessions (id, header, revision) VALUES (?1, ?2, 0)",
+            rusqlite::params![id.raw(), header_text],
+        )
+        .map_err(|e| PersistenceError::Other(format!("sqlite materialize: {e}")))?;
+        tx.execute("DELETE FROM events WHERE id = ?1", rusqlite::params![id.raw()])
+            .map_err(|e| PersistenceError::Other(format!("sqlite materialize clear: {e}")))?;
         // 首批次须从 seq 0 连续。
         if events.first().map(|e| e.seq) != Some(0) {
             return Err(PersistenceError::Invalid(format!(
@@ -460,23 +459,38 @@ mod tests {
         assert_eq!(stored.events[0].data["text"], "hello");
     }
 
-    /// 契约违规 fail-loud：重复 materialize + 非连续 append seq。
+    /// materialize = create-or-replace（镜像 JSONL 原子覆盖；供 rehydrate 重灌幂等，
+    /// D-092 修正）+ 非连续 append seq 仍 fail-loud。
     #[test]
-    fn sqlite_rejects_duplicate_materialize_and_seq_gap() {
-        let (_dir, db) = tmp_db("reject");
+    fn sqlite_materialize_is_idempotent_create_or_replace_and_seq_gap_rejected() {
+        let (_dir, db) = tmp_db("replace");
         let backend = SqliteBackend::open(&db).unwrap();
         let meta = hdr("default");
         backend
             .materialize_batch(&meta, &[ev(0, EventKind::UserMessage, json!({"text": "a"}))])
             .unwrap();
-        assert!(
-            backend
-                .materialize_batch(&meta, &[ev(1, EventKind::TurnEnd, json!({}))])
-                .is_err(),
-            "duplicate materialize rejected"
-        );
+        // 重复 materialize：幂等原子覆盖（新 header + 事件），非 Err。
+        let mut meta2 = meta.clone();
+        meta2.created_at = 1;
+        backend
+            .materialize_batch(
+                &meta2,
+                &[
+                    ev(0, EventKind::UserMessage, json!({"text": "b"})),
+                    ev(1, EventKind::TurnEnd, json!({"reason": "stop"})),
+                ],
+            )
+            .expect("idempotent overwrite");
+        let stored = backend
+            .load_stored(&SessionId::from_raw("default".to_string()))
+            .unwrap()
+            .expect("loaded");
+        assert_eq!(stored.meta.created_at, 1, "header overwritten");
+        assert_eq!(stored.events.len(), 2, "events replaced");
+        assert_eq!(stored.events[0].data["text"], "b");
+        // seq 缺口 append 仍 fail-loud。
         let gap = backend.append_batch(
-            &hdr("default"),
+            &meta2,
             &[ev(5, EventKind::TurnEnd, json!({}))],
         );
         assert!(gap.is_err(), "seq gap rejected: {gap:?}");
