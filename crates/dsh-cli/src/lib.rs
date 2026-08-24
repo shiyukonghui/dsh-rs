@@ -29,6 +29,9 @@ pub mod host_dir;
 /// Windows 真交互在 `host_picker_windows`（进程内 IFileDialog，零子进程）。
 pub mod host_picker;
 
+/// D-099：`/plugins/events` HMR SSE 通道（客户端插件热重载，对齐 TS `client/hmr`）。
+pub mod hmr_events;
+
 /// D-098：Windows 原生目录选择绑定（IFileDialog/COM via 新版 windows crate）。
 #[cfg(windows)]
 pub mod host_picker_windows;

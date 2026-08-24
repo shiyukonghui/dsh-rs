@@ -19,6 +19,7 @@
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use dsh_core::*;
@@ -197,6 +198,15 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
     // 的 web 插件；每个是 `/plugins/<id>/client.js?rev=<hash>` 一行）。
     let manifest = build_boot_manifest(&cfg.plugin_root)?;
 
+    // D-099：HMR SSE 通道（`/plugins/events`）。Arc 共享 + 独立 watcher 线程——每
+    // `HMR_POLL_INTERVAL_MS` 扫一遍 client bundle 内容变化，广播 `rebuilt` 帧；
+    // 无重建 watcher 改 bundle 时通道保持空闲（对齐 TS「the chain stays idle」）。
+    let hmr = std::sync::Arc::new(crate::hmr_events::HmrChannel::new(&manifest));
+    {
+        let hmr = hmr.clone();
+        std::thread::spawn(move || hmr.run(crate::hmr_events::HMR_POLL_INTERVAL_MS));
+    }
+
     let web_root = cfg.web_root;
     // M1e：SessionHost——SessionStore（权威历史）+ 可选持久化挂载 + EventSink
     // 下链。loop 仍写 `boot.sessions`（SessionLog）；`session.prompt` adopt 进
@@ -274,10 +284,11 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
         if let Some(request) = request {
             let root = web_root.clone();
             let manifest = manifest.clone();
+            let hmr = hmr.clone();
             let sink = sink.clone();
             // tiny_http 每请求已在线程处理；这里再派发。RPC/静态用 `&Boot`
             // （非 Send，留在调用线程），SSE/WS 用 `EventSink`（Send+Sync）。
-            dispatch_request(request, &root, &manifest, boot, &host, &sink);
+            dispatch_request(request, &root, &manifest, &hmr, boot, &host, &sink);
         }
         if let (Some(sched), Some(bridge)) = (&tick_schedule, &tick_bridge) {
             let now = system_now_ms();
@@ -293,11 +304,33 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
 /// bash jobs 合作结算；非阻塞（recv_timeout），无忙轮询。
 pub const M6_SERVE_TICK_INTERVAL_MS: u64 = 250;
 
+/// `/plugins/events` HMR SSE 通道的路由决策（D-099）：GET→连接流、HEAD→事件流头、
+/// 其他方法→405（对齐 TS 路由的非 GET/HEAD 405 语义）；路径不匹配 → None
+/// （回落 `/plugins/<id>/client.js` bundle 分支）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HmrEventsPlan {
+    Stream,
+    HeadersOnly,
+    MethodNotAllowed,
+}
+
+fn hmr_events_plan(path: &str, method: &Method) -> Option<HmrEventsPlan> {
+    if path != crate::hmr_events::EVENTS_ENDPOINT {
+        return None;
+    }
+    Some(match *method {
+        Method::Get => HmrEventsPlan::Stream,
+        Method::Head => HmrEventsPlan::HeadersOnly,
+        _ => HmrEventsPlan::MethodNotAllowed,
+    })
+}
+
 /// 派发一个请求：`/plugins/*` bundle、`/api/*` RPC/SSE，否则静态文件（SPA fallback）。
 fn dispatch_request(
     mut request: tiny_http::Request,
     web_root: &Path,
     manifest: &BootManifest,
+    hmr: &Arc<crate::hmr_events::HmrChannel>,
     boot: &Boot,
     host: &Rc<SessionHost>,
     sink: &crate::session_host::EventSink,
@@ -314,6 +347,32 @@ fn dispatch_request(
             "message": "Host must be loopback",
         }));
         let _ = request.respond(resp);
+        return;
+    }
+
+    // D-099：`/plugins/events` 是客户端插件 HMR SSE 通道（前端 `client-hmr` 无条件
+    // 订阅），须先于 `/plugins/<id>/client.js` bundle 分支拦截，否则按未知资源 404
+    // （使用测试发现：控制台 `GET /plugins/events` 404 + EventSource 重连刷屏）。
+    if let Some(plan) = hmr_events_plan(&path, request.method()) {
+        match plan {
+            HmrEventsPlan::Stream => {
+                // SSE 连接独立线程：写头 → connected + graph 帧 → watcher 广播帧；
+                // 连接关闭即退（long-lived，线程隔离，不阻塞 accept 循环）。
+                let writer = request.into_writer();
+                let ch = hmr.clone();
+                std::thread::spawn(move || crate::hmr_events::stream_hmr_events(writer, ch));
+            }
+            // HEAD：事件流头（无体）。浏览器 EventSource 用 GET，HEAD 仅为对齐语义。
+            HmrEventsPlan::HeadersOnly => {
+                let resp = Response::empty(200u16).with_header(
+                    Header::from_bytes(&b"Content-Type"[..], b"text/event-stream").unwrap(),
+                );
+                let _ = request.respond(resp);
+            }
+            HmrEventsPlan::MethodNotAllowed => {
+                let _ = request.respond(Response::empty(405u16));
+            }
+        }
         return;
     }
 
@@ -566,8 +625,11 @@ pub fn build_boot_manifest(plugin_root: &Path) -> Result<BootManifest, CordisErr
     Ok(BootManifest { rev, entries })
 }
 
-/// sha1 前 12 hex（对齐 `ClientModuleRegistry.shortHash`）。
-fn short_hash(input: &[u8]) -> String {
+/// 内容哈希（同为 bundle rev；D-099：HMR watcher 用它比对内容是否变化）。原始意图是
+/// sha1 前 12 hex（对齐 `ClientModuleRegistry.shortHash`）；沿用无 sha1 crate 时代的
+/// DefaultHasher 确定性变体——进程内内容变化检测足够（HMR 契约），跨进程不稳定属
+/// 既有债务（D-099 已知限制②）。
+pub(crate) fn short_hash(input: &[u8]) -> String {
     // 无 sha1 crate：用简单确定 hash（bundle 内容哈希一致性锚）。
     // 注：对齐语义是「内容一致则同 rev」——用 std DefaultHasher 的确定性变体。
     let mut state = std::collections::hash_map::DefaultHasher::new();
@@ -3466,6 +3528,18 @@ mod tests {
         // 未知 id
         assert!(serve_plugin_bundle(&m, "/plugins/@deepseek-ai/nope/client.js").is_none());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D-099：`/plugins/events` 路由决策——GET→SSE 流、HEAD→事件流头、其他方法→405；
+    /// 非该路径→None（回落 `/plugins/<id>/client.js` 与 `/api/*` 既有分支，不再 404）。
+    #[test]
+    fn hmr_events_plan_routes() {
+        use tiny_http::Method;
+        assert_eq!(hmr_events_plan("/plugins/events", &Method::Get), Some(HmrEventsPlan::Stream));
+        assert_eq!(hmr_events_plan("/plugins/events", &Method::Head), Some(HmrEventsPlan::HeadersOnly));
+        assert_eq!(hmr_events_plan("/plugins/events", &Method::Post), Some(HmrEventsPlan::MethodNotAllowed));
+        assert_eq!(hmr_events_plan("/plugins/@deepseek-ai/x/client.js", &Method::Get), None);
+        assert_eq!(hmr_events_plan("/api/events.mux", &Method::Get), None);
     }
 
     /// 阶段2：websocket_accept 计算对齐 RFC 6455 规范测试向量

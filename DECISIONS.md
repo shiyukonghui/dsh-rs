@@ -3682,5 +3682,58 @@ Send，改动面大且不必要——只有 user-paced 的 pickDirectory 需要�
 
 ---
 
+## D-099（使用测试发现：控制台 404）：实现 `/plugins/events` HMR SSE 通道
+
+**日期**：2026（用户反馈控制台报错 `XHR GET http://127.0.0.1:60165/plugins/events
+[HTTP/1.1 404 Not Found]` + Firefox 重连提示）。
+**触发问题**：前端的 web 组合包**无条件挂载** `@deepseek-ai/dsh-client-hmr`（TS
+`web-app` 组合的 always-on 客户端插件重载链，其文档：「mounts this row unconditionally;
+without a rebuild watcher rewriting client bundles, the chain stays idle」）。该插件
+浏览器半（`packages/client/hmr/src/client`）在 `ctx.effect` 里**无条件**
+`new EventSource('/plugins/events')`。我们的 Rust serve 只实现 `/plugins/<id>/client.js`
+bundle 路由，从未提供 `/plugins/events` SSE 通道 → 404 → EventSource 自动重连刷屏。
+**第一性原理**：这不是前端多发的请求，而是**缺失的请求面**——TS 宿主永远为这条通道
+服务（`/plugins/events` SSE：连上即写 `: connected\n\n` + `{type:"graph", graph}` 帧；
+随后对 bundle 内容变化广播 `{type:"rebuilt", id, rev}` 帧）。我们的 serve 要做到
+TS 对等，就必须实现同样语义的通道。
+**考虑过的选项**：A）仅实现**空闲 SSE 桩**（只发 connected+graph，永不广播 rebuilt）——
+能消 404 但把通道做空，损害 TS 对等；当开发者对 client bundle 跑重建时浏览器仍拿旧
+bundle（违背「不为『快速完成』选最小实现」）。B）**完整移植一个 stat-poll watcher +
+rebuilt 广播**（TS 活半的 1:1）——浏览器收到 rebuilt 帧后经缓存模块系统 invalidate→
+prefetch→refresh 热换单插件（`entry.refresh()` 按 `?rev=` 重拉我们服务的新 bundle），
+真实支持客户端插件热重载；无重建时通道空闲（与 TS 完全一致）。C）从组合排除
+`dsh-client-hmr`（像目录选择器那样）——让 /plugins/events 永不请求；但偏离 web-app
+的「无条件挂载」契约，且只有我们 Rust 侧排除、TS 应用不排除，二者行为分叉。**采纳 B**。
+**最终选择**（对齐 TS `client/hmr` 宿主半）：
+1. `hmr_events.rs`（新）：`HmrChannel`（Arc 共享）——`WatchedRow{id, path, mtime_ms,
+   size, rev, dirty}` 表 + `HashMap<u64, mpsc::Sender<String>>` 连接集。`poll_once()`
+   纯可重入（stat 每行 → 变化才 re-hash 内容找新 rev → 返回 `(id, rev)` rebuilt 列表；
+   缺文件标 dirty 跳过；未变静默），供单测零时序驱动；`run(interval)` 是薄循环
+   （sleep → poll_once → broadcast）。`connect()` 注册客户端返回 receiver；广播用
+   mpsc 发送，发送失败（对端 drop）即移除连接——**每条连接只有连接线程碰 socket**，
+   watcher 线程绝不并发写 socket（避免与 TS `Set<ServerResponse>` 直写的并发写面）。
+   帧序列化纯函数：connected 注释 + graph 帧（复用 boot 图形状）+ rebuilt 帧，逐字节单测。
+2. web.rs 接线：`dispatch_request` 在 `/plugins/` 前缀分支**之前**判 `path == "/plugins/events"`
+   ——GET → `into_writer()` 起线程跑 `stream_hmr_events`（SSE 头 + connected + graph +
+   增量帧 + keepalive 心跳，连接关闭即退）；HEAD → 200 event-stream 头（无体）；其余
+   方法 → 405（对齐 TS 路由的 405 语义）。`serve()` 在 manifest 组装后
+   `Arc<HmrChannel>::new(&manifest)` + 起 watcher 线程（默认 500ms，TS 同值）；manifest
+   是 watcher 的静态 watch 集（我们的宿主不在运行时挂/卸客户端插件——TS 的
+   `onGraphChanged` 动态增删行超出 Rust 侧范围，如实记录）。rebuilt 帧的 rev 即新内容
+   `short_hash`，与 `/plugins/<id>/client.js?rev=` 一致（no-cache 从盘直读）。
+**被否决**：空闲 SSE 桩（做空通道、破坏 TS 对等）；组合排除 client-hmr（偏离无条件
+挂载契约、与 TS 行为分叉）；让 watcher 线程直写 socket（并发写面，mpsc 隔离更稳）。
+**TDD + 验收**：hmr_events 单测（graph 帧/connected 注释/rebuilt 帧 wire 格式、poll_once
+无变化空闲/改 bundle 报 rebuilt/缺文件 dirty 后恢复、broadcast 达达且对端 drop 即移除）
++ web route 纯判定单测 + 回归 128 项全绿 + clippy `-D warnings` 零告警。实战：重启后
+`GET /plugins/events` 返回 SSE 200（connected+graph）不再 404；临时宿主（DSH_PLUGIN_ROOT
+覆盖到 scratch）改一 bundle → SSE 流收到真实 `rebuilt` 帧。页面刷新后控制台无 404/重连。
+**已知限制（如实）**：① watch 集静态（manifest 启动时定）；TS 运行时增减行超出 Rust 侧
+宿主能力，未移植，文档说明；② `short_hash` 沿 D-095 前的 DefaultHasher（非加密、跨进程
+不稳定）——进程内内容变化检测足够（HMR 契约），属既有债务非本决策引入。
+**回滚**：撤本提交；serve 回到无 /plugins/events（只有 404 控制台噪音，功能不受影响）。
+
+---
+
 
 
