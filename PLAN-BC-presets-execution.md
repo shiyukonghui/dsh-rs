@@ -108,7 +108,7 @@
 | spike-3 ✅ | SystemPrompt scoped sections/persona/变量/完整链 assemble（C-02） | **已核实 src**：`SystemPrompt.layers: ScopedLayers<PromptLayer>`（每层 scoped `sections/contexts/runtime_context_suppressors/tool_providers/variables`）；`assemble(&AssembleContext{scope})` = `layers.merge(scope)` **全局基+远→近覆盖（最近胜）** + 变量同规则 + `suppress_runtime_context`→contexts 清空 + **单 `complete` section 整体替换提示词**；`section(scope)/context(scope)/tools(scope)/variable(scope)/suppress_runtime_context(scope)` 全现成。**minimal 的 `complete:true`+`includeRuntimeContext:false` 直接映射。** | C-02 |
 | spike-4 ✅ | `!!js`→`__jsExpr` 复制转译 4 个 vendored 预设 + dsh-loader 装载 + win32 门控生效 | **已核实**；见下「spike-4 结论」——转译机械可做，但 dsh-eval 作用域有缺口 | B-02, B-05 |
 | spike-5 ✅（预核） | 基线与 C-01 最小改动验证：`agent.rs:664` 已用 `assemble_context_for(&agent)` 装配 + host.rs:185-187 `tools.schemas(ctx.scope)` 已按 scope 决议 → **P4 是机械的**（填 standing 层即被 loop 拾取；未 join 的 default 保持全局=安全基线） | default 全绿 + s2 join standing 后可见 standing 工具 | C-03, C-01 |
-| spike-6 ✅（由构造推证） | 装配 `process` 门面进 dsh-eval 作用域（platform/env）+ 静态预排除效果 | dsh-eval 已支持标识符/成员访问/`===`（tokenize+parser 全读毕）→ scope 注入 `process:{platform:"win32"}`（`std::env::consts::OS` 映射）即可精确求值；`env` 注入为真实环境变量（白名单核对）。实现期验证 | B-14 |
+| spike-6 ✅（已核实就位） | 装配 `process` 门面进 dsh-eval 作用域（platform/env/cwd）+ 静态预排除效果 | **已核实**：`process.platform`/`process.env.X`=member access，JSON 门面即可；`process.cwd()` 是 Call，需 `eval_call` 增一条 `process.cwd` 白名单项（lib.rs:314-341）；`entry_disabled` 用同一 eval_scope（loader.rs:84-117）。P1 TDD 最小切面 = 门面注入 + 1 白名单项 + 回归测试 | B-14, B-02 |
 | spike-7 | 基带回归：`pwsh` 工具面在 win32 的最小可执行路径（§6.1-2 方向 A） | standard 在 win32 有 shell（A）或 bash 启用（B） | C-03 |
 | spike-8 ✅ | bash on win32 可用性（§6.1-2 前提） | **已核实**：dsh-shell/resolve.rs:100-105 在 win32 解析 Git Bash（`C:\Program Files\Git\bin\bash.exe` 等）→ Rust bash 工具 win32 可用 | §6.1-2 |
 
@@ -120,14 +120,20 @@
   （cordis customSkillDirs，1 处）。`!!js` → `{"__jsExpr": "<expr>"}` 可直接在复制脚本做。
 - **⚠️ dsh-eval 作用域缺口（真 bug 倾向）**：`dsh-loader::eval_scope`（loader.rs:120-125）只有
   `{config, ctx, env}`，**无 `process`**；`disabled` 求值 fail-closed（loader.rs:102-104
-  `.unwrap_or(true)`）→ win32 上 `!!js process.platform === 'win32'` 求值失败 → 被当 disabled
-  （pwsh 行被错误禁用，恰反）。修复 = eval_scope 注入 `process.platform` 门面
-  （`std::env::consts::OS` → `"win32"`，对齐 JS）。
+  `.unwrap_or(true)`）→ **当前所有平台门控行在任意平台上都被判定 disabled（win32 的
+  `===` 与 !win32 的 `!==` 求值全失败 → 全禁用）**——不是偶发，是结构性错。修复 = eval_scope
+  注入 `process` 门面（`std::env::consts::OS` → `"win32"` 对齐 JS）+ 断言级回归测试。
 - **`env` 为空对象**（loader.rs:124）→ `process.env.DSH_CWD` 读不到真环境；最小改 = 真实 env 注入
-  （白名单/全量，需安全核对）。
-- **两处超出 dsh-eval 子集**：`process.cwd()`（方法调用不在白名单）与 cordis `new URL(...)` +
-  `baseUrl`。处理：`cwd` 用受控门面单测白名单或复制期静态解析；`customSkillDirs` 复制期按
-  `baseUrl`=预设目录静态解析为 `<preset_dir>/skills` 字面路径（诚实差异，见 D-C）。
+  （白名单核对）。
+- **调用白名单是硬门（spike-6 实测核到）**：`dsh-eval::eval_call`（lib.rs:314-341）只放行
+  标识符 `String/Number/Boolean` 与成员 `Array.isArray/Object.keys`；scope 值为纯 JSON（无可调用
+  值）→ `process.cwd()` 是**Call**，靠 scope 注入不够，需给 `eval_call` 增**一条白名单项
+  `process.cwd`**（返回注入的 cwd 字符串），`process.env.DSH_CWD` 才是 member access（JSON
+  门面即可）。二者合起来 `cwd` 表达式可精确求值；这是 P1 TDD 的最小切面。
+- **两处超出 dsh-eval 子集**：`process.cwd()`（上一条的白名单扩展解决）与 cordis `new URL(...)` +
+  `baseUrl`（`new` 不在文法，tokenizer 视其为标识符，必 fail）。处理：`customSkillDirs` 复制期按
+  `baseUrl`=预设目录静态解析为 `<preset_dir>/skills` 字面路径（诚实差异，见 D-C + §5 遗留
+  F-06）。
 
 ---
 
