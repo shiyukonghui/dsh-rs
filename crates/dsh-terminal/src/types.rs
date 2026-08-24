@@ -137,10 +137,11 @@ pub struct TerminalSendResult {
     pub truncated: bool,
 }
 
-/// 后端类型（未来可扩 pwsh；当前 Bash）。
+/// 后端类型（Bash / PowerShell；A 并行落地后 pwsh 也在册）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalBackendKind {
     Bash,
+    PowerShell,
 }
 
 /// 会话视图（list 输出）。

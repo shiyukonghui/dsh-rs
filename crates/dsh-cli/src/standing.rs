@@ -119,8 +119,8 @@ impl StandingRegistry {
         let mut undos: Vec<Undo> = Vec::new();
 
         // 行审计：走 tree（组递归；组容器自身不列），叶子 → disabled/活化。
-        // D-103 win32-B：禁用判定先过平台策略（bash 系 win32 强制可用、pwsh 系
-        // win32 判禁——Rust 暂无 pwsh 执行器，见 A 并行），再回落忠实 `row_disabled`。
+        // P3-e（A 并行收口）：禁用判定 = 忠实 `row_disabled`——pwsh 执行器已在册
+        // （P3-d），win32-B 覆盖已撤，平台取舍完全交给组合自身 `disabled_expr`。
         fn walk<'a>(
             rows: &'a [CompositionRow],
             process: &Value,
@@ -432,51 +432,21 @@ impl StandingRegistry {
 /// D-103 win32-B 平台策略：bash 系行在 win32 **强制可用**（Rust 经 Git Bash 可跑
 /// bash），pwsh 系行在 win32 **判禁**（无 pwsh 执行器，A 并行落地后移除此覆盖）。
 /// 非 win32 回落忠实 `disabled_expr` 求值。
+/// 禁用判定走**忠实门控**（P3-e 起，A 并行收口）：pwsh 执行器已在册（P3-d）且有
+/// pwsh 工具/终端后端可桥（P3-e），win32 不再需要 win32-B 强制覆盖——各平台一律由组合
+/// 自身的 `disabled_expr` 决定（win32 上 bash 系 `=== 'win32'` 判禁、pwsh 系活化）。
 fn row_disabled_for_platform(row: &CompositionRow, process: &Value) -> bool {
-    let platform = process.get("platform").and_then(Value::as_str);
-    match platform {
-        Some("win32") => {
-            if is_bash_family(row) {
-                return false;
-            }
-            if is_pwsh_family(row) {
-                return true;
-            }
-            row_disabled(row, process)
-        }
-        _ => row_disabled(row, process),
-    }
+    row_disabled(row, process)
 }
 
-/// bash 系：`dsh-tool-bash(-persistent)`；或 `dsh-terminal-bash` 的 **bash 方言**
-/// 变体（`shellDialect` 非 pwsh、或未标注 = 默认 bash）。
-fn is_bash_family(row: &CompositionRow) -> bool {
-    let n = row.name.as_str();
-    let dialect = row
-        .config
-        .as_ref()
-        .and_then(|c| c.get("shellDialect"))
-        .and_then(Value::as_str);
-    n.contains("dsh-tool-bash") || (n.contains("dsh-terminal-bash") && dialect != Some("pwsh"))
-}
-
-/// pwsh 系：`dsh-tool-pwsh(-persistent)`；或 `dsh-terminal-bash` 的 pwsh 方言变体。
-fn is_pwsh_family(row: &CompositionRow) -> bool {
-    let n = row.name.as_str();
-    let dialect = row
-        .config
-        .as_ref()
-        .and_then(|c| c.get("shellDialect"))
-        .and_then(Value::as_str);
-    n.contains("dsh-tool-pwsh") || (n.contains("dsh-terminal-bash") && dialect == Some("pwsh"))
-}
-
-/// 单工具行 → 宿主工具名（P3-a 桥表）。多工具行（fs-local/terminal/…）见
-/// `host_tool_group_for_row`。
+/// 单工具行 → 宿主工具名（P3-a 桥表；P3-e 加 pwsh）。多工具行（fs-local/
+/// terminal/…）见 `host_tool_group_for_row`。
 fn host_tool_for_row(row: &CompositionRow) -> Option<&'static str> {
     match row.name.as_str() {
         "@deepseek-ai/dsh-tool-bash" => Some("bash"),
         "@deepseek-ai/dsh-tool-bash-persistent" => Some("bash"),
+        "@deepseek-ai/dsh-tool-pwsh" => Some("pwsh"),
+        "@deepseek-ai/dsh-tool-pwsh-persistent" => Some("pwsh"),
         "@deepseek-ai/dsh-tool-str-replace-editor" => Some("str_replace_editor"),
         _ => None,
     }
@@ -507,8 +477,10 @@ fn host_tool_group_for_row(row: &CompositionRow) -> Option<&'static [&'static st
 /// 组与后端行在桥内已被前置解析，不落此函数。
 fn tool_guard_reason(row: &CompositionRow) -> String {
     let n = row.name.as_str();
-    if is_pwsh_family(row) || n.contains("pwsh") {
-        "no host pwsh executor (D-103 A-parallel lands in P3)".to_string()
+    if n.contains("pwsh") {
+        // P3-e 后 dsh-tool-pwsh/-persistent 已入桥表；仅未映射的 pwsh 系变体到此。
+        "unmapped pwsh-family row (A-parallel: only dsh-tool-pwsh/-persistent bridge to host \"pwsh\")"
+            .to_string()
     } else if n.contains("tool-skill") {
         "minimal read-only per A-03: SKILL.md files are readable via fs tools; a skill loader tool needs the host skill service (C)"
             .to_string()
@@ -679,20 +651,20 @@ mod tests {
             "bridged: {:?}",
             r.bridged
         );
-        // D-103 win32-B：win32 上 bash 系**保持可用**（Rust 可跑 bash），pwsh 系判禁
-        // （无 pwsh 执行器）。
+        // P3-e（A 并行收口）：win32 忠实门控——bash 系 `=== 'win32'` 判禁，pwsh 系
+        // `!== 'win32'` 活化（pwsh 执行器已在册）。
         assert!(
-            !r.disabled
+            r.disabled
                 .iter()
                 .any(|s| s == "@deepseek-ai/dsh-tool-bash-persistent"),
-            "win32-B keeps bash active: {:?}",
+            "win32 faithful disables bash: {:?}",
             r.disabled
         );
         assert!(
-            r.disabled
+            !r.disabled
                 .iter()
                 .any(|s| s == "@deepseek-ai/dsh-tool-pwsh-persistent"),
-            "win32-B blocks pwsh: {:?}",
+            "win32 faithful keeps pwsh active: {:?}",
             r.disabled
         );
         // 无工具注册面（boot_with_sessions 占位）→ 工具行 guarded（诚实）。
@@ -940,6 +912,7 @@ mod tests {
             "terminal_close",
             "terminal_list",
             "bash",
+            "pwsh",
             "str_replace_editor",
         ] {
             tools.register_global(tool_def(name, name, 1000.0)).unwrap();
@@ -959,26 +932,22 @@ mod tests {
             "terminal group bridged: {:?}",
             r.bridged
         );
+        // P3-e 忠实门控（win32）：bash 系判禁（组合 `=== 'win32'`）、pwsh 系活化已桥。
         assert!(
-            bridged("@deepseek-ai/dsh-tool-bash-persistent"),
-            "bash single-tool bridged"
+            r.disabled
+                .iter()
+                .any(|s| s == "@deepseek-ai/dsh-tool-bash-persistent"),
+            "win32 bash-persistent disabled: {:?}",
+            r.disabled
+        );
+        assert!(
+            bridged("@deepseek-ai/dsh-tool-pwsh-persistent"),
+            "pwsh single-tool bridged: {:?}",
+            r.bridged
         );
         assert!(
             bridged("@deepseek-ai/dsh-tool-str-replace-editor"),
             "editor bridged"
-        );
-        // win32-B：pwsh 系 → disabled（不进 guarded、不 bridged）。
-        assert!(
-            r.disabled
-                .iter()
-                .any(|s| s == "@deepseek-ai/dsh-tool-pwsh-persistent"),
-            "pwsh-persistent disabled"
-        );
-        assert!(
-            !r.bridged
-                .iter()
-                .any(|b| b.starts_with("@deepseek-ai/dsh-tool-pwsh-persistent")),
-            "pwsh not bridged"
         );
         // joined agent 模型面整组工具可见（全局基 + standing 链）。
         let joined = ScopeKey::new();
@@ -993,6 +962,7 @@ mod tests {
             "terminal_open",
             "terminal_send",
             "bash",
+            "pwsh",
             "str_replace_editor",
         ] {
             assert!(names.iter().any(|n| n == t), "joined model sees {t}");

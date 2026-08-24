@@ -31,7 +31,7 @@ fn conpty_available() -> bool {
             Err(_) => return false,
         };
         eprintln!("PTY-PROBE: open…");
-        let mut backend = PtyBackend::new("smoke", program);
+        let mut backend = PtyBackend::new("smoke", program, dsh_terminal::TerminalBackendKind::Bash);
         let opened = backend.open("t", &TerminalConfig::default());
         eprintln!("PTY-PROBE: open done ok={}", opened.is_ok());
         if opened.is_err() {
@@ -74,7 +74,7 @@ fn require_pty() -> bool {
 
 fn open_backend() -> PtyBackend {
     let (_, program) = slave_program().expect("slave program");
-    let mut backend = PtyBackend::new("pty-test", program);
+    let mut backend = PtyBackend::new("pty-test", program, dsh_terminal::TerminalBackendKind::Bash);
     backend
         .open("t", &TerminalConfig::default())
         .expect("pty open");

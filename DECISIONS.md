@@ -4251,5 +4251,39 @@ dsh-agent-presets（P1-a 独立提交可保留）。
   每 per-agent `{{cwd}}`（C）；C 段收敛未动。
 - **回滚**：`git revert` P3-d 提交——回退双方言 API + 环境基修复与测试，其余保留。
 
+### D-103 实施补记（P3-e：A 并行收口——pwsh 工具/终端后端在册 + win32 切回忠实门控，round 19）——决策 + 验收
+
+- 触发：win32-A 决议「A 随 P3」收尾——P3-d 已给 pwsh 执行器，还缺 m5 tool-pwsh、
+  dsh-terminal "pwsh" 后端注册、以及落地后的**忠实门控切换**（撤 win32-B「pwsh 判禁」
+  覆盖）。
+- 裁决：
+  - **m5 tool-pwsh**：`ShellHost` 加平行 `pwsh: LocalShellExecutor`（同 root，配置
+    shell=PowerShell）；`bash_tool` 重构为 `shell_tool(name, desc)`，新增 `pwsh_tool()`
+    （同 schema/渲染词表，说明写 powershell5.1/pwsh7）；`bash_executor/bash_background`
+    重构为 `shell_executor(name, shost, use_pwsh, bridge)/shell_background(...)`；
+    `BashJobsBridge::start_bash` → `start_shell_job(kind, ...)`（kind="bash"/"pwsh"，
+    subprocess producer 本就方言无关）。**否决** M5HostServices 加字段（会让 6 处测试
+    struct 字面量全改；pwsh 执行器随 ShellHost 共存即可）。
+  - **dsh-terminal "pwsh" 后端注册**：`TerminalBackendKind` 加 `PowerShell`；
+    `PtyBackend::new(label, program, kind)`；**生产 M5Host::assemble 注册真实后端
+    bash+pwsh**（resolve_bash/pwsh_program；spawn 失败诚实 NoBackend）——顺带修掉
+    P3-b「terminal backend; host default shell」守卫文案在无真实后端时的过宣称。
+  - **忠实门控切换**：`row_disabled_for_platform` 删除 win32-B 覆盖 → 恒等
+    `row_disabled`；`host_tool_for_row` +`dsh-tool-pwsh(-persistent)`→"pwsh"；
+    `tool_guard_reason` pwsh 分支改「unmapped pwsh-family（仅
+    dsh-tool-pwsh/-persistent 桥到宿主 pwsh）」。win32 上组合自身 `disabled_expr` 决定：
+    bash 系判禁、pwsh 系活化。
+- 验收（TDD 红=旧 win32-B 期望在忠实门控下失效 → 更新测试为忠实期望 = 绿）：
+  `guard_report_splits_bridged_disabled_guarded`（win32：bash 判禁、pwsh 活化）、
+  `fs_and_terminal_groups_...`（工具集 +pwsh；bash-persistent disabled、pwsh-persistent
+  bridged、joined 可见 pwsh）翻新；guarded-reason 的 pwsh 断言在新桥表下仍过（no host
+  tool "pwsh"）。五 crate（tools/agent-loop/shell/terminal/cli）**438/438** 绿；clippy
+  `-D warnings` 零；rustfmt 不整跑既有文件（standing.rs 可跑）。
+- **已知未接（对 P3-d 收窄）**：pwsh 输出编码在 tool 层兜底（5.1 pipe 输出 console
+  code page；ASCII/UTF-8 均成，中文场景随 P3-e 后 live 观察）；planMode/compaction 桥
+  （loop 级，C）；web/tool-cordis/command-compact broken；skill 加载器工具（宿主 service，
+  C）；per-agent `{{cwd}}`（C）；C 段收敛未动。
+- **回滚**：`git revert` P3-e 提交——回退 pwsh 工具/终端后端/忠实门控与测试，其余保留。
+
 
 

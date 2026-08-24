@@ -52,10 +52,11 @@ fn tail_utf8(s: &str, max_bytes: usize) -> String {
     s[end..].to_string()
 }
 
-/// 真实 PTY 会话后端（`program` 注入以便测试/受限环境）。
+/// 真实 PTY 会话后端（`program` 注入以便测试/受限环境；`kind` 随方言）。
 pub struct PtyBackend {
     label: String,
     program: String,
+    kind: TerminalBackendKind,
     cfg: TerminalConfig,
     pair: Option<portable_pty::PtyPair>,
     child: Option<Box<dyn Child + Send + Sync>>,
@@ -74,10 +75,11 @@ mod boxed {
 }
 
 impl PtyBackend {
-    pub fn new(label: &str, program: &str) -> PtyBackend {
+    pub fn new(label: &str, program: &str, kind: TerminalBackendKind) -> PtyBackend {
         PtyBackend {
             label: label.to_string(),
             program: program.to_string(),
+            kind,
             cfg: TerminalConfig::default(),
             pair: None,
             child: None,
@@ -271,7 +273,7 @@ impl TerminalBackend for PtyBackend {
     }
 
     fn kind(&self) -> TerminalBackendKind {
-        TerminalBackendKind::Bash
+        self.kind
     }
 }
 

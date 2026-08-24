@@ -136,21 +136,32 @@ impl FsHost {
     }
 }
 
-/// shell 宿主：本地 shell 后端（root 为默认工作目录；`On Mac/Linux` 亦可）。按
-/// `BashConfig.shell` 方言执行（bash / pwsh，A 并行）。
+/// shell 宿主：本地 shell 后端（root 为默认工作目录）。`executor` = bash 方言
+/// （`On Mac/Linux` 亦可）；`pwsh` = PowerShell 方言（A 并行：win32 经
+/// powershell.exe 5.1 / pwsh 7 平行执行）。两执行器同 root、同 config 兜底。
 pub struct ShellHost {
     pub executor: LocalShellExecutor,
+    pub pwsh: LocalShellExecutor,
     pub root: PathBuf,
 }
 
 impl ShellHost {
-    /// 构造并校验 bash 配置；cwd 锚定宿主 root（工作区）。
+    /// 构造并校验 bash/pwsh 双配置；cwd 锚定宿主 root（工作区）。
     pub fn new(root: PathBuf) -> Result<Self, String> {
-        let executor = LocalShellExecutor::new(BashConfig {
+        let base = BashConfig {
             cwd: Some(root.clone()),
             ..BashConfig::default()
-        })?;
-        Ok(ShellHost { executor, root })
+        };
+        let pwsh_cfg = BashConfig {
+            cwd: Some(root.clone()),
+            shell: dsh_shell::ShellKind::PowerShell,
+            ..BashConfig::default()
+        };
+        Ok(ShellHost {
+            executor: LocalShellExecutor::new(base)?,
+            pwsh: LocalShellExecutor::new(pwsh_cfg)?,
+            root,
+        })
     }
 }
 
@@ -182,18 +193,19 @@ impl BashJobsBridge {
         Self::default()
     }
 
-    /// 注册一个已 spawn 的后台 bash 进程为 job（owner 归属 caller；label 缺省命令摘要）。
-    /// 成功后 job 可见、可被 job_kill/job_read 操作。进程先在调用方 spawn：jobs.start
-    /// 的 producer 只回喂 hooks，不重新触发执行。
-    pub fn start_bash(
+    /// 注册一个已 spawn 的后台 shell 进程为 job（owner 归属 caller；label 缺省命令
+    /// 摘要；`kind` 随方言 "bash"/"pwsh"）。成功后 job 可见、可被 job_kill/job_read
+    /// 操作。进程先在调用方 spawn：jobs.start 的 producer 只回喂 hooks，不重新触发执行。
+    pub fn start_shell_job(
         &self,
+        kind: &str,
         owner: &str,
         label: &str,
         process: Rc<ShellProcess>,
     ) -> Result<String, JobStartError> {
         let proc = process.clone();
         let id = self.registry.borrow_mut().start(StartSpec {
-            kind: "bash",
+            kind,
             label,
             owner: Some(owner.to_string()),
             producer: Box::new(move || {
@@ -370,6 +382,47 @@ impl M5Host {
     pub fn assemble(root: PathBuf) -> Result<Self, String> {
         let root_abs = root.canonicalize().unwrap_or(root);
         let terminal = Rc::new(RefCell::new(TerminalSessionService::new()));
+        // P3-e（A 并行收口）：真实 PTY 后端在册——bash（resolve_bash_program）与
+        // pwsh（resolve_pwsh_program，win32 = powershell.exe 5.1 兜底）。terminal_open
+        // 按 `type` 后端名开真实会话；spawn 失败 → 诚实 NoBackend。
+        {
+            let bash_program = dsh_shell::resolve_bash_program(&BashConfig::default());
+            let pwsh_program = dsh_shell::resolve_pwsh_program(&BashConfig::default());
+            terminal
+                .borrow_mut()
+                .register_backend(
+                    dsh_terminal::BackendDefinition {
+                        id: "bash".into(),
+                        kind: dsh_terminal::TerminalBackendKind::Bash,
+                        label: format!("bash pty ({bash_program})"),
+                    },
+                    Box::new(move |_cfg| {
+                        Box::new(dsh_terminal::PtyBackend::new(
+                            "bash",
+                            &bash_program,
+                            dsh_terminal::TerminalBackendKind::Bash,
+                        ))
+                    }),
+                )
+                .map_err(|e| format!("register terminal backend bash: {e}"))?;
+            terminal
+                .borrow_mut()
+                .register_backend(
+                    dsh_terminal::BackendDefinition {
+                        id: "pwsh".into(),
+                        kind: dsh_terminal::TerminalBackendKind::PowerShell,
+                        label: format!("pwsh pty ({pwsh_program})"),
+                    },
+                    Box::new(move |_cfg| {
+                        Box::new(dsh_terminal::PtyBackend::new(
+                            "pwsh",
+                            &pwsh_program,
+                            dsh_terminal::TerminalBackendKind::PowerShell,
+                        ))
+                    }),
+                )
+                .map_err(|e| format!("register terminal backend pwsh: {e}"))?;
+        }
         let fs = Rc::new(FsHost::new(root_abs.clone()));
         let shell = Rc::new(ShellHost::new(root_abs.clone())?);
         let bash_jobs = Rc::new(BashJobsBridge::new());
@@ -632,11 +685,21 @@ pub fn register_m5_tools_with_host(
     let bash = bash_tool();
     if let Some(shost) = host.and_then(|h| h.shell.clone()) {
         let bridge = host.and_then(|h| h.bash_jobs.clone());
-        bash.bind(bash_executor(shost, bridge));
+        bash.bind(shell_executor("bash", shost, false, bridge));
     }
     registry
         .register_global(Rc::clone(&bash.definition()))
         .expect("register bash");
+
+    // ---- pwsh（A 并行）：PowerShell 方言工具，绑 shost.pwsh 执行器 ----
+    let pwsh = pwsh_tool();
+    if let Some(shost) = host.and_then(|h| h.shell.clone()) {
+        let bridge = host.and_then(|h| h.bash_jobs.clone());
+        pwsh.bind(shell_executor("pwsh", shost, true, bridge));
+    }
+    registry
+        .register_global(Rc::clone(&pwsh.definition()))
+        .expect("register pwsh");
 
     // ---- fs 六件套 + 搜索 + sr-editor：纯面定义（schema + 渲染）+ 宿主 bind ----
     let fs_read = fs_read_tool();
@@ -721,16 +784,32 @@ fn code_failure_json(e: &CodeRunFailure) -> Value {
 /// bash 工具定义：execute 产生规范化 value，render 依值重建 `ShellRunResult`（前台）或
 /// job 启动说明（后台返回 jobId），走 `render_bash_result` 同词表（显式=值/可见性=渲染）。
 fn bash_tool() -> M5Tool {
-    define_m5_tool(
+    shell_tool(
         "bash",
         "Run a shell command in the host workspace, returning its output, exit code, and sandbox status.".into(),
+    )
+}
+
+/// pwsh 工具定义（A 并行）：与 bash 同 schema/渲染，执行器走 PowerShell 方言。
+fn pwsh_tool() -> M5Tool {
+    shell_tool(
+        "pwsh",
+        "Run a PowerShell command in the host workspace, returning its output, exit code, and sandbox status. Runs via powershell (5.1) or pwsh (7).".into(),
+    )
+}
+
+fn shell_tool(name: &str, description: String) -> M5Tool {
+    let name_owned = name.to_owned();
+    define_m5_tool(
+        name,
+        description,
         bash_tool_parameters(true, &[]),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| {
+        Rc::new(move |_a, v| {
             if let Some(id) = v["jobId"].as_str() {
                 // 后台启动：值只含 jobId（final-output 语义，job_read 消费终态输出）。
                 return vec![ContentBlock::text(format!(
-                    "bash: background job {id} started (collect via job_read; completion settled by host tick)"
+                    "{name_owned}: background job {id} started (collect via job_read; completion settled by host tick)"
                 ))];
             }
             let result = ShellRunResult {
@@ -750,18 +829,29 @@ fn bash_tool() -> M5Tool {
     .expect("bash defines")
 }
 
-/// 规范化 bash 执行结果（execute → value；render 只消费 value，不独走）。
-/// 后台路径：`bridge` 在场 → 起 job（jobId）；否则诚实 `UNSUPPORTED_OPTION`。
-fn bash_executor(shost: Rc<ShellHost>, bridge: Option<Rc<BashJobsBridge>>) -> ToolExecute {
+/// 规范化 shell 执行结果（execute → value；render 只消费 value，不独走）。按方言
+/// 选执行器：`use_pwsh` → `shost.pwsh`（ShellKind::PowerShell），否则 `shost.executor`
+/// （bash）。后台路径：`bridge` 在场 → 起 job（jobId）；否则诚实 `UNSUPPORTED_OPTION`。
+fn shell_executor(
+    name: &'static str,
+    shost: Rc<ShellHost>,
+    use_pwsh: bool,
+    bridge: Option<Rc<BashJobsBridge>>,
+) -> ToolExecute {
     Rc::new(move |args, ctx| {
-        let parsed = parse_bash_args(args).map_err(|m| invalid_args("bash", m))?;
+        let parsed = parse_bash_args(args).map_err(|m| invalid_args(name, m))?;
         if let Some(perms) = &parsed.sandbox_permissions {
             if !perms.is_empty() {
                 return Err(unsupported(
-                    "bash: sandbox_permissions: non-empty requires sandboxed execution (SAND mode projection not yet wired; D-070)",
+                    "shell: sandbox_permissions: non-empty requires sandboxed execution (SAND mode projection not yet wired; D-070)",
                 ));
             }
         }
+        let executor: &LocalShellExecutor = if use_pwsh {
+            &shost.pwsh
+        } else {
+            &shost.executor
+        };
         let request = ShellExecRequest {
             command: parsed.command.clone(),
             workdir: parsed.workdir.map(PathBuf::from),
@@ -772,25 +862,29 @@ fn bash_executor(shost: Rc<ShellHost>, bridge: Option<Rc<BashJobsBridge>>) -> To
             env: None,
             dsh_env: None,
         };
-        let spec = shost
-            .executor
+        let spec = executor
             .resolve(&request)
-            .map_err(|m| invalid_args("bash", m))?;
+            .map_err(|m| invalid_args(name, m))?;
         if parsed.run_in_background == Some(true) {
-            return bash_background(&shost, &spec, &parsed.command, ctx, bridge.as_deref());
+            return shell_background(
+                name,
+                executor,
+                &spec,
+                &parsed.command,
+                ctx,
+                bridge.as_deref(),
+            );
         }
-        let result = shost
-            .executor
-            .run(&spec)
-            .map_err(|e| shell_failure("bash", e))?;
+        let result = executor.run(&spec).map_err(|e| shell_failure(name, e))?;
         Ok(bash_canonical(&parsed.command, &result))
     })
 }
 
 /// 后台路径：spawn ShellProcess → jobs producer 桥登记 → 返回 jobId。
 /// 登记失败（配额等）掐掉刚 spawn 的进程（不产生孤儿），诚实报错。
-fn bash_background(
-    shost: &ShellHost,
+fn shell_background(
+    name: &str,
+    executor: &LocalShellExecutor,
     spec: &ShellExecSpec,
     command: &str,
     ctx: &dsh_tools::ToolRunContext,
@@ -798,29 +892,28 @@ fn bash_background(
 ) -> Result<Value, ToolFailureData> {
     let bridge = bridge.ok_or_else(|| {
         unsupported(
-            "bash: run_in_background: true requires the jobs producer bridge (BashJobsBridge host handle) — not wired for this surface",
+            "shell: run_in_background: true requires the jobs producer bridge (BashJobsBridge host handle) — not wired for this surface",
         )
     })?;
-    let owner = required_agent(ctx.agent.as_deref(), "bash/run_in_background")?;
-    let process = shost
-        .executor
+    let owner = required_agent(ctx.agent.as_deref(), &format!("{name}/run_in_background"))?;
+    let process = executor
         .start(spec)
-        .map_err(|e| shell_failure("bash", e))?;
+        .map_err(|e| shell_failure(name, e))?;
     let process = Rc::new(process);
     let label = {
         let joined: String = command.trim().chars().take(60).collect();
         if joined.is_empty() {
-            "bash background".to_string()
+            format!("{name} background")
         } else {
             joined
         }
     };
-    match bridge.start_bash(owner, &label, process.clone()) {
+    match bridge.start_shell_job(name, owner, &label, process.clone()) {
         Ok(id) => Ok(json!({ "jobId": id })),
         Err(e) => {
             process.kill();
             Err(ToolFailureData::new(
-                format!("bash: start background job: {e:?}"),
+                format!("{name}: start background job: {e:?}"),
                 "JOB_START",
                 "JobStartError",
             ))
