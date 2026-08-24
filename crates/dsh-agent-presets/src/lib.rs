@@ -15,6 +15,9 @@ pub mod discovery;
 pub mod home;
 pub mod metadata;
 
+/// P2-a：组合的**类型化**解析 + `disabled_expr` 行分类（standing mount 的行审计核心）。
+pub mod parse;
+
 use std::path::PathBuf;
 
 /// 组合文件名（容器目录内唯一入口）。

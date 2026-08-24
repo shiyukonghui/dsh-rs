@@ -326,7 +326,7 @@ fn eval_call(callee: &Expr, args: &[Expr], scope: &Scope) -> Result<Value, EvalE
             };
             let full = format!("{base_name}.{key_name}");
             match full.as_str() {
-                "Array.isArray" | "Object.keys" => {
+                "Array.isArray" | "Object.keys" | "process.cwd" => {
                     return call_whitelist(&full, args, scope);
                 }
                 _ => return Err(EvalError(format!("call `{full}` is not allowed"))),
@@ -341,7 +341,11 @@ fn eval_call(callee: &Expr, args: &[Expr], scope: &Scope) -> Result<Value, EvalE
 }
 
 /// 成员访问（Member 与 OptionalMember 共用）：字符串键（含数组 length）或
-/// 数字索引；未命中/越界报错。
+/// 数字索引。
+///
+/// JS 语义（P2-a 修正）：**对象**上缺键 → `undefined`（本实现以 `Null` 表示，
+/// 使 `process.env.X ?? fallback` 正确回落）；**非对象**基值（string/number/bool/
+/// null）上取键 → 报错（JS `TypeError`，保持 fail-loud）；数组越界 → 报错。
 fn member_access(base_val: Value, key: Value) -> Result<Value, EvalError> {
     match key {
         Value::String(k) => {
@@ -351,9 +355,10 @@ fn member_access(base_val: Value, key: Value) -> Result<Value, EvalError> {
                     return Ok(Value::from(arr.len()));
                 }
             }
-            base_val.get(&k).cloned().ok_or_else(|| {
-                EvalError(format!("no member `{k}` on value"))
-            })
+            match &base_val {
+                Value::Object(map) => Ok(map.get(&k).cloned().unwrap_or(Value::Null)),
+                _ => Err(EvalError(format!("no member `{k}` on value"))),
+            }
         }
         Value::Number(n) => base_val
             .get(n.as_u64().map(|v| v as usize).unwrap_or(0))
@@ -395,6 +400,16 @@ fn call_whitelist(name: &str, args: &[Expr], scope: &Scope) -> Result<Value, Eva
             .eval(scope)
     };
     match name {
+        // P2-a（spike-6 结论）：`process.cwd()` 无参调用 → 作用域 `process.cwd` 成员
+        // （值为字符串；`process` 门面由 host 注入 `process_facade`）。
+        "process.cwd" => {
+            let proc = scope
+                .get("process")
+                .ok_or_else(|| EvalError("call `process.cwd` needs a `process` facade in scope".into()))?;
+            proc.get("cwd")
+                .cloned()
+                .ok_or_else(|| EvalError("`process.cwd` is not provided by the facade".into()))
+        }
         "String" => Ok(Value::String(value_str(&arg(0)?))),
         "Number" => {
             let v = arg(0)?;
@@ -833,5 +848,94 @@ impl<'a> Parser<'a> {
             }
             other => Err(EvalError(format!("unexpected token {other:?}"))),
         }
+    }
+}
+
+/// Node `process` 门面值（`platform`/`env`/`cwd`），供 `!!js` 表达式求值。
+/// platform 映射 Rust → Node：`windows`→`win32` / `macos`→`darwin` / `linux`→`linux`。
+/// env = 当前进程全部环境变量；cwd = 当前工作目录。host 注入进 eval 作用域。
+pub fn process_facade() -> Value {
+    let platform = match std::env::consts::OS {
+        "windows" => "win32",
+        "macos" => "darwin",
+        "linux" => "linux",
+        other => other,
+    };
+    let env: serde_json::Map<String, Value> =
+        std::env::vars().map(|(k, v)| (k, Value::from(v))).collect();
+    let cwd = std::env::current_dir()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    serde_json::json!({ "platform": platform, "env": env, "cwd": cwd })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// spike-6 结论回归：win32 平台门控表达式按声明的平台求值（**不再** fail-closed
+    /// 全禁用）。`process.facade` 也可由 host 注入固定值（`eval_scope_with_process`）。
+    #[test]
+    fn process_gate_platform_expression() {
+        let mut scope = Scope::new();
+        scope.insert(
+            "process".to_string(),
+            serde_json::json!({
+                "platform": "win32",
+                "env": { "DSH_CWD": "C:\\x" },
+                "cwd": "C:\\repo",
+            }),
+        );
+        assert!(truthy(&evaluate(&scope, "process.platform === 'win32'").unwrap()));
+        assert!(!truthy(&evaluate(&scope, "process.platform !== 'win32'").unwrap()));
+        // minimal cwd 行：`process.env.DSH_CWD ?? process.cwd()`
+        let cwd = evaluate(&scope, "process.env.DSH_CWD ?? process.cwd()").unwrap();
+        assert_eq!(cwd, serde_json::json!("C:\\x"));
+        // `process.cwd()` 无参调用 → facade.cwd
+        assert_eq!(
+            evaluate(&scope, "process.cwd()").unwrap(),
+            serde_json::json!("C:\\repo")
+        );
+        // 非 facade 目标调用仍被拒（白名单收窄）。
+        let err = evaluate(&scope, "process.kill()").unwrap_err();
+        assert!(err.to_string().contains("not allowed"), "err: {err}");
+    }
+
+    /// 成员链 `process.env.X` / `process.platform`（Member 路径，非 Call）。
+    #[test]
+    fn process_member_chain() {
+        let mut scope = Scope::new();
+        scope.insert(
+            "process".to_string(),
+            serde_json::json!({ "platform": "linux", "env": { "HOME": "/root" }, "cwd": "/w" }),
+        );
+        assert_eq!(evaluate(&scope, "process.env.HOME").unwrap(), serde_json::json!("/root"));
+        assert_eq!(evaluate(&scope, "process.platform").unwrap(), serde_json::json!("linux"));
+        // JS 语义：对象上缺键 = undefined（Null），`??` 可回落（P2-a 修正）。
+        assert_eq!(evaluate(&scope, "process.env.NOPE").unwrap(), Value::Null);
+        assert_eq!(
+            evaluate(&scope, "process.env.NOPE ?? 'x'").unwrap(),
+            serde_json::json!("x")
+        );
+        // 非对象基值取键 → fail（JS TypeError 等价，保持 fail-loud）。
+        assert!(evaluate(&scope, "process.platform.x").is_err());
+        // 空 scope 引用 process（无门面注入）→ fail。
+        let empty = Scope::new();
+        assert!(evaluate(&empty, "process.cwd()").is_err());
+    }
+
+    /// 平台映射：windows→win32 / macos→darwin / linux→linux。
+    #[test]
+    fn process_facade_platform_mapping() {
+        let f = process_facade();
+        let platform = f["platform"].as_str().unwrap();
+        match std::env::consts::OS {
+            "windows" => assert_eq!(platform, "win32"),
+            "macos" => assert_eq!(platform, "darwin"),
+            "linux" => assert_eq!(platform, "linux"),
+            _ => assert!(!platform.is_empty(), "unknown os maps to itself, must stay non-empty"),
+        }
+        assert!(f["env"].is_object());
+        assert!(f["cwd"].as_str().unwrap().contains(std::path::MAIN_SEPARATOR));
     }
 }

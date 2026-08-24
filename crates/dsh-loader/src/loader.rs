@@ -116,10 +116,17 @@ fn entry_disabled(st: &LoaderState, id: &str) -> bool {
     }
 }
 
-/// `!!js` 求值作用域：`{ config, ctx, env }`。
+/// `!!js` 求值作用域（默认 `process` 门面 = 真实 OS 事实，D-103/P2-a）：
+/// `{ config, process, ctx, env }`。
 fn eval_scope(config: &Value) -> HashMap<String, Value> {
+    eval_scope_with_process(config, &dsh_eval::process_facade())
+}
+
+/// `!!js` 求值作用域 + 可注入 `process` 门面（确定性测试用；host 装配真实 facade）。
+pub fn eval_scope_with_process(config: &Value, process: &Value) -> HashMap<String, Value> {
     let mut scope = HashMap::new();
     scope.insert("config".to_string(), config.clone());
+    scope.insert("process".to_string(), process.clone());
     scope.insert("ctx".to_string(), serde_json::json!({}));
     scope.insert("env".to_string(), serde_json::json!({}));
     scope
@@ -1498,5 +1505,67 @@ fn options_diff(prev: &EntryOptions, next: &EntryOptions) -> OptionsDiff {
         disabled: prev.disabled != next.disabled,
         group: prev.group != next.group,
         inject: prev.inject != next.inject,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    /// P2-a（spike-6 结论）回归：`process.platform` 门控现在按真实平台求值，
+    /// **不再** fail-closed 全禁用（结构性 bug）。entry_disabled 对该表达式做
+    /// `evaluate(scope).map(truthy).unwrap_or(true)`——这里复刻同一行求值。
+    fn disabled_truthy(expr: &str, platform: &str) -> bool {
+        let config = Value::Null;
+        let process = serde_json::json!({
+            "platform": platform,
+            "env": { "DSH_CWD": "x" },
+            "cwd": "x",
+        });
+        let scope = eval_scope_with_process(&config, &process);
+        dsh_eval::evaluate(&scope, expr)
+            .map(|v| dsh_eval::truthy(&v))
+            .unwrap_or(true) // fail-closed 语义保留：求值失败 = 禁用
+    }
+
+    #[test]
+    fn platform_gates_are_now_platform_specific() {
+        // `dsh-tool-bash` 的门控：win32 上禁用；非 win32 可用。
+        assert!(disabled_truthy("process.platform === 'win32'", "win32"));
+        assert!(!disabled_truthy("process.platform === 'win32'", "linux"));
+        // `dsh-tool-pwsh` 的门控：win32 可用；非 win32 禁用。
+        assert!(!disabled_truthy("process.platform !== 'win32'", "win32"));
+        assert!(disabled_truthy("process.platform !== 'win32'", "linux"));
+    }
+
+    #[test]
+    fn process_env_and_cwd_available_in_scope() {
+        let config = Value::Null;
+        let process = serde_json::json!({
+            "platform": "win32",
+            "env": { "DSH_CWD": "C:\\w" },
+            "cwd": "C:\\repo",
+        });
+        let scope = eval_scope_with_process(&config, &process);
+        assert_eq!(
+            dsh_eval::evaluate(&scope, "process.env.DSH_CWD ?? process.cwd()").unwrap(),
+            serde_json::json!("C:\\w")
+        );
+        assert_eq!(
+            dsh_eval::evaluate(&scope, "process.cwd()").unwrap(),
+            serde_json::json!("C:\\repo")
+        );
+    }
+
+    /// 真实 eval_scope（默认 facade）不吃惊：本机平台表达式的求值绝不报错。
+    #[test]
+    fn real_facade_evaluates_cleanly() {
+        let config = Value::Null;
+        let scope = eval_scope(&config);
+        let v = dsh_eval::evaluate(&scope, "process.platform === 'win32'").unwrap();
+        let _ = dsh_eval::truthy(&v);
+        let v2 = dsh_eval::evaluate(&scope, "process.env.DSH_CWD ?? process.cwd()").unwrap();
+        assert!(v2.is_string());
     }
 }

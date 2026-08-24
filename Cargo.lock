@@ -563,6 +563,7 @@ dependencies = [
 name = "dsh-agent-presets"
 version = "0.1.0"
 dependencies = [
+ "dsh-eval",
  "serde",
  "serde_json",
  "serde_yaml",
