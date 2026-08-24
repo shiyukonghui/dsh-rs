@@ -38,6 +38,7 @@ pub mod workspace_host;
 
 /// P1-b：preset 发现宿主（roster/read/authorable 的 domain 侧；mount/guard 是 P2）。
 pub mod preset_host;
+pub mod standing;
 
 /// D-098：Windows 原生目录选择绑定（IFileDialog/COM via 新版 windows crate）。
 #[cfg(windows)]

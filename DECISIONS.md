@@ -3988,5 +3988,46 @@ domain 侧）+ `Boot.presets` 字段 + wire 接线：
 **回滚**：`git revert` P1-b 提交——撤销 Boot.presets/接线/挂 handler，不触 crates/
 dsh-agent-presets（P1-a 独立提交可保留）。
 
+### D-103 实施补记（P2：standing 挂载机制，round 13）——决策 + 验收
+
+**P2-a（提交 e5e69d1）——process 门面 + 组合类型化解析，修复结构性 bug**
+- 触发：loader `eval_scope={config,ctx,env}` 无 `process` → 全部平台门控
+  `disabled_expr` fail-closed 判禁用（**10 处门控行全失效**）；且
+  `process.env.X ?? process.cwd()` 在 `DSH_CWD` 未设时因「缺成员报错」必失败。
+- 选型与裁决：
+  1. `dsh-eval::process_facade()` 注入 `{platform,env,cwd}`；platform 映射
+     windows→win32/macos→darwin/linux→linux；env=全量环境变量；cwd=current_dir。
+     **否决**按行改写 disabled_expr——那是 P3 win32 B 门控（A=pwsh 随 P3）的职责，
+     平台门面必须先忠实于「正在运行的 OS 事实」。
+  2. `process.cwd()` 进调用白名单（读 facade.cwd，无参）。**否决**更宽的任意
+     成员调用。
+  3. **member_access JS 语义修正**：对象上缺键 → `Null`（=undefined，使 `??`
+     回落成立）；非对象基值取键仍报错（JS `TypeError` 等价，保持 fail-loud）；
+     数组越界仍报错。**否决**全静默返回 Null（掩盖拼写错）。
+- 验收：eval 3 + loader 3 + presets 18 全绿；真实四预设文件全部门控可干净求值、
+  无「全禁用」回归；dsh-cli 155/155。
+
+**P2-b（本提交）——每 preset 一 standing scope + scope 父链 join + 守卫报告**
+- 触发：如何让「选中 preset」真实改变会话行为，且机制先于桥面（P3）可测。
+- 选型与裁决：standing = 一个唯一 `ScopeKey`（贡献挂进共享 `SystemPrompt`
+  注册面的 scoped layer）；agent **join** = `dsh_scope::bind_scope_parent(agent→
+  standing)`（`assemble(agent_scope)` 沿父链合并）；**换 preset**（select）= 原
+  绑定 `rebind` 到另一 standing scope；**换代**（re-mount 同 id）= unmount 撤销
+  scoped 贡献（undo 精确幂等）+ 铸新 scope。守卫报告三态：
+  `bridged`/`disabled`/`guarded(name,reason)`——P2 只桥 `@deepseek-ai/dsh-persona`
+  （complete + includeRuntimeContext 抑制均真实生效），其余活化叶行一律
+  `guarded("no Rust bridge yet (P3/P5)")`（D-103「先 broken」，不伪装）。
+  **否决**让 standing 直接持有/管理 release 服务抽象——真实 isolate 服务隔离
+  归 C 段收敛（P2 诚实不伪装）。
+- 验收：4 测试全绿——①两 standing 隔离 + join 可见（X∝minimal 只见 minimal
+  persona、Y∝standard 只见 standard、未 join 的 Z 两者皆不可见、父链断言）；
+  ②守卫报告拆分（win32 下 bash 行 disabled / persona bridged / fs、editor
+  guarded）；③rebind 切换视图；④re-mount 换代撤销旧贡献；dsh-cli **159/159**
+  全绿；clippy `-D warnings` 零告警；rustfmt 仅新 standing.rs/parse.rs。
+- **已知未接（诚实列表）**：`agentPreset.select` 仅在 store 记录选择、join 生效
+  待 P4 的 loop 消费 scope（assemble 以 agent_scope 走链）；桥面行（shell/fs/
+  editor/web/skill 等）P3；C 段 en-route。
+- **回滚**：`git revert` P2-b 提交；P2-a 另可独立 revert（不互依赖）。
+
 
 
