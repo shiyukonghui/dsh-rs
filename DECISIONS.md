@@ -4216,5 +4216,40 @@ dsh-agent-presets（P1-a 独立提交可保留）。
   （host skill service，C）；per-agent `{{cwd}}`（C）；C 段收敛未动。
 - **回滚**：`git revert` P3-c 提交——回退 mount_at/skill 桥与测试，其余阶段保留。
 
+### D-103 实施补记（P3-d：dsh-shell 双方言——bash/pwsh 平行能力 + 环境基修复，round 18）——决策 + 验收
+
+- 触发：win32-A 决议「A 随 P3」（dsh-shell 平行 pwsh executor + dsh-terminal "pwsh"
+  后端 + m5 tool-pwsh，随后撤 win32-B 覆盖）——P3 已完，pwsh 执行器第一步仍缺；
+  dsh-shell 全程 bash 中心（`spec.bash_program`、argv `-c`）。
+- TDD 红→绿：新测试引 `ShellKind`/`resolve_pwsh_program`/`LocalShellExecutor` →
+  红（E0433/E0560/E0609，`bash_program` 字段不在）。
+- 裁决：
+  - `ShellKind{Bash,PowerShell}`；`ShellExecSpec.bash_program` → **`program` + `shell`**；
+    `BashConfig` +`shell` +`pwsh_path`；新增 `resolve_pwsh_program`（PowerShell 7 安装
+    候选 → powershell.exe 5.1 兜底 → 非 win32 裸名 pwsh）。
+  - `LocalBashExecutor` → **`LocalShellExecutor`**（单一执行器按 `spec.shell` 分发
+    argv：bash `-c cmd` / pwsh `-NoProfile -NonInteractive -Command cmd`）。**否决**
+    双 LocalBash/LocalPowerShell 独立类型：超时/收集/kill/环境/spill 全共享，双份纯
+    维护负担（A 的「平行」指能力平行，非类型成对）。
+  - **★ 环境基修复**（pwsh 测试红暴露的真实 bug，同时修了 bash）：`assemble_env`
+    原为**仅 4 个 ENV_OVERRIDES 键** → dsh-subprocess `env_clear` 清掉父环境
+    （SystemRoot/TEMP/PATH…）→ PowerShell 5.1 初始化托管 .NET/DPAPI 崩
+    （`8009001d`）；bash 在本沙箱被拒（msys 需 signal pipe/共享内存）同根因。修复 =
+    **父环境 scrubbed 为基**（凭据形/`DSH_*` 键经 `dsh_subprocess::scrubbed_parent_env`
+    剔除——key 纪律：`DEEPSEEK_API_KEY` 等**绝不**进模型 shell）+ ENV_OVERRIDES 覆盖
+    + 调用方 env + 托管 `DSH_*` 最后（不可被顶替）。**否决**全量继承父环境（key 直落
+    模型 shell，违背 key 纪律）；也**否决**改 dsh-subprocess `env:Some` 语义为 merge
+    （影响全库既有隔离调用方，越界，留给独立决策）。
+- 验收：`tests/executor.rs` **8/8**（7 bash + 1 pwsh 全**真实执行**；环境修复后本沙箱
+  Git Bash 从「探测不可用跳过」变「真实跑」）；`tests/resolve.rs` **7/7**（新增 pwsh
+  resolve：方言语义 + 显式 pwsh_path）；dsh-tools/agent-loop/cli/shell **410/410** 全
+  绿；clippy `-D warnings` 零告警；rustfmt 仅 dsh-shell 三文件（lib/web_m5 精准 edit）。
+- **已知未接（对 P3-c 收窄）**：dsh-terminal "pwsh" 后端 + m5 tool-pwsh + standing
+  win32-B 撤「pwsh 判禁」覆盖（下一段 P3-e，随其 live 复验）；pwsh 输出编码
+  （5.1 pipe 输出 console code page / UTF-16 歧义）在 tool 层处理；planMode/compaction
+  桥（loop 级，C）；web/tool-cordis/command-compact broken；skill 加载器工具（C）；
+  每 per-agent `{{cwd}}`（C）；C 段收敛未动。
+- **回滚**：`git revert` P3-d 提交——回退双方言 API + 环境基修复与测试，其余保留。
+
 
 

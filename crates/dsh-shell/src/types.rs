@@ -10,6 +10,16 @@ use std::path::PathBuf;
 /// 托管环境变量前缀（对齐 `dsh-subprocess` 的 scrubbed 词表）。
 pub const DSH_ENV_PREFIX: &str = "DSH_";
 
+/// shell 方言（决定 argv 形状与程序解析；A 并行：bash/pwsh 平行能力）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellKind {
+    /// `bash -c <command>`（Git Bash / WSL / 裸名）。
+    Bash,
+    /// `pwsh -NoProfile -NonInteractive -Command <command>`（PowerShell 7，Windows
+    /// 上缺省回退 powershell.exe 5.1）。
+    PowerShell,
+}
+
 /// 沙箱事实（仅沙箱化 executor 产生；本地 bash 后端恒为 None）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellSandboxInfo {
@@ -50,8 +60,10 @@ pub struct ShellExecSpec {
     pub stdin: Option<String>,
     pub env: Option<Vec<(String, String)>>,
     pub dsh_env: Option<Vec<(String, String)>>,
-    /// 已解析的 bash 可执行（config 注入或候选解析结果）。
-    pub bash_program: String,
+    /// 已解析的 shell 程序（随 `shell` 方言解析：bash 候选 / pwsh 候选）。
+    pub program: String,
+    /// shell 方言（decides argv 形状）。
+    pub shell: ShellKind,
 }
 
 /// 最终收集输出（前台 run 结果用；镜像 `CollectedOutput` 三要素）。

@@ -68,7 +68,43 @@ fn resolve_applies_defaults_and_clamp() {
     assert_eq!(spec.timeout_ms, DEFAULT_TIMEOUT_MS);
     assert_eq!(spec.stdout_max_bytes, DEFAULT_MAX_OUTPUT_BYTES);
     assert_eq!(spec.workdir, std::env::current_dir().expect("cwd"));
-    assert!(!spec.bash_program.is_empty(), "bash 程序已解析");
+    assert!(!spec.program.is_empty(), "shell 程序已解析");
+    assert_eq!(spec.shell, dsh_shell::ShellKind::Bash, "default = bash");
+}
+
+/// A 并行（P3-d）：config.shell = PowerShell → spec.shell 语义 + program 解析。
+#[test]
+fn resolve_respects_pwsh_shell_kind_and_program() {
+    let cfg = BashConfig {
+        shell: dsh_shell::ShellKind::PowerShell,
+        ..Default::default()
+    };
+    let spec = resolve(
+        &ShellExecRequest {
+            command: "Write-Output 'hi'".into(),
+            ..Default::default()
+        },
+        &cfg,
+    )
+    .expect("resolve ok");
+    assert_eq!(spec.shell, dsh_shell::ShellKind::PowerShell);
+    assert_eq!(spec.command, "Write-Output 'hi'");
+    assert!(!spec.program.is_empty(), "pwsh 程序已解析");
+    // 显式 pwsh_path 直接采用。
+    let with_path = BashConfig {
+        shell: dsh_shell::ShellKind::PowerShell,
+        pwsh_path: Some("C:\\Custom\\pwsh-custom.exe".into()),
+        ..Default::default()
+    };
+    let s2 = resolve(
+        &ShellExecRequest {
+            command: "x".into(),
+            ..Default::default()
+        },
+        &with_path,
+    )
+    .unwrap();
+    assert_eq!(s2.program, "C:\\Custom\\pwsh-custom.exe");
 }
 
 #[test]

@@ -1,12 +1,14 @@
-//! dsh-shell 本地 bash 后端（M5-DESIGN §5.3）。
+//! dsh-shell 本地 shell 后端（M5-DESIGN §5.3；A 并行：bash + pwsh 双方言）。
 //!
-//! 参考 `bash-local/src/index.ts`：命令以 `bash -c` 在托管进程组/Job 内执行（经
-//! dsh-subprocess spawn），ENV_OVERRIDES 模型友好环境、前台 `run`（默认/上限 + 同步
-//! 超时杀 + 结果分类）、后台 `start`（无超时、增量读取、kill、done settle）。
+//! 参考 `bash-local/src/index.ts`：命令以 `bash -c` 或 `pwsh -Command` 在托管进程组/
+//! Job 内执行（经 dsh-subprocess spawn），ENV_OVERRIDES 模型友好环境、前台 `run`
+//! （默认/上限 + 同步超时杀 + 结果分类）、后台 `start`（无超时、增量读取、kill、done
+//! settle）。
 
 use crate::resolve::{resolve, BashConfig};
 use crate::types::{
-    ShellCollectedOutput, ShellError, ShellExecRequest, ShellExecSpec, ShellProcess, ShellRunResult,
+    ShellCollectedOutput, ShellError, ShellExecRequest, ShellExecSpec, ShellKind, ShellProcess,
+    ShellRunResult,
 };
 use dsh_subprocess::{
     ChildStdio, StdinMode, StdoutMode, SubprocessCollect, SubprocessSpawnSpec, SubprocessSpill,
@@ -23,20 +25,21 @@ pub const ENV_OVERRIDES: [(&str, &str); 4] = [
     ("GIT_PAGER", "cat"),
 ];
 
-/// `ctx.shell` 的本地实现：capability seam 的 Consumer/provider 角色。
-pub struct LocalBashExecutor {
+/// `ctx.shell` 的本地实现：capability seam 的 Consumer/provider 角色。按 `spec.shell`
+/// 分发 argv 形状（bash `-c` / pwsh `-NoProfile -NonInteractive -Command`）。
+pub struct LocalShellExecutor {
     pub config: BashConfig,
-    bash_program: String,
+    program: String,
 }
 
-impl LocalBashExecutor {
-    /// 构造并校验配置（positive-finite + grace 上限）。
-    pub fn new(config: BashConfig) -> Result<LocalBashExecutor, String> {
-        let bash_program = crate::resolve::resolve_bash_program(&config);
-        Ok(LocalBashExecutor {
-            config,
-            bash_program,
-        })
+impl LocalShellExecutor {
+    /// 构造并校验配置（positive-finite + grace 上限）；解析本方言默认程序。
+    pub fn new(config: BashConfig) -> Result<LocalShellExecutor, String> {
+        let program = match config.shell {
+            ShellKind::Bash => crate::resolve::resolve_bash_program(&config),
+            ShellKind::PowerShell => crate::resolve::resolve_pwsh_program(&config),
+        };
+        Ok(LocalShellExecutor { config, program })
     }
 
     /// Clamp（字段缺省由实现兜底）。
@@ -44,7 +47,8 @@ impl LocalBashExecutor {
         resolve(request, &self.config)
     }
 
-    /// 前台执行 `bash -c <command>`；非零退出/超时杀都 resolve 成结果。
+    /// 前台执行 `bash -c <command>` / `pwsh -Command <command>`；非零退出/超时杀都
+    /// resolve 成结果。
     pub fn run(&self, spec: &ShellExecSpec) -> Result<ShellRunResult, ShellError> {
         let spawn_spec = self.spawn_spec_for(spec, spec.stdin.clone(), spec.stdout_max_bytes);
         let mut handle =
@@ -70,12 +74,22 @@ impl LocalBashExecutor {
         })
     }
 
-    /// 后台启动 `bash -c <command>`；无超时；返回立即可读/可杀/可等的句柄。
+    /// 后台启动 `bash -c <command>` / `pwsh -Command <command>`；无超时；返回立即可读/
+    /// 可杀/可等的句柄。
     pub fn start(&self, spec: &ShellExecSpec) -> Result<ShellProcess, ShellError> {
         let spawn_spec = self.spawn_spec_for(spec, None, spec.stdout_max_bytes);
         let handle =
             dsh_subprocess::spawn(&spawn_spec).map_err(|e| ShellError::Spawn(e.to_string()))?;
         Ok(ShellProcess::new(handle))
+    }
+
+    /// argv 形状随方言：bash `-c cmd`；pwsh `-NoProfile -NonInteractive -Command cmd`。
+    fn program(&self, spec: &ShellExecSpec) -> String {
+        if spec.program.is_empty() {
+            self.program.clone()
+        } else {
+            spec.program.clone()
+        }
     }
 
     fn spawn_spec_for(
@@ -96,8 +110,19 @@ impl LocalBashExecutor {
             }),
         };
         let env = self.assemble_env(spec);
+        let program = self.program(spec);
+        let argv = match spec.shell {
+            ShellKind::Bash => vec![program, "-c".into(), spec.command.clone()],
+            ShellKind::PowerShell => vec![
+                program,
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                spec.command.clone(),
+            ],
+        };
         SubprocessSpawnSpec {
-            argv: vec![self.bash_program.clone(), "-c".into(), spec.command.clone()],
+            argv,
             cwd: spec.workdir.clone(),
             stdio: ChildStdio {
                 stdin,
@@ -110,17 +135,36 @@ impl LocalBashExecutor {
         }
     }
 
-    /// overrides 先、调用方 env 次之、托管 DSH_* 最后（不可被顶替）。
+    /// 参考 bash-local：父进程环境为基（凭据形/`DSH_*` 键 scrubbed——key 纪律，见
+    /// dsh-subprocess::scrubbed_parent_env）→ ENV_OVERRIDES 覆盖 → 调用方 env →
+    /// 托管 DSH_* 最后（不可被顶替）。修复前 base 恒为 4 个 override 键（env_clear
+    /// 清掉 SystemRoot 等），Windows PowerShell 5.1 初始化 .NET/DPAPI 即崩
+    /// （8009001d）。
     fn assemble_env(&self, spec: &ShellExecSpec) -> Vec<(String, String)> {
-        let mut env: Vec<(String, String)> = Vec::new();
+        let mut env: Vec<(String, String)> = dsh_subprocess::scrubbed_parent_env(
+            &std::env::vars_os().collect::<Vec<dsh_subprocess::EnvEntry>>(),
+        )
+        .into_iter()
+        .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+        .collect();
+        let put = |env: &mut Vec<(String, String)>, k: String, v: String| {
+            match env.iter_mut().find(|(ek, _)| *ek == k) {
+                Some(entry) => entry.1 = v,
+                None => env.push((k, v)),
+            }
+        };
         for (k, v) in ENV_OVERRIDES {
-            env.push((k.to_string(), v.to_string()));
+            put(&mut env, k.to_string(), v.to_string());
         }
         if let Some(entries) = &spec.env {
-            env.extend(entries.clone());
+            for (k, v) in entries {
+                put(&mut env, k.clone(), v.clone());
+            }
         }
         if let Some(entries) = &spec.dsh_env {
-            env.extend(entries.clone());
+            for (k, v) in entries {
+                put(&mut env, k.clone(), v.clone());
+            }
         }
         env
     }

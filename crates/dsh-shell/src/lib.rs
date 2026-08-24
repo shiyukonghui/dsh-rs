@@ -8,17 +8,17 @@ mod resolve;
 mod tool_bash;
 mod types;
 
-pub use executor::{LocalBashExecutor, ENV_OVERRIDES};
+pub use executor::{LocalShellExecutor, ENV_OVERRIDES};
 pub use resolve::{
-    assert_serviceable_bash_config, clamp_timeout, resolve, resolve_bash_program, BashConfig,
-    DEFAULT_GRACE_MS, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_SPILL_BYTES, DEFAULT_MAX_TIMEOUT_MS,
-    DEFAULT_TIMEOUT_MS, MAX_TIMER_DELAY_MS,
+    assert_serviceable_bash_config, clamp_timeout, resolve, resolve_bash_program,
+    resolve_pwsh_program, BashConfig, DEFAULT_GRACE_MS, DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_MAX_SPILL_BYTES, DEFAULT_MAX_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, MAX_TIMER_DELAY_MS,
 };
 pub use tool_bash::{
     bash_tool_parameters, parse_bash_args, render_bash_process_read, render_bash_result,
     BashToolArgs,
 };
 pub use types::{
-    ShellCollectedOutput, ShellError, ShellExecRequest, ShellExecSpec, ShellProcess,
+    ShellCollectedOutput, ShellError, ShellExecRequest, ShellExecSpec, ShellKind, ShellProcess,
     ShellProcessRead, ShellProcessStatus, ShellRunResult, ShellSandboxInfo, DSH_ENV_PREFIX,
 };

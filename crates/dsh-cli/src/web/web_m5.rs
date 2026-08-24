@@ -43,7 +43,7 @@ use dsh_jobs::{
 };
 use dsh_sandbox::SandboxMode;
 use dsh_shell::{
-    bash_tool_parameters, parse_bash_args, render_bash_result, BashConfig, LocalBashExecutor,
+    bash_tool_parameters, parse_bash_args, render_bash_result, BashConfig, LocalShellExecutor,
     ShellCollectedOutput, ShellError, ShellExecRequest, ShellExecSpec, ShellProcess,
     ShellProcessStatus, ShellRunResult,
 };
@@ -136,16 +136,17 @@ impl FsHost {
     }
 }
 
-/// shell 宿主：本地 bash 后端（root 为默认工作目录；`On Mac/Linux` 亦可）。
+/// shell 宿主：本地 shell 后端（root 为默认工作目录；`On Mac/Linux` 亦可）。按
+/// `BashConfig.shell` 方言执行（bash / pwsh，A 并行）。
 pub struct ShellHost {
-    pub executor: LocalBashExecutor,
+    pub executor: LocalShellExecutor,
     pub root: PathBuf,
 }
 
 impl ShellHost {
     /// 构造并校验 bash 配置；cwd 锚定宿主 root（工作区）。
     pub fn new(root: PathBuf) -> Result<Self, String> {
-        let executor = LocalBashExecutor::new(BashConfig {
+        let executor = LocalShellExecutor::new(BashConfig {
             cwd: Some(root.clone()),
             ..BashConfig::default()
         })?;

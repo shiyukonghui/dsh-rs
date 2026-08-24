@@ -5,7 +5,10 @@
 //! E_ACCESSDENIED）。因此每个用例先做一次可用性探测：不可用则打印明确原因并跳过，
 //! 在 Linux/正常开发机/CI 上这些用例真实跑 bash（不降级架构、不假绿，见 DECISIONS）。
 
-use dsh_shell::{BashConfig, LocalBashExecutor, ShellExecRequest, ShellProcessStatus};
+use dsh_shell::{
+    resolve_pwsh_program, BashConfig, LocalShellExecutor, ShellExecRequest, ShellExecSpec,
+    ShellKind, ShellProcessStatus,
+};
 use std::sync::OnceLock;
 
 fn test_bash() -> String {
@@ -81,8 +84,8 @@ fn require_bash() -> bool {
     }
 }
 
-fn executor() -> LocalBashExecutor {
-    LocalBashExecutor::new(BashConfig {
+fn executor() -> LocalShellExecutor {
+    LocalShellExecutor::new(BashConfig {
         bash_path: Some(test_bash().into()),
         ..Default::default()
     })
@@ -96,6 +99,93 @@ fn resolve_spec(cmd: &str) -> dsh_shell::ShellExecSpec {
         ..Default::default()
     })
     .expect("resolve ok")
+}
+
+/// A 并行（P3-d）：pwsh 解析程序可启动探测（Windows 恒有 powershell.exe；其余平台需
+/// pwsh，不可用则跳过——与 bash 探测同纪律：真实跑，不降级不假绿）。
+fn pwsh_test_program() -> String {
+    resolve_pwsh_program(&BashConfig::default())
+}
+
+/// 探测 pwsh 解析程序是否在本环境真正可启动（一次缓存）。
+fn pwsh_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let program = pwsh_test_program();
+        let Ok(mut child) = std::process::Command::new(&program)
+            .args(["-NoProfile", "-NonInteractive", "-Command", "Write-Output dsh-pwsh-probe-ok"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            eprintln!("dsh-shell: {program} 无法启动，跳过真实 pwsh 用例");
+            return false;
+        };
+        let mut ok = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    if st.success() {
+                        use std::io::Read;
+                        let mut out = String::new();
+                        let _ = child.stdout.take().map(|mut f| f.read_to_string(&mut out));
+                        ok = out.contains("dsh-pwsh-probe-ok");
+                    }
+                    break;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(e) => {
+                    eprintln!("dsh-shell: pwsh 探测异常（{e}），跳过真实 pwsh 用例");
+                    break;
+                }
+            }
+        }
+        if !ok {
+            eprintln!("dsh-shell: pwsh 在本沙箱不可用（无 PowerShell），跳过真实 pwsh 用例");
+        }
+        ok
+    })
+}
+
+fn require_pwsh() -> bool {
+    if pwsh_available() {
+        true
+    } else {
+        eprintln!("    ~ 跳过：当前环境无可用 PowerShell（非实现缺陷，见文件头）");
+        false
+    }
+}
+
+#[test]
+fn run_pwsh_write_output_via_shell_kind() {
+    if !require_pwsh() {
+        return;
+    }
+    let ex = LocalShellExecutor::new(BashConfig {
+        shell: ShellKind::PowerShell,
+        ..Default::default()
+    })
+    .expect("config serviceable");
+    let spec: ShellExecSpec = ex
+        .resolve(&ShellExecRequest {
+            command: "Write-Output 'shell-pwsh-ok'".into(),
+            ..Default::default()
+        })
+        .expect("resolve ok");
+    assert_eq!(spec.shell, ShellKind::PowerShell);
+    let result = ex.run(&spec).expect("run ok");
+    assert_eq!(
+        result.exit_code, Some(0),
+        "stdout: {} | stderr: {} | signal: {:?}",
+        result.stdout.text, result.stderr.text, result.signal
+    );
+    assert!(
+        result.stdout.text.contains("shell-pwsh-ok"),
+        "stdout: {}",
+        result.stdout.text
+    );
 }
 
 #[test]

@@ -25,7 +25,8 @@ pub const DEFAULT_MAX_SPILL_BYTES: u64 = 64 * 1024 * 1024;
 /// 默认 SIGTERM→SIGKILL 宽限（OpenCode 3s）。
 pub const DEFAULT_GRACE_MS: u64 = 3_000;
 
-/// bash-local 配置（全部可选，`Default` 供默认值）。
+/// bash-local 配置（全部可选，`Default` 供默认值）。`shell` 决定方言；pwsh 相关
+/// 字段仅 `shell == PowerShell` 时生效。
 #[derive(Debug, Clone)]
 pub struct BashConfig {
     pub cwd: Option<PathBuf>,
@@ -34,8 +35,12 @@ pub struct BashConfig {
     pub max_output_bytes: usize,
     pub max_spill_bytes: u64,
     pub grace_ms: u64,
-    /// bash 可执行（显式注入/覆盖；缺省按候选顺序解析）。
+    /// bash 可执行（显式注入/覆盖；缺省按候选顺序解析）。默认方言即 Bash。
     pub bash_path: Option<PathBuf>,
+    /// shell 方言。`PowerShell` 时 argv 走 `-NoProfile -NonInteractive -Command`。
+    pub shell: crate::types::ShellKind,
+    /// pwsh 可执行（显式注入/覆盖；缺省按候选顺序解析，仅 shell=PowerShell 使用）。
+    pub pwsh_path: Option<PathBuf>,
 }
 
 impl Default for BashConfig {
@@ -48,6 +53,8 @@ impl Default for BashConfig {
             max_spill_bytes: DEFAULT_MAX_SPILL_BYTES,
             grace_ms: DEFAULT_GRACE_MS,
             bash_path: None,
+            shell: crate::types::ShellKind::Bash,
+            pwsh_path: None,
         }
     }
 }
@@ -112,6 +119,30 @@ pub fn resolve_bash_program(config: &BashConfig) -> String {
     "bash".to_string()
 }
 
+/// 解析 pwsh 可执行：显式 pwsh_path > PowerShell 7 安装候选；Windows 恒有
+/// powershell.exe（5.1）兜底，其余平台回落裸名 `pwsh`。
+pub fn resolve_pwsh_program(config: &BashConfig) -> String {
+    if let Some(p) = &config.pwsh_path {
+        return p.to_string_lossy().into_owned();
+    }
+    #[cfg(windows)]
+    {
+        for candidate in [
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+            "C:\\Program Files\\PowerShell\\7-preview\\pwsh.exe",
+        ] {
+            if std::path::Path::new(candidate).exists() {
+                return candidate.to_string();
+            }
+        }
+        "powershell.exe".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        "pwsh".to_string()
+    }
+}
+
 /// 参考 `shell resolve()`：对 request 应用默认与 clamp，产出完全规格。
 pub fn resolve(request: &ShellExecRequest, config: &BashConfig) -> Result<ShellExecSpec, String> {
     assert_serviceable_bash_config(config)?;
@@ -135,6 +166,11 @@ pub fn resolve(request: &ShellExecRequest, config: &BashConfig) -> Result<ShellE
         .clone()
         .or_else(|| config.cwd.clone())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let shell = config.shell;
+    let program = match shell {
+        crate::types::ShellKind::Bash => resolve_bash_program(config),
+        crate::types::ShellKind::PowerShell => resolve_pwsh_program(config),
+    };
     Ok(ShellExecSpec {
         command: request.command.clone(),
         workdir,
@@ -144,6 +180,7 @@ pub fn resolve(request: &ShellExecRequest, config: &BashConfig) -> Result<ShellE
         stdin: request.stdin.clone(),
         env: request.env.clone(),
         dsh_env: request.dsh_env.clone(),
-        bash_program: resolve_bash_program(config),
+        program,
+        shell,
     })
 }
