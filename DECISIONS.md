@@ -3377,5 +3377,31 @@ workspace check 绿。回滚 = 撤本提交（含 Cargo.lock）。
 
 ---
 
+## M6-ACCEPTANCE（复活轮复跑：真实 API + step10 收口）
+
+**日期**：2026（M6 复活轮，用户指令：真实 key 冒烟 + 实现 ts-host diff / SQLite）。
+**真实 API 冒烟（P4 纪律：key 仅进程环境注入，两次运行后已清除，永不落盘/入 git）**：
+- `serve_closure_real_endpoint_smoke_gated` 两次执行均 **GATED-SMOKE-OK: real turn replied "OK"**——
+  完整 serve 装配（真实 M4+M5 工具 + deepseek LLM，key 仅 env）+ `session.prompt` RPC →
+  真实 DeepSeek 端点（base http://100.105.152.101:18080/v1, model deepseek-v4-flash-0731-ext）
+  回复落共享 store（assistant/message 非空）+ EventSink downlink ≥4 + 无 AUTH/NETWORK 失败。
+- 说明：你提供的 key 在本会话仅作两次测试进程的临时环境变量，注入后即 remove（未写入任何文件/
+  DECISIONS/git history；仓库无 key 痕迹）。
+**step10 收口（复活 D-089 范围外项，TDD）**：
+- D-090 ts-host 差分：`diff/ts-host/session-host.mjs` + Rust dsh-diff session 步骤（真实
+  dsh-session store）+ `scenarios/session-01-simple(.json/.golden)`；`node verify-diff.mjs`
+  **17 场景 ALL PASS**（新 session-01 7 行逐字节对齐 + 16 场景零回归）。
+- D-091 SQLite：`PersistenceBackend` 缝上 `SqliteBackend`（rusqlite bundled，事务原子落盘/回读），
+  7 测绿（含跨 reopen 持久/surface 保真/repair/coordinator 无缝）。
+**最终状态（workspace 复跑）**：全量 test 零失败 + clippy `-D warnings` 零告警 + check 绿 +
+dsh-diff 单测绿；提交链 D-077→D-091 与 `88a327b`..`d91688d` 互查无断链。
+**诚实边界更新**：D-089 原「范围外」裁定经用户复活——step10 已交付；SessionHost/`dsh web`
+的 SQLite 接线（后端 seam 即插兼容）与 TS session 生产包 vendored（真实面在 Rust dsh-session）
+仍为记录在案的后续面，不作静默宣称。
+**结论**：M6 全部达成（主线 + 穿插篮 step7-9 + 复活 step10 + 真实 API 闭环证据）。回滚 =
+按 D-* 逐提交回退。
+
+---
+
 
 
