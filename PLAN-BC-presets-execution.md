@@ -45,7 +45,7 @@
 | B-01 | 改动 | **`agent.cordis.yml` 解析复用**：`dsh-loader` Include/EntryOptions 已吃顶层数组（验证 include.rs:308-355），preset 组合与其同形——确认直接复用 + `cordis:group`/`isolate` 键解析 | dsh-loader | 复用；补 `presetEntryList` 方言校验（对齐 TS `entryListSchema` 的健康检查，B-03） | — |
 | B-02 | 改动 | **`!!js` 标签进 Rust**：vendored preset 文件是字面 `!!js` YAML 标签；Rust `serde_yaml` 不认 → 需（①构建期复制时转译成 `__jsExpr` 对象（对齐 include.rs:6 既有差异）；②运行期自定义 YAML tag handler） | 复制/解析层 | **建议①**（复制脚本一次性转译；文档 `D-C` 平台静态预排除顺带在此做） | B-01 |
 | B-03 | 改动 | **preset 元数据 `preset.yml`**（name/description/order）解析 + **健康检查**（组合缺失/不可加载→broken；用 loader 方言校验而非自造 schema） | 发现层 | 对齐 discovery.ts；`first root wins`、trust 来自 root、`authorable`=存在 user 根 | B-01 |
-| B-04 | 决策 | **自定义根位置**：`.agent-presets` 放 harness home 还是 cwd？TS=用户 home；Rust 进程无强 home 约定 → 用 `cwd` 还是显式 `--agent-presets-root`？ | 发现层/CLI | 建议：**默认 cwd**（workspace 维一致）+ 可配置根叠加（对齐 TS roots 数组） | B-03 |
+| B-04 | 决策 | **自定义根位置**：`.agent-presets` 放 harness home 还是 cwd？ | 发现层/CLI | **round-7 已核实 TS 权威约定**：`resolveDshHome()` = 显式配置路径 → `$DSH_HOME`（空/纯空白视为未设）→ `~/.dsh`（`DSH_HOME_DIR_NAME='.dsh'`，util/home-paths/src/index.ts:12,18,62,88）；用户根= `dshHomePath('.agent-presets')` trust:`'user'`（index.ts:134 追加到配置 roots）；系统根=SHIPPED `config/agent-presets` trust:`'system'`；`discoverPresets` 按 roots 顺序**每 id 首根胜出**（用户可覆盖内置）。→ **Rust 建议照抄**：P1 加 `dsh_home()`（`$DSH_HOME`→空白忽略→`home_dir()/.dsh`）＋用户根 `<dsh_home>/.agent-presets`（`authorable`=其存在即真，D 决策）＋系统根 `resources/agent-presets` ＋ roots 数组 + `includeUserRoot:false` 开关（hermetic 测试用） | B-03, D |
 | B-05 | 改动 | **内置根下发形态**：4 个预设拷进 Rust 项目，作为资源随二进制下发（`include_bytes!`/装箱资源）还是原样目录 + 数据路径？版本同步策略（与 vendored 参考树的差异标注） | 构建/资源 | 建议资源目录 + 复制脚本（含 `!!js`→`__jsExpr` 转译 + win32 预排除，与 B-02 合并）；内置与自定义同形同逻辑 | B-02 |
 
 ### 1.3 插件行实现 / 服务桥（P3）
@@ -197,7 +197,9 @@ C 收敛（独立架构里程碑，P5 之后）    F-01..F-06
    门控（win32 用 bash，诚实差异、零新增）——推荐 **B 作直通 P4 的先行 + A 随 P3**。
 3. **A-05** 组合文件变动：**round-6 已核实** `Loader::create/update/remove/sync` 均为公开流程 →
    推荐**原地换代（generation-based，无需重启）**为 P2 起主路径；HMR 文件监听后置；进程级重启仅兜底。
-4. **B-04** 自定义根位置（cwd 默认 vs 显式根叠加）。
+4. **B-04** 自定义根位置——**round-7 已核实 TS 权威约定**（`$DSH_HOME`→空白忽略→`~/.dsh`；
+   用户根 `<dsh_home>/.agent-presets` trust=user、系统根 `resources/agent-presets` trust=system、
+   每 id 首根胜出）→ 推荐 Rust 照抄，P1 加 `dsh_home()` 解析 + roots 数组 + `includeUserRoot`。待确认采纳。
 5. **C-04** 默认会话与预设关系（不 join 保持现状 vs default 也 join standard）。
 6. **F-05/F-06** 收敛后 WASM/native 双驱动与 ScopeId/ScopeKey 键空间去留（C 阶段决策，可后置）。
 
