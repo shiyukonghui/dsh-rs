@@ -4,6 +4,7 @@
 > **依据**：用户已确认——执行路径 **B（组合权威归位 dsh-core/loader + 窄服务桥）→ C（循环开进 dsh-core 收敛）**；
 > preset 决策 **A（内置复制自持 + 支持读取自定义 agent）、B（直通 P4：组合真实改变会话行为）、C（`dsh-eval` 现成子集）、D（按推荐）**。
 > **前置调研**：`DESIGN-agent-presets-composition.md`（TS 权威语义 standing mount/join/realm/settings 全带 file:line 引用 + Rust 基建盘点 + **架构偏离逐缝表 §3.0** + **收敛路径 §5.1**）。
+> **需求结论**：`REQUIREMENTS-agent-presets-composition.md`（瀑布流需求分析阶段关闸工件：目标/非目标/假设/约束/边界/验收标准）。
 > **本文档职责**：把 B+C 落地所需的**全部问题/改动点/风险/技术验证**逐条编号列出（每条注明类型、影响面、选项、建议、依赖、阻塞），末尾给**阶段规划草案**供用户修订后成为正式执行计划。**不写实现代码。**
 
 ---
