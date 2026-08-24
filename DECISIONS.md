@@ -4333,7 +4333,10 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
 
 **C-B 分段计划**（各阶段独立提交=回滚点；TDD 红绿 + live 复验）：
 1. **K1 键/生命周期**：dsh-core 侧组合挂载原语（agent scope → fiber 子树 + scope-join +
-   disposer），保留 ScopeKey 单键。
+   disposer），保留 ScopeKey 单键。**= dsh-core 自身 M1 里程碑**（`lib.rs` 自述 M0 限制：
+   「isolate/intercept 作用域在 M1 引入，当前所有服务共享根作用域」；`types::ScopeId`
+   已存在）——引入"agent 子作用域"承载 preset 子树挂载，正是 leakedServices 守卫能成立
+   的前提（泄漏 = 贡献绕过 agent 子作用域落进根域）。
 2. **K2 泄漏守卫**：root-realm `leakedServices` 检测（dsh-core reflect）+ 负例测试
    （root 注册 → 挂载失败）。
 3. **K3 挂载否决**：unusable-rows 审计（显式 broken 集除外，D-103 兼容）→ 挂载失败。
