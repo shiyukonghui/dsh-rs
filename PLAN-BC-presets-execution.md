@@ -200,7 +200,10 @@ C 收敛（独立架构里程碑，P5 之后）    F-01..F-06
 4. **B-04** 自定义根位置——**round-7 已核实 TS 权威约定**（`$DSH_HOME`→空白忽略→`~/.dsh`；
    用户根 `<dsh_home>/.agent-presets` trust=user、系统根 `resources/agent-presets` trust=system、
    每 id 首根胜出）→ 推荐 Rust 照抄，P1 加 `dsh_home()` 解析 + roots 数组 + `includeUserRoot`。待确认采纳。
-5. **C-04** 默认会话与预设关系（不 join 保持现状 vs default 也 join standard）。
+5. **C-04** 默认会话与预设关系——**建议（TS 对齐）**：default 会话**不隐式 join**——保持「部署
+   默认组合」语义（E-02 安全基线、向后兼容）；`agent-presets.default` 设置（TS `SETTINGS_NAMESPACE`
+   的 `{default: z.string()}` 字段，apiproxy-config.spec.ts:464）只决定**新会话的初始预设选择**
+   （仍走同一 standing+join 流程），不改变未选择预设的既有行为。
 6. **F-05/F-06** 收敛后 WASM/native 双驱动与 ScopeId/ScopeKey 键空间去留（C 阶段决策，可后置）。
 
 ## 6. shipped 预设行 → Rust 实现映射盘点（B-11 预研结果，2026 实测四 yml + Rust 工具面）
