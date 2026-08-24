@@ -25,10 +25,6 @@ pub mod web;
 /// M3a host 目录方法面（listDirectory/createDirectory 真实 fs 实现，可差分单测）。
 pub mod host_dir;
 
-/// M3a+（D-096）：`host.pickDirectory` 原生目录选择后端（Windows FolderBrowserDialog；
-/// 三态：选中/取消/不可用——不可用绝不冒充取消）。
-pub mod host_picker;
-
 /// M1e SessionHost：把 WASM loop 的 SessionLog 事件 adopt 进 dsh-session store，
 /// 并挂载持久化（dsh-persistence coordinator event 回调）。
 pub mod session_host;
@@ -41,10 +37,6 @@ pub mod subagent_runtime;
 /// fail-loud；key 仅 `DEEPSEEK_API_KEY` 环境变量）。
 pub mod m6_llm;
 pub mod m6_env;
-
-/// `host.pickDirectory` 宿主选择器：`Ok(Some(path))` 选中 / `Ok(None)` 取消 /
-/// `Err(msg)` 不可用（wire `directory-picker-unavailable`）。
-pub type HostPicker = Rc<dyn Fn() -> Result<Option<String>, String>>;
 
 /// 启动结果：运行时上下文 + loop 插件句柄（供驱动）。
 pub struct Boot {
@@ -75,9 +67,6 @@ pub struct Boot {
     /// M4h：会话投影注册表（当前挂 `todos` unit；goal/plan/subagent/jobs 投影
     /// 挂 dsh-session 事件流为 M4 后续接入，本子步仅注册 + 可选暴露）。
     pub projections: Rc<std::cell::RefCell<dsh_session_query::projection::ProjectionRegistry>>,
-    /// M3a+（D-096）：`host.pickDirectory` 后端（None → wire `directory-picker-unavailable`，
-    /// 诚实上报而非 `{path:null}` 冒充取消）。web serve 装配为原生选择器；测试注入 stub。
-    pub host_picker: Option<crate::HostPicker>,
 }
 
 /// M56：转储生效配置（对齐生产 `dsh --dump-config`）——读主配置 + overlays
@@ -258,7 +247,6 @@ pub fn boot(
             dsh_goal::ServiceOptions::default(),
         ))),
         projections: crate::web::assembled_projection_registry(),
-        host_picker: None,
     })
 }
 

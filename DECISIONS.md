@@ -3600,5 +3600,46 @@ powershell FolderBrowserDialog 升级为 IFileDialog 现代对话框（同一 Ho
 
 ---
 
+## D-097（web 使用验证发现，覆盖 D-096）：目录选择改为 browse 组合，移除 native 子进程
+
+**日期**：2026（用户真实使用：D-096 的 powershell 弹框触发杀毒软件警告）。
+**触发问题**：D-096 用 `powershell.exe -STA` + FolderBrowserDialog 弹原生对话框，
+每次打开即 spawn 带内联 `-Command` 脚本的子进程——杀软按「脚本唤醒」启发式告警。
+用户问：有没有和 TS 代码一致、由浏览器打开文件夹目录的方式？
+**语义梳理（TS seam，权威）**：目录选择是组合式能力（`ctx.directoryPicker` 后端）：
+- **browse** 能力 = `host.listDirectory`/`host.createDirectory`（页内目录浏览，纯 fs、
+  面包屑+home 锚点+hidden 标志；**零子进程**）。对应客户端 `dsh-client-ui-directory-picker-browse`。
+- **native** 能力 = `host.pickDirectory`（原生对话框；TS Windows 实现为 **IFileDialog/COM
+  后台 worker**，非脚本子进程）。对应客户端 `dsh-client-ui-directory-picker-native`。
+- TS 组合期**只挂一个与后端能力匹配的 flow 包**；「组合之外的方法」→
+  `directory-picker-unavailable`。我们 Rust 早已供齐 browse 后端（`host_dir.rs`）。
+**根因**：`build_boot_manifest` 把 plugin_root 下**所有** web 客户端插件都收进
+`__DSH_BOOT__`，native+browse 两个 flow 客户端同时被浏览器装载；ui-workspace 的
+directory-flow 洞是 `single` kind，native 占据 → 点「打开工作区」调 `host.pickDirectory`。
+**最终选择**：**组合 browse、排除 native**（与 TS 组合期一致，且天然零 AV 面）：
+1. `build_boot_manifest` 新增 `HOST_COMPOSITION_EXCLUDED_CLIENTS`，排除
+   `@deepseek-ai/dsh-client-ui-directory-picker-native`（boot 图只留 browse 客户端，
+   占据 single directory-flow 洞 → 页内目录浏览）；
+2. `host.pickDirectory` **恒报 `directory-picker-unavailable`**（browse 组合下 native 方法
+   不可用，TS 逐字语义；绝不返回 `{path:null}` 冒充取消）；
+3. **删除 D-096 的 `host_picker.rs`（powershell 子进程实现）+ `Boot.host_picker` 接缝 +
+   `HostPicker` 别名**——杀软敏感面从代码树彻底清零，不再是「不调用但留后门」。
+**被否决**：① 保留 D-096 子进程（AV 面仍在，违背用户诉求）；② browse+native 都留让运行时
+选（洞是 single kind，仍有一个被抢；TS 组合期就只挂一个）；③ 改前端运行时重组（动前端
+装配面，非重启即得，且 TS 不做）；④ 在 Rust 进程内直接做 IFileDialog/COM（TS 正解，
+但成本/收益当前不成比例——记录为后续可选升级，路径=恢复 `host.pickDirectory` 真实现 +
+boot 图切回 native 客户端）。
+**TDD + 验收**：红 = `build_boot_manifest_composes_only_one_directory_picker_flow`
+（fixture 含 browse+native，断言 browse 在、native 不在、恰 1 entry）先失败；绿 = 加
+exclusion 后通过。`rpc_host_pick_directory_unavailable_when_browse_composed`（恒
+`directory-picker-unavailable`、value 无 `{path:null}`）。dsh-cli lib 全绿、clippy
+`-D warnings` 零告警；fmt 仅 web.rs 既有漂移行（勿套 rustfmt 全文件）。
+**回滚**：撤本提交（恢复 D-096）。
+**预期影响**：点「打开工作区」= 页内目录浏览选择（`host.listDirectory`/`createDirectory`，
+零子进程、杀软零告警）；`host.pickDirectory` 对直接 API 调用来访者诚实报不可用。若未来要
+原生对话框，按 TS 用进程内 IFileDialog/COM（不 spawn 脚本子进程）。
+
+---
+
 
 
