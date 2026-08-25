@@ -4536,6 +4536,24 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
   回滚：`git revert` U2 提交。
 - 下一：U3（tool-skill 等保持 guard 原因收口 + 安全网测试）→ L1（plan-mode C 档）。
 
+### D-105 实施补记（U3：guard 原因收口 + 安全网测试，round 27；TDD 红→绿）
+
+- 触发：D-105 U3（tool-skill 等保持 guard 的原因收口 + 安全网）。
+- 枚举（4 真实预设全部行名）：U1/U2 后仍落泛化「no Rust bridge yet」的行 =
+  `dsh-plan-mode`、`dsh-compaction-basic`、`dsh-compaction-tool-result-pruner`、
+  `dsh-agent-tool-presentation`（仅 code）。全部给**经过决策的专用原因**：
+  - `dsh-plan-mode` → L1 (D-105 C 档) pending：config.section 状态驱动注入 +
+    exit_plan_mode 真实执行器 + approval 联动（显式待桥，不伪装 bridged 也不落泛化）；
+  - `dsh-compaction-basic` / `dsh-compaction-tool-result-pruner` → L3 (档位 3)：
+    守卫段 + 接口预留（thresholdChars/headChars/tailChars 语义留接口、不行为）；
+  - `dsh-agent-tool-presentation` → standing 桥已对单工具行按 config 逐行重呈现，
+    即该装配期呈现变换的宿主落地（U3 显式标注）。
+- 安全网测试：真实 4 预设 × 生产宿主 → **任何守卫行原因都不允许落入泛化**
+  （防未来新行悄悄掉进「no Rust bridge yet」黑洞）；且无 stuck。
+- 验收：standing 24/24（+1 安全网）、八 crate **650/650**、clippy 零、live 四预设
+  select OK。回滚：`git revert` U3。
+- 下一：**L1（plan-mode C 档）**——先自下而上核对 harness 语义 + 宿主 approval 现状。
+
 ### D-104 实施补记预留
 
 

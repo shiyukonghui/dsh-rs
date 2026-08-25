@@ -701,6 +701,23 @@ fn tool_guard_reason(row: &CompositionRow) -> String {
     } else if n.contains("ask-user") {
         "host ask-user is a UI/approval RPC, not an agent-callable tool in this build (U2)"
             .to_string()
+    } else if n == "@deepseek-ai/dsh-plan-mode" {
+        // L1（D-105 C 档，待桥）：dsh-plan-mode 行的 config.section 将随会话 plan 模式
+        // 注入 SystemPrompt；exit_plan_mode 从 NOT_BOUND 升真实执行器。U3 显式标注 pending。
+        "L1 (D-105 plan-mode C-tier): state-driven section bridge pending (config.section injection + exit_plan_mode real executor + approval linkage)"
+            .to_string()
+    } else if n == "@deepseek-ai/dsh-compaction-basic"
+        || n == "@deepseek-ai/dsh-compaction-tool-result-pruner"
+    {
+        // L3（D-105 compaction 档位 3，待桥）：守卫段 + 接口预留；tool-result-pruner 的
+        // thresholdChars/headChars/tailChars 语义留接口、不实现行为（不接 append_tool_result）。
+        "L3 (D-105 compaction tier-3): guard section + reserved interface; no summarization/pruning behavior yet"
+            .to_string()
+    } else if n == "@deepseek-ai/dsh-agent-tool-presentation" {
+        // U3：tool-presentation 是装配期呈现变换（把工具 B 以 A 呈现）；standing 桥已对
+        // 单工具行按 config 的 description/timeoutMs 逐行呈现，即此变换的宿主落地。
+        "tool-presentation is an assembly-time presentation transform; standing already re-presents tools per row config (U3)"
+            .to_string()
     } else {
         "no Rust bridge yet (P3/P5)".to_string()
     }
@@ -1485,6 +1502,38 @@ mod tests {
                     r.guarded
                 );
             }
+        }
+    }
+
+    /// —— U3（D-105）—— 安全网：真实 shipped 预设在生产宿主下，**每一行守卫原因都
+    /// 必须来自经过决策的专用集**（broken-D-103 / A-03 skill / U1 goal / U2 delegation /
+    /// L1 plan-mode pending / L3 compaction tier-3 pending / 工具呈现），不得落入泛化
+    /// 「no Rust bridge yet」；且无 stuck 行。TDD 红→绿。
+    #[test]
+    fn real_presets_guarded_rows_all_have_deliberate_reasons() {
+        let sp = new_sp();
+        let root = repo_root().join("resources").join("agent-presets");
+        for id in ["minimal", "standard", "code", "cordis"] {
+            let mut reg = StandingRegistry::new(sp.clone(), Some(realistic_tools()));
+            reg.mount_at(id, &preset_rows(id), Some(&root.join(id)), &win32_facade())
+                .unwrap_or_else(|e| panic!("{id}: mount failed: {e}"));
+            let r = reg.report(id).unwrap();
+            for (name, why) in &r.guarded {
+                assert!(
+                    !why.contains("no Rust bridge yet"),
+                    "{id}: {name} fell through to a generic unbridged reason — needs a deliberate one: {why}"
+                );
+                assert!(
+                    !["", "no shared tool registry in this host"]
+                        .contains(&why.as_str()),
+                    "{id}: {name} has a degenerate reason: {why}"
+                );
+            }
+            assert!(
+                r.unusable_rows().is_empty(),
+                "{id}: no stuck rows on production host: {:?}",
+                r.unusable_rows()
+            );
         }
     }
 
