@@ -4646,6 +4646,35 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
 - 下一：L1 收口（本段闭）；approval RPC 里程碑承接执行层联动 + enter 宿主入口 + 多
   会话 plan-mode 保真；TEST_REPORT §10 已落裁决。
 
+### D-106 需求分析（approval RPC 里程碑，round 1；无实现）
+
+- 触发：用户指示按流程推进 approval RPC 里程碑（承接 D-105 L1 裁决「执行层并入
+  approval 里程碑」）。规划工件：`PLAN-approval-rpc.md`（需求关闸）。
+- 自下而上核对（新增事实，D-105 未覆盖）：
+  - ApprovalProvider 缝同步单次裁决、**生产 web 未注册**、**dsh-agent-loop 不消费
+    审批缝**（grep 零命中）；`add_pre_decision` 注入缝现成（web_m5 hook 先例）；
+  - loop 同步执行工具，**无 turn 暂停/恢复**——真实异步 UI 轮询需 loop 异步缝（大改）；
+  - `commands/list` 已声明 `/plan`（`[off|message]`）但**无执行 RPC**——enter 宿主
+    入口本 build 缺；
+  - ApprovalAsked/Decided/Policy 事件词已存在但**零消费者**；
+  - harness 语义对照（web 检索）：plan-mode 入口即 `/plan` 命令，进入/离开落
+    `plan/mode{active}`（fold 纯重放，与 dsh_plan 一致；[plan-mode README](
+    https://github.com/deepseek-ai/DeepSeek-Harness/blob/master/packages/plan/plan-mode/README.md)）。
+- 三段：S1 enter/leave 宿主入口（`/plan` 执行面）；S2 执行层联动（plan-active →
+  mutation 工具强制审批：Asked/Decided/Policy 事件 + AllowedOnce/Rejected +
+  fail-closed）；S3 per-agent 保真（范围核算）。
+- 决策点（已呈用户）：**D-a** 执行层同步落地边界（选项 A 同步 fail-closed（推荐，
+  不碰 loop 构架）/ 选项 B 本轮异步 UI 往返（需 loop 异步缝，大改））；**D-b** mutation
+  工具集清单；**D-c** 判定作用域（agent→session 折叠）。
+- **用户裁决（round 1）**：**D-a = 异步 UI 往返（本轮即做）**——改造 dsh-agent-loop
+  为异步工具门（turn 暂停/恢复），plan-active mutation → ApprovalAsked + 挂起 →
+  GUI → approval/decided(allowedOnce|rejected) → 放行/拒绝；**D-b = 采纳提案清单**
+  （fs write/edit、terminal open/send/signal、bash/pwsh、str_replace_editor、
+  run_code、schedule create/delete、job_kill；read 系不拦）；**D-c/S3 = 留后续**
+  （执行层判定走 agent→session 解析；prompt 段 per-agent 另段）。
+- 验收关闸见 PLAN §2；本条目是需求阶段工件，回滚 = 无代码变更、删/改本规划即可。
+- 下一：**系统设计阶段（当前）**——S1 wire/RPC 面 + S2 loop 异步工具门设计决策 → TDD。
+
 ### D-104 实施补记预留
 
 
