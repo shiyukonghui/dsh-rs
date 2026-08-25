@@ -21,8 +21,10 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_agent_presets::parse::{row_disabled, CompositionRow};
+use dsh_core::{Cordis, CordisError, EffectOutcome, FiberHandle, Plugin, ScopeId};
 use dsh_scope::{bind_scope_parent, store::Undo, ScopeKey, ScopeParentBinding};
 use dsh_system_prompt::{PromptSection, PromptSectionText, SystemPrompt};
 use dsh_tools::ToolRegistry;
@@ -84,12 +86,45 @@ fn guard_kind(why: &str) -> GuardKind {
     }
 }
 
+/// K3/C：挂载记录插件——把「本 preset 已挂载」落为一个真实 dsh-core agent-scope
+/// 子树（组合权威的生存期/泄漏审计本体；`Cordis` 挂载点随 standing 收薄）。
+/// apply（record fiber 已在挂载作用域）：正常 → `isolate("preset.mount", scope)`
+/// → 记录服务落 agent realm（`audit_subtree` 判定干净）；fault 注入
+/// （`leakToRoot: true`，**仅测试**经 `set_fault_root_leak` 设定）→ 不 isolate →
+/// 落 root realm → 审计判定泄漏（复刻 harness `leakedServices`，验证守卫正路与
+/// 拒绝路径）。
+struct PresetRecordPlugin(Value);
+
+impl Plugin for PresetRecordPlugin {
+    fn name(&self) -> &'static str {
+        "dsh.preset.mount"
+    }
+    fn apply(&self, ctx: &Cordis, config: Value) -> Result<EffectOutcome, CordisError> {
+        let scope = ctx.current_scope();
+        let leak = config
+            .get("leakToRoot")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !leak {
+            ctx.isolate("preset.mount", scope)?;
+        }
+        ctx.provide("preset.mount", Arc::new(self.0.clone()))?;
+        Ok(EffectOutcome::None)
+    }
+}
+
 /// 一个 standing 挂载。
 pub struct Standing {
     pub id: String,
     /// standing scope：贡献（persona section 等）挂这里；agent join 时成为其父。
     pub scope: ScopeKey,
     pub report: StandingReport,
+    /// K3/C：dsh-core 侧该 standing 的 agent-scope 子树（`mount_scope` 铸造）——
+    /// 组合权威的生存期本体：`unmount` 走 `unmount_scope` 整树卸载；挂载记录
+    /// fiber（`record_fiber`）在该子树内 provide 记录服务，是 `audit_subtree`
+    /// （leakedServices 守卫）的审计目标。
+    pub core_scope: ScopeId,
+    pub record_fiber: FiberHandle,
     undos: Vec<Undo>,
 }
 
@@ -102,6 +137,12 @@ pub struct StandingRegistry {
     /// 工具行一律 guarded，诚实）。
     tools: Option<Rc<ToolRegistry>>,
     standings: HashMap<String, Standing>,
+    /// K3/C：组合运行时（dsh-core）——每个挂载铸造真实 agent-scope 子树，生存期/
+    /// 泄漏审计本体（组合权威归位 dsh-core 的收敛载体）。
+    core: Cordis,
+    /// K3/C 故障注入（root-realm 泄漏）：生产恒 false；仅测试
+    /// （`set_fault_root_leak`，cf(g test)-only）置真以推泄漏拒绝路径。
+    fault_root_leak: bool,
 }
 
 impl Default for StandingRegistry {
@@ -123,6 +164,8 @@ impl StandingRegistry {
             system_prompt,
             tools,
             standings: HashMap::new(),
+            core: Cordis::new(),
+            fault_root_leak: false,
         }
     }
     /// 挂载 preset：行审计 + 铸 standing scope + 桥贡献（persona / instructions /
@@ -413,12 +456,31 @@ impl StandingRegistry {
             }
         }
 
+        // K3/C：铸造组合权威本体——dsh-core agent-scope 子树 + 挂载记录 fiber。
+        // 放在所有可失败桥之后：桥出错时**不**留悬空 pending_scope / 幽灵 fiber。
+        let (core_scope, _) = self
+            .core
+            .mount_scope()
+            .map_err(|e| format!("preset {id}: core mount_scope: {e}"))?;
+        let record_fiber = self
+            .core
+            .plugin(
+                PresetRecordPlugin(serde_json::json!({ "preset": id })),
+                serde_json::json!({ "leakToRoot": self.fault_root_leak }),
+            )
+            .map_err(|e| {
+                self.core.unmount_scope(core_scope);
+                format!("preset {id}: core record plugin: {e}")
+            })?;
+
         self.standings.insert(
             id.to_string(),
             Standing {
                 id: id.to_string(),
                 scope,
                 report,
+                core_scope,
+                record_fiber,
                 undos,
             },
         );
@@ -448,12 +510,14 @@ impl StandingRegistry {
         self.standings.get(preset_id).map(|s| &s.report)
     }
 
-    /// 换代/销毁：撤销 scoped 贡献（undo 精确幂等）；scope 随注册表释放。
+    /// 换代/销毁：撤销 scoped 贡献（undo 精确幂等）+ dsh-core 子树整树卸载
+    /// （`unmount_scope`，随 fiber 展开）；scope 随注册表释放。
     pub fn unmount(&mut self, id: &str) {
         if let Some(standing) = self.standings.remove(id) {
             for undo in standing.undos {
                 undo();
             }
+            self.core.unmount_scope(standing.core_scope);
         }
     }
 
@@ -463,6 +527,39 @@ impl StandingRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.standings.is_empty()
+    }
+
+    /// K3/C：该 standing 的 dsh-core 挂载子树作用域（join/report 等的核心对应物）。
+    pub fn core_scope_of(&self, preset_id: &str) -> Option<ScopeId> {
+        self.standings.get(preset_id).map(|s| s.core_scope)
+    }
+
+    /// K3/C：该 standing 的挂载记录 fiber（生存期断言：Active ↔ 挂载存续）。
+    pub fn record_fiber(&self, preset_id: &str) -> Option<FiberHandle> {
+        self.standings.get(preset_id).map(|s| s.record_fiber)
+    }
+
+    /// K3/C：组合运行时（dsh-core）句柄——审计/测试/宿主自检用。
+    pub fn core(&self) -> &Cordis {
+        &self.core
+    }
+
+    /// K3/C：root-realm 泄漏审计（harness `leakedServices`）。对**每个**已挂载
+    /// standing 的 agent-scope 子树跑 `audit_subtree`；空 = 全部干净。宿主
+    /// （web select）见非空即拒绝该挂载并 unmount（fail-loud，同 K2）。
+    pub fn audit(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for st in self.standings.values() {
+            out.extend(self.core.audit_subtree(st.core_scope));
+        }
+        out
+    }
+
+    /// K3/C 故障注入（root-realm 泄漏；**测试专用**）：下一次挂载的记录服务不
+    /// isolate → 落 root realm → `audit` 判定泄漏（验证泄漏拒绝路径端到端）。
+    #[cfg(test)]
+    pub(crate) fn set_fault_root_leak(&mut self) {
+        self.fault_root_leak = true;
     }
 }
 
@@ -1151,6 +1248,70 @@ mod tests {
             "declared-broken / minimal-skill / unbridged rows must not reject: {:?}",
             r.unusable_rows()
         );
+    }
+
+    // —— K3/C —— dsh-core agent-scope 子树承载每个 standing 的挂载本体：挂载记录
+    // fiber 提供记录服务（isolate 于 agent realm → 审计干净）；unmount 走
+    // `unmount_scope` 整树卸载；fault 注入（root-realm 泄漏）→ `audit` 捕获。
+    /// 真实预设（minimal/standard/code/cordis）+ 生产等同工具集 → 每个挂载都铸造
+    /// dsh-core 子树（记录 fiber Active）且泄漏审计干净（K3 对四个真实预设零回归）。
+    #[test]
+    fn real_presets_mount_core_subtrees_and_audit_clean() {
+        use dsh_core::FiberState;
+        let sp = new_sp();
+        let root = repo_root().join("resources").join("agent-presets");
+        for id in ["minimal", "standard", "code", "cordis"] {
+            let mut reg = StandingRegistry::new(sp.clone(), Some(realistic_tools()));
+            reg.mount_at(id, &preset_rows(id), Some(&root.join(id)), &win32_facade())
+                .unwrap_or_else(|e| panic!("{id}: mount failed: {e}"));
+            let fid = reg
+                .record_fiber(id)
+                .unwrap_or_else(|| panic!("{id}: record fiber must exist"));
+            assert_eq!(
+                reg.core().fiber_state(fid),
+                Some(FiberState::Active),
+                "{id}: record fiber Active"
+            );
+            assert_eq!(
+                reg.core().audit_subtree(reg.core_scope_of(id).unwrap()).len(),
+                0,
+                "{id}: isolated record must not leak"
+            );
+            let leaks = reg.audit();
+            assert!(leaks.is_empty(), "{id}: registry audit clean: {leaks:?}");
+            // unmount → dsh-core 整树卸载（fiber 转 Disposed）+ 注册面无残留。
+            reg.unmount(id);
+            assert!(reg.record_fiber(id).is_none(), "{id}: fiber gone after unmount");
+            assert!(reg.core_scope_of(id).is_none(), "{id}: scope gone after unmount");
+            assert_eq!(
+                reg.core().fiber_state(fid),
+                Some(FiberState::Disposed),
+                "{id}: fiber disposed"
+            );
+        }
+    }
+
+    /// fault 注入：记录服务不 isolate → 落 root realm → `audit` 判定泄漏（验证
+    /// leakedServices 守卫的真实拒绝输入）；unmount 后干净。
+    #[test]
+    fn fault_root_leak_is_caught_by_audit_and_unmount_cleans() {
+        let sp = new_sp();
+        let comp = "- id: persona\n  name: '@deepseek-ai/dsh-persona'\n  config:\n    text: LEAK\n";
+        let rows = dsh_agent_presets::parse::parse_composition(comp).unwrap();
+        let mut reg = StandingRegistry::new(sp.clone(), None);
+        reg.set_fault_root_leak();
+        reg.mount("leaky", &rows, &win32_facade()).unwrap();
+        let leaks = reg.audit();
+        assert!(
+            !leaks.is_empty(),
+            "root-leaking record must be flagged by audit"
+        );
+        assert!(
+            leaks.iter().any(|l| l.contains("preset.mount")),
+            "leak names the record service: {leaks:?}"
+        );
+        reg.unmount("leaky");
+        assert!(reg.audit().is_empty(), "unmount cleans the leak");
     }
 
     /// —— P3-a：agent-instructions 内容桥 —— `<cwd>/AGENTS.md` → joined 视图 scoped

@@ -2906,6 +2906,23 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
                         ),
                     );
                 }
+                // K3/C：root-realm 泄漏审计（harness `leakedServices`）——挂载子树的
+                // 服务发布进 root realm 即拒绝（fail-loud）+ unmount 不留残留。
+                let leaks: Vec<String> = reg
+                    .core_scope_of(&preset)
+                    .map(|s| reg.core().audit_subtree(s))
+                    .unwrap_or_default();
+                if !leaks.is_empty() {
+                    let detail = leaks.join("\n  - ");
+                    reg.unmount(&preset);
+                    return err(
+                        "agent-preset-leak-rejected",
+                        format!(
+                            "preset \"{preset}\" published {} service(s) into the root realm (leakedServices guard):\n  - {detail}",
+                            leaks.len()
+                        ),
+                    );
+                }
                 match reg.scope_of(&preset) {
                     Some(s) => s.clone(),
                     None => unreachable!("just-mounted preset must have a scope"),
@@ -5033,6 +5050,97 @@ mod tests {
             "stuck row named in diagnostic: {msg}"
         );
         // 拒绝后不留残留挂载（unmount 已撤销）。
+        assert_eq!(
+            boot.standings.borrow().len(),
+            0,
+            "rejected mount must leave nothing mounted"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// K3/C：`agentPreset.select` 的 leakedServices root-realm 泄漏否决 —— 挂载
+    /// 子树的记录服务发布进 root realm（fault 注入）→ 拒绝 + `fail-loud` 报
+    /// `agent-preset-leak-rejected` + 不留残留挂载（对齐 harness mount.ts）。
+    #[test]
+    fn rpc_agent_preset_select_rejects_root_realm_leak_and_leaves_nothing() {
+        use dsh_agent_loop::{AgentLoopConfig, AgentLoopHost, ConfiguredAgent};
+        use dsh_agent_presets::{PresetRoot, PresetTrust};
+        let mut boot = boot_with_sessions();
+        {
+            let mut sp = boot.settings.borrow_mut();
+            crate::preset_host::register_agent_presets_settings(&mut sp);
+        }
+        let base = std::env::temp_dir().join(format!("dsh-cli-presets-leak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sys = base.join("sys");
+        let preset_dir = sys.join("ok");
+        std::fs::create_dir_all(&preset_dir).unwrap();
+        // 仅 persona 行：无工具桥依赖 → K2 干净（只测泄漏守卫路径）。
+        std::fs::write(
+            preset_dir.join("agent.cordis.yml"),
+            "- id: persona\n  name: '@deepseek-ai/dsh-persona'\n  config:\n    text: MARKER\n",
+        )
+        .unwrap();
+        std::fs::write(preset_dir.join("preset.yml"), "order: 1\n").unwrap();
+        *boot.presets.borrow_mut() = crate::preset_host::PresetHost::with_user_root(
+            vec![PresetRoot { path: sys.clone(), trust: PresetTrust::System }],
+            None,
+        );
+
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let config = AgentLoopConfig {
+            max_parallel_tool_calls: None,
+            agents: vec![ConfiguredAgent {
+                id: "a-main".into(),
+                provider: Some("mock".into()),
+                model: Some("mock-model".into()),
+                session_id: Some("default".into()),
+                max_tokens: None,
+                cwd: None,
+                resume_session_id: None,
+            }],
+        };
+        let loop_host = AgentLoopHost::with_store(
+            config,
+            std::rc::Rc::new(dsh_llm::LlmRuntime::new()),
+            std::rc::Rc::new(dsh_tools::ToolRegistry::new(dsh_tools::ToolExecutionMode::Native)),
+            session_host.store.clone(),
+        )
+        .unwrap();
+        loop_host.ensure_agent(&loop_host.config.agents[0]).unwrap();
+        boot.agent_loop = Some(loop_host.clone());
+        boot.standings = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::standing::StandingRegistry::new(
+                loop_host.prompt.clone(),
+                Some(loop_host.tools.clone()),
+            ),
+        ));
+        boot.standings.borrow_mut().set_fault_root_leak();
+
+        let call = |method: &str, payload: serde_json::Value| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": method, "payload": payload,
+            }))
+            .unwrap();
+            handle_rpc_host(&boot, method, &body, &session_host).1
+        };
+
+        let res = call(
+            "agentPreset.select",
+            serde_json::json!({"sessionId": "default", "agentPreset": "ok"}),
+        );
+        assert_eq!(res["result"]["ok"], false, "select rejected: {res}");
+        assert_eq!(
+            res["result"]["error"]["code"], "agent-preset-leak-rejected",
+            "fail-loud code: {res}"
+        );
+        let msg = res["result"]["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("preset.mount") && msg.contains("root realm"),
+            "leak named in diagnostic: {msg}"
+        );
         assert_eq!(
             boot.standings.borrow().len(),
             0,

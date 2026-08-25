@@ -4405,6 +4405,33 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
 - **已知未接/下一**：K3（standing.rs 收成薄适配层 over 新 core runtime）；K2 的「卡住」
   判定仍属 standing 层（组合走树处），K3 迁移时随迁 dsh-core 挂载审计。live 进程 term-31。
 
+### D-104 实施补记（K3：standing 挂载本体归位 dsh-core agent-scope 子树，round 23；TDD 红→绿）
+
+- 触发：D-104 计划 K3（standing.rs 收成薄适配层 over K1/K2 的新核心 runtime）。
+- 架构裁决（对用户诚实）：**「循环平面迁移到 dsh-core」出作用域**——生产 loop 的
+  SystemPrompt / ToolRegistry 平面不跑 dsh-core，强行搬迁移会打断已验证 live 或退化成
+  仪式性换皮。K3 采取可验证的收敛：**standing 的挂载生存期 + 隔离 + 泄漏完整性归位
+  dsh-core**，内容呈现桥保持 loop 平面直连（standing 收成「dsh-core 承载结构 + 桥」）。
+- 实现：
+  - 每个 `mount_at` 铸造真实 dsh-core agent-scope 子树：`mount_scope()` + 注册
+    `PresetRecordPlugin`（挂载记录 fiber；apply 内 `isolate("preset.mount", scope)` 后
+    `provide` 记录服务 → 落 agent realm，`audit_subtree` 判定干净）。可失败桥全部在记录
+    注册**之前**完成，保证出错时不悬空 pending_scope/幽灵 fiber（桥出错 → 不铸造）。
+  - `unmount` = undo(loop 平面) + `core.unmount_scope(core_scope)`（整树随 fiber 展开）。
+  - select 接线（同 K2 位）：`core.audit_subtree` 非空 → `agent-preset-leak-rejected`
+    fail-loud + unmount 不留残留（harness `leakedServices`）。
+  - 故障注入缝（仅 cfg(test) `set_fault_root_leak`）：记录服务不 isolate → 落 root
+    realm → 审计捕获——端到端验证泄漏拒绝路径；生产恒 false。
+- 被否决：整 loop 迁移 dsh-core（出作用域，见上）；给 Standing 存第二个 ScopeKey（无；
+    dsh-core ScopeId 即该 standing 的核心对应物，单身份轴保持）。
+- 验收：+3 standing 测（4 真实预设核心子树 Active+审计干净+unmount 整树卸载 Disposed /
+  root-leak fault 被捕获+unmount 清净）+1 select 端到端泄漏拒绝测（不留残留）；standing
+  18/18、dsh-cli lib 178/178、六 crate 全回归 **580/580** 绿；clippy `-D warnings` 零；
+  live 60165 **四个真实预设 select 全 OK**（K3 零回归，隔离记录不触发守卫）。回滚：
+  `git revert` K3 提交。
+- **已知未接/下一**：K4/F-05（WASM 组合引擎 spike：结果一致性 vs dsh-eval、native 兜底）。
+  live 进程 term-32。
+
 ### D-104 实施补记预留
 
 
