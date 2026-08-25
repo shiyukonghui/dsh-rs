@@ -272,6 +272,25 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
                 Some(bundle.host.tools.clone()),
             ),
         ));
+        // L1（D-105）：plan-mode 折叠源接线——单一权威态 = 会话 `plan/mode` 事件日志
+        // （`dsh_plan::fold_plan_mode` 纯重放，无第二状态源）。single-active GUI：
+        // 折叠「最后一次 agentPreset.select 的会话」（standings 按 preset-id 挂载且单
+        // 活跃）；进入/退出经事件驱动（exit_plan_mode 执行器 + 宿主 enter 入口）。
+        let plan_session = std::rc::Rc::new(std::cell::RefCell::new("default".to_string()));
+        boot.plan_session = Some(plan_session.clone());
+        {
+            let store = bundle.host.store.clone();
+            let ps = plan_session.clone();
+            boot.standings
+                .borrow()
+                .set_plan_mode_source(Some(std::rc::Rc::new(move || {
+                    let sid = dsh_session::types::SessionId::from_raw(ps.borrow().clone());
+                    store
+                        .get(&sid)
+                        .map(|s| dsh_plan::fold_plan_mode(&s.events()))
+                        .unwrap_or(false)
+                })));
+        }
         // M6 step8（D-087）：真实 provider catalog 视图注入 Boot（llm.models caps）。
         boot.agent_catalog = Some(crate::m6_llm::server_catalog_view(&base_url, &model));
         tick_schedule = Some(bundle.schedule.clone());
@@ -1580,6 +1599,9 @@ pub struct M4HostServices {
     pub schedule: Option<Rc<dsh_cli_host::ScheduleHost>>,
     /// todo 域：把 `todo/write` 事件落到属主 agent 的会话（todo 工具的真实句柄）。
     pub todo: Option<Rc<dsh_cli_host::TodoWriteHost>>,
+    /// L1（D-105）：plan-mode 域——`plan/mode` 事件追加/折叠 + exit_plan_mode 前置
+    /// 校验与落事件（exit_plan_mode 绑定的真实句柄；None → NOT_BOUND 诚实）。
+    pub plan_mode: Option<Rc<dsh_cli_host::PlanModeHost>>,
 }
 
 /// M4h 补实：TodoWriteHost —— `todo_write` 工具写入属主会话的真实句柄。
@@ -1808,6 +1830,96 @@ pub mod dsh_cli_host {
             Ok((framing, dispatched))
         }
     }
+
+    /// L1（D-105）：plan-mode 宿主——`plan/mode` 会话事件的追加 + 折叠（单一权威态 =
+    /// 会话事件日志，`dsh_plan::fold_plan_mode` 纯重放；对齐 `packages/plan/plan-mode`）。
+    /// `exit_plan_mode` 执行器的前置校验（`dsh_plan::exit_plan_mode_check`：in-plan-mode
+    /// / plan 以 `# 标题` 开头 / 评审通道可用）与落事件都走这里。
+    pub struct PlanModeHost {
+        host: Rc<crate::session_host::SessionHost>,
+        agent_to_session: RefCell<HashMap<String, String>>,
+        default_session: String,
+        /// 宿主是否装配 user-questions 评审通道（`exit_plan_mode_check` 第三前置）。
+        review_channel: bool,
+    }
+
+    impl PlanModeHost {
+        pub fn new(
+            host: Rc<crate::session_host::SessionHost>,
+            default_session: String,
+            review_channel: bool,
+        ) -> Self {
+            Self {
+                host,
+                agent_to_session: RefCell::new(HashMap::new()),
+                default_session,
+                review_channel,
+            }
+        }
+
+        /// 登记 agent id 的属主会话（与 TodoWriteHost 同模式；未登记回退 default）。
+        pub fn bind_agent(&self, agent: &str, session_id: &str) {
+            self.agent_to_session
+                .borrow_mut()
+                .insert(agent.to_string(), session_id.to_string());
+        }
+
+        /// 解析属主会话 id：agent 登记优先 → agent 名即会话 id（本 build 命名约定）→
+        /// 默认会话。
+        pub fn session_id_for(&self, agent: Option<&str>) -> String {
+            agent
+                .and_then(|a| self.agent_to_session.borrow().get(a).cloned())
+                .or_else(|| agent.map(str::to_string))
+                .unwrap_or_else(|| self.default_session.clone())
+        }
+
+        fn session(&self, agent: Option<&str>) -> Result<Rc<Session>, String> {
+            self.host
+                .session(&self.session_id_for(agent))
+                .map_err(|e| format!("plan-mode: session lookup: {e}"))
+        }
+
+        /// 当前 plan mode 是否 active（fold 该属主会话 `plan/mode` 事件；无事件 →
+        /// inactive）。
+        pub fn active(&self, agent: Option<&str>) -> bool {
+            self.session(agent)
+                .map(|s| dsh_plan::fold_plan_mode(&s.events()))
+                .unwrap_or(false)
+        }
+
+        /// 进入 plan mode：追加 `plan/mode{active:true}` 事件（GUI/loop 的 enter 源）。
+        pub fn enter(&self, agent: Option<&str>) -> Result<(), String> {
+            self.session(agent)?
+                .append(EventKind::PlanMode, json!({ "active": true }), None)
+                .map(|_| ())
+                .map_err(|e| e.0)
+        }
+
+        /// 退出 plan mode（exit_plan_mode 执行器）：前置校验 → 通过则追加
+        /// `plan/mode{active:false}` 并返回 Ok；失败返回具体原因（fail-loud，诚实）。
+        pub fn exit(&self, agent: Option<&str>, plan: &str) -> Result<(), String> {
+            let s = self.session(agent)?;
+            match dsh_plan::exit_plan_mode_check(&s.events(), plan, self.review_channel) {
+                Ok(()) => {
+                    s.append(EventKind::PlanMode, json!({ "active": false }), None)
+                        .map_err(|e| e.0)?;
+                    Ok(())
+                }
+                Err(c) => Err(match c {
+                    dsh_plan::exit::ExitCheck::NotInPlanMode => {
+                        "not in plan mode (no plan/mode active in this session)".to_string()
+                    }
+                    dsh_plan::exit::ExitCheck::NeedsHeading => {
+                        "plan must start with a '# ' heading that names it".to_string()
+                    }
+                    dsh_plan::exit::ExitCheck::NoReviewChannel => {
+                        "no user-questions review channel is available".to_string()
+                    }
+                    dsh_plan::exit::ExitCheck::Ok => unreachable!("Ok handled above"),
+                }),
+            }
+        }
+    }
 }
 
 /// M4 h：注册全部 M4 工具（todo/job_*/schedule_*/exit_plan_mode/workflow）。
@@ -1878,8 +1990,12 @@ pub fn register_m4_tools_with_host(
         .register_global(schedule_delete.definition())
         .expect("register schedule_delete");
 
-    // exit_plan_mode：计划前置校验（无宿主 plan-mode 服务 → NOT_BOUND 诚实）。
+    // exit_plan_mode：宿主 plan-mode 服务在场 → 绑真实执行器（前置校验 + 追加
+    // `plan/mode{active:false}`）；否则注册定义保持 NOT_BOUND（诚实）。
     let exit_plan = m4::exit_plan_mode().expect("exit_plan_mode defines");
+    if let Some(pm) = host.and_then(|h| h.plan_mode.clone()) {
+        exit_plan.bind(exit_plan_mode_with_host_executor(pm));
+    }
     registry
         .register_global(exit_plan.definition())
         .expect("register exit_plan_mode");
@@ -1888,6 +2004,33 @@ pub fn register_m4_tools_with_host(
     registry
         .register_global(m4::workflow().expect("workflow defines"))
         .expect("register workflow");
+}
+
+// ---- exit_plan_mode 宿主 executor（bind 目标；前置校验 + 落 `plan/mode` 事件） ----
+
+/// exit_plan_mode 宿主绑定版：前置校验（`dsh_plan::exit_plan_mode_check`，复用权威
+/// 校验——in-plan-mode / `# 标题` / 评审通道）通过 → 追加 `plan/mode{active:false}`
+/// 事件并返回 `{approved: true}`（对齐工具输出 schema const）；失败 → 结构化失败
+/// （诚实报出具体原因，非 NOT_BOUND）。
+fn exit_plan_mode_with_host_executor(
+    pm: Rc<dsh_cli_host::PlanModeHost>,
+) -> dsh_tools::types::ToolExecute {
+    use dsh_tools::types::ToolFailureData;
+    Rc::new(move |args, ctx| {
+        let plan = args
+            .get("plan")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        match pm.exit(ctx.agent.as_deref(), &plan) {
+            Ok(()) => Ok(serde_json::json!({ "approved": true })),
+            Err(msg) => Err(ToolFailureData::new(
+                msg,
+                dsh_tools::CODE_INVALID_ARGS,
+                "PlanModeError",
+            )),
+        }
+    })
 }
 
 // ---- todo_write 宿主 executor（bind 目标；落 `todo/write` 事件 + 规范化输出） ----
@@ -2312,10 +2455,20 @@ pub fn assemble_server_runtime_with_llm(
     let schedule = Rc::new(dsh_cli_host::ScheduleHost::new(session));
     let todo = Rc::new(dsh_cli_host::TodoWriteHost::new(host.clone(), "default".into()));
     todo.bind_agent("default", "default");
+    // L1（D-105）：plan-mode 宿主。「评审通道」= 宿主 user-questions 面（GUI
+    // ask_user_question RPC 在场——U2 守卫已把 ask-user 归为既有 UI/approval RPC）；
+    // loop 级 ApprovalProvider 往返属 M3 后续，不影响 exit 前置的通道存在性判定。
+    let plan_mode = Rc::new(dsh_cli_host::PlanModeHost::new(
+        host.clone(),
+        "default".into(),
+        true,
+    ));
+    plan_mode.bind_agent("default", "default");
     let m4 = M4HostServices {
         jobs: Some(jobs),
         schedule: Some(schedule.clone()),
         todo: Some(todo),
+        plan_mode: Some(plan_mode),
     };
     let m5 = web_m5::M5Host::assemble(workspace_root.clone())?;
     let bash_jobs = m5.services.bash_jobs.clone();
@@ -2951,6 +3104,10 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             if let Err(e) = host.join_standing(&agent_id, &standing_scope) {
                 return err("agent-preset-broken", format!("preset \"{preset}\" join: {e}"));
             }
+            // L1（D-105）：记录「当前计划会话」——standing 折叠源读取它的事件日志。
+            if let Some(ps) = &boot.plan_session {
+                *ps.borrow_mut() = session.clone();
+            }
             serde_json::json!({"ok": true, "value": {"agentPreset": preset, "agent": agent_id}})
         }
         "agentPreset.read" => {
@@ -3309,6 +3466,7 @@ mod tests {
             standings: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::standing::StandingRegistry::default(),
             )),
+            plan_session: None,
         }
     }
 
@@ -5765,6 +5923,114 @@ mod tests {
         );
     }
 
+    /// L1（D-105）：plan-mode 宿主——会话 `plan/mode` 事件为**单一权威态**
+    /// （fold 折叠；enter/exit 落事件）；exit 前置校验（in-plan-mode / `# 标题` /
+    /// 评审通道）逐点验证。
+    #[test]
+    fn plan_mode_host_folds_events_and_exit_checks() {
+        use crate::web::dsh_cli_host::PlanModeHost;
+        let host_store = SessionHost::in_memory();
+        let _ = host_store.session("default");
+        let pm = Rc::new(PlanModeHost::new(host_store.clone(), "default".into(), true));
+        // 初始：无 plan/mode 事件 → inactive。
+        assert!(!pm.active(None), "no events -> inactive");
+        // 进入：落 plan/mode{active:true}。
+        pm.enter(None).unwrap();
+        assert!(pm.active(None), "enter -> active");
+        // exit 前置：非 `# 标题` → NeedsHeading。
+        let e = pm.exit(None, "no heading plan").unwrap_err();
+        assert!(e.contains("heading"), "heading required: {e}");
+        // 有效 plan + 评审通道 → OK，落 plan/mode{active:false}。
+        pm.exit(None, "# Complete the rename\n\nPlan body").unwrap();
+        assert!(!pm.active(None), "exit -> inactive");
+        let evs = host_store.events("default");
+        let modes: Vec<_> = evs
+            .iter()
+            .filter(|e| e.kind == dsh_session::types::EventKind::PlanMode)
+            .collect();
+        assert_eq!(modes.len(), 2, "enter + exit 各一");
+        assert_eq!(modes[0].data["active"], true);
+        assert_eq!(modes[1].data["active"], false);
+        // 再次 exit（非 plan mode）→ NotInPlanMode。
+        let e = pm.exit(None, "# Again").unwrap_err();
+        assert!(e.contains("not in plan mode"), "NotInPlanMode: {e}");
+        // 无评审通道 → NoReviewChannel。
+        let pm2 = Rc::new(PlanModeHost::new(host_store.clone(), "default".into(), false));
+        pm2.enter(None).unwrap();
+        let e = pm2.exit(None, "# Ok").unwrap_err();
+        assert!(e.contains("review channel"), "NoReviewChannel: {e}");
+    }
+
+    /// L1（D-105）：exit_plan_mode **真实执行器**——宿主 plan-mode 服务在场 → 绑定
+    /// （不再 NOT_BOUND）；前置校验失败 → 结构化失败（非 NOT_BOUND）；通过 →
+    /// `{approved:true}` + 落 plan/mode{active:false}，会话折叠随之 inactive。
+    #[test]
+    fn exit_plan_mode_host_executor_bound_and_enforces_checks() {
+        use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
+        let registry = ToolRegistry::new(ToolExecutionMode::Native);
+        let host_store = SessionHost::in_memory();
+        let _ = host_store.session("default");
+        let pm = Rc::new(dsh_cli_host::PlanModeHost::new(
+            host_store.clone(),
+            "default".into(),
+            true,
+        ));
+        pm.bind_agent("agent-1", "default");
+        let m4 = M4HostServices {
+            jobs: None,
+            schedule: None,
+            todo: None,
+            plan_mode: Some(pm.clone()),
+        };
+        register_m4_tools_with_host(&registry, Some(&m4));
+        // 不在 plan mode → 结构化失败（PlanModeError，**非** NOT_BOUND）。
+        let r = registry.execute(
+            &ToolExecutionInput::new(
+                "e1",
+                "exit_plan_mode",
+                serde_json::json!({ "plan": "# Plan" }),
+                Some("agent-1".into()),
+            ),
+            None,
+        );
+        assert!(r.is_error, "not-in-plan-mode fails loud");
+        assert_ne!(
+            r.error.as_ref().and_then(|e| e.info.as_ref()).map(|i| i.code.as_str()),
+            Some("NOT_BOUND"),
+            "real executor, not NOT_BOUND"
+        );
+        // 进入 plan mode 后：缺标题 → 失败；合格 → 成功 + 事件。
+        pm.enter(None).unwrap();
+        let r = registry.execute(
+            &ToolExecutionInput::new(
+                "e2",
+                "exit_plan_mode",
+                serde_json::json!({ "plan": "no heading" }),
+                Some("agent-1".into()),
+            ),
+            None,
+        );
+        assert!(r.is_error, "no heading rejected");
+        let r = registry.execute(
+            &ToolExecutionInput::new(
+                "e3",
+                "exit_plan_mode",
+                serde_json::json!({ "plan": "# Full plan\n\nbody" }),
+                Some("agent-1".into()),
+            ),
+            None,
+        );
+        assert!(!r.is_error, "valid exit ok: {:?}", r.error);
+        assert_eq!(r.value.unwrap()["approved"], true);
+        let evs = host_store.events("default");
+        let modes: Vec<_> = evs
+            .iter()
+            .filter(|e| e.kind == dsh_session::types::EventKind::PlanMode)
+            .collect();
+        assert_eq!(modes.len(), 2, "enter(active:true)+exit(active:false)");
+        assert!(!pm.active(None), "session folded inactive after exit");
+    }
+
     /// M4i 验收 #6：register_m4_tools_with_host 带 JobRegistry bind——job_list/read
     /// 走真实注册表状态机（start → list → read 内容 → kill）。
     #[test]
@@ -5781,6 +6047,7 @@ mod tests {
             jobs: Some(jobs.clone()),
             schedule: None,
             todo: None,
+            plan_mode: None,
         };
         register_m4_tools_with_host(&registry, Some(&host));
         // start 一个真实 job（写输出由 settle 模拟）。
@@ -5837,6 +6104,7 @@ mod tests {
             jobs: None,
             schedule: Some(sched.clone()),
             todo: None,
+            plan_mode: None,
         };
         register_m4_tools_with_host(&registry, Some(&host));
         // schedule_create (after, 1s)。
@@ -5919,6 +6187,7 @@ mod tests {
             jobs: None,
             schedule: None,
             todo: Some(todo_host.clone()),
+            plan_mode: None,
         };
         register_m4_tools_with_host(&registry, Some(&host));
         // todo_write：有效表执行 → 输出 {todos, counts} + default 会话落 todo/write。
@@ -7152,6 +7421,7 @@ mod tests {
             jobs: None,
             schedule: None,
             todo: Some(todo),
+            plan_mode: None,
         };
 
         // 工作区 + M5 宿主（真实生产工厂）。
@@ -7935,6 +8205,7 @@ mod tests {
             jobs: None,
             schedule: None,
             todo: None,
+            plan_mode: None,
         };
         let root = std::env::temp_dir().join(format!("dsh-m6-hook-{}", std::process::id()));
         if root.exists() {

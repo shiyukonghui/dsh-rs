@@ -4609,6 +4609,38 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
 - 验收：本篇为设计关闸工件；执行器实现段的验收另记。回滚：无代码变更。
 - 下一：§接线方案实施（或用户裁决 execution-layer 联动的段）→ 全回归/clippy/live。
 
+### D-105 实施补记（L1 执行器 + 折叠接线，round 29；TDD 红→绿）
+
+- 触发：D-105 L1 余片（exit_plan_mode 真实执行器）。自下而上发现 **`dsh-plan` crate
+  已存在**（`fold_plan_mode` 折叠 + `exit_plan_mode_check` 三重前置：in-plan-mode /
+  `# 标题` / 评审通道）——harness 的 plan-mode 语义权威实现，**纠正 slice-1 设计**：
+  standing cell 是第二状态源（exit 后与事件折叠分叉），改回**单一权威态 = 会话
+  `plan/mode` 事件日志（纯重放，无 live mirror 无第二状态）**。
+- 实现：
+  1. **standing 重构**：删除 per-standing `Rc<RefCell<bool>>` cell 与
+     `set_plan_mode`/`plan_mode` API；改注册表级**可注入折叠源**
+     `PlanModeSource = Rc<RefCell<Option<Rc<dyn Fn() -> bool>>>>`（post-装配注入）；
+     Fn 段组装期 `is_some_and(active)` → 注入/缺席。slice-1 测试改为可控折叠源替身。
+  2. **`web::dsh_cli_host::PlanModeHost`**：agent→session 归属（登记优先 → agent 即
+     会话名 → 默认）+ `plan/mode` 事件追加 + `dsh_plan::fold_plan_mode` 折叠 +
+     `dsh_plan::exit_plan_mode_check` 前置；`enter`/`exit` 只落事件，不维护二态。
+  3. **exit_plan_mode 真实执行器**：`M4HostServices.plan_mode` 在场 → bind
+     `exit_plan_mode_with_host_executor`（前置失败 → 结构化 `PlanModeError`、**非**
+     NOT_BOUND；通过 → `{approved:true}` + 落 `plan/mode{active:false}`）；缺席保持
+     NOT_BOUND 诚实。
+  4. **live 接线**：`assemble_server_runtime_with_llm` 构造 PlanModeHost
+     （`review_channel=true`——GUI user-questions 面在场；loop 级 ApprovalProvider 属
+     M3，不影响 exit 前置通道判定）；serve 期 standings 重建后注入折叠源（fold
+     `boot.plan_session` 的会话事件；select 记录 plan_session = 最后一次 select 的会话）。
+- 诚实边界/caveat：single-active GUI——折叠源折叠「最后一次 select 的会话」（standings
+  按 preset-id 挂载且单活跃）；多会话共享某 standing 的 per-agent plan-mode 保真留白
+  （若需多会话并发异态，需 standing join 期记 agent→session，另段）。approval
+  **execution-layer 联动仍待用户裁决**（§设计关闸：指令层已随段注入，执行层属宿主导线
+  策略并入 approval RPC 里程碑）。
+- 验收：standing 25/25、plan-mode 测试 3/3（折叠/前置逐点/执行器绑定）、八 crate
+  **655/655**、clippy 零、live 60165 四真实预设 select OK。回滚：`git revert` L1-executor。
+- 下一：用户裁决 execution-layer 联动；TEST_REPORT §8 更新。
+
 ### D-104 实施补记预留
 
 

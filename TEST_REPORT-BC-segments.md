@@ -92,7 +92,7 @@
 
 ---
 
-# 追加章：D-105 后续段（未桥面桥接 + loop 级状态桥，round 26–28）
+# 追加章：D-105 后续段（未桥面桥接 + loop 级状态桥，round 26–29）
 
 段目标（用户拍板 D-105）与交付：规划见 `PLAN-loop-state-bridge.md`；决策见
 `DECISIONS.md` D-105 各补记。
@@ -105,25 +105,32 @@
 | U2 | 下伸面 honest 呈现：dsh-tool-workflow → 桥到 M4 桩（注册即见、fail-loud）；subagent 家 / workflow-worker-thread / ralph / ask-user → 专用诚实 guard（宿主确无模型工具，第一性原理不为快伪造桥）；**parse 保真修复**：静态 `disabled: true` 与 disabled_expr 同等判禁 | `3b77dac` | dsh-agent-presets 19/19（+1）、standing +2；649/649 |
 | U3 | guard 原因收口：枚举四预设全部行 → 仍落泛化的只剩 plan-mode/compaction/presentation，全部给经过决策的专用原因；**安全网测试**：真实预设任何守卫行不得落入泛化 | `75b1d83` | standing +1；650/650 |
 
-## 8. L1 · plan-mode C 档（slice-1 完成，执行器设计关闸）
+## 8. L1 · plan-mode C 档（slice-1 → 折叠接线 + 真实执行器，完成）
 
 - **slice-1 状态驱动段**（`e40ce09`）：`dsh-plan-mode` 行 config.section 经
   `PromptSectionText::Fn` 在 standing scope 注册（order 55，override 工具指引带）；
-  Fn 组装期按 standing 的 **per-agent plan_mode cell** 注入/缺席；
-  `StandingRegistry::set_plan_mode(id, bool)` / `plan_mode(id)`。standing 25/25、
-  八 crate 651/651、live 四预设 select OK。
-- **设计结论（执行器 + approval 联动，未实现、诚实 NOT_BOUND）**：
-  - wy 线已核对：`ToolExecutionInput.agent` 携带调用方 agent；`host.join_standing`
-    只存 binding 不记 preset；live boot 于 bundle 装配后重设 `boot.standings`
-    （web.rs:269）→ 执行器闭包无法在装配期捕获最终 standings。
-  - 接线方案（下一轮实施）：select 处理记录 agent→active-preset；
-    serve 期（boot.standings 设定后）把 `exit_plan_mode` 绑定为闭包——按
-    `call.agent` → active-preset → `standings.set_plan_mode(preset, false)` + 追加
-    会话事件（dsh-session 事件 schema 下轮核，缺则新增 plan/mode 面，不臆造）。
-  - approval 联动裁决：预设文本即「rules override 更晚工具指引 / tools 保持列出不
-    变」的**指令层**语义（harness 正路，slice-1 已注入）；执行层
-    （ApprovalProvider 按 plan 模式自动拒绝 mutation）属宿主导线策略、非预设契约，
-    并入 approval RPC 里程碑。**呈用户确认**：C 档 execution-layer 联动是否本轮跟进。
+  Fn 组装期按 **plan-mode 折叠源**注入/缺席。standing 25/25、八 crate 651/651、
+  live 四预设 select OK。
+- **折叠接线（round 29，改造 slice-1 的双源设计）**：
+  - 自下而上发现 `dsh-plan` crate（`fold_plan_mode` + `exit_plan_mode_check` 三重
+    前置）即 harness 的 plan-mode 权威实现 → **单一权威态 = 会话 `plan/mode` 事件
+    日志**（纯重放）。standing 删 per-standing cell，改**可注入折叠源**（会话事件
+    fold 的替身注入/宿主注入），slice-1 测试随迁。
+- **exit_plan_mode 真实执行器（round 29，`web::dsh_cli_host::PlanModeHost`）**：
+  - PlanModeHost：agent→session 归属 + 事件追加 + `dsh_plan` fold + 前置校验
+    （in-plan-mode / `# 标题` / 评审通道）；`enter`/`exit` 只落事件。
+  - 执行器绑定：`M4HostServices.plan_mode` 在场 → bind（前置失败 → 结构化
+    `PlanModeError`、非 NOT_BOUND；通过 → `{approved:true}` + `plan/mode{active:false}`）；
+    缺席保持 NOT_BOUND 诚实。
+  - live 接线：装配构造 PlanModeHost（`review_channel=true`，GUI user-questions 面在
+    场）；standings 重建后注入折叠源（fold `boot.plan_session` 事件；select 记录之）。
+  - 测试：plan-mode 3/3（折叠/前置逐点/执行器绑定）；**八 crate 655/655**；clippy 零。
+- **approval linkage 裁决（执行层待用户确认）**：预设文本即「rules override 更晚工具
+  指引 / tools 保持列出不变」的**指令层**语义（harness 正路，随段注入）；执行层
+  （ApprovalProvider 按 plan 模式自动拒绝 mutation）属宿主导线策略、非预设契约，并入
+  approval RPC 里程碑。**呈用户确认**：是否要求 execution-layer 联动。
+- caveat：single-active GUI——折叠源折叠「最后一次 select 的会话」；多会话共享某
+  standing 的 per-agent plan-mode 保真留白（另段）。
 
 ## 9. L3 · compaction 档位 3（完成）
 
@@ -132,14 +139,16 @@
   fail-loud），**行为明确不实现**（不接 append_tool_result）；真实行 config 解析测试 +2。
   dsh-agent-presets 21/21。
 
-## 10. 段状态总览（本轮收口）
+## 10. 段状态总览（round 29 收口）
 
 - 已交付提交：U1 `9aff8d0`、U2 `3b77dac`、U3 `75b1d83`、L1-slice-1 `e40ce09`、
-  L3 `3be1551`（各自回滚点）。
-- 全回归基线：**651/651**（round 28 末）；clippy `-D warnings` 零；live（term-37，
+  L3 `3be1551`、+ L1 执行器/折叠接线（round 29 提交）（各自回滚点）。
+- 全回归基线：**655/655**（round 29 末）；clippy `-D warnings` 零；live（term-38，
   :60165）四真实预设 select 全 OK。
-- **剩余**：L1 执行器（下一轮按 §8 设计接线）+ approval execution-layer（待用户
-  确认）；`enter_plan_mode` 宿主入口（GUI/loop 状态源）随执行器一并定。
+- **剩余/待用户确认**：approval **execution-layer** 联动（指令层已随段注入；执行层
+  属宿主导线策略，并入 approval RPC 里程碑）；`enter_plan_mode` 宿主入口
+  （PlanModeHost.enter 已备，GUI/loop 状态源接法随联动物化）；多会话共享 standing 的
+  per-agent plan-mode 保真（另段，见 §8 caveat）。
 - 诚实边界笔记：U1/U2 自下而上推翻了「subagent/ralph/ask-user 可桥」的预设（宿主无
   对应模型工具）；tool-skill 保持 A-03 只读 guard；broken-D-103（web/tool-cordis/
   command-compact）全程保持报错降级未改——与用户拍板一致。

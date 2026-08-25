@@ -115,6 +115,11 @@ impl Plugin for PresetRecordPlugin {
     }
 }
 
+/// L1（D-105）：plan-mode 折叠源句柄——`Rc<RefCell<Option<…>>>` 便于宿主在 standings
+/// 重建后注入/替换；Fn 段组装期经 `active()` 判定（单一权威态 = 会话 `plan/mode` 事件
+/// 折叠）。`None` = 永不注入（无 loop/未接）。
+type PlanModeSource = Rc<RefCell<Option<Rc<dyn Fn() -> bool>>>>;
+
 /// 一个 standing 挂载。
 pub struct Standing {
     pub id: String,
@@ -127,11 +132,6 @@ pub struct Standing {
     /// （leakedServices 守卫）的审计目标。
     pub core_scope: ScopeId,
     pub record_fiber: FiberHandle,
-    /// L1/D-105：plan-mode 状态（per-agent 本性，随 standing；Fn 段组装期读取——
-    /// active → 注入 config.section 文本，否则空串不贡献）。
-    pub plan_mode: Rc<RefCell<bool>>,
-    /// L1：plan-mode 行 config.section 文本（预设无该行/无 section → None → 不注册段）。
-    pub plan_mode_section: Option<String>,
     undos: Vec<Undo>,
 }
 
@@ -155,6 +155,9 @@ pub struct StandingRegistry {
     combo: Rc<dyn ComboEvaluator>,
     /// combo 是否为 WASM 主面（`from_default_build` 成功即 wasm；否则 native-only）。
     combo_wasm: bool,
+    /// L1/D-105：plan-mode 折叠源（单一权威态 = 会话 `plan/mode` 事件折叠；宿主注入）。
+    /// Fn 段组装期经此判定 active → 注入 `dsh-plan-mode` 行 config.section。
+    plan_mode_source: PlanModeSource,
 }
 
 impl Default for StandingRegistry {
@@ -190,7 +193,14 @@ impl StandingRegistry {
             fault_root_leak: false,
             combo,
             combo_wasm,
+            plan_mode_source: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// L1：注入 plan-mode 折叠源（`None` = 永不注入）。经 `Rc<RefCell<Option<_>>>`
+    /// 承载——宿主在 standings 重建后注入亦可；Fn 段组装期读取。
+    pub fn set_plan_mode_source(&self, source: Option<Rc<dyn Fn() -> bool>>) {
+        *self.plan_mode_source.borrow_mut() = source;
     }
 
     /// 注入组合求值引擎（测试替身 / 宿主自选）。
@@ -208,6 +218,7 @@ impl StandingRegistry {
             fault_root_leak: false,
             combo,
             combo_wasm,
+            plan_mode_source: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -244,11 +255,9 @@ impl StandingRegistry {
             ..Default::default()
         };
         let mut undos: Vec<Undo> = Vec::new();
-        // L1/D-105：plan-mode 状态 cell（per-agent 本性，随 standing；host 经
-        // `set_plan_mode` 翻转，Fn 段组装期读取）。section 文本在行桥循环内若有
-        // config.section 即填充并注册 Fn 段。
-        let plan_mode = Rc::new(RefCell::new(false));
-        let mut plan_mode_section: Option<String> = None;
+        // L1/D-105：plan-mode 折叠源（注册表注入，单一权威态 = 会话 `plan/mode` 事件
+        // 折叠）。Fn 段每组装期判定 active → 注入 config.section、否则空串。
+        let plan_mode_source = self.plan_mode_source.clone();
 
         // 行审计：走 tree（组递归；组容器自身不列），叶子 → disabled/活化。
         // 禁用判定 = `row_disabled_with`（fail-closed + truthy 权威在 dsh-agent-presets），
@@ -444,14 +453,17 @@ impl StandingRegistry {
                     .map(str::to_string);
                 match section {
                     Some(text) => {
-                        plan_mode_section = Some(text.clone());
-                        let cell = plan_mode.clone();
+                        let source = plan_mode_source.clone();
                         let ftext = text.clone();
                         let pc = PromptSection {
                             name: format!("preset:{id}:plan-mode"),
                             order: PLAN_MODE_ORDER,
                             text: PromptSectionText::Fn(Rc::new(move |_ctx: &AssembleContext| {
-                                if *cell.borrow() {
+                                let active = source
+                                    .borrow()
+                                    .as_ref()
+                                    .is_some_and(|f| f());
+                                if active {
                                     ftext.clone()
                                 } else {
                                     String::new()
@@ -584,8 +596,6 @@ impl StandingRegistry {
                 report,
                 core_scope,
                 record_fiber,
-                plan_mode,
-                plan_mode_section,
                 undos,
             },
         );
@@ -609,23 +619,6 @@ impl StandingRegistry {
     /// standing 的 scope key（join/rebind 用）。
     pub fn scope_of(&self, preset_id: &str) -> Option<&ScopeKey> {
         self.standings.get(preset_id).map(|s| &s.scope)
-    }
-
-    /// L1：plan-mode 状态读写（per-agent 本性；host/loop 进入/退出 plan mode 时经此
-    /// 翻转，Fn 段组装期读取）。未知 id → Err（fail-loud）；无 plan-mode 行 → 翻转
-    /// 无害的 cell（无段可注入）。
-    pub fn set_plan_mode(&self, id: &str, active: bool) -> Result<(), String> {
-        let standing = self
-            .standings
-            .get(id)
-            .ok_or_else(|| format!("dsh-cli standing: no preset {id} mounted"))?;
-        *standing.plan_mode.borrow_mut() = active;
-        Ok(())
-    }
-
-    /// 当前 plan-mode 状态（None = 未挂载该 preset）。
-    pub fn plan_mode(&self, id: &str) -> Option<bool> {
-        self.standings.get(id).map(|s| *s.plan_mode.borrow())
     }
 
     pub fn report(&self, preset_id: &str) -> Option<&StandingReport> {
@@ -1613,14 +1606,19 @@ mod tests {
     }
 
     /// —— L1（D-105）—— plan-mode 状态驱动段：组合 `dsh-plan-mode` 行的
-    /// config.section 随 standing 的 plan-mode 状态注入 SystemPrompt（per-agent 本性，
-    /// 预设注释：「Plan state is per-agent by nature…entry-local realm is the correct
-    ///  lifetime」）。状态开 → 段出现；关 → 消失；该行从守卫转 bridged（section bridge）。
-    /// TDD 红→绿（先红：行仍在守卫、无段）。
+    /// config.section 随**折叠源**（会话 `plan/mode` 事件 fold 的注入替身）状态注入
+    /// SystemPrompt——active → 段出现；非 active → 消失；无源 → 永不注入。该行从
+    /// 守卫转 bridged（section bridge）。TDD 红→绿（先红：行仍在守卫、无段）。
     #[test]
-    fn plan_mode_section_injected_when_active_else_absent() {
+    fn plan_mode_section_injected_when_fold_source_active_else_absent() {
         let sp = new_sp();
         let mut reg = StandingRegistry::new(sp.clone(), Some(realistic_tools()));
+        // 折叠源替身：单一权威态应从 `dsh_plan::fold_plan_mode(events)` 折叠；这里
+        // 注入可控闭包验证段对 folding 结果的响应（真实 fold 由 dsh-plan 测试与
+        // PlanModeHost 测试覆盖）。
+        let state = Rc::new(RefCell::new(false));
+        let src = state.clone();
+        reg.set_plan_mode_source(Some(Rc::new(move || *src.borrow())));
         let comp = "
 - id: plan-mode
   name: '@deepseek-ai/dsh-plan-mode'
@@ -1644,14 +1642,22 @@ mod tests {
                 .any(|t| t.contains("YOU-ARE-IN-PLAN-MODE-MARKER"))
         };
         assert!(!has_marker(&sp, &scope), "inactive: no plan-mode section");
-        reg.set_plan_mode("l1", true).expect("enter plan mode");
+        *state.borrow_mut() = true; // 会话进入 plan mode（fold active）
         assert!(has_marker(&sp, &scope), "active: plan-mode section injected");
-        reg.set_plan_mode("l1", false).expect("leave plan mode");
+        *state.borrow_mut() = false; // 会话退出 plan mode（fold inactive）
         assert!(!has_marker(&sp, &scope), "left: section removed again");
-        assert_eq!(reg.plan_mode("l1"), Some(false), "state cell readable");
+
+        // 无源 → 永不注入（未接 loop 的诚实面）。
+        let sp2 = new_sp();
+        let mut reg2 = StandingRegistry::new(sp2.clone(), Some(realistic_tools()));
+        reg2.mount("l1", &rows, &win32_facade()).unwrap();
+        let scope2 = ScopeKey::new();
+        reg2.join("l1", &scope2).unwrap();
         assert!(
-            reg.set_plan_mode("no-such", true).is_err(),
-            "unknown id errors loudly"
+            !sect_texts(&sp2, &scope2)
+                .iter()
+                .any(|t| t.contains("YOU-ARE-IN-PLAN-MODE-MARKER")),
+            "no source: never injected"
         );
     }
 

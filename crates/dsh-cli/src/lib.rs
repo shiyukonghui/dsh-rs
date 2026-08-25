@@ -109,6 +109,10 @@ pub struct Boot {
     /// P4：standing 注册表（共享 SystemPrompt 的 scoped 贡献 + join 报告）。web
     /// serve 装配 agent-loop 后以 `host.prompt` 重建（否则为占位）。
     pub standings: Rc<std::cell::RefCell<crate::standing::StandingRegistry>>,
+    /// L1（D-105）：plan-mode 折叠的「当前计划会话」（single-active GUI：最后一次
+    /// agentPreset.select 的会话；standings 按 preset-id 挂载且单活跃，折叠取其事件
+    /// 日志）。web serve 装配时 Some 并注入 standing 折叠源；None（未启 loop）→ 无源。
+    pub plan_session: Option<Rc<std::cell::RefCell<String>>>,
 }
 
 /// M56：转储生效配置（对齐生产 `dsh --dump-config`）——读主配置 + overlays
@@ -296,6 +300,7 @@ pub fn boot(
         host_events: None,
         presets: Rc::new(std::cell::RefCell::new(crate::preset_host::PresetHost::default())),
         standings: Rc::new(std::cell::RefCell::new(crate::standing::StandingRegistry::default())),
+        plan_session: None,
     })
 }
 
