@@ -4581,6 +4581,34 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
   select 全 OK（plan-mode 行转入 bridged 不回归）。回滚：`git revert` L1-slice。
 - 下一：exit_plan_mode 真实执行器（web 会话宿主接线）+ approval 联动需求结论。
 
+### D-105 实施补记（L1 执行器 + approval 联动：需求/设计关闸，round 28；实现未做）
+
+- 触发：L1 C 档余片。按自下而上核对后**定接线方案**，如实标 NOT_BOUND 不伪造。
+- 已核对事实：
+  - `ToolExecutionInput.agent: Option<String>`（dsh-tools runtime:166）——执行回调
+    携带调用方 agent 身份；
+  - `AgentLoopHost::join_standing`（host.rs:341）只存 `joins: agent_id → binding`，
+    **不记 preset id**；`configured_for_session` 给出 session→agent 配置（含 session_id）；
+  - live boot（web.rs:269）在 `assemble_server_runtime` **之后**才重设 `boot.standings`
+    （用 host.prompt / host.tools）→ exit_plan_mode 的闭包不能在装配期捕获最终
+    standings：
+- 接线方案（设计定案，下轮实施）：
+  1. select 处理记录 `session → active-preset`（boot 侧 `Rc<RefCell<HashMap>>`）；
+  2. serve 期（standings 重设后）把 `exit_plan_mode` 绑定为闭包：`call.agent` →
+     active-preset → `standings.set_plan_mode(preset, false)` + 追加会话事件
+     （具体事件类型下轮核 dsh-session 既有 schema，缺则新增 plan/mode 面——不臆造）；
+  3. `enter_plan_mode` 宿主入口（GUI/loop 状态源）随执行器一并定（进入点在会话/UI）。
+- **approval 联动裁决**：预设文本即「plan-mode rules override 任何更晚工具指引 /
+  工具保持列出以不改变目录」的**指令层**语义（harness 正路——harness 自身也以指令
+  约束，非执行层强制）；slice-1 已注入该文本。执行层联动（ApprovalProvider 在 plan
+  模式自动 deny/ask mutation 工具的 execute）是**宿主导线策略**、非预设契约（M3
+  approval 往返在 loop 之外），并入 approval RPC 里程碑。**呈用户确认**：C 档
+  execution-layer 联动是否本轮跟进（若要求，下一轮单独一段实现 + 验收）。
+- 诚实边界：未实现执行器前 exit_plan_mode 保持 **NOT_BOUND**（工具注册在，
+  执行时明确报错），不冒 web 半吊子接线风险。
+- 验收：本篇为设计关闸工件；执行器实现段的验收另记。回滚：无代码变更。
+- 下一：§接线方案实施（或用户裁决 execution-layer 联动的段）→ 全回归/clippy/live。
+
 ### D-104 实施补记预留
 
 
