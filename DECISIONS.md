@@ -5168,6 +5168,76 @@ events.host 新增 `host/session-status`（zod 联合本就含该型，无新拒
 
 ---
 
+## D-115：请求面并发化——Rc/RefCell 单线程纪律 → Arc/Mutex + worker 线程（用户拍板方案 II）
+
+**日期**：2025（本机时间）
+
+**触发的问题**：D-114 修复「发送→停止按钮」后暴露第二层：单线程 serve 主循环里
+`session.prompt` 同步排空整轮 turn（LLM 流为阻塞 Iterator），turn 期间 accept
+循环被占死 → `session.cancel` 无法并发送达，「生成中一键即停」不可达。用户提出用
+性能/复杂度/拓展性/架构优雅度/远见五维判据求长远方案，明确「不为短期省事让后续
+付出巨大代价」，最终拍板**方案 II（Send 化 + worker 线程）分阶段**，方案 I
+（协作式泵）因脆弱的隐性重入、无法跑多秒级请求、单线程序列死「同时仅一 turn」、
+不具拓展性/远见而被否决。
+
+**自下而上盘点（Phase 0 库存）**：
+- `dsh-session`：`Session.data: RefCell<SessionData>`；`SessionStore` 的
+  `store/counter/on_*` 全 `RefCell`；所有句柄 `Rc<Session>`/`Rc<SessionStore>`。
+- `dsh-agent`：`Agent`、`AgentRegistry`（store/order/factory/initiator 全
+  `RefCell`）、`Inbox.inner: Rc<RefCell<InboxInner>>`、`AgentBus.items` +
+  监听器族（`InboxNotify/NextFn/ChainListener/AgentListener = Rc<dyn Fn>`）、
+  `model_selection.sel`、`invariant.last`。
+- `dsh-agent-loop`：`ReactLoopAgent.phase/approval_pending`（RefCell）、
+  `LoopDeps` 全 `Rc<dyn Fn>`（assemble/prepare_call/stream/project_context/
+  tool_exec）；`AgentLoopHost` 的 `agents/runtime_agents/disposers/joins/
+  tool_exec_factory` 全 `RefCell`。
+- `dsh-llm`：`LlmRuntime.adapters: RefCell<HashMap>` + `Rc<dyn LlmAdapter>`。
+- `dsh-tools`：`ToolRegistry` slots、`approval/run_code_executor` 槽
+  （`Rc<RefCell<Option<..>>>`）、`ToolExecution.aborted: Rc<Cell<bool>>`、
+  `ToolExecute = Rc<dyn Fn>`。
+- 已并发面（不改）：EventSink `Arc<Mutex<Vec>>`（mux/SSE 流线程）、host_events、
+  tick 的 schedule/bash_jobs（`Arc`）。→ 9 成并发形态已定型，请求面是最后补齐。
+
+**设计（Phase 0 结论）**：
+1. **锁粒度**（粗边界，热路径单锁）：
+   - `Session.data` → `Mutex<SessionData>`（append 校验-提交-通知在锁内；见死锁审计）；
+   - `SessionStore` 单 `Mutex` 护 map+counter；回调表 `Mutex<Vec<..>>`；
+   - `ReactLoopAgent.phase`/`approval_pending` 各一 `Mutex`；`AgentRegistry`/`Inbox`
+     /`AgentBus` 各一 `Mutex`；
+   - `dsh-tools` 槽 → `Mutex<Option<..>>`、`aborted: Rc<Cell<bool>>` → `AtomicBool`；
+   - `Rc<dyn Fn(..)>` 监听器/闭包族 → `Arc<dyn Fn(..) + Send + Sync>`（最宽的连锁：
+     所有闭包提供方须 Send+Sync，机械但大量）。
+2. **死锁审计（前置门槛）**：`append` 在持有 `Session.data` 锁时同步调用
+   store 观察者；观察者（session_host 持久化→sink、running-frames→host_events）
+   只取**叶子锁**（Arc<Mutex<Vec>>），且绝不反向取 session/store 锁 →
+   排序 `session.data → 叶子锁` 一致无环。迁移后逐观察者复核「回调不得再取本会话/本
+   store 锁」（如 `session.id()` 须读非锁字段或锁外取）。
+3. **worker 化（Phase 4）**：长 RPC（`session.prompt`/`agent.run|loop|turn`/
+   `commands/execute` steer + `/plan <msg>`/审批 decide kick 的恢复回合）上
+   worker 线程（Result 经 channel 回填 accept 线程，HTTP 同步契约不变）；accept
+   线程空闲接 `session.cancel` → 真一键即停；每 driver 仍单 turn（相位机连续），
+   跨会话 turn 可并行（扩展点）。
+4. **顺序**：Phase 1 `dsh-session` → Phase 2 `dsh-agent` → Phase 3
+   `dsh-agent-loop`+`dsh-llm`+`dsh-tools` → Phase 4 serve worker 化 →
+   Phase 5 回归 + live wire 验证 + 文档。每阶段 `cargo test` 全量关闸。
+
+**最终选择**：方案 II（Send 化 + worker 线程）分阶段；方案 I（协作式泵）否决；
+full async（tokio）维持 D-004/D-006 既判否决（全套栈 async 分歧最大）。
+
+**被否决**：方案 I（见上）；「只把 turn 送 worker 而 store 留在主线程」——store 是
+主线程（RPC 读 history/plan/respond）与 worker（写事件）共享的唯一 Rc 纠缠点，
+不 Send 化即死锁/借用冲突（自下而上验证为不可行）。
+
+**预期影响与回滚点**：serve 获真并发（生成中 cancel/steer/二会话/随时交互），
+对齐 fork 请求面性质；三 crate 公开类型 Rc→Arc 连锁更新全部消费者。回滚：分阶段
+各自可回；Phase 1-3 独立，Phase 4 在 1-3 之上。
+
+**验证（Phase 0 现状）**：本条为设计阶段工件，无代码。Phase 1-5 逐阶段以
+dsh-session 61 / dsh-cli 212 / dsh-agent-loop 全量测试为关闸；终态补
+live 60880 wire 全链（含生成中 cancel 即停）。
+
+---
+
 
 
 
