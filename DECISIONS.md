@@ -4912,6 +4912,22 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
   - 验收：8 个 approval_wire 单测（requested 帧形/rpcId 稳定性/重放逐字/resolved 终态/
     增量游标/respond accepted+not-pending+bad-response×审计 mismatch+decide 失败不
     resolve）；dsh-cli lib 204 全绿；clippy `-D warnings` 零。提交见下一 commit。
+  - true-machine 验证（真自部署网关 deepseek-v4-flash-0731-ext + fork 前端 dist 为
+    web-root + `DSH_PLUGIN_ROOT` 指 junction 聚合的 42 个 web 客户端包）：
+    - **闭环 ALLOW**：plan enter → 真模型 bash 调用 → `approval/requested`（stable
+      rpcId、approvalId `ap-<callId>`、sessionId/callId/reason 齐全）→
+      `POST /api/respond` allowed-once → `{accepted:true}` → `approval/resolved`
+      (allowed-once) → bash 真执行（marker 落盘）→ 迟到 respond `{accepted:false,
+      reason:"not-pending"}`。
+    - **闭环 REJECT**：第二 turn → 新 requested（新 rpcId）→ respond rejected →
+      resolved (rejected) → 工具**未执行**（marker 不存在）。
+    - 自下而上发现：`build_boot_manifest` 用 `file_type().is_dir()` 会把 junction
+      （Windows reparse point）当 symlink 跳过 → 42 包全漏扫。改为 `path.is_dir()`
+      （跟随符号链接/联接点，对齐 pnpm/node_modules 链接分布）；stage1 插件测试仍
+      绿。证据：`target/wire-driver.mjs`（Node；fetch SSE + POST respond）。
+  - 浏览器级真机：交给用户开 `http://127.0.0.1:60165` 点「允许/拒绝」（前端 composer
+    由 fork 内在 `apps/web/tests/approval-composer.e2e.ts` 担保；本里程碑向后端契约
+    已在本 DECISIONS 验证）。
 
 ### D-104 实施补记预留
 

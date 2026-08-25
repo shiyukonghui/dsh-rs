@@ -638,7 +638,9 @@ pub fn build_boot_manifest(plugin_root: &Path) -> Result<BootManifest, CordisErr
             .map_err(|e| CordisError::Internal(format!("web plugin_root read: {e}")))?
         {
             let dir = dir.map_err(|e| CordisError::Internal(format!("web plugin_root entry: {e}")))?;
-            if !dir.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            // `path.is_dir()` 跟随符号链接/联接点（pnpm/node_modules 惯用链接分布；
+            // `file_type().is_dir()` 对 junction 返回 false 会整个漏扫）。
+            if !dir.path().is_dir() {
                 continue;
             }
             let pkg_path = dir.path().join("package.json");
