@@ -387,6 +387,112 @@ fn plan_mode_resolver(
     }
 }
 
+/// `plan_state_active` 的会话显式版：`sid` Some → 折叠该会话（`commands/execute`
+/// 走 `agentId`），None → 回退 `plan_session`。
+fn plan_state_active_on(boot: &crate::Boot, sid: Option<&str>) -> bool {
+    let sid = sid.map(str::to_string).unwrap_or_else(|| {
+        boot.plan_session
+            .as_ref()
+            .map(|ps| ps.borrow().clone())
+            .unwrap_or_else(|| "default".to_string())
+    });
+    match boot.agent_loop.as_ref().and_then(|h| {
+        h.store
+            .get(&dsh_session::types::SessionId::from_raw(sid))
+    }) {
+        Some(s) => dsh_plan::fold_plan_mode(&s.events()),
+        None => false,
+    }
+}
+
+/// 目标会话的句柄（None = 未装配）。`sid` Some 优先（`commands/execute` 的
+/// `agentId`），否则回退 `plan_session`。
+fn plan_session_ref_on(boot: &crate::Boot, sid: Option<&str>) -> Option<std::rc::Rc<dsh_session::Session>> {
+    let sid = sid.map(str::to_string).unwrap_or_else(|| {
+        boot.plan_session
+            .as_ref()
+            .map(|ps| ps.borrow().clone())
+            .unwrap_or_else(|| "default".to_string())
+    });
+    boot.agent_loop.as_ref().and_then(|h| {
+        h.store
+            .get(&dsh_session::types::SessionId::from_raw(sid))
+    })
+}
+
+/// `commands/execute`（前端 `/plan` 命令路径，真浏览器测试发现缺失后补）。
+/// 对齐 fork `dsh-client-commands` 的 remote 契约 + `@deepseek-ai/dsh-plan-mode` 的
+/// `/plan` handler：命名命令执行时**落 `command/run` + `command/done` 生命周期事件**
+/// （流程节点 + 前端 plan 投影），返回 `{ok:true, value:{commandId, result:{kind,text}}}`
+/// 或 `{ok:true, value:undefined}`（未知/非命令，不落事件）。`command/run` 的 `args`
+/// 是含分隔空白的 verbatim rawInput（镜像 fixture：`/plan off` → `" off"`）。
+fn commands_execute(boot: &crate::Boot, agent_id: Option<&str>, line: &str, images: &[Value]) -> Value {
+    use dsh_session::EventKind;
+    let Some(rest) = line.trim().strip_prefix('/') else {
+        return serde_json::json!({"ok": true, "value": Value::Null});
+    };
+    let (name, args) = match rest.find(char::is_whitespace) {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, ""),
+    };
+    if name != "plan" {
+        return serde_json::json!({"ok": true, "value": Value::Null});
+    }
+    let Some(session) = plan_session_ref_on(boot, agent_id) else {
+        return serde_json::json!({"ok": false, "error": {"code": "internal", "message": "no Rust SessionHost assembled in this boot"}});
+    };
+    // 落 command/run（commandId 取日志长度，per-session 单调唯一；镜像 fixture）。
+    let command_id = format!("cmd-{}", session.events().len());
+    let appended = session.append(
+        EventKind::CommandRun,
+        serde_json::json!({
+            "commandId": command_id,
+            "name": name,
+            "args": args,
+            "source": {"kind": "user"},
+        }),
+        None,
+    );
+    if let Err(e) = appended {
+        return serde_json::json!({"ok": false, "error": {"code": "internal", "message": e.0}});
+    }
+    // 执行 handler → CommandResult；随后落 command/done 并返回 {ok, value:{commandId,result}}。
+    let finish = |session: &dsh_session::Session, command_id: &str, result: Value| -> Value {
+        let mut data = serde_json::Map::new();
+        data.insert("commandId".into(), serde_json::json!(command_id));
+        if let Some(obj) = result.as_object() {
+            for (k, v) in obj {
+                data.insert(k.clone(), v.clone());
+            }
+        }
+        let _ = session.append(EventKind::CommandDone, Value::Object(data), None);
+        serde_json::json!({"ok": true, "value": {"commandId": command_id, "result": result}})
+    };
+    let message = args.trim();
+    let outcome = if message == "off" {
+        if !images.is_empty() {
+            serde_json::json!({"kind": "error", "text": "Image attachments cannot accompany /plan off."})
+        } else {
+            let was_active = plan_state_active_on(boot, agent_id);
+            match crate::web::approval::set_plan_mode_on(boot, agent_id, false, None) {
+                Ok(_) => serde_json::json!({"kind": "success", "text": if was_active {
+                    "Plan mode off."
+                } else {
+                    "Plan mode is already inactive."
+                }}),
+                Err(e) => return serde_json::json!({"ok": false, "error": {"code": "internal", "message": e}}),
+            }
+        }
+    } else {
+        let msg = if message.is_empty() { None } else { Some(message) };
+        match crate::web::approval::set_plan_mode_on(boot, agent_id, true, msg) {
+            Ok(_) => serde_json::json!({"kind": "success", "text": "Plan mode on. Use /plan off to leave."}),
+            Err(e) => return serde_json::json!({"ok": false, "error": {"code": "internal", "message": e}}),
+        }
+    };
+    finish(&session, &command_id, outcome)
+}
+
 /// 派发一个请求：`/plugins/*` bundle、`/api/*` RPC/SSE，否则静态文件（SPA fallback）。
 fn dispatch_request(
     mut request: tiny_http::Request,
@@ -733,9 +839,17 @@ fn serve_plugin_bundle(manifest: &BootManifest, path: &str) -> Option<Vec<u8>> {
     std::fs::read(&bundle).ok()
 }
 
-/// 渲染 `/` 的 index.html：读 dist index.html，注入 `window.__DSH_BOOT__`
-/// （对齐 `injectBootManifest`——`<head>` 首 script，`<` 转义防逃逸）。
+/// 渲染 `/` 的 index.html：读 dist index.html，注入 web boot 三件套（对齐
+/// `dsh-client-modules` 的 `bootInjections`，Host 侧职责）：先注入
+/// `window.__ModuleLoader__` queue-mode 门面（`@deepseek-ai/dsh-client-modules` 的
+/// `create` 会把它切成 live 模式）；再注入 parser **preload**——modules 与 runtime
+/// 两个 bundle 的**阻塞经典** `<script>`（先于 Vite shell 执行——module script 默认
+/// deferred，注册必达）；最后注入 `window.__DSH_BOOT__` graph global。缺
+/// modules/runtime entry（如老前端）→ 跳过对应 preload；`__DSH_BOOT__` 照旧注入
+/// （`<` 转义防逃逸，对齐 `injectBootManifest`）。
 fn render_index_with_boot(web_root: &Path, manifest: &BootManifest) -> Option<Vec<u8>> {
+    const MODULES_ID: &str = "@deepseek-ai/dsh-client-modules";
+    const PRELOAD_IDS: [&str; 2] = [MODULES_ID, "@deepseek-ai/dsh-client-runtime"];
     let html = std::fs::read_to_string(web_root.join("index.html")).ok()?;
     let graph = serde_json::json!({
         "rev": manifest.rev,
@@ -756,11 +870,47 @@ fn render_index_with_boot(web_root: &Path, manifest: &BootManifest) -> Option<Ve
         }).collect::<Vec<_>>(),
     });
     let json = serde_json::to_string(&graph).unwrap_or_default().replace('<', "\\u003c");
-    let script = format!("<script>window.__DSH_BOOT__ = {json}</script>");
+    // 1) queue-mode 门面（逐字对齐 `bootInjections` 的 queue 文本；bootstrapId =
+    // MODULES_ID）。
+    let facade = "(()=>{\n\
+const pendingQueue=[]\n\
+window.__ModuleLoader__={\n\
+  mode:\"queue\",\n\
+  pendingQueue,\n\
+  load(registration){pendingQueue.push(registration)},\n\
+  create(options){\n\
+    if(this.mode!==\"queue\")throw new Error(\"client-modules: window.__ModuleLoader__.create called after module-system boot\")\n\
+    const index=pendingQueue.findIndex(registration=>registration.id===\"@deepseek-ai/dsh-client-modules\")\n\
+    const registration=pendingQueue[index]\n\
+    if(registration===undefined)throw new Error(\"client-modules: HTML did not preload @deepseek-ai/dsh-client-modules/client.js\")\n\
+    pendingQueue.splice(index,1)\n\
+    const exports=registration.factory(specifier=>{\n\
+      throw new Error('client-modules: @deepseek-ai/dsh-client-modules/client.js requested external \"'+specifier+'\" before the module system existed')\n\
+    })\n\
+    if(typeof exports!==\"object\"||exports===null||typeof exports.createClientModuleSystem!==\"function\"||typeof exports.apply!==\"function\"){\n\
+      throw new Error(\"client-modules: @deepseek-ai/dsh-client-modules/client.js did not export the bootstrap module face\")\n\
+    }\n\
+    return exports.createClientModuleSystem(this,{id:registration.id,exports},options)\n\
+  }\n\
+}\n\
+})()";
+    // 2) parser preload（阻塞经典脚本；按 PRELOAD_IDS 顺序）。
+    let mut preloads = String::new();
+    for id in PRELOAD_IDS {
+        if let Some(e) = manifest.entries.iter().find(|e| e.id == id) {
+            preloads.push_str(&format!(
+                "<script src=\"/plugins/{}/client.js?rev={}\"></script>",
+                e.id, e.rev
+            ));
+        }
+    }
+    // 3) __DSH_BOOT__ global。
+    let boot = format!("<script>window.__DSH_BOOT__ = {json}</script>");
+    let head = format!("<script>{facade}</script>{preloads}{boot}");
     let out = if let Some(pos) = html.find("<head>") {
-        format!("{}{}{}", &html[..pos + 6], script, &html[pos + 6..])
+        format!("{}{}{}", &html[..pos + 6], head, &html[pos + 6..])
     } else {
-        format!("{script}{html}")
+        format!("{head}{html}")
     };
     Some(out.into_bytes())
 }
@@ -3482,6 +3632,15 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
                 }}),
             }
         }
+        // D-111：`commands/execute`——前端 `/plan` 命令路径（真浏览器测试发现缺失后补）；
+        // 只实现 plan 命令，镜像 fork `plan-mode` handler + commands admission 契约；
+        // `agentId` 会话路由（S3 per-agent 保真：作用到该会话而非默认）。
+        "commands/execute" => {
+            let agent_id = payload.get("agentId").and_then(Value::as_str);
+            let line = payload.get("line").and_then(Value::as_str).unwrap_or("").to_string();
+            let images = payload.get("images").and_then(Value::as_array).cloned().unwrap_or_default();
+            commands_execute(boot, agent_id, &line, &images)
+        }
         "commands/list" => {
             serde_json::json!({"ok": true, "value": [
                 {"name": "compact", "description": "压缩当前会话上下文"},
@@ -3674,6 +3833,138 @@ mod tests {
         let evs = s.events();
         let pol = evs.iter().rfind(|e| e.kind == EventKind::ApprovalPolicy).unwrap();
         assert_eq!(pol.data["active"], json!(false));
+    }
+
+    /// D-111：`commands/execute` `/plan` 命令路径——进入带 message、/plan off 离开、
+    /// 未知命令 → value undefined（前端 “unknown or malformed command”）、
+    /// /plan off + images → error 结果（镜像 fork plan-mode handler + admission）。
+    #[test]
+    fn commands_execute_plan_flips_mode_like_frontend_command() {
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let m4 = M4HostServices {
+            jobs: None,
+            schedule: None,
+            todo: None,
+            plan_mode: None,
+        };
+        let root = std::env::temp_dir().join(format!("dsh-m6-cmdexe-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        let loop_host = assemble_server_loop(
+            session_host.store.clone(),
+            root.clone(),
+            llm,
+            "mock",
+            "mock-model",
+            m4,
+            m5,
+        )
+        .expect("assemble ok");
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(loop_host.clone());
+        boot.plan_session = Some(std::rc::Rc::new(std::cell::RefCell::new("default".to_string())));
+        let sid = dsh_session::types::SessionId::from_raw("default".to_string());
+        let img = serde_json::json!([{"type": "image", "url": "x"}]);
+
+        // 未知/非命令：value undefined。
+        let r = commands_execute(&boot, None, "not a command", &[]);
+        assert_eq!(r["ok"], json!(true));
+        assert!(r["value"].is_null(), "unmatched line -> undefined");
+        let r = commands_execute(&boot, None, "/compact", &[]);
+        assert_eq!(r["ok"], json!(true));
+        assert!(r["value"].is_null(), "未实现命令 -> undefined");
+
+        // /plan：进入 + message 落事件；折叠即时可见；成功结果 {ok, value:{commandId,result}}。
+        let r = commands_execute(&boot, None, "/plan  investigate", &[]);
+        assert_eq!(r["ok"], json!(true));
+        assert_eq!(r["value"]["result"]["kind"], json!("success"));
+        assert_eq!(
+            r["value"]["result"]["text"],
+            json!("Plan mode on. Use /plan off to leave.")
+        );
+        let cid = r["value"]["commandId"].as_str().unwrap().to_string();
+        assert!(cid.starts_with("cmd-"), "commandId minted");
+        let s = loop_host.store.get(&sid).unwrap();
+        assert!(dsh_plan::fold_plan_mode(&s.events()), "进入即折叠 true");
+        let evs = s.events();
+        let mode = evs
+            .iter()
+            .rfind(|e| e.kind == EventKind::PlanMode)
+            .unwrap();
+        assert_eq!(mode.data["message"], json!("investigate"));
+        // 生命周期事件：command/run（verbatim args）→ … → command/done（同步到结果）。
+        let run = evs
+            .iter()
+            .find(|e| e.kind == EventKind::CommandRun && e.data["commandId"] == json!(cid.as_str()))
+            .expect("command/run logged");
+        assert_eq!(run.data["name"], json!("plan"));
+        assert_eq!(run.data["args"], json!("  investigate"), "verbatim rawInput");
+        assert_eq!(run.data["source"], json!({"kind": "user"}));
+        let done = evs
+            .iter()
+            .find(|e| e.kind == EventKind::CommandDone && e.data["commandId"] == json!(cid.as_str()))
+            .expect("command/done logged");
+        assert_eq!(done.data["kind"], json!("success"));
+
+        // /plan off + images：error 结果，plan 保持 active（handler 未 set）。
+        let r = commands_execute(&boot, None, "/plan off", &img.as_array().unwrap());
+        assert_eq!(r["value"]["result"]["kind"], json!("error"));
+        assert!(dsh_plan::fold_plan_mode(&loop_host.store.get(&sid).unwrap().events()));
+
+        // /plan off：离开（无 heading 前置）。
+        let r = commands_execute(&boot, None, "/plan off", &[]);
+        assert_eq!(r["value"]["result"]["text"], json!("Plan mode off."));
+        let s = loop_host.store.get(&sid).unwrap();
+        assert!(!dsh_plan::fold_plan_mode(&s.events()), "离开后折叠 false");
+
+        // 再 /plan off（已 inactive）：idempotent 文案。
+        let r = commands_execute(&boot, None, "/plan off", &[]);
+        assert_eq!(r["value"]["result"]["text"], json!("Plan mode is already inactive."));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D-111：`commands/execute` 走 `agentId` 会话路由——`/plan` 作用到该会话
+    /// （S3 per-agent 保真），不落到 `plan_session`/default。
+    #[test]
+    fn commands_execute_routes_by_agent_id() {
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let _ = session_host.session("s2");
+        let m4 = M4HostServices { jobs: None, schedule: None, todo: None, plan_mode: None };
+        let root = std::env::temp_dir().join(format!("dsh-m6-cmdsid-{}", std::process::id()));
+        if root.exists() { let _ = std::fs::remove_dir_all(&root); }
+        std::fs::create_dir_all(&root).unwrap();
+        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        let loop_host = assemble_server_loop(
+            session_host.store.clone(), root.clone(), llm, "mock", "mock-model", m4, m5,
+        )
+        .expect("assemble ok");
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(loop_host.clone());
+        boot.plan_session = Some(std::rc::Rc::new(std::cell::RefCell::new("default".to_string())));
+        let sid_default = dsh_session::types::SessionId::from_raw("default".to_string());
+        let sid_s2 = dsh_session::types::SessionId::from_raw("s2".to_string());
+
+        let r = commands_execute(&boot, Some("s2"), "/plan  investigate", &[]);
+        assert_eq!(r["ok"], json!(true));
+        assert!(dsh_plan::fold_plan_mode(&loop_host.store.get(&sid_s2).unwrap().events()),
+            "agentId=s2 的 plan 落在 s2");
+        assert!(!dsh_plan::fold_plan_mode(&loop_host.store.get(&sid_default).unwrap().events()),
+            "default 不受影响");
+
+        // agentId=None → 回退 plan_session(default)。
+        let r = commands_execute(&boot, None, "/plan", &[]);
+        assert_eq!(r["ok"], json!(true));
+        assert!(dsh_plan::fold_plan_mode(&loop_host.store.get(&sid_default).unwrap().events()),
+            "None 回退 plan_session");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// S3（D-107）：折叠解析器 per-agent 保真——`Some(sid)` 按**该组装会话**折叠，
@@ -4884,6 +5175,51 @@ mod tests {
         assert!(text.contains("client.js?rev="), "entry has bundle url");
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&pr).ok();
+    }
+
+    /// 阶段1：render_index_with_boot 注入 `__ModuleLoader__` 门面 + 两个 parser
+    /// preload（modules/runtime 阻塞经典脚本）+ `__DSH_BOOT__`，顺序即对齐
+    /// `dsh-client-modules` 的 `bootInjections`（门面 → preload → graph global）。
+    #[test]
+    fn render_index_injects_module_loader_facade_then_preloads_then_boot() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-web-idx2-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("index.html"), "<html><head></head><body></body></html>").unwrap();
+        let e = |id: &str, rev: &str, immediately: bool| BootEntry {
+            id: id.to_string(),
+            bundle_root: root.join("unused"),
+            rev: rev.to_string(),
+            inject: Vec::new(),
+            immediately,
+        };
+        let m = BootManifest {
+            rev: "graph-rev".to_string(),
+            entries: vec![
+                e("@deepseek-ai/dsh-client-modules", "mods", true),
+                e("@deepseek-ai/dsh-client-runtime", "rt", true),
+                e("@deepseek-ai/dsh-client-ui-conversation", "ui", false),
+            ],
+        };
+        let text = String::from_utf8(render_index_with_boot(&root, &m).unwrap()).unwrap();
+        // 门面先行，含 queue 语义；preload 其次；graph global 最后。
+        let fpos = text.find("window.__ModuleLoader__").expect("facade injected");
+        assert!(text[fpos..].starts_with("window.__ModuleLoader__={"), "queue facade");
+        assert!(text.contains("pendingQueue"), "queue-mode pendingQueue");
+        assert!(text.contains("create(options)"), "create 门面");
+        let mpos = text.find("src=\"/plugins/@deepseek-ai/dsh-client-modules/client.js?rev=mods\"").expect("modules preload");
+        let rpos = text.find("src=\"/plugins/@deepseek-ai/dsh-client-runtime/client.js?rev=rt\"").expect("runtime preload");
+        let bpos = text.find("window.__DSH_BOOT__ = ").expect("boot global");
+        assert!(fpos < mpos && mpos < rpos && rpos < bpos, "order: facade -> modules -> runtime -> boot");
+        // UI 包不 preload（只 modules/runtime 需要阻塞经典脚本）。
+        assert!(!text.contains("dsh-client-ui-conversation/client.js\""), "ui 不 preload");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// M2g：session.prompt 在装配了 Rust AgentLoopHost 时改驱真实 agent-loop，

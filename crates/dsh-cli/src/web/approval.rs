@@ -274,11 +274,25 @@ pub fn set_plan_mode(
     active: bool,
     message: Option<&str>,
 ) -> Result<bool, String> {
-    let sid = boot
-        .plan_session
-        .as_ref()
-        .map(|ps| ps.borrow().clone())
-        .unwrap_or_else(|| "default".to_string());
+    set_plan_mode_on(boot, None, active, message)
+}
+
+/// `set_plan_mode` 的会话显式版：`sid` Some → 作用到该会话（per-agent 保真，
+/// `commands/execute` 走 `agentId` 路由），None → 回退 `plan_session`。
+pub fn set_plan_mode_on(
+    boot: &crate::Boot,
+    sid: Option<&str>,
+    active: bool,
+    message: Option<&str>,
+) -> Result<bool, String> {
+    let sid = sid
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            boot.plan_session
+                .as_ref()
+                .map(|ps| ps.borrow().clone())
+                .unwrap_or_else(|| "default".to_string())
+        });
     let host = boot
         .agent_loop
         .as_ref()

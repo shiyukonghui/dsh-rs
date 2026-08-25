@@ -4931,5 +4931,53 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
 
 ### D-104 实施补记预留
 
+---
+
+## D-111：fork 前端端到端（Chrome DevTools MCP 真浏览器）暴露的 serve 两缺口
+
+**日期**：2025（本机时间）
+
+**触发的问题**：G（D-108）wire/后端闭环已验证，但「浏览器级 GUI 打点」是本里程碑的
+收口验收。按用户要求用 Chrome DevTools MCP 做真浏览器测试时，fork 前端（`apps/web`）
+在自部署 serve 上连失败两处，均是从未在 wire 层暴露的 **serve 功能缺口**：
+1. 页面仅渲染「Failed to load plugins / web boot: window.__ModuleLoader__
+   bootstrap facade is missing」——我们 `render_index_with_boot` 只注入了
+   `__DSH_BOOT__`，缺 Host 侧的 `__ModuleLoader__` 门面 + parser preload。
+2. 前端 composer 的 `/plan` 命令走 `commands/execute` RPC，我们的 `/api` 派发
+   返回 `not-implemented: method "commands/execute" not implemented by dsh web`。
+
+**自下而上验证**：fork 权威契约 `packages/client/modules/src/index.ts` 的
+`bootInjections`：注入顺序 = queue 门面 IIFE → `@deepseek-ai/dsh-client-modules`
+与 `-runtime` 的**阻塞经典** preload `<script>`（先于 Vite shell 执行，module 默认
+deferred）→ `__DSH_BOOT__` global。`commands/execute` 的语义在
+`packages/plan/plan-mode/src/index.ts` 的 `/plan` handler（`set(agent, active)` +
+可选 steer message）与 `ui-commands` admission 契约（`ok:true + value:undefined`
+→ “unknown or malformed command”；`value.result {kind,text}` 为成功结果）。
+
+**最终选择**：
+1. `render_index_with_boot` 扩展为三件套注入（门面 + preload + boot），逐字对齐
+   `bootInjections` 的 queue facade 文本；缺 modules/runtime entry 时跳过对应
+   preload，`__DSH_BOOT__` 照旧注入。
+2. `/api` 派发新增 `commands/execute` arm → `commands_execute(boot, line, images)`：
+   只实现 `/plan[ off|message]`；`/plan off` + images → error 结果（前端保留草稿）；
+   message 进入 plan 事件 `message` 字段（复用 D-106 的 `set_plan_mode` steering）；
+   `off` 时按折叠前置判定「Plan mode off.」/「Plan mode is already inactive.」；
+   其余命令/非命令 → `value:undefined`。
+
+**被否决**：在 npx 安装包上打补丁（禁止区）；改 fork 前端让 /plan 走别的 RPC
+（fork 零接触、命令路径是 Host 责任）。
+
+**预期影响与回滚点**：fork 前端自此可完整 boot 并原生进入 plan 模式；`commands/execute`
+只认 plan（compact/goal/subagents 诚实返回 unknown，与本 serve 的 support 面一致）。
+回滚：撤销 `web.rs` 该 arm + `render_index_with_boot` 三件套即可，不影响 D-108 wire
+契约。
+
+**验证**：单测 `render_index_injects_module_loader_facade_then_preloads_then_boot` +
+`commands_execute_plan_flips_mode_like_frontend_command`；dsh-cli lib 206/206 绿；
+clippy `-D warnings` 零。真浏览器：页面完整 boot（42 plugin entries + 内测声明 +
+composer 全要素），`/plan` 命令路径待 D-112 浏览器闭环确认。
+
+---
+
 
 
