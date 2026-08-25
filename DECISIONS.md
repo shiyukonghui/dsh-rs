@@ -4818,6 +4818,101 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
   模型**下逐帧验证；此前「环境阻塞」判定撤销（根因是我跨进程取 key 的探针伪影 + 旧
   配置变体瞬时抖动）。key 纪律不变（仅 live 进程 env 注入）。
 
+### D-107（S3 需求结论 + 设计，round 3；无实现）
+
+- 触发：S3 = D-106 里程碑目标③「多会话共享 standing 的 per-agent plan-mode 保真」——
+  审批执行层已是 per-driver 折叠（段 B），但**standing 提示层的 plan-mode 段折叠源是
+  全局的**（`boot.plan_session` 最后一次 select 的会话），多会话共享一预设时 A 的提示
+  会带上 B 的 plan 状态。
+- 第一性原理（目标剥到底）：「plan 激活 → 该 agent 系统提示含 dsh-plan-mode 段」的
+  per-agent 真义 = **折叠该 agent 自身会话的 plan/mode 事件重放**（`fold_plan_mode`），
+  与「GUI 上次选中哪个会话」无关。做对它就同时满足单/多会话。
+- 自上而下：按组装 agent → 拿会话身份 → 折叠该会话。自下而上：`AssembleContext` 现
+  只带 `scope`；`dsh_agent::assemble_context_for(agent)` 是唯一从 Agent 构造点（loop
+  agent.rs:713 组装走它）；`Agent.id = 会话 id`；standing plan-mode 段注册为
+  `PromptSectionText::Fn(&AssembleContext)` 但当前忽略 ctx。两向可遇：**给 AssembleContext
+  补会话身份，折叠源按 ctx 身份解析**。
+- 验收：两会话共享 standing，A 进 plan → A 组装含段、B 不含；翻转亦然；无身份组装
+  （None）回退 boot.plan_session（原单活跃行为保留，兼容既有测试）。
+- 设计决策：
+  - D-S3.1 `AssembleContext` 增 `session_id: Option<String>`（additive、Default 保持）；
+    既有字面量补 `..Default::default()`。
+  - D-S3.2 `assemble_context_for` 填 `session_id = Some(agent.id)`。
+  - D-S3.3 standing 折叠源 `PlanModeSource` Fn 签名改 `Fn(Option<&str>) -> bool`（组装
+    会话 id；None→全局回退）；plan-mode 段 Fn 传 `ctx.session_id.as_deref()`。
+  - D-S3.4 web.rs 折叠解析器抽 `plan_mode_resolver(plan_session, store)` 便于单测：
+    Some(sid)→fold 该会话；None→fold plan_session。语义：身份在场 per-agent 权威，
+    boot.plan_session 仅 None 回退（GUI `session.plan.mode` 本就写目标会话，per-agent
+    折叠自然反映）。
+  - 被否决：scope→session 注册表解析（隐式 + 费一张表 + 难测）；线程局部/全局
+    override（脆弱不诚实）；保持全局源继续（正是被修缺陷）。
+- 回滚点：D-S3.1/3.2 一个提交、D-S3.3/3.4 一个提交，可独立 revert。
+
+### D-108（GUI 里程碑需求结论 + 设计，round 3；Rust 实现待做，fork 分支已建/已装依赖）
+
+- 触发：D-106 收口后用户许可「GUI 任务」——让 **DeepSeek Harness 前端（项目内源码
+  fork `deepseek-harness`，新分支 `feature/approval-gui`）** 对我们的 Rust serve 的
+  approval 弹窗闭环可用；安装包（npx）零接触；依赖安装与测试由我完成。
+- 需求核证（自下而上，读 fork 源码权威契约）：
+  - **wire 契约**（`packages/host/apiproxy/src/api/{approvals.ts,approvals.schema.ts,
+    events.ts,events.schema.ts,rpc.schema.ts}` + `tests/api-proxy-approval.spec.ts`）：
+    - `approval/requested` MuxFrame `{type, sessionId, approvalId, toolName, callId?,
+      reason?}`，装进 **server-request** `{type:"server-request", rpcId(stable),
+      method, payload}`（stable rpcId，**pending 期间在 mux 重开时逐字重放**）。
+    - 前端答复 = **client-response** `{type:"client-response", rpcId(echo requested 的
+      rpcId), result:{ok:true,value:{sessionId, approvalId, outcome:
+      'allowed-once'|'rejected'}}}`，走 **`POST /api/respond`**（非 unary RPC，回应体
+      RpcReceipt）；首次 → `{accepted:true}`；迟到 → `{accepted:false,
+      reason:'not-pending'}`；畸形/审计不符 → `{accepted:false, reason:'bad-response'}`。
+    - 结算帧 `approval/resolved` MuxFrame `{type, sessionId, approvalId, outcome}`
+      （outcome 含 host 侧 'cancelled'/'unavailable'）。
+    - **approvalId = 审计 id**（配对 `approval/asked` 与 `approval/decided`；按 callId
+      配平并行 ask）——不是 callId。
+  - 服务域（`packages/interaction/user-approval/src/index.ts`）：语言恰是我们 D-106 的
+    `approval/asked`/`approval/decided`/`approval/policy`；`ApprovalService.request`
+    要求**开 turn 内**（审计对 turn 封闭）；answerer waterfall `approval/request`，
+    无 answerer → fail-closed 'unavailable'；policy 'ask'|'never'，'never' 确定性拒绝。
+- 我们的 gap：approval 执行层已 per-driver（段 B），但**不发射前端 wire 帧、不接受
+  `/api/respond`、approval/asked 无配对审计 id**。
+- 设计：
+  - G-a `approval_wire`（dsh-cli/web，新文件）：pending 注册表 `ApprovalWire`——
+    每次 mutation 挂起 → `push_requested({rpcId:"approval-<n>", session, approvalId
+    (=审计 id), callId, toolName, reason})`；decide → `resolve(rpcId, outcome)`；
+    提供 pending 重放 + append-only 帧游标（requested+resolved 按 seq）。
+  - G-b `approval/asked` 事件增 **审计 `id`**（配对 decided），approvalId 用它；
+    decide 写 `approval/decided{id,outcome}` 保持配对（对齐服务域）。
+  - G-c mux 下链：SSE/WS `events.mux` 线程**重放 pending requested**（开链）+ 增量推
+    requested/resolved 帧（与 session/event 同信封 server-request）。
+  - G-d `POST /api/respond` 处理 client-response（echo rpcId 路由 pending）、
+    allowed-once/rejected → 映射 decide + kick；返回 `{accepted}` 语义（not-pending/
+    bad-response）。保留 `session.approval.decide`（早期验证路径向后兼容）。
+  - 前端侧：fork 的 connection/runtime 已内建 PendingApproval composer + respond——
+    预期**零前端改动**，以 fork 构建产物 + 真机闭环验证为准。
+- 验收（对齐 fork 规格，Rust 侧单测 + live）：requested 帧/重放/rpcId 稳定性、
+  respond 首答/迟到/畸形、resolved 广播、allowed-once 真执行、rejected 合成拒绝、
+  GUI 弹窗现形响应。
+- 被否决：动 npx 安装包（会破坏下载）；改 fork 的 loop 核心（一切皆插件、最小
+  blast radius）；approvalId 直接用 callId（不忠实审计配对）。
+- 纪律记档：fork 侧非平凡改动需 Agent Note + 快照 + 文档 + pnpm 门禁；凭据永不提交。
+- 实施记录（round 4，`web/approval_wire.rs` 新建 + `web.rs`/`approval.rs`/`lib.rs` 接线）：
+  - G-a `ApprovalWire`（`Arc<Mutex>`；append-only 帧日志 + pending 表；stable rpcId
+    `approval-<n>`；approvalId = 审计 id `ap-<call_id>` 派生，配对 asked/decided；
+    `pending_requests()` 重放 + `frames_since()` 增量；`resolve_by_rpc`/`resolve_by_call_id`）。
+  - G-c mux 下链：SSE `stream_sse_events` + WS `stream_ws_events` 各持 wire 游标——
+    开链重放 still-pending requested（逐字同 rpcId），随后增量推 requested/resolved
+    （信封 `{type:"server-request", rpcId, method:<帧类型>, payload}`，对齐
+    `fullFrame()` method = frame.type）。
+  - G-d `POST /api/respond`：`/api` 分派加专用 arm → `approval_respond`（client-response
+    echo rpcId 路由 pending → 校验 sessionId+approvalId+outcome → 映射到执行层
+    decide + kick → resolve + 返回 RpcReceipt）；语义对齐 harness（accepted/not-pending/
+    bad-response）。
+  - G-b 审计配对：asked（3 处）与 decided 事件增 `id` 字段；approval_tool_exec 挂起时
+    push_requested；decide() 落 decided 后按 call id 结算 wire（`session.approval.decide`
+    与 respond 两路径都推进 wire，前端 pending 不悬挂）。
+  - 验收：8 个 approval_wire 单测（requested 帧形/rpcId 稳定性/重放逐字/resolved 终态/
+    增量游标/respond accepted+not-pending+bad-response×审计 mismatch+decide 失败不
+    resolve）；dsh-cli lib 204 全绿；clippy `-D warnings` 零。提交见下一 commit。
+
 ### D-104 实施补记预留
 
 

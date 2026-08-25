@@ -113,6 +113,10 @@ pub struct Boot {
     /// agentPreset.select 的会话；standings 按 preset-id 挂载且单活跃，折叠取其事件
     /// 日志）。web serve 装配时 Some 并注入 standing 折叠源；None（未启 loop）→ 无源。
     pub plan_session: Option<Rc<std::cell::RefCell<String>>>,
+    /// D-108/G：approval wire 注册表（前端 `approval/requested`/`resolved` 帧 +
+    /// `POST /api/respond` 答复）。serve 装配 agent-loop 时 Some；None（未启 loop /
+    /// 测试口）→ 不推 wire 帧、respond 一律 not-pending（无决可答，诚实）。
+    pub approval_wire: Option<crate::web::approval_wire::ApprovalWireRef>,
 }
 
 /// M56：转储生效配置（对齐生产 `dsh --dump-config`）——读主配置 + overlays
@@ -301,6 +305,7 @@ pub fn boot(
         presets: Rc::new(std::cell::RefCell::new(crate::preset_host::PresetHost::default())),
         standings: Rc::new(std::cell::RefCell::new(crate::standing::StandingRegistry::default())),
         plan_session: None,
+        approval_wire: None,
     })
 }
 

@@ -22,6 +22,8 @@ use dsh_session::{EventKind, Session};
 use dsh_tools::ToolRegistry;
 use serde_json::{json, Value};
 
+use super::approval_wire::{approval_audit_id, ApprovalWireRef};
+
 /// `approval/decided` 的 decision 值（对齐 harness 一次性语义）。
 pub const DECISION_ALLOWED_ONCE: &str = "allowedOnce";
 pub const DECISION_REJECTED: &str = "rejected";
@@ -49,15 +51,25 @@ fn is_mutation(name: &str) -> bool {
 
 /// 宿主注入 tool_exec 的工厂（`AgentLoopHost::set_tool_exec_factory`）。
 /// 按每个 driver 绑定事实产出包装；与服务直通路径（`pending` 恒空）逐位一致，仅当
-/// 会话 plan 折叠 active 且调用为 mutation 时才走审批门。
-pub fn approval_tool_exec_factory() -> Rc<ToolExecFactory> {
+/// 会话 plan 折叠 active 且调用为 mutation 时才走审批门。`wire`（Some）→ 挂起时把
+/// requested 帧投影到 wire 供 mux 下推（serve 装配注入；None = 纯记录）。
+pub fn approval_tool_exec_factory(wire: Option<ApprovalWireRef>) -> Rc<ToolExecFactory> {
     Rc::new(move |session, tools, scope, agent, max_parallel| {
         let session = session.clone();
         let tools = tools.clone();
         let scope = scope.clone();
         let agent = agent.clone();
+        let wire = wire.clone();
         Rc::new(move |ctx: &ToolExecCtx| -> ToolExecOutcome {
-            approval_tool_exec(&session, &tools, scope.as_ref(), agent.as_deref(), max_parallel, ctx)
+            approval_tool_exec(
+                &session,
+                &tools,
+                scope.as_ref(),
+                agent.as_deref(),
+                max_parallel,
+                ctx,
+                wire.as_ref(),
+            )
         })
     })
 }
@@ -69,6 +81,7 @@ fn approval_tool_exec(
     agent: Option<&str>,
     max_parallel: usize,
     ctx: &ToolExecCtx,
+    wire: Option<&ApprovalWireRef>,
 ) -> ToolExecOutcome {
     // 恢复路径优先：处理上一步暂停的 pending（决策已下）。
     if !ctx.resume.is_empty() {
@@ -91,19 +104,27 @@ fn approval_tool_exec(
     }
     let pending = emit_pending_calls(session, ctx.turn, ctx.step, &pending_blocks);
     for p in &pending {
+        let reason = format!(
+            "tool \"{}\" mutates state and requires approval while plan mode is active",
+            p.block.name
+        );
+        let call_id = p.block.id.raw();
         let _ = session.append(
             EventKind::ApprovalAsked,
             json!({
+                "id": approval_audit_id(call_id),
                 "tool": p.block.name,
-                "toolCallId": p.block.id.raw(),
+                "toolCallId": call_id,
                 "agent": agent,
-                "reason": format!(
-                    "tool \"{}\" mutates state and requires approval while plan mode is active",
-                    p.block.name
-                ),
+                "reason": reason,
             }),
             None,
         );
+        // D-108/G：把 requested 投影到 wire（mux 下推 + respond 可答）。approvalId =
+        // 审计 id（配对 asked/decided）。
+        if let Some(w) = wire {
+            let _ = w.push_requested(session.id().raw(), call_id, &p.block.name, Some(&reason));
+        }
     }
     run_calls(session, tools, scope, agent, max_parallel, ctx.turn, ctx.step, &run, &[], pending)
 }
@@ -223,12 +244,22 @@ pub fn decide(boot: &crate::Boot, call_id: &str, decision: &str) -> Result<usize
         .append(
             EventKind::ApprovalDecided,
             json!({
+                "id": approval_audit_id(call_id),
                 "toolCallId": call_id,
                 "decision": decision,
             }),
             None,
         )
         .map_err(|e| e.0)?;
+    // D-108/G：decide 落定 → wire 按 call id 结算（resolved 广播；前端 pending 不悬挂）。
+    if let Some(w) = &boot.approval_wire {
+        let outcome = if decision == DECISION_ALLOWED_ONCE {
+            super::approval_wire::WIRE_OUTCOME_ALLOWED_ONCE
+        } else {
+            super::approval_wire::WIRE_OUTCOME_REJECTED
+        };
+        let _ = w.resolve_by_call_id(call_id, outcome);
+    }
     host.kick(AGENT)?;
     Ok(host.pending_calls(AGENT)?.len())
 }
@@ -372,6 +403,7 @@ mod tests {
             Some("agent-1"),
             8,
             &ctx(1, 1, &[block("c1", "bash")]),
+            None,
         );
         assert!(out.pending.is_empty(), "plan 非激活 → 直通");
         assert!(asked_call_ids(&s).is_empty());
@@ -389,6 +421,7 @@ mod tests {
             Some("agent-1"),
             8,
             &ctx(1, 1, &[block("c1", "bash"), block("c2", "read")]),
+            None,
         );
         // bash 是 mutation → pending；read 不是 → 不拦。
         assert_eq!(out.pending.len(), 1, "只 pending mutation");
@@ -430,7 +463,7 @@ mod tests {
             resume: pending,
         };
         let tools2 = registry();
-        let out = approval_tool_exec(&s, &tools2, None, Some("agent-1"), 8, &resume_ctx);
+        let out = approval_tool_exec(&s, &tools2, None, Some("agent-1"), 8, &resume_ctx, None);
         assert!(out.pending.is_empty(), "allowedOnce → 全部放行");
         // 只追 result，不重复 call。
         let calls = s
@@ -461,7 +494,7 @@ mod tests {
             tool_calls: &[],
             resume: pending,
         };
-        let out = approval_tool_exec(&s, &tools, None, Some("agent-1"), 8, &resume_ctx);
+        let out = approval_tool_exec(&s, &tools, None, Some("agent-1"), 8, &resume_ctx, None);
         assert!(out.pending.is_empty());
         let results: Vec<_> = s
             .events()

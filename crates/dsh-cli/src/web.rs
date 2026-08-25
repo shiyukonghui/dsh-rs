@@ -35,6 +35,8 @@ pub use web_m5::{register_m5_tools_with_host, M5HostServices};
 
 /// D-106：执行层审批策略（宿主侧；loop 只提供 pending 机制，策略在此）。
 pub mod approval;
+/// D-108/G：approval wire 注册表（requested/resolved 帧 + respond 答复处理）。
+pub mod approval_wire;
 
 /// trust fence（阶段4）：判定请求 Host 头是否为 loopback 权威
 /// （对齐前端 `isLoopbackHostname`：localhost / `[::1]` / 127/8）。
@@ -288,6 +290,15 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
                 .borrow()
                 .set_plan_mode_source(Some(std::rc::Rc::new(resolver)));
         }
+        // D-108/G：approval wire 注册表（前端 requested/resolved 帧 + respond 答复）。
+        // 与执行层审批门共用：mutation 挂起 → push_requested（mux 下推）；respond/
+        // decide → resolve_by_*（resolved 广播）。须在 ensure_agent 之前以带 wire 的
+        // 工厂覆盖装配默认（默认无 wire，serve 之外路径保持纯记录）。
+        let approval_wire = std::sync::Arc::new(crate::web::approval_wire::ApprovalWire::new());
+        boot.approval_wire = Some(approval_wire.clone());
+        bundle.host.set_tool_exec_factory(Some(crate::web::approval::approval_tool_exec_factory(
+            Some(approval_wire.clone()),
+        )));
         // M6 step8（D-087）：真实 provider catalog 视图注入 Boot（llm.models caps）。
         boot.agent_catalog = Some(crate::m6_llm::server_catalog_view(&base_url, &model));
         tick_schedule = Some(bundle.schedule.clone());
@@ -470,6 +481,19 @@ fn dispatch_request(
                     let _ = request.respond(resp);
                 });
             }
+            (Method::Post, "respond") => {
+                // D-108/G：审批答复。body 是 client-response（echo requested 的 rpcId），
+                // 非 unary RPC 信封 → 专用 arm；响应体即 RpcReceipt（非 server-response）。
+                let mut body = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut request.as_reader(), &mut body);
+                let wire = boot.approval_wire.clone();
+                let resp = json_response(200, &crate::web::approval_wire::approval_respond(
+                    wire.as_ref(),
+                    &body,
+                    |call_id, decision| crate::web::approval::decide(boot, call_id, decision),
+                ));
+                let _ = request.respond(resp);
+            }
             (Method::Post, m) if !m.is_empty() => {
                 // 读 body → RPC 分派 → JSON 响应
                 let mut body = Vec::new();
@@ -505,11 +529,13 @@ fn dispatch_request(
                         );
                     let stream = request.upgrade("websocket", resp);
                     let sink = sink.clone();
-                    std::thread::spawn(move || stream_ws_events(stream, &sink, is_host, host_events));
+                    let approval_wire = boot.approval_wire.clone();
+                    std::thread::spawn(move || stream_ws_events(stream, &sink, is_host, host_events, approval_wire));
                 } else {
                     let writer = request.into_writer();
                     let sink = sink.clone();
-                    std::thread::spawn(move || stream_sse_events(writer, &sink, is_host, host_events));
+                    let approval_wire = boot.approval_wire.clone();
+                    std::thread::spawn(move || stream_sse_events(writer, &sink, is_host, host_events, approval_wire));
                 }
             }
             _ => {
@@ -756,6 +782,7 @@ fn stream_sse_events(
     sink: &EventSink,
     is_host: bool,
     host_events: Option<Arc<std::sync::Mutex<Vec<Value>>>>,
+    approval_wire: Option<crate::web::approval_wire::ApprovalWireRef>,
 ) {
     // SSE 响应头（tiny_http 的 into_writer 是原始 socket 写；手写头 + data 帧）。
     if write_err(
@@ -786,6 +813,18 @@ fn stream_sse_events(
     if write_sse(&mut writer, &hello).is_none() {
         return;
     }
+    // D-108/G：approval wire——重开时重放仍 pending 的 requested（逐字同 rpcId，
+    // 刷新恢复），随后持游标增量下推 requested/resolved 帧（与 session/event 同母线）。
+    let mut approval_cursor = if let Some(wire) = &approval_wire {
+        for frame in wire.pending_requests() {
+            if write_sse(&mut writer, &frame).is_none() {
+                return;
+            }
+        }
+        wire.len()
+    } else {
+        0
+    };
     // host 帧游标（`events.host` 通道独有；每连接独立，append-only 日志安全）。
     let mut host_cursor = 0usize;
     loop {
@@ -804,6 +843,16 @@ fn stream_sse_events(
             }
         }
         cursor = new_cursor;
+        // approval wire 增量帧（requested/resolved；append-only 游标安全）。
+        if let Some(wire) = &approval_wire {
+            let (new_cur, wire_frames) = wire.frames_since(approval_cursor);
+            approval_cursor = new_cur;
+            for frame in &wire_frames {
+                if write_sse(&mut writer, frame).is_none() {
+                    return;
+                }
+            }
+        }
         if is_host {
             // D-100：host 通道独有下推 `host/*` 帧（server-request host/event 信封）。
             let host_frames = {
@@ -853,6 +902,7 @@ fn stream_ws_events(
     sink: &EventSink,
     is_host: bool,
     host_events: Option<Arc<std::sync::Mutex<Vec<Value>>>>,
+    approval_wire: Option<crate::web::approval_wire::ApprovalWireRef>,
 ) {
     use tungstenite::protocol::{Role, WebSocket, WebSocketConfig};
     let mut ws = WebSocket::from_raw_socket(stream, Role::Server, Some(WebSocketConfig::default()));
@@ -881,6 +931,18 @@ fn stream_ws_events(
     if ws_send(&mut ws, &hello).is_none() {
         return;
     }
+    // D-108/G：approval wire——重开时重放仍 pending 的 requested（逐字同 rpcId，
+    // 刷新恢复），随后持游标增量下推 requested/resolved 帧（与 session/event 同母线）。
+    let mut approval_cursor = if let Some(wire) = &approval_wire {
+        for frame in wire.pending_requests() {
+            if ws_send(&mut ws, &frame).is_none() {
+                return;
+            }
+        }
+        wire.len()
+    } else {
+        0
+    };
     // host 帧游标（`events.host` 通道独有；每连接独立，append-only 日志安全）。
     let mut host_cursor = 0usize;
     loop {
@@ -898,6 +960,16 @@ fn stream_ws_events(
             }
         }
         cursor = new_cursor;
+        // approval wire 增量帧（requested/resolved；append-only 游标安全）。
+        if let Some(wire) = &approval_wire {
+            let (new_cur, wire_frames) = wire.frames_since(approval_cursor);
+            approval_cursor = new_cur;
+            for frame in &wire_frames {
+                if ws_send(&mut ws, frame).is_none() {
+                    return;
+                }
+            }
+        }
         if is_host {
             // D-100：host 通道独有下推 `host/*` 帧（server-request host/event 信封）。
             let host_frames = {
@@ -2392,7 +2464,9 @@ pub fn assemble_server_loop(
     let host = dsh_agent_loop::AgentLoopHost::with_store(config, llm, tools.clone(), session_store)?;
     // D-106：宿主 tool_exec 工厂——approval 策略包装（plan-active 时 mutation 走审批
     // pending 门；连 driver 事实）。须在 ensure_agent（懒创建）之前设置；未设 = 直通。
-    host.set_tool_exec_factory(Some(crate::web::approval::approval_tool_exec_factory()));
+    // serve 装配后续以带 `approval_wire` 的工厂覆盖（web 下推 requested/resolved 帧）；
+    // 此处 None = 纯记录（非 web/测试路径，wire 不投影）。
+    host.set_tool_exec_factory(Some(crate::web::approval::approval_tool_exec_factory(None)));
     // M6 step9（D-088）：宿主 pre-execute 钩子——把「记录 + 放行」钩子接上共享
     // `default` 会话（dsh-tools pre-decision 缝延伸；`hookInvoked` 事件记录 vs TS
     // `HookInvoked` 对齐；放行保持既有语义）。
@@ -3537,6 +3611,7 @@ mod tests {
                 crate::standing::StandingRegistry::default(),
             )),
             plan_session: None,
+            approval_wire: None,
         }
     }
 
