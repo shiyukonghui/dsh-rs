@@ -487,7 +487,10 @@ pub fn run_turn(boot: &Boot, input: &Value) -> Result<Value, CordisError> {
 /// - agent 懒装配（ensure_agent 幂等）；事件直接写 AgentLoopHost 持有的共享 store
 ///   （web 侧与 SessionHost 同店 → 前端读模型/下链/持久化同一事实源）；
 /// - 无 host 或无可路由 agent → Err（fail loud）。
-pub fn run_rust_loop(boot: &Boot, session_id: &str, content: &str) -> Result<(), CordisError> {
+///
+/// 返回（D-106）：该 turn 后**仍待审批**的调用 id 列表（空 = 无审批挂起）；GUI 以此
+/// 感知弹窗并把 `session.approval.decide` 作为回执。
+pub fn run_rust_loop(boot: &Boot, session_id: &str, content: &str) -> Result<Vec<String>, CordisError> {
     let host = boot.agent_loop.as_ref().ok_or_else(|| {
         CordisError::Internal("no Rust AgentLoopHost assembled in this boot".into())
     })?;
@@ -516,7 +519,15 @@ pub fn run_rust_loop(boot: &Boot, session_id: &str, content: &str) -> Result<(),
         vec![dsh_llm::ContentBlock::text(content)],
     );
     host.followup(&configured.id, message)
-        .map_err(|e| CordisError::Internal(format!("agent-loop host: {e}")))
+        .map_err(|e| CordisError::Internal(format!("agent-loop host: {e}")))?;
+    // D-106：驱动后仍待审批的调用（GUI 感知；空 = 无挂起）。
+    let pending = host
+        .pending_calls(&configured.id)
+        .map_err(|e| CordisError::Internal(format!("agent-loop host: {e}")))?;
+    Ok(pending
+        .into_iter()
+        .map(|p| p.block.id.raw().to_string())
+        .collect())
 }
 
 /// D-101：给一个**运行时铸出**的会话（web `session.create`/`fork`）挂接一个真实

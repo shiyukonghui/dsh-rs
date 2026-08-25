@@ -33,6 +33,9 @@ pub mod web_m5;
 #[allow(unused_imports)]
 pub use web_m5::{register_m5_tools_with_host, M5HostServices};
 
+/// D-106：执行层审批策略（宿主侧；loop 只提供 pending 机制，策略在此）。
+pub mod approval;
+
 /// trust fence（阶段4）：判定请求 Host 头是否为 loopback 权威
 /// （对齐前端 `isLoopbackHostname`：localhost / `[::1]` / 127/8）。
 fn host_is_loopback(request: &tiny_http::Request) -> bool {
@@ -2373,6 +2376,9 @@ pub fn assemble_server_loop(
         }],
     };
     let host = dsh_agent_loop::AgentLoopHost::with_store(config, llm, tools.clone(), session_store)?;
+    // D-106：宿主 tool_exec 工厂——approval 策略包装（plan-active 时 mutation 走审批
+    // pending 门；连 driver 事实）。须在 ensure_agent（懒创建）之前设置；未设 = 直通。
+    host.set_tool_exec_factory(Some(crate::web::approval::approval_tool_exec_factory()));
     // M6 step9（D-088）：宿主 pre-execute 钩子——把「记录 + 放行」钩子接上共享
     // `default` 会话（dsh-tools pre-decision 缝延伸；`hookInvoked` 事件记录 vs TS
     // `HookInvoked` 对齐；放行保持既有语义）。
@@ -2767,7 +2773,9 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
                     })
                     .unwrap_or_default();
                 return match crate::run_rust_loop(boot, &sid, &text) {
-                    Ok(()) => serde_json::json!({"ok": true, "value": {"accepted": true}}),
+                    Ok(approval_pending) => {
+                        serde_json::json!({"ok": true, "value": {"accepted": true, "approvalPending": approval_pending}})
+                    }
                     Err(e) => serde_json::json!({"ok": false, "error": {
                         "code": "internal",
                         "message": e.to_string(),
@@ -3337,6 +3345,37 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
         "subagent.list" | "subagent.history" | "subagent.prompt" | "subagent.interrupt" => {
             subagent_dispatch(boot, method, payload, host)
         }
+        // D-106：执行层审批决定——写 `approval/decided` + 裸踢恢复（GUI 弹窗回执）。
+        "session.approval.decide" => {
+            let call_id = payload
+                .get("toolCallId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let decision = payload
+                .get("decision")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if call_id.is_empty()
+                || (decision != crate::web::approval::DECISION_ALLOWED_ONCE
+                    && decision != crate::web::approval::DECISION_REJECTED)
+            {
+                return serde_json::json!({"ok": false, "error": {
+                    "code": "invalid-args",
+                    "message": "session.approval.decide requires toolCallId + decision (allowedOnce|rejected)",
+                }});
+            }
+            match crate::web::approval::decide(boot, &call_id, &decision) {
+                Ok(remaining) => serde_json::json!({"ok": true, "value": {
+                    "resumed": true, "approvalPending": remaining,
+                }}),
+                Err(e) => serde_json::json!({"ok": false, "error": {
+                    "code": "internal",
+                    "message": e,
+                }}),
+            }
+        }
         "commands/list" => {
             serde_json::json!({"ok": true, "value": [
                 {"name": "compact", "description": "压缩当前会话上下文"},
@@ -3362,7 +3401,7 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
                     .unwrap_or("")
                     .to_string();
                 return match crate::run_rust_loop(boot, "default", &text) {
-                    Ok(()) => serde_json::json!({"ok": true, "value": {"accepted": true}}),
+                    Ok(approval_pending) => serde_json::json!({"ok": true, "value": {"accepted": true, "approvalPending": approval_pending}}),
                     Err(e) => serde_json::json!({"ok": false, "error": {
                         "code": "internal",
                         "message": e.to_string(),

@@ -145,3 +145,20 @@ pub fn create_loop_agent(
     let deps = build_loop_deps(&agent, prompt, llm, tools, max_parallel_tool_calls);
     ReactLoopAgent::new(agent, registry, deps)
 }
+
+/// D-106：装配真实 deps 但**覆盖 tool_exec** 为宿主注入的实现（approval 策略
+/// 包装等）。宿主工厂（`AgentLoopHost::set_tool_exec_factory`）按 driver 事实产出的
+/// tool_exec 经此落位；其余 deps 与 `create_loop_agent` 一致。
+pub fn create_loop_agent_with_tool_exec(
+    agent: Rc<Agent>,
+    registry: Rc<AgentRegistry>,
+    prompt: Rc<SystemPrompt>,
+    llm: Rc<LlmRuntime>,
+    tools: Rc<ToolRegistry>,
+    max_parallel_tool_calls: usize,
+    tool_exec: Rc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome>,
+) -> Rc<ReactLoopAgent> {
+    let mut deps = build_loop_deps(&agent, prompt, llm, tools, max_parallel_tool_calls);
+    deps.tool_exec = tool_exec;
+    ReactLoopAgent::new(agent, registry, deps)
+}

@@ -4728,6 +4728,35 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
   独立全量，见 segA-regression.txt）；live 复验推迟到 D 段（live 需 host 接线后才改观）。
 - 回滚：`git revert` 段 A 提交（含 types/ToolExecCtx/Outcome/driver/helpers/tests）。
 
+### D-106 段 B 实施（执行层审批策略：宿主 ApprovalGate 缝 + decide RPC，round 2；TDD 红→绿）
+
+- 触发：段 A（loop pending 机制）提交 `5b22bd6`；策略段 B（web 宿主）。
+- 自下而上核证：`AgentLoopHost` deps 在装配期定死（driver 私有）→ loop 无 post-hoc
+  换 tool_exec 缝 → 加**宿主注入缝**：`ToolExecFactory`（按 driver 事实产 tool_exec，
+  须在 ensure_agent 懒创建前设；未设 = service 直通，行为逐位不变）。web 装配
+  `assemble_server_loop` 在 with_store 后设 factory。dsh_plan::fold_plan_mode 直接
+  折叠**该 driver 自己的会话事件**（driver 即会话绑定，无需 agent→session 映射）。
+- 实现（dsh-agent-loop + dsh-cli）：
+  - loop：`host.rs` 增 `ToolExecFactory` 类型 + `tool_exec_factory` 字段 +
+    `set_tool_exec_factory` + ensure_agent 分支（有工厂 → `create_loop_agent_with_tool_exec`）；
+    `service.rs` 增该构造（其余 deps 同直通）。
+  - web `src/web/approval.rs`：`approval_tool_exec_factory`（plan 非激活 → 直通；
+    plan active ∧ mutation(D-b 清单) → `emit_pending_calls` + `approval/asked` + pending；
+    resume：`fold_decided` allowedOnce → 只追 result；rejected → `append_pending_rejection`
+    (`TOOL_REJECTED`)；未决（防御）→ 重发 asked + 再停留）。`decide()`：写
+    `approval/decided` + `host.kick`（不伪造批准，无决策拒绝/停留）。
+  - `run_rust_loop` 返回面：`Ok(Vec<String>)`（仍待审批调用 id）；agent.turn /
+    session.prompt RPC 回 `{"accepted":true,"approvalPending":[...]}` 弹窗载体。
+  - RPC `session.approval.decide {toolCallId, decision: allowedOnce|rejected}`。
+- 硬纪律：read 系 + plan 非激活全直通（与既有行为逐位一致）；key 永不落盘。
+- 测试（TDD）：mutation 清单覆盖 D-b + read 豁免；plan 非激活直通（无 pending 无
+  asked）；plan active mutation → pending+asked+不执行、read 仍直通执行；
+  resume allowedOnce → 只追 result 不重 call；resume rejected → 合成 `TOOL_REJECTED`
+  错误 result 不执行。（红先绿后全绿，5 tests。）
+- 验证：dsh-agent-loop + dsh-cli clippy `-D warnings` 零；全 workspace 回归
+  （segB-regression.txt）；live 复验推迟到 D 段。
+- 回滚：`git revert` 段 B 提交（loop 缝 + approval.rs + RPC + 返回面 + tests）。
+
 ### D-104 实施补记预留
 
 

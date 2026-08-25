@@ -23,15 +23,28 @@ use dsh_llm::{LlmRuntime, Message};
 use dsh_scope::{bind_scope_parent, ScopeKey, ScopeParentBinding};
 use dsh_session::store::SessionStore;
 use dsh_session::types::{CreateSessionOptions, SessionId};
+use dsh_session::Session;
 use dsh_system_prompt::{
     AssembleContext, Config as PromptConfig, SystemPrompt, ToolProvider, ToolProviderResult,
 };
 use dsh_tools::ToolRegistry;
 
+use crate::agent::{ToolExecCtx, ToolExecOutcome};
 use crate::constants::CONFIGURED_AGENT_IDENTITIES_KEY;
-use crate::service::create_loop_agent;
+use crate::service::{create_loop_agent, create_loop_agent_with_tool_exec};
 use crate::settings::resolve_max_parallel_tool_calls;
 use crate::ReactLoopAgent;
+
+/// D-106：宿主「工具执行工厂」缝——按每个 driver 绑定事实（session/tools/scope/agent/
+/// max_parallel）产出一个 `tool_exec` 实现。缺省 `None` → `service` 直通路径
+/// （永不暂停审批）。宿主（web）注入 approval 策略包装即经此缝。
+pub type ToolExecFactory = dyn Fn(
+    Rc<Session>,
+    Rc<ToolRegistry>,
+    Option<ScopeKey>,
+    Option<String>,
+    usize,
+) -> Rc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome>;
 
 /// 组合配置形态的 agent 身份（对齐 `AgentLoop.Config.agents` 条）。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -152,6 +165,8 @@ pub struct AgentLoopHost {
     /// P4：每 agent 的 standing 父绑定（agent scope → preset standing scope）。
     /// select 回调 join/rebind；随 agent 生命周期（host 持有）。
     joins: RefCell<HashMap<String, ScopeParentBinding>>,
+    /// D-106：宿主工具执行工厂（approval 策略包装注入缝；须在 `ensure_agent` 之前设）。
+    tool_exec_factory: RefCell<Option<Rc<ToolExecFactory>>>,
 }
 
 impl AgentLoopHost {
@@ -205,7 +220,14 @@ impl AgentLoopHost {
             runtime_agents: RefCell::new(Vec::new()),
             disposers: RefCell::new(Vec::new()),
             joins: RefCell::new(HashMap::new()),
+            tool_exec_factory: RefCell::new(None),
         }))
+    }
+
+    /// D-106：设置（或清除）宿主工具执行工厂。必须在该工厂要覆盖的 agent 被
+    /// `ensure_agent` 创建**之前**调用（agents 懒创建）。
+    pub fn set_tool_exec_factory(&self, factory: Option<Rc<ToolExecFactory>>) {
+        *self.tool_exec_factory.borrow_mut() = factory;
     }
 
     /// 当前配置身份列表（`CONFIGURED_AGENT_IDENTITIES_KEY` 的宿主侧值）。
@@ -307,14 +329,36 @@ impl AgentLoopHost {
         );
 
         let max_parallel = self.config.resolved_max_parallel_tool_calls()? as usize;
-        let driver = create_loop_agent(
-            agent.clone(),
-            self.registry.clone(),
-            self.prompt.clone(),
-            self.llm.clone(),
-            self.tools.clone(),
-            max_parallel,
-        );
+        let driver = match self.tool_exec_factory.borrow().clone() {
+            Some(factory) => {
+                // D-106：宿主注入工具执行工厂（approval 策略等）——按 driver 事实产
+                // 出 tool_exec 覆盖 service 直通路径。
+                let tool_exec = factory(
+                    agent.session.clone(),
+                    self.tools.clone(),
+                    Some(agent.scope.clone()),
+                    Some(agent.id.raw().to_string()),
+                    max_parallel,
+                );
+                create_loop_agent_with_tool_exec(
+                    agent.clone(),
+                    self.registry.clone(),
+                    self.prompt.clone(),
+                    self.llm.clone(),
+                    self.tools.clone(),
+                    max_parallel,
+                    tool_exec,
+                )
+            }
+            None => create_loop_agent(
+                agent.clone(),
+                self.registry.clone(),
+                self.prompt.clone(),
+                self.llm.clone(),
+                self.tools.clone(),
+                max_parallel,
+            ),
+        };
         let id = configured.id.clone();
         self.agents.borrow_mut().insert(id, driver.clone());
         Ok(driver)

@@ -23,11 +23,11 @@ pub use build_request::{build_request, request_proposal, BuiltRequest};
 pub use constants::*;
 pub use host::{
     AgentLoopConfig, AgentLoopHost, ConfiguredAgent, ConfiguredAgentIdentity,
-    validate_configured_agents,
+    ToolExecFactory, validate_configured_agents,
 };
 pub use invariant::{check_loop_request, AgentLoopRequest};
 pub use runtime_context::{RuntimeContextProjection, CLEARED as RUNTIME_CONTEXT_CLEARED};
-pub use service::{build_loop_deps, create_loop_agent};
+pub use service::{build_loop_deps, create_loop_agent, create_loop_agent_with_tool_exec};
 pub use settings::{validate_max_parallel_tool_calls, validate_max_tokens, AgentLoopSettings};
 pub use tool_calls::{
     append_pending_rejection, emit_pending_calls, execute_tool_calls, CODE_TOOL_REJECTED,
