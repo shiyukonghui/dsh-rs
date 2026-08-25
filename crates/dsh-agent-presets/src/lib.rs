@@ -18,6 +18,10 @@ pub mod metadata;
 /// P2-a：组合的**类型化**解析 + `disabled_expr` 行分类（standing mount 的行审计核心）。
 pub mod parse;
 
+/// L3（D-105 compaction 档位 3）：`dsh-compaction-tool-result-pruner` 的**接口预留**
+/// （契约定型、行为未实现）。
+pub mod compaction;
+
 use std::path::PathBuf;
 
 /// 组合文件名（容器目录内唯一入口）。
