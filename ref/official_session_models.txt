@@ -1,2 +1,0 @@
-===== session.models =====
-{"type":"server-response","rpcId":"r2","result":{"ok":false,"error":{"code":"bad-request","message":"invalid payload for session.models","details":{"issues":[{"expected":"string","code":"invalid_type","path":["sessionId"],"message":"Invalid input: expected string, received undefined"}]}}}}

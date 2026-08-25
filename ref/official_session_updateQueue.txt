@@ -1,2 +1,0 @@
-===== session.updateQueue =====
-{"type":"server-response","rpcId":"r18","result":{"ok":false,"error":{"code":"bad-request","message":"invalid payload for session.updateQueue","details":{"issues":[{"expected":"string","code":"invalid_type","path":["sessionId"],"message":"Invalid input: expected string, received undefined"},{"expected":"string","code":"invalid_type","path":["itemId"],"message":"Invalid input: expected string, received undefined"},{"code":"invalid_type","expected":"object","path":["action"],"message":"Invalid input: expected object, received undefined"}]}}}}

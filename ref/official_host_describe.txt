@@ -1,2 +1,0 @@
-===== host.describe =====
-{"type":"server-response","rpcId":"r0","result":{"ok":true,"value":{"version":"0.0.1","cwd":"D:\\Program Files\\DeepSeek Harness\\resources\\host","provider":"yjy","model":"deepseek-v4-flash-0731-ext","attachedSessions":0,"canOpenPath":true}}}

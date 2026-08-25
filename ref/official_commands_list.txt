@@ -1,2 +1,0 @@
-===== commands.list =====
-<error: HTTP Error 404: Not Found>

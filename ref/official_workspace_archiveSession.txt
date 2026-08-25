@@ -1,2 +1,0 @@
-===== workspace.archiveSession =====
-{"type":"server-response","rpcId":"r19","result":{"ok":false,"error":{"code":"bad-request","message":"invalid payload for workspace.archiveSession","details":{"issues":[{"expected":"string","code":"invalid_type","path":["sessionId"],"message":"Invalid input: expected string, received undefined"}]}}}}
