@@ -4464,7 +4464,8 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
   全绿、dsh-cli lib 180/180、八 crate 全回归 **644/644** 绿；clippy `-D warnings`
   零；live 60165 **四真实预设 select 全 OK**（WASM 面门控 = native 门控，零回归）。
   回滚：`git revert` K4 提交。
-- **已接/下一**：K1..K4 全齐 → 整理 **C 段测试报告**（瀑布流阶段关闸工件），并呈
+- **已接/下一**：K1..K4 全齐 → **C 段测试报告已交付**（`TEST_REPORT-BC-segments.md`，
+  瀑布流关闸工件：交付范围/验收证据/644 全回归/live 复验/诚实边界/遗留决策），并呈
   「shipped preset 未桥行 → disabled:true vs 保持 guard 降级」给用户定夺。live term-33。
 
 ### D-104 实施补记预留
