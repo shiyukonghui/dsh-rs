@@ -145,10 +145,11 @@
   L3 `3be1551`、+ L1 执行器/折叠接线（round 29 提交）（各自回滚点）。
 - 全回归基线：**655/655**（round 29 末）；clippy `-D warnings` 零；live（term-38，
   :60165）四真实预设 select 全 OK。
-- **剩余/待用户确认**：approval **execution-layer** 联动（指令层已随段注入；执行层
-  属宿主导线策略，并入 approval RPC 里程碑）；`enter_plan_mode` 宿主入口
-  （PlanModeHost.enter 已备，GUI/loop 状态源接法随联动物化）；多会话共享 standing 的
-  per-agent plan-mode 保真（另段，见 §8 caveat）。
+- **剩余/待用户确认**：（round 29 裁决已下）approval **execution-layer** 联动**用户选定
+  指令层优先、并入 approval RPC 里程碑**——L1 approval 联动以指令层收口（harness 正路，
+  随段注入）；`enter_plan_mode` 宿主入口（PlanModeHost.enter 已备）与 GUI/loop 状态源
+  随 approval 里程碑一并物化；多会话共享 standing 的 per-agent plan-mode 保真另段（§8
+  caveat）。
 - 诚实边界笔记：U1/U2 自下而上推翻了「subagent/ralph/ask-user 可桥」的预设（宿主无
   对应模型工具）；tool-skill 保持 A-03 只读 guard；broken-D-103（web/tool-cordis/
   command-compact）全程保持报错降级未改——与用户拍板一致。

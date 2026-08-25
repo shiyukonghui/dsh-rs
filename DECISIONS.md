@@ -4639,7 +4639,12 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
   策略并入 approval RPC 里程碑）。
 - 验收：standing 25/25、plan-mode 测试 3/3（折叠/前置逐点/执行器绑定）、八 crate
   **655/655**、clippy 零、live 60165 四真实预设 select OK。回滚：`git revert` L1-executor。
-- 下一：用户裁决 execution-layer 联动；TEST_REPORT §8 更新。
+- **approval 联动收口（round 29 用户裁决）**：**指令层优先，执行层并入 approval RPC
+  里程碑**——L1 approval 联动以指令层（预设文本如 harness 正路，随段注入）交付；
+  `enter_plan_mode` 宿主入口（PlanModeHost.enter 已备）与 GUI/loop 状态源随该里程碑
+  一并物化；多会话共享 standing 的 per-agent plan-mode 保真另段。
+- 下一：L1 收口（本段闭）；approval RPC 里程碑承接执行层联动 + enter 宿主入口 + 多
+  会话 plan-mode 保真；TEST_REPORT §10 已落裁决。
 
 ### D-104 实施补记预留
 
