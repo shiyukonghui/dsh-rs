@@ -27,6 +27,10 @@ pub struct CompositionRow {
     pub config: Option<Value>,
     /// `disabled_expr`（`!js` 译文）；平台门控表达式。
     pub disabled_expr: Option<String>,
+    /// 静态 `disabled: true`（preset 作者显式禁用的行，如需宿主装对应 Bundle 的
+    /// 可选 provider 行）。U2/D-105：与 `disabled_expr` 同等判禁（若忽略会被误报为
+    /// 「未桥」守卫行）。
+    pub disabled: bool,
     /// 组行递归子行。
     pub children: Vec<CompositionRow>,
 }
@@ -61,6 +65,7 @@ fn parse_row(value: &Value) -> Result<CompositionRow, String> {
     let disabled_expr = get("disabled_expr")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let disabled = get("disabled").and_then(Value::as_bool).unwrap_or(false);
     let children = if group {
         parse_rows(&config.clone().unwrap_or(Value::Null))?
     } else {
@@ -72,6 +77,7 @@ fn parse_row(value: &Value) -> Result<CompositionRow, String> {
         group,
         config,
         disabled_expr,
+        disabled,
         children,
     })
 }
@@ -113,6 +119,10 @@ pub fn row_disabled_with(
     process: &Value,
     eval: &dyn Fn(&Value, &str) -> Result<Value, String>,
 ) -> bool {
+    if row.disabled {
+        // 静态 `disabled: true`（U2/D-105）：作者显式禁用，无条件判禁（无需求值）。
+        return true;
+    }
     let Some(expr) = &row.disabled_expr else {
         return false;
     };
@@ -186,6 +196,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// U2（D-105）：honor 静态 `disabled: true`（preset 作者显式禁用的行，如
+    /// subagent codex/claude-code 需宿主装对应 Bundle）——与 `disabled_expr` 一样判禁，
+    /// 而**不**走挂载守卫（否则会误报为「未桥」）。TDD 红→绿。
+    #[test]
+    fn static_disabled_flag_disables_row_without_expr() {
+        let rows = parse_composition(
+            "- id: a\n  name: '@deepseek-ai/dsh-tool-bash'\n  disabled: true\n- id: b\n  name: '@deepseek-ai/dsh-tool-subagent'\n  config:\n    provider: spawn\n",
+        )
+        .unwrap();
+        let (a, b) = (&rows[0], &rows[1]);
+        assert!(a.disabled, "static disabled parsed");
+        assert!(!b.disabled, "no static disabled");
+        assert!(
+            row_disabled(a, &facade(LINUX)),
+            "static-disabled row is disabled"
+        );
+        assert!(
+            !row_disabled(b, &facade(LINUX)),
+            "plain row stays active"
+        );
+        assert_eq!(row_state(a, &facade(LINUX)), RowState::Disabled);
     }
 
     /// win32 门控在 win32 facade 下：bash 系禁用、pwsh 系生效、`cwd` 的 `__jsExpr`

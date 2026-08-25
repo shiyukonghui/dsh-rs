@@ -625,6 +625,10 @@ fn host_tool_for_row(row: &CompositionRow) -> Option<&'static str> {
         "@deepseek-ai/dsh-tool-pwsh-persistent" => Some("pwsh"),
         "@deepseek-ai/dsh-tool-str-replace-editor" => Some("str_replace_editor"),
         "@deepseek-ai/dsh-tool-todo" => Some("todo_write"),
+        // U2（D-105）：dsh-tool-workflow → 宿主已注册的 M4 `workflow`（恒注册；执行
+        // 为 UNSUPPORTED_OPTION 桩 → fail-loud。工具在目录中可见、调用即诚实报错，
+        // 故为桥非守卫——守卫的「no bridge」说法反而不实）。
+        "@deepseek-ai/dsh-tool-workflow" => Some("workflow"),
         _ => None,
     }
 }
@@ -676,6 +680,26 @@ fn tool_guard_reason(row: &CompositionRow) -> String {
         // dsh-session-query goal_projection），**没有**注册为 agent 可调用工具；预设注释
         // 亦声明「model-facing tool，service 在 host 面」——故不桥，诚实 guard。
         "host goal is an RPC/session-projection surface, not an agent tool in this build (U1)"
+            .to_string()
+    } else if n.contains("subagent") {
+        // U2/D-105 自下而上核对：dsh-subagent + subagent_runtime + 会话 subagent 投影 +
+        // jobs kind "subagent" 都在，但**没有**注册为 agent 可调用模型工具（模型无法
+        // 发 subagent 调用）——故不桥，诚实 guard。
+        if n.contains("control") {
+            "subagent control surfaces are internal RPC/projections, not agent-callable tools in this build (U2)"
+                .to_string()
+        } else {
+            "host exposes subagent delegation via an internal runtime/RPC (dsh-subagent + subagent_runtime + session projections); no agent-callable tool in this build (U2)"
+                .to_string()
+        }
+    } else if n == "@deepseek-ai/dsh-workflow-worker-thread" {
+        // U2/D-105：M4 workflow 是桩（UNSUPPORTED_OPTION），无 worker-thread 后端。
+        "host workflow is the registered M4 stub (UNSUPPORTED_OPTION); no worker-thread backend in this build (U2)"
+            .to_string()
+    } else if n.contains("ralph") {
+        "no host ralph loop tool in this build (U2)".to_string()
+    } else if n.contains("ask-user") {
+        "host ask-user is a UI/approval RPC, not an agent-callable tool in this build (U2)"
             .to_string()
     } else {
         "no Rust bridge yet (P3/P5)".to_string()
@@ -1189,6 +1213,8 @@ mod tests {
             "job_output",
             "job_list",
             "job_kill",
+            // U2（D-105）：M4 workflow 恒注册（桩 → UNSUPPORTED_OPTION）。
+            "workflow",
         ] {
             tools.register_global(tool_def(name, name, 1000.0)).unwrap();
         }
@@ -1331,6 +1357,131 @@ mod tests {
                 assert!(
                     r.guarded.iter().any(|(n, _)| n == want),
                     "{id}: {want} honestly guarded: {:?}",
+                    r.guarded
+                );
+            }
+        }
+    }
+
+    /// —— U2（D-105）—— 下伸面：subagent 家 / workflow-worker-thread / ralph /
+    /// ask-user 宿主**无对应模型工具**（dsh-subagent 是内部运行时/RPC + 会话投影，
+    /// 非 agent 可调用工具；M4 workflow 是桩）→ 全部诚实 guard（专用原因，非泛化
+    /// "no Rust bridge yet"）；`dsh-tool-workflow` → 单工具桥到宿主已注册 `workflow`
+    /// （M4 桩 → 执行 fail-loud UNSUPPORTED_OPTION，注册即见）。TDD 红→绿。
+    #[test]
+    fn delegation_rows_guard_specifically_workflow_bridges() {
+        let sp = new_sp();
+        let mut reg = StandingRegistry::new(sp.clone(), Some(realistic_tools()));
+        let comp = "
+- id: wf
+  name: '@deepseek-ai/dsh-tool-workflow'
+- id: wfwt
+  name: '@deepseek-ai/dsh-workflow-worker-thread'
+- id: sub
+  name: '@deepseek-ai/dsh-tool-subagent'
+- id: subc
+  name: '@deepseek-ai/dsh-tool-subagent-control'
+- id: subl
+  name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+- id: ral
+  name: '@deepseek-ai/dsh-tool-ralph'
+- id: ask
+  name: '@deepseek-ai/dsh-tool-ask-user'
+- id: web
+  name: '@deepseek-ai/dsh-tool-web'
+";
+        let rows = dsh_agent_presets::parse::parse_composition(comp).unwrap();
+        reg.mount("u2", &rows, &win32_facade()).unwrap();
+        let r = reg.report("u2").unwrap();
+        assert!(
+            r.bridged
+                .iter()
+                .any(|s| s.starts_with("@deepseek-ai/dsh-tool-workflow")),
+            "workflow row bridged to host workflow: {:?}",
+            r.bridged
+        );
+        let guarded_of = |n: &str| {
+            r.guarded
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, w)| w.as_str())
+                .unwrap_or("<not guarded>")
+        };
+        assert!(
+            guarded_of("@deepseek-ai/dsh-tool-subagent").contains("internal runtime"),
+            "subagent guarded: {}",
+            guarded_of("@deepseek-ai/dsh-tool-subagent")
+        );
+        assert!(
+            guarded_of("@deepseek-ai/dsh-tool-subagent-control").contains("control"),
+            "subagent-control guarded: {}",
+            guarded_of("@deepseek-ai/dsh-tool-subagent-control")
+        );
+        assert!(
+            guarded_of("@deepseek-ai/dsh-tool-subagent-control/list-agents").contains("control"),
+            "list-agents guarded: {}",
+            guarded_of("@deepseek-ai/dsh-tool-subagent-control/list-agents")
+        );
+        assert!(
+            guarded_of("@deepseek-ai/dsh-workflow-worker-thread").contains("worker-thread"),
+            "workflow-worker-thread guarded: {}",
+            guarded_of("@deepseek-ai/dsh-workflow-worker-thread")
+        );
+        assert!(
+            guarded_of("@deepseek-ai/dsh-tool-ralph").contains("ralph"),
+            "ralph guarded: {}",
+            guarded_of("@deepseek-ai/dsh-tool-ralph")
+        );
+        assert!(
+            guarded_of("@deepseek-ai/dsh-tool-ask-user").contains("ask-user"),
+            "ask-user guarded: {}",
+            guarded_of("@deepseek-ai/dsh-tool-ask-user")
+        );
+        assert!(
+            guarded_of("@deepseek-ai/dsh-tool-web").contains("broken per D-103"),
+            "web stays broken-D-103 (unchanged): {}",
+            guarded_of("@deepseek-ai/dsh-tool-web")
+        );
+        assert!(
+            r.unusable_rows().is_empty(),
+            "none of these are stuck: {:?}",
+            r.unusable_rows()
+        );
+    }
+
+    /// U2 在真实 shipped 预设上的呈现：静态 `disabled: true`（subagent codex/
+    /// claude-code）→ disabled（不进守卫）；workflow 行 → bridged；subagent 家 /
+    /// workflow-worker-thread / ralph / ask-user → 诚实 guard（专用原因）。
+    #[test]
+    fn real_presets_present_delegation_rows_static_disabled_and_specific_guard() {
+        let sp = new_sp();
+        let root = repo_root().join("resources").join("agent-presets");
+        for id in ["standard", "code", "cordis"] {
+            let mut reg = StandingRegistry::new(sp.clone(), Some(realistic_tools()));
+            reg.mount_at(id, &preset_rows(id), Some(&root.join(id)), &win32_facade())
+                .unwrap_or_else(|e| panic!("{id}: mount failed: {e}"));
+            let r = reg.report(id).unwrap();
+            assert!(
+                r.disabled.iter().any(|n| n == "@deepseek-ai/dsh-tool-subagent"),
+                "{id}: static-disabled subagent (codex/claude-code) held in disabled: {:?}",
+                r.disabled
+            );
+            assert!(
+                r.bridged.iter().any(|s| s.starts_with("@deepseek-ai/dsh-tool-workflow")),
+                "{id}: workflow row bridged: {:?}",
+                r.bridged
+            );
+            for want in [
+                "@deepseek-ai/dsh-tool-subagent-control",
+                "@deepseek-ai/dsh-tool-subagent-control/list-agents",
+                "@deepseek-ai/dsh-tool-subagent",
+                "@deepseek-ai/dsh-workflow-worker-thread",
+                "@deepseek-ai/dsh-tool-ralph",
+                "@deepseek-ai/dsh-tool-ask-user",
+            ] {
+                assert!(
+                    r.guarded.iter().any(|(n, _)| n == want),
+                    "{id}: {want} must stay honestly guarded: {:?}",
                     r.guarded
                 );
             }

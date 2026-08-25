@@ -4510,6 +4510,32 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
 - 下一：U2（subagent 家 / workflow / ralph / ask-user）→ U3（tool-skill 等保持 guard
   原因收口 + 安全网）→ L1（plan-mode C 档）。
 
+### D-105 实施补记（U2：下伸面 honest 呈现 + 静态 `disabled: true` 保真，round 27；TDD 红→绿）
+
+- 触发：D-105 决策 1 的 U2（subagent 家 / workflow / ralph / ask-user）。
+- 自下而上核对（dsh-tools/m4.rs 全清单 + web 注册面）：**没有** subagent / ralph /
+  ask-user 的模型工具定义与注册；subagent 仅存在于内部运行时（dsh-subagent crate +
+  subagent_runtime.rs + 会话 subagent 投影 + jobs kind "subagent"）——模型**无法**发
+  subagent 调用；M4 `workflow` 恒注册但为**桩**（执行 → UNSUPPORTED_OPTION）。
+  自上而下说「桥接这些行」，自下而上说「宿主没有可调用工具」——第一性原理裁决：
+  不为「快」伪造桥，诚实 guard；不把「工具在目录、调用 fail-loud」说成「未桥」。
+- 决策/实现：
+  - `dsh-tool-workflow` → **桥**到宿主 `workflow`（M4 恒注册；注册即见、执行 fail-loud
+    UNSUPPORTED_OPTION；guard 的「no bridge」说法反而不实）；
+  - `dsh-tool-subagent-control` / `.../list-agents` / `dsh-tool-subagent` →
+    **诚实 guard**（专用原因：内部运行时/RPC 非 agent 可调用工具）；
+  - `dsh-workflow-worker-thread` → guard（M4 桩、无 worker-thread 后端）；
+  - `dsh-tool-ralph` / `dsh-tool-ask-user` → guard（无宿主工具）；
+  - **parse 保真修复（U2 附带）**：honor 静态 `disabled: true`——preset 作者显式禁用的
+    行（subagent codex/claude-code，需宿主装对应 Bundle）此前被解析成活化→守卫（误报
+    「未桥」）；现与 `disabled_expr` 同等判禁（进 disabled 不进守卫）。`CompositionRow`
+    增 `disabled: bool`，`row_disabled_with` 静态短路径。
+- 验收：dsh-agent-presets 19/19（+1 静态禁用）、standing 23/23（+2：synthetic 五行 +
+    真实 3 预设呈现）、八 crate 全回归 **649/649**（m20 WASM/native 一致性不受影响）、
+    clippy `-D warnings` 零、live 60165 四真实预设 select 全 OK（零回归）。
+  回滚：`git revert` U2 提交。
+- 下一：U3（tool-skill 等保持 guard 原因收口 + 安全网测试）→ L1（plan-mode C 档）。
+
 ### D-104 实施补记预留
 
 
