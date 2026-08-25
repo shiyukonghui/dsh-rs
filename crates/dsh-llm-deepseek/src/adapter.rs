@@ -7,7 +7,7 @@
 //! thunk（连接事实 + 荷载源在每次操作时解析）。wire 序列化、SSE 行解析、
 //! translate 全在本 crate 单测覆盖，标称 goldens 供差分验证。
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_llm::types::{
     GenerateOptions, LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo,
@@ -65,12 +65,12 @@ pub struct DeepSeekConnection {
 /// transport thunk 的稳定类型：给定已解析连接事实 + wire 请求 + 原始选项，
 /// 产出 SSE `data:` payloads（或失败）。
 pub type PayloadsResolver =
-    Rc<dyn Fn(&DeepSeekConnection, &WireRequest, &GenerateOptions) -> Result<Vec<String>, LlmError>>;
+    Arc<dyn Fn(&DeepSeekConnection, &WireRequest, &GenerateOptions) -> Result<Vec<String>, LlmError> + Send + Sync>;
 
 /// 适配器构造选项：插件拥有的操作本地 resolve 钩子。
 pub struct DeepSeekAdapterOptions {
     /// 当前验证的连接事实；每次操作调用一次。
-    pub resolve_connection: Rc<dyn Fn() -> DeepSeekConnection>,
+    pub resolve_connection: Arc<dyn Fn() -> DeepSeekConnection + Send + Sync>,
     /// 解析一次操作的 SSE data payload 序列（transport thunk）。
     /// 服务层线程桥（M1e）在桥内执行真实 HTTP + SSE 字节 → payloads。
     pub resolve_payloads: PayloadsResolver,
@@ -318,8 +318,8 @@ mod tests {
 
     pub use crate::adapter::PayloadsResolver;
     fn adapter_with_payload(payloads: Vec<String>) -> DeepSeekAdapter {
-        let connection: Rc<dyn Fn() -> DeepSeekConnection> = Rc::new(connection);
-        let resolve: PayloadsResolver = Rc::new(move |_conn, _req, _ops| Ok(payloads.clone()));
+        let connection: Arc<dyn Fn() -> DeepSeekConnection + Send + Sync> = Arc::new(connection);
+        let resolve: PayloadsResolver = Arc::new(move |_conn, _req, _ops| Ok(payloads.clone()));
         DeepSeekAdapter::new(DeepSeekAdapterOptions {
             resolve_connection: connection,
             resolve_payloads: resolve,
@@ -440,8 +440,8 @@ mod tests {
             }],
             ..connection()
         };
-        let conn: Rc<dyn Fn() -> DeepSeekConnection> = Rc::new(move || connection.clone());
-        let resolve: PayloadsResolver = Rc::new(|_c, _r, _o| Ok(vec![]));
+        let conn: Arc<dyn Fn() -> DeepSeekConnection + Send + Sync> = Arc::new(move || connection.clone());
+        let resolve: PayloadsResolver = Arc::new(|_c, _r, _o| Ok(vec![]));
         let adapter = DeepSeekAdapter::new(DeepSeekAdapterOptions { resolve_connection: conn, resolve_payloads: resolve });
         let info = adapter.resolve_model("deepseek", "big");
         assert_eq!(info.context.unwrap().context_window, 64_000);

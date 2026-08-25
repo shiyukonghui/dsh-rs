@@ -10,7 +10,6 @@
 //! 硬纪律：不伪造批准来源（无 decided → 拒绝/停留，绝不冒充放行）；read 系工具与
 //! plan 非激活时的全部工具 → 直通（与既有行为逐位一致）。
 
-use std::rc::Rc;
 use std::sync::Arc;
 
 use dsh_agent_loop::{
@@ -54,14 +53,14 @@ fn is_mutation(name: &str) -> bool {
 /// 按每个 driver 绑定事实产出包装；与服务直通路径（`pending` 恒空）逐位一致，仅当
 /// 会话 plan 折叠 active 且调用为 mutation 时才走审批门。`wire`（Some）→ 挂起时把
 /// requested 帧投影到 wire 供 mux 下推（serve 装配注入；None = 纯记录）。
-pub fn approval_tool_exec_factory(wire: Option<ApprovalWireRef>) -> Rc<ToolExecFactory> {
-    Rc::new(move |session, tools, scope, agent, max_parallel| {
+pub fn approval_tool_exec_factory(wire: Option<ApprovalWireRef>) -> Arc<ToolExecFactory> {
+    Arc::new(move |session, tools, scope, agent, max_parallel| {
         let session = session.clone();
         let tools = tools.clone();
         let scope = scope.clone();
         let agent = agent.clone();
         let wire = wire.clone();
-        Rc::new(move |ctx: &ToolExecCtx| -> ToolExecOutcome {
+        Arc::new(move |ctx: &ToolExecCtx| -> ToolExecOutcome {
             approval_tool_exec(
                 &session,
                 &tools,
@@ -77,7 +76,7 @@ pub fn approval_tool_exec_factory(wire: Option<ApprovalWireRef>) -> Rc<ToolExecF
 
 fn approval_tool_exec(
     session: &Arc<Session>,
-    tools: &Rc<ToolRegistry>,
+    tools: &Arc<ToolRegistry>,
     scope: Option<&ScopeKey>,
     agent: Option<&str>,
     max_parallel: usize,
@@ -134,7 +133,7 @@ fn approval_tool_exec(
 /// 拒绝、未决（防御，decide 是先决）保持 pending 并重发 asked。
 fn resume_path(
     session: &Arc<Session>,
-    tools: &Rc<ToolRegistry>,
+    tools: &Arc<ToolRegistry>,
     scope: Option<&ScopeKey>,
     agent: Option<&str>,
     max_parallel: usize,
@@ -188,7 +187,7 @@ fn resume_path(
 #[allow(clippy::too_many_arguments)]
 fn run_calls(
     session: &Arc<Session>,
-    tools: &Rc<ToolRegistry>,
+    tools: &Arc<ToolRegistry>,
     scope: Option<&ScopeKey>,
     agent: Option<&str>,
     max_parallel: usize,
@@ -287,7 +286,7 @@ pub fn set_plan_mode_on(
         .unwrap_or_else(|| {
             boot.plan_session
                 .as_ref()
-                .map(|ps| ps.borrow().clone())
+                .map(|ps| ps.lock().unwrap().clone())
                 .unwrap_or_else(|| "default".to_string())
         });
     let host = boot
@@ -337,20 +336,20 @@ mod tests {
         .unwrap())
     }
 
-    fn registry() -> Rc<ToolRegistry> {
-        let r = Rc::new(ToolRegistry::new(ToolExecutionMode::Native));
+    fn registry() -> Arc<ToolRegistry> {
+        let r = Arc::new(ToolRegistry::new(ToolExecutionMode::Native));
         for name in ["bash", "read"] {
             let def = define_tool(DefineToolOptions {
                 name: name.to_string(),
                 description: format!("{name} a value"),
                 parameters: json!({}),
                 output_schema: json!({ "type": "json" }),
-                render: Rc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
-                execute: Rc::new(|_, _| Ok(json!({"ran": true}))),
+                render: Arc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
+                execute: Arc::new(|_, _| Ok(json!({"ran": true}))),
                 ..Default::default()
             })
             .unwrap();
-            r.register_global(Rc::new(def)).unwrap();
+            r.register_global(Arc::new(def)).unwrap();
         }
         r
     }

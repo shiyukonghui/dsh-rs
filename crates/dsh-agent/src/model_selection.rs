@@ -13,10 +13,8 @@
 //! D-030 记）。无 fallback/并发合并（loop 层职责，报告 A.3 model-selection 明示）。
 //!
 //! D-115：`sel: Rc<RefCell>` → `Arc<Mutex>`、bus 监听器 `Rc<dyn Fn>` → `Arc<dyn Fn +
-//! Send + Sync>`（worker 化前置）。dsh-system-prompt 一侧仍 `Rc<dyn Fn>`（不在 D-115
-//! 库存，Phase 3 预算外）——`register_assemble_listener` 保持 Rc，闭包内捕获 Arc 即可。
+//! Send + Sync>`（worker 化前置）。dsh-system-prompt 侧 listener 同转入 Arc（Phase 3）。
 
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use dsh_scope::ScopeKey;
@@ -38,16 +36,15 @@ fn upsert_variable(variables: &mut Vec<(String, Option<String>)>, name: &str, va
 /// 由驱动方（loop/lifecycle）维护读。
 #[allow(clippy::type_complexity)]
 pub fn install_model_selection(
-    sp: &Rc<SystemPrompt>,
+    sp: &SystemPrompt,
     bus: &AgentBus,
     scope: &ScopeKey,
     sel: Arc<Mutex<ModelSelectionRef>>,
 ) {
     // 1) prompt 组装侧（system-prompt assemble 水岭，scoped 到 agent）
-    //    注：dsh-system-prompt 的 listener 仍是 Rc<dyn Fn>（D-115 库存外）。
     let sel1 = sel.clone();
     let scope1 = scope.clone();
-    sp.register_assemble_listener(Some(scope1), false, Rc::new(
+    sp.register_assemble_listener(Some(scope1), false, Arc::new(
         move |assembly, _ctx, next| {
             // 进入时捕获 current（不理会链中变化）
             let selected = sel1.lock().unwrap().current.clone();

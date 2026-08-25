@@ -10,8 +10,6 @@
 #![allow(clippy::type_complexity)]
 #![allow(clippy::result_large_err)]
 
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use dsh_agent::{
@@ -135,18 +133,21 @@ pub struct ToolExecOutcome {
     pub pending: Vec<PendingCall>,
 }
 
-/// driver 依赖哑合（全部 Rc，构造即注入；M2e-3 由 AgentLoop 服务装配真实实现）。
+/// driver 依赖哑合（全部 Arc，构造即注入；M2e-3 由 AgentLoop 服务装配真实实现）。
+///
+/// D-115（请求面并发化）：`Rc<dyn Fn>` → `Arc<dyn Fn + Send + Sync>`——worker 化前置
+/// （worker 线程构建/持有 deps，Send+Sync 保证跨线程捕获安全）。
 pub struct LoopDeps {
     /// `systemPrompt.assemble(context)`：装配 system sections/contexts/tools。
-    pub assemble: Rc<dyn Fn(&AssembleContext) -> Result<PromptAssembly, String>>,
+    pub assemble: Arc<dyn Fn(&AssembleContext) -> Result<PromptAssembly, String> + Send + Sync>,
     /// `llm.prepareCall(config)`：路由解析/默认值。
-    pub prepare_call: Rc<dyn Fn(CallConfig) -> Result<PreparedLlmCall, LlmError>>,
+    pub prepare_call: Arc<dyn Fn(CallConfig) -> Result<PreparedLlmCall, LlmError> + Send + Sync>,
     /// `llm.stream(request)`：拖出原始 chunk（sync；finish error/aborted 在 chunk 内表达）。
-    pub stream: Rc<dyn Fn(&GenerateOptions) -> Result<Vec<StreamChunk>, LlmError>>,
+    pub stream: Arc<dyn Fn(&GenerateOptions) -> Result<Vec<StreamChunk>, LlmError> + Send + Sync>,
     /// runtime-context 投影（M2e-3 接 RuntimeContextProjection；缺省不写）。
-    pub project_context: Rc<dyn Fn(&PromptAssembly) -> Option<Message>>,
+    pub project_context: Arc<dyn Fn(&PromptAssembly) -> Option<Message> + Send + Sync>,
     /// 工具调用执行（M2e-3 接 executeToolCalls）。
-    pub tool_exec: Rc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome>,
+    pub tool_exec: Arc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome + Send + Sync>,
 }
 
 /// pre-step 决策（对齐 `PreparedStep`；assembly 在 driver 本地附着）。
@@ -189,9 +190,9 @@ pub struct ReactLoopAgent {
     pub registry: Arc<AgentRegistry>,
     pub deps: LoopDeps,
     dispatch: AgentEventDispatch,
-    propose: Rc<dyn Fn(CallConfig, u64, u64) -> Result<CallConfig, String>>,
-    phase: RefCell<Phase>,
-    request_header_logged: Cell<bool>,
+    propose: Arc<dyn Fn(CallConfig, u64, u64) -> Result<CallConfig, String> + Send + Sync>,
+    phase: Mutex<Phase>,
+    request_header_logged: std::sync::atomic::AtomicBool,
     /// D-115（请求面并发化）：**共享取消令牌**——Send+Sync 上下文（bus 监听器 / 未来
     /// worker 的 accept 线程）经 `cancel_token()` 写入取消请求，driver 在 turn/step
     /// 边界 `abort_reason()` 轮询消费。与既有 `cancel()`（直改 phase，宿主单线程
@@ -200,15 +201,15 @@ pub struct ReactLoopAgent {
     cancel_token: Arc<Mutex<Option<AgentCancelCause>>>,
     /// 审批暂停中的待决调用（D-106）。**agent 级（非 Phase 字段）**：越过
     /// pause→Idle 停驻存活；恢复 turn 由 step() 顶部消费并清空。
-    approval_pending: RefCell<Vec<PendingCall>>,
+    approval_pending: Mutex<Vec<PendingCall>>,
 }
 
 impl ReactLoopAgent {
-    pub fn new(agent: Arc<Agent>, registry: Arc<AgentRegistry>, deps: LoopDeps) -> Rc<Self> {
+    pub fn new(agent: Arc<Agent>, registry: Arc<AgentRegistry>, deps: LoopDeps) -> Arc<Self> {
         let dispatch = AgentEventDispatch::new(agent.ctx.bus().clone(), agent_carrier(&agent));
-        let propose: Rc<dyn Fn(CallConfig, u64, u64) -> Result<CallConfig, String>> = {            let dispatch = dispatch.clone();
+        let propose: Arc<dyn Fn(CallConfig, u64, u64) -> Result<CallConfig, String> + Send + Sync> = {            let dispatch = dispatch.clone();
             let agent = agent.clone();
-            Rc::new(move |seed: CallConfig, turn: u64, step: u64| -> Result<CallConfig, String> {
+            Arc::new(move |seed: CallConfig, turn: u64, step: u64| -> Result<CallConfig, String> {
                 let seed_json = serde_json::to_value(&seed).map_err(|e| e.to_string())?;
                 let innermost: NextFn = Arc::new(move |_p| seed_json.clone());
                 let d = dispatch.clone();
@@ -247,16 +248,16 @@ impl ReactLoopAgent {
             agent.set_inbox_notify(notify);
         }
         let last_turn = last_turn_of(&agent.session);
-        Rc::new(ReactLoopAgent {
+        Arc::new(ReactLoopAgent {
             agent,
             registry,
             deps,
             dispatch,
             propose,
-            phase: RefCell::new(Phase::Idle { last_turn }),
-            request_header_logged: Cell::new(false),
+            phase: Mutex::new(Phase::Idle { last_turn }),
+            request_header_logged: std::sync::atomic::AtomicBool::new(false),
             cancel_token: Arc::new(Mutex::new(None)),
-            approval_pending: RefCell::new(Vec::new()),
+            approval_pending: Mutex::new(Vec::new()),
         })
     }
 
@@ -269,7 +270,7 @@ impl ReactLoopAgent {
     }
 
     pub fn status(&self) -> AgentStatus {
-        match &*self.phase.borrow() {
+        match &*self.phase.lock().unwrap() {
             Phase::Idle { .. } | Phase::Maintenance { .. } => AgentStatus::Idle,
             Phase::Running { .. } => AgentStatus::Running,
         }
@@ -285,7 +286,7 @@ impl ReactLoopAgent {
             Phase::Idle { .. } | Phase::Maintenance { .. } => AgentStatus::Idle,
             Phase::Running { .. } => AgentStatus::Running,
         };
-        *self.phase.borrow_mut() = next;
+        *self.phase.lock().unwrap() = next;
         self.agent.set_status(now);
         if now != prev {
             let mut warns = Vec::new();
@@ -298,8 +299,8 @@ impl ReactLoopAgent {
 
     pub fn send(&self, message: Message, target: InboxTarget, wakeup: bool) -> Result<(), String> {
         let waking_after_abort = wakeup
-            && !matches!(*self.phase.borrow(), Phase::Idle { .. })
-            && self.phase.borrow().abort_reason().is_some();
+            && !matches!(*self.phase.lock().unwrap(), Phase::Idle { .. })
+            && self.phase.lock().unwrap().abort_reason().is_some();
         let resolved = if waking_after_abort {
             InboxTarget::NextTurn
         } else {
@@ -324,13 +325,13 @@ impl ReactLoopAgent {
     /// pending 调用（`approval_pending` 非空才有效；同步排空到 idle）。fail-loud：
     /// 无待决审批或 driver 非 Idle 均拒绝（不臆造恢复入口）。
     pub fn kick_resume(&self) -> Result<(), String> {
-        if self.approval_pending.borrow().is_empty() {
+        if self.approval_pending.lock().unwrap().is_empty() {
             return Err(format!(
                 "agent \"{}\": no pending approval to resume",
                 self.agent.id
             ));
         }
-        if !matches!(*self.phase.borrow(), Phase::Idle { .. }) {
+        if !matches!(*self.phase.lock().unwrap(), Phase::Idle { .. }) {
             return Err(format!(
                 "agent \"{}\": cannot resume while not idle",
                 self.agent.id
@@ -342,7 +343,7 @@ impl ReactLoopAgent {
 
     /// D-106：待决审批调用（只读，宿主 decide RPC 感知）。
     pub fn pending_calls(&self) -> Vec<PendingCall> {
-        self.approval_pending.borrow().clone()
+        self.approval_pending.lock().unwrap().clone()
     }
 
     pub fn steer(&self, input: Message) -> Result<(), String> {
@@ -356,8 +357,8 @@ impl ReactLoopAgent {
     pub fn cancel(&self, cause: AgentCancelCause, options: &CancelOptions) {
         if !options.keep_inbox.unwrap_or(false) {
             let _ = self.agent.inbox.clear();
-            if !matches!(*self.phase.borrow(), Phase::Idle { .. }) {
-                let mut ph = self.phase.borrow_mut();
+            if !matches!(*self.phase.lock().unwrap(), Phase::Idle { .. }) {
+                let mut ph = self.phase.lock().unwrap();
                 match &mut *ph {
                     Phase::Running { wake_requested, .. }
                     | Phase::Maintenance { wake_requested, .. } => {
@@ -367,8 +368,8 @@ impl ReactLoopAgent {
                 }
             }
         }
-        if !matches!(*self.phase.borrow(), Phase::Idle { .. }) {
-            let mut ph = self.phase.borrow_mut();
+        if !matches!(*self.phase.lock().unwrap(), Phase::Idle { .. }) {
+            let mut ph = self.phase.lock().unwrap();
             match &mut *ph {
                 Phase::Running { abort_reason, .. }
                 | Phase::Maintenance { abort_reason, .. } => {
@@ -393,14 +394,14 @@ impl ReactLoopAgent {
 
     /// sync：send/kick 返回前整个 driver 已排空（D-032；无并发等待）。
     pub fn when_idle(&self) {
-        let _ = &*self.phase.borrow();
+        let _ = &*self.phase.lock().unwrap();
     }
 
     pub fn run_maintenance<T>(&self, job: impl FnOnce() -> T) -> Result<T, String> {
-        if !matches!(*self.phase.borrow(), Phase::Idle { .. }) {
+        if !matches!(*self.phase.lock().unwrap(), Phase::Idle { .. }) {
             return Err(format!("agent \"{}\" already has active work", self.agent.id));
         }
-        let last_turn = self.phase.borrow().turn();
+        let last_turn = self.phase.lock().unwrap().turn();
         self.set_phase(Phase::Maintenance {
             last_turn,
             wake_requested: false,
@@ -408,7 +409,7 @@ impl ReactLoopAgent {
         });
         let result = job();
         let (idle_turn, rewake) = {
-            let mut ph = self.phase.borrow_mut();
+            let mut ph = self.phase.lock().unwrap();
             match &mut *ph {
                 Phase::Maintenance {
                     last_turn,
@@ -430,7 +431,7 @@ impl ReactLoopAgent {
 
     fn wake_driver(&self, wake_after_abort: bool) {
         {
-            let mut ph = self.phase.borrow_mut();
+            let mut ph = self.phase.lock().unwrap();
             match &mut *ph {
                 Phase::Running {
                     wake_requested,
@@ -459,7 +460,7 @@ impl ReactLoopAgent {
                 Phase::Idle { .. } => {}
             }
         }
-        let last_turn = match &*self.phase.borrow() {
+        let last_turn = match &*self.phase.lock().unwrap() {
             Phase::Idle { last_turn } => *last_turn,
             _ => unreachable!("non-idle handled above"),
         };
@@ -473,7 +474,7 @@ impl ReactLoopAgent {
             Ok(()) => {}
             Err(_) => {
                 // initiator 作用域已 disposed：关闭无主 running 相位（dispose 时 wake 不拉 latch）
-                let t = self.phase.borrow().turn();
+                let t = self.phase.lock().unwrap().turn();
                 self.set_phase(Phase::Idle { last_turn: t });
             }
         }
@@ -484,14 +485,14 @@ impl ReactLoopAgent {
         if let Some(c) = self.cancel_token.lock().unwrap().take() {
             return Some(c);
         }
-        self.phase.borrow().abort_reason()
+        self.phase.lock().unwrap().abort_reason()
     }
 
     fn kick(&self) {
         loop {
             while let Ok(true) = self.turn() {}
             let (idle_turn, rewake) = {
-                let mut ph = self.phase.borrow_mut();
+                let mut ph = self.phase.lock().unwrap();
                 match &mut *ph {
                     Phase::Running { turn, wake_requested, .. } => {
                         let r = *wake_requested && self.agent.inbox.has_pending();
@@ -517,7 +518,7 @@ impl ReactLoopAgent {
 
     fn emit_agent_error(&self, failure: LlmFailure) {
         let (turn, step) = {
-            let ph = self.phase.borrow();
+            let ph = self.phase.lock().unwrap();
             (ph.turn(), ph.step())
         };
         let mut warns = Vec::new();
@@ -547,7 +548,7 @@ impl ReactLoopAgent {
 
     /// 打开一个 turn 并驱动其步骤。Ok(true) = 换新相位继续下一 turn。
     fn turn(&self) -> Result<bool, Halt> {
-        let running = matches!(*self.phase.borrow(), Phase::Running { .. });
+        let running = matches!(*self.phase.lock().unwrap(), Phase::Running { .. });
         if !running {
             let f = unknown_failure(format!(
                 "agent \"{}\": turn without driver reservation",
@@ -560,7 +561,7 @@ impl ReactLoopAgent {
         if let Some(c) = self.abort_reason() {
             return Err(Halt::Aborted(c));
         }
-        let phase_turn = self.phase.borrow().turn();
+        let phase_turn = self.phase.lock().unwrap().turn();
         let turn = phase_turn + 1;
         if let Err(e) = self
             .agent
@@ -571,7 +572,7 @@ impl ReactLoopAgent {
             self.emit_agent_error(f.clone());
             return Err(Halt::Failed(f));
         }
-        self.phase.borrow_mut().set_turn(turn);
+        self.phase.lock().unwrap().set_turn(turn);
         let mut turn_ends: Option<TurnEndReason> = None;
         let mut target = InboxTarget::NextTurn;
 
@@ -581,7 +582,7 @@ impl ReactLoopAgent {
                 if let Some(c) = self.abort_reason() {
                     return Err(Halt::Aborted(c));
                 }
-                let step = self.phase.borrow().step() + 1;
+                let step = self.phase.lock().unwrap().step() + 1;
                 let decision = self.pre_step(target, turn, step)?;
                 match decision {
                     PreStepDecision::Reject => {
@@ -592,9 +593,9 @@ impl ReactLoopAgent {
                         if turn_ends.is_some() && messages.is_empty() {
                             break;
                         }
-                        if self.phase.borrow().step() == 0
+                        if self.phase.lock().unwrap().step() == 0
                             && messages.is_empty()
-                            && self.approval_pending.borrow().is_empty()
+                            && self.approval_pending.lock().unwrap().is_empty()
                         {
                             turn_ends = Some(TurnEndReason::Completed);
                             return Ok(false);
@@ -606,7 +607,7 @@ impl ReactLoopAgent {
                             .session
                             .append(EventKind::StepStart, json!({ "turn": turn, "step": step }), None)
                             .map_err(|e| Halt::Failed(unknown_failure(e.0)))?;
-                        self.phase.borrow_mut().set_step(step);
+                        self.phase.lock().unwrap().set_step(step);
                         // step 内部 try/finally：finally 总是写 step/end
                         let step_result: Result<Option<TurnEndReason>, Halt> = (|| {
                             for m in &messages {
@@ -690,7 +691,7 @@ impl ReactLoopAgent {
                     wake_requested,
                     step,
                     ..
-                } = &mut *self.phase.borrow_mut()
+                } = &mut *self.phase.lock().unwrap()
                 {
                     *abort_reason = None;
                     *wake_requested = false;
@@ -719,7 +720,7 @@ impl ReactLoopAgent {
 
     /// 提出一个步骤：claim + 装配 + runtime-context + pre-step 决策水岭。
     fn pre_step(&self, target: InboxTarget, turn: u64, step: u64) -> Result<PreStepDecision, Halt> {
-        if !matches!(*self.phase.borrow(), Phase::Running { .. }) {
+        if !matches!(*self.phase.lock().unwrap(), Phase::Running { .. }) {
             return Err(Halt::Failed(unknown_failure(format!(
                 "agent \"{}\": pre-step outside running phase",
                 self.agent.id
@@ -789,7 +790,7 @@ impl ReactLoopAgent {
     /// 执行一个步骤：守恒 buildRequest → 流式 → 组装 → 消息落盘 → 工具。
     /// 返回 `None` = 继续（tool 续步）；`Some(reason)` = 本 step 关闭。
     fn step(&self, turn: u64, step: u64, assembly: &PromptAssembly) -> Result<Option<TurnEndReason>, Halt> {
-        if !matches!(*self.phase.borrow(), Phase::Running { .. }) {
+        if !matches!(*self.phase.lock().unwrap(), Phase::Running { .. }) {
             return Err(Halt::Failed(unknown_failure(format!(
                 "agent \"{}\": step outside running phase",
                 self.agent.id
@@ -802,8 +803,8 @@ impl ReactLoopAgent {
         // D-106：审批恢复——先重跑暂停的 pending 调用（结果落会话后再走 LLM）。
         // 消费 `approval_pending`（挂在 resume 语义上）；宿主仍判未决（防御分支）→
         // 再次暂停。恢复结果若 concludesTurn → 本 step 关闭。
-        if !self.approval_pending.borrow().is_empty() {
-            let pending = std::mem::take(&mut *self.approval_pending.borrow_mut());
+        if !self.approval_pending.lock().unwrap().is_empty() {
+            let pending = std::mem::take(&mut *self.approval_pending.lock().unwrap());
             let blocks: Vec<ToolCallBlock> = pending.iter().map(|p| p.block.clone()).collect();
             let resume_outcome = (self.deps.tool_exec)(&ToolExecCtx {
                 turn,
@@ -822,7 +823,7 @@ impl ReactLoopAgent {
                 return Err(Halt::Aborted(c));
             }
             if !resume_outcome.pending.is_empty() {
-                *self.approval_pending.borrow_mut() = resume_outcome.pending;
+                *self.approval_pending.lock().unwrap() = resume_outcome.pending;
                 return Ok(Some(TurnEndReason::ApprovalPending));
             }
             if resume_outcome.concluded {
@@ -839,7 +840,7 @@ impl ReactLoopAgent {
             let mut built = build_request(
                 &self.agent.session,
                 &self.agent.options,
-                self.request_header_logged.get(),
+                self.request_header_logged.load(std::sync::atomic::Ordering::SeqCst),
                 &assembly.tools,
                 &system,
                 boundary,
@@ -849,7 +850,10 @@ impl ReactLoopAgent {
                 &*self.deps.prepare_call,
             )
             .map_err(|e| Halt::Failed(unknown_failure(e)))?;
-            self.request_header_logged.set(built.request_header_logged);
+            self.request_header_logged.store(
+                built.request_header_logged,
+                std::sync::atomic::Ordering::SeqCst,
+            );
             let request = built.request.options().clone();
             if let Some(c) = self.abort_reason() {
                 return Err(Halt::Aborted(c));
@@ -965,7 +969,7 @@ impl ReactLoopAgent {
             }
             // D-106：宿主判为待审批 → 存 pending + 暂停（turn/end reason=approval-pending）。
             if !outcome.pending.is_empty() {
-                *self.approval_pending.borrow_mut() = outcome.pending;
+                *self.approval_pending.lock().unwrap() = outcome.pending;
                 return Ok(Some(TurnEndReason::ApprovalPending));
             }
             return Ok(if outcome.concluded {

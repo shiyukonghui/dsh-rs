@@ -10,8 +10,8 @@ use dsh_tools::{
     ToolExecutionMode, ToolRegistry, ToolRestriction, ToolSignal, ToolFailureData,
 };
 use serde_json::{json, Value};
-use std::cell::Cell;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -25,10 +25,10 @@ fn echo_def(name: &str) -> ToolDefinition {
             "text": { "type": "string", "required": true },
         }),
         output_schema: json!({ "type": "json" }),
-        render: Rc::new(|_, value| {
+        render: Arc::new(|_, value| {
             vec![ContentBlock::text(serde_json::to_string(value).unwrap())]
         }),
-        execute: Rc::new(|args, _| Ok(args["text"].clone())),
+        execute: Arc::new(|args, _| Ok(args["text"].clone())),
         ..Default::default()
     })
     .unwrap()
@@ -37,13 +37,13 @@ fn echo_def(name: &str) -> ToolDefinition {
 #[allow(clippy::type_complexity)]
 fn json_tool(
     name: &str,
-    body: Rc<dyn Fn(&Value) -> Result<Value, ToolFailureData>>,
+    body: Arc<dyn Fn(&Value) -> Result<Value, ToolFailureData> + Send + Sync>,
 ) -> ToolDefinition {
     define_tool(DefineToolOptions {
         name: name.to_string(),
         output_schema: json!({ "type": "json" }),
-        render: Rc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
-        execute: Rc::new(move |_, _| body(&json!(null))),
+        render: Arc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
+        execute: Arc::new(move |_, _| body(&json!(null))),
         ..Default::default()
     })
     .unwrap()
@@ -70,7 +70,7 @@ fn kid(parent: &ScopeKey) -> ScopeKey {
 #[test]
 fn register_global_then_get_schemas_known_names() {
     let r = registry();
-    r.register_global(Rc::new(echo_def("echo"))).unwrap();
+    r.register_global(Arc::new(echo_def("echo"))).unwrap();
 
     assert!(r.get("echo", None).is_some());
     assert!(r.get("nope", None).is_none());
@@ -84,8 +84,8 @@ fn register_global_then_get_schemas_known_names() {
 #[test]
 fn register_duplicate_global_message() {
     let r = registry();
-    r.register_global(Rc::new(echo_def("echo"))).unwrap();
-    let err = r.register_global(Rc::new(echo_def("echo"))).err().unwrap();
+    r.register_global(Arc::new(echo_def("echo"))).unwrap();
+    let err = r.register_global(Arc::new(echo_def("echo"))).err().unwrap();
     assert_eq!(
         err,
         "tool \"echo\" is already registered (for a per-agent variant, register through that agent's `agent.ctx` instead)"
@@ -96,8 +96,8 @@ fn register_duplicate_global_message() {
 fn register_duplicate_scoped_message() {
     let r = registry();
     let agent = ScopeKey::new();
-    r.register(Rc::new(echo_def("echo")), Some(&agent)).unwrap();
-    let err = r.register(Rc::new(echo_def("echo")), Some(&agent)).err().unwrap();
+    r.register(Arc::new(echo_def("echo")), Some(&agent)).unwrap();
+    let err = r.register(Arc::new(echo_def("echo")), Some(&agent)).err().unwrap();
     assert_eq!(err, "tool \"echo\" is already registered in this scope");
 }
 
@@ -112,7 +112,7 @@ fn register_reserved_run_code_rejected() {
     })
     .unwrap();
     tool.name = "run_code".to_string();
-    let err = r.register_global(Rc::new(tool)).err().unwrap();
+    let err = r.register_global(Arc::new(tool)).err().unwrap();
     assert_eq!(
         err,
         "tool name \"run_code\" is reserved for the Code Mode presentation transport and cannot be registered or shadowed"
@@ -126,14 +126,14 @@ fn register_rejects_non_positive_timeout() {
     let mut tool = echo_def("slow");
     tool.name = "slow".to_string();
     tool.timeout_ms = Some(-5.0);
-    let err = r.register_global(Rc::new(tool)).err().unwrap();
+    let err = r.register_global(Arc::new(tool)).err().unwrap();
     assert_eq!(err, "tool \"slow\" timeoutMs must be a positive finite number");
 }
 
 #[test]
 fn register_disposer_removes_tool() {
     let r = registry();
-    let d = r.register_global(Rc::new(echo_def("echo"))).unwrap();
+    let d = r.register_global(Arc::new(echo_def("echo"))).unwrap();
     assert!(r.get("echo", None).is_some());
     d();
     assert!(r.get("echo", None).is_none());
@@ -151,15 +151,15 @@ fn scoped_tool_shadows_global_within_scope_only() {
     let child = kid(&root);
     let sibling = kid(&root);
 
-    r.register_global(Rc::new(echo_def("echo"))).unwrap();
+    r.register_global(Arc::new(echo_def("echo"))).unwrap();
     r.register(
-        Rc::new(define_tool(DefineToolOptions {
+        Arc::new(define_tool(DefineToolOptions {
             name: "echo".to_string(),
             description: "child echo".to_string(),
             parameters: json!({ "text": { "type": "string", "required": true } }),
             output_schema: json!({ "type": "string" }),
-            render: Rc::new(|_, v| vec![ContentBlock::text(v.as_str().unwrap().to_string())]),
-            execute: Rc::new(|_, _| Ok(json!("child"))),
+            render: Arc::new(|_, v| vec![ContentBlock::text(v.as_str().unwrap().to_string())]),
+            execute: Arc::new(|_, _| Ok(json!("child"))),
             ..Default::default()
         })
         .unwrap()),
@@ -180,15 +180,15 @@ fn ancestor_layers_shadow_farthest_first() {
     let mid = kid(&root);
     let leaf = kid(&mid);
 
-    r.register_global(Rc::new(echo_def("echo"))).unwrap();
+    r.register_global(Arc::new(echo_def("echo"))).unwrap();
     r.register(
-        Rc::new(define_tool(DefineToolOptions {
+        Arc::new(define_tool(DefineToolOptions {
             name: "echo".to_string(),
             description: "mid echo".to_string(),
             parameters: json!({ "text": { "type": "string", "required": true } }),
             output_schema: json!({ "type": "string" }),
-            render: Rc::new(|_, v| vec![ContentBlock::text(v.as_str().unwrap().to_string())]),
-            execute: Rc::new(|_, _| Ok(json!("mid"))),
+            render: Arc::new(|_, v| vec![ContentBlock::text(v.as_str().unwrap().to_string())]),
+            execute: Arc::new(|_, _| Ok(json!("mid"))),
             ..Default::default()
         })
         .unwrap()),
@@ -196,13 +196,13 @@ fn ancestor_layers_shadow_farthest_first() {
     )
     .unwrap();
     r.register(
-        Rc::new(define_tool(DefineToolOptions {
+        Arc::new(define_tool(DefineToolOptions {
             name: "echo".to_string(),
             description: "leaf echo".to_string(),
             parameters: json!({ "text": { "type": "string", "required": true } }),
             output_schema: json!({ "type": "string" }),
-            render: Rc::new(|_, v| vec![ContentBlock::text(v.as_str().unwrap().to_string())]),
-            execute: Rc::new(|_, _| Ok(json!("leaf"))),
+            render: Arc::new(|_, v| vec![ContentBlock::text(v.as_str().unwrap().to_string())]),
+            execute: Arc::new(|_, _| Ok(json!("leaf"))),
             ..Default::default()
         })
         .unwrap()),
@@ -240,7 +240,7 @@ fn restrict_unknown_names_error_lists_known() {
         "tools.restrict() names unknown global tool \"bogus\"; known global tools: (none)"
     );
 
-    r.register_global(Rc::new(echo_def("echo"))).unwrap();
+    r.register_global(Arc::new(echo_def("echo"))).unwrap();
     let err = r.restrict(ToolRestriction::deny(&["ghost", "echo"]), &agent).err().unwrap();
     assert_eq!(
         err,
@@ -262,8 +262,8 @@ fn restrict_deny_hides_from_schemas_keeps_known_names() {
     let r = registry();
     let root = ScopeKey::new();
     let child = kid(&root);
-    r.register_global(Rc::new(echo_def("echo"))).unwrap();
-    r.register_global(Rc::new(echo_def("list"))).unwrap();
+    r.register_global(Arc::new(echo_def("echo"))).unwrap();
+    r.register_global(Arc::new(echo_def("list"))).unwrap();
 
     assert_eq!(r.schemas(Some(&child)).len(), 2);
     let d = r.restrict(ToolRestriction::deny(&["echo"]), &child).unwrap();
@@ -281,8 +281,8 @@ fn restrict_deny_hides_from_schemas_keeps_known_names() {
 fn restrict_allow_keeps_only_listed() {
     let r = registry();
     let agent = ScopeKey::new();
-    r.register_global(Rc::new(echo_def("echo"))).unwrap();
-    r.register_global(Rc::new(echo_def("list"))).unwrap();
+    r.register_global(Arc::new(echo_def("echo"))).unwrap();
+    r.register_global(Arc::new(echo_def("list"))).unwrap();
 
     let _d = r.restrict(ToolRestriction::allow(&["echo"]), &agent).unwrap();
     let names: Vec<String> = r.schemas(Some(&agent)).iter().map(|s| s.name.clone()).collect();
@@ -309,7 +309,7 @@ fn present_as_conflict_message() {
 fn code_mode_injects_run_code_and_collapses_others() {
     let r = registry();
     let agent = ScopeKey::new();
-    r.register_global(Rc::new(echo_def("echo"))).unwrap();
+    r.register_global(Arc::new(echo_def("echo"))).unwrap();
     r.present_as(ToolExecutionMode::Code, &agent).unwrap();
 
     let names: Vec<String> = r.known_names(Some(&agent)).into_iter().collect();
@@ -335,7 +335,7 @@ fn code_mode_injects_run_code_and_collapses_others() {
 fn run_code_executor_override_replaces_placeholder() {
     let r = registry();
     let agent = ScopeKey::new();
-    r.register_global(Rc::new(echo_def("echo"))).unwrap();
+    r.register_global(Arc::new(echo_def("echo"))).unwrap();
     r.present_as(ToolExecutionMode::Code, &agent).unwrap();
 
     // 缺省占位：可见但执行报「code runtime」缺失。
@@ -346,14 +346,14 @@ fn run_code_executor_override_replaces_placeholder() {
     assert!(out.error.unwrap().message.contains("code runtime"));
 
     // 宿主接好真实执行 → 覆盖注入传输的 execute（命名/schema 注入不变）。
-    r.set_run_code_executor(Rc::new(|args, _| Ok(json!({ "ran": args["code"] }))));
+    r.set_run_code_executor(Arc::new(|args, _| Ok(json!({ "ran": args["code"] }))));
     let out = r.execute(&input("run_code", json!({ "code": "print(1)" })), Some(&agent));
     assert!(!out.is_error, "override executes: {:?}", out.error);
     assert_eq!(out.value.unwrap()["ran"], "print(1)");
 
     // 保留名注册/遮蔽守卫不变：register_global 仍无条件拒 run_code。
     let shadow = echo_def("run_code");
-    let err = r.register_global(Rc::new(shadow)).err().expect("rejected");
+    let err = r.register_global(Arc::new(shadow)).err().expect("rejected");
     assert!(err.contains("reserved"), "guard intact: {err}");
 }
 
@@ -366,23 +366,23 @@ fn execution_mode_fail_closed() {
     let r = registry();
     let agent = ScopeKey::new();
 
-    r.register_global(Rc::new(echo_def("plain"))).unwrap();
+    r.register_global(Arc::new(echo_def("plain"))).unwrap();
     assert_eq!(
         r.execution_mode(&input("plain", json!({ "text": "x" })), Some(&agent)),
         ToolExecutionClass::Exclusive
     );
 
     let mut safe = echo_def("safe");
-    safe.is_concurrency_safe = Some(Rc::new(|_| true));
-    r.register_global(Rc::new(safe)).unwrap();
+    safe.is_concurrency_safe = Some(Arc::new(|_| true));
+    r.register_global(Arc::new(safe)).unwrap();
     assert_eq!(
         r.execution_mode(&input("safe", json!({ "text": "x" })), Some(&agent)),
         ToolExecutionClass::Parallel
     );
 
     let mut unsafe_tool = echo_def("unsafe");
-    unsafe_tool.is_concurrency_safe = Some(Rc::new(|_| false));
-    r.register_global(Rc::new(unsafe_tool)).unwrap();
+    unsafe_tool.is_concurrency_safe = Some(Arc::new(|_| false));
+    r.register_global(Arc::new(unsafe_tool)).unwrap();
     assert_eq!(
         r.execution_mode(&input("unsafe", json!({ "text": "x" })), Some(&agent)),
         ToolExecutionClass::Exclusive
@@ -401,7 +401,7 @@ fn execution_mode_fail_closed() {
 #[test]
 fn execute_success_runs_body_render_and_validates() {
     let r = registry();
-    r.register_global(Rc::new(echo_def("echo"))).unwrap();
+    r.register_global(Arc::new(echo_def("echo"))).unwrap();
     let out = r.execute(&input("echo", json!({ "text": "hello" })), None);
     assert!(!out.is_error);
     assert_eq!(out.value, Some(json!("hello")));
@@ -421,7 +421,7 @@ fn execute_unknown_tool_message() {
 #[test]
 fn execute_tool_failure_is_error_result() {
     let r = registry();
-    r.register_global(Rc::new(json_tool("boom", Rc::new(|_| {
+    r.register_global(Arc::new(json_tool("boom", Arc::new(|_| {
         Err(ToolFailureData::new("kaboom", "BOOM", "SomeError"))
     }))))
     .unwrap();
@@ -436,11 +436,11 @@ fn execute_tool_failure_is_error_result() {
 #[test]
 fn execute_invalid_output_is_tool_output_error() {
     let r = registry();
-    r.register_global(Rc::new(define_tool(DefineToolOptions {
+    r.register_global(Arc::new(define_tool(DefineToolOptions {
         name: "bad".to_string(),
         output_schema: json!({ "type": "string" }),
-        render: Rc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
-        execute: Rc::new(|_, _| Ok(json!({ "not": "a string" }))),
+        render: Arc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
+        execute: Arc::new(|_, _| Ok(json!({ "not": "a string" }))),
         ..Default::default()
     })
     .unwrap()))
@@ -455,11 +455,11 @@ fn execute_invalid_output_is_tool_output_error() {
 #[test]
 fn execute_render_panic_is_output_error_mentioning_render() {
     let r = registry();
-    r.register_global(Rc::new(define_tool(DefineToolOptions {
+    r.register_global(Arc::new(define_tool(DefineToolOptions {
         name: "renderpanic".to_string(),
         output_schema: json!({ "type": "json" }),
-        render: Rc::new(|_, _| panic!("render blew up")),
-        execute: Rc::new(|_, _| Ok(json!("ok"))),
+        render: Arc::new(|_, _| panic!("render blew up")),
+        execute: Arc::new(|_, _| Ok(json!("ok"))),
         ..Default::default()
     })
     .unwrap()))
@@ -474,7 +474,7 @@ fn execute_render_panic_is_output_error_mentioning_render() {
 #[test]
 fn execute_aborted_before_dispatch() {
     let r = registry();
-    r.register_global(Rc::new(echo_def("echo"))).unwrap();
+    r.register_global(Arc::new(echo_def("echo"))).unwrap();
     let inp = input("echo", json!({ "text": "x" }));
     inp.signal.abort("cancelled by user");
     let out = r.execute(&inp, None);
@@ -485,11 +485,11 @@ fn execute_aborted_before_dispatch() {
 #[test]
 fn execute_aborted_after_body() {
     let r = registry();
-    r.register_global(Rc::new(define_tool(DefineToolOptions {
+    r.register_global(Arc::new(define_tool(DefineToolOptions {
         name: "selfabort".to_string(),
         output_schema: json!({ "type": "json" }),
-        render: Rc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
-        execute: Rc::new(|_, ctx| {
+        render: Arc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
+        execute: Arc::new(|_, ctx| {
             ctx.signal.abort("inside");
             Ok(json!("late"))
         }),
@@ -505,7 +505,7 @@ fn execute_aborted_after_body() {
 #[test]
 fn execute_signal_reason_visible() {
     let r = registry();
-    r.register_global(Rc::new(echo_def("echo"))).unwrap();
+    r.register_global(Arc::new(echo_def("echo"))).unwrap();
     let inp = input("echo", json!({ "text": "x" }));
     inp.signal.abort("user cancelled");
     let _ = r.execute(&inp, None);
@@ -517,15 +517,15 @@ fn execute_signal_reason_visible() {
 fn execute_guard_blocks_before_body() {
     let r = registry();
     let agent = ScopeKey::new();
-    let ran = Rc::new(Cell::new(false));
+    let ran = Arc::new(AtomicBool::new(false));
     let ran2 = ran.clone();
     r.register(
-        Rc::new(define_tool(DefineToolOptions {
+        Arc::new(define_tool(DefineToolOptions {
             name: "secret".to_string(),
             output_schema: json!({ "type": "json" }),
-            render: Rc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
-            execute: Rc::new(move |_, _| {
-                ran2.set(true);
+            render: Arc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
+            execute: Arc::new(move |_, _| {
+                ran2.store(true, Ordering::SeqCst);
                 Ok(json!("ran"))
             }),
             ..Default::default()
@@ -536,7 +536,7 @@ fn execute_guard_blocks_before_body() {
     .unwrap();
     let _guard = r
         .add_guard(
-            Rc::new(|name, _| {
+            Arc::new(|name, _| {
                 if name == "secret" {
                     Some("secret tool requires approval".to_string())
                 } else {
@@ -549,19 +549,19 @@ fn execute_guard_blocks_before_body() {
 
     let out = r.execute(&input("secret", json!({})), Some(&agent));
     assert!(out.is_error);
-    assert!(!ran.get(), "body must not run when guard blocks");
+    assert!(!ran.load(Ordering::SeqCst), "body must not run when guard blocks");
     assert_eq!(out.content[0].as_text().map(|t| t.text()).unwrap(), "Error: secret tool requires approval");
 }
 
 #[test]
 fn execute_finalize_transforms_content() {
     let r = registry();
-    r.register_global(Rc::new(define_tool(DefineToolOptions {
+    r.register_global(Arc::new(define_tool(DefineToolOptions {
         name: "tx".to_string(),
         output_schema: json!({ "type": "json" }),
-        render: Rc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
-        execute: Rc::new(|_, _| Ok(json!("raw"))),
-        finalize_content: Some(Rc::new(|_, snapshot| {
+        render: Arc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
+        execute: Arc::new(|_, _| Ok(json!("raw"))),
+        finalize_content: Some(Arc::new(|_, snapshot| {
             let mut c = snapshot.content.clone();
             c.push(ContentBlock::text(" (finalized)"));
             Some(c)
@@ -581,14 +581,14 @@ fn execute_finalize_transforms_content() {
 #[test]
 fn execute_tool_sees_shared_call_signal() {
     let r = registry();
-    let captured: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
+    let captured: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
     let cap2 = captured.clone();
-    r.register_global(Rc::new(define_tool(DefineToolOptions {
+    r.register_global(Arc::new(define_tool(DefineToolOptions {
         name: "probe".to_string(),
         output_schema: json!({ "type": "json" }),
-        render: Rc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
-        execute: Rc::new(move |_, ctx| {
-            cap2.set(Some(ctx.signal.aborted()));
+        render: Arc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
+        execute: Arc::new(move |_, ctx| {
+            *cap2.lock().unwrap() = Some(ctx.signal.aborted());
             Ok(json!("probed"))
         }),
         ..Default::default()
@@ -596,7 +596,7 @@ fn execute_tool_sees_shared_call_signal() {
     .unwrap()))
     .unwrap();
     let _ = r.execute(&input("probe", json!({})), None);
-    assert_eq!(captured.get(), Some(false));
+    assert_eq!(*captured.lock().unwrap(), Some(false));
 }
 
 // 保留 ToolSignal 类型引用（signal 复合字段在输入中可用）

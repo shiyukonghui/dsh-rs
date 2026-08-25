@@ -5,9 +5,7 @@
 #![allow(clippy::type_complexity)] // 录制工具闭包（Rc<dyn Fn>）与 define_tool seam 一致
 #![allow(clippy::result_large_err)]
 
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use dsh_llm::{
     CallId, ContentBlock, Message, MessageSource, Role, ToolCallBlock,
@@ -34,10 +32,10 @@ fn echo_def(name: &str) -> dsh_tools::ToolDefinition {
             "text": { "type": "string", "required": true },
         }),
         output_schema: json!({ "type": "json" }),
-        render: Rc::new(|_, value| {
+        render: Arc::new(|_, value| {
             vec![ContentBlock::text(serde_json::to_string(value).unwrap())]
         }),
-        execute: Rc::new(|args, _| Ok(args["text"].clone())),
+        execute: Arc::new(|args, _| Ok(args["text"].clone())),
         ..Default::default()
     })
     .unwrap()
@@ -46,25 +44,25 @@ fn echo_def(name: &str) -> dsh_tools::ToolDefinition {
 /// 并行 echo（is_concurrency_safe → true）。
 fn parallel_echo_def(name: &str) -> dsh_tools::ToolDefinition {
     let mut def = echo_def(name);
-    def.is_concurrency_safe = Some(Rc::new(|_| true));
+    def.is_concurrency_safe = Some(Arc::new(|_| true));
     def
 }
 
 /// 把 model 产生的 arguments 原样记录下来的工具（用于 parseArguments 断言）。
 /// 直接构造 `ToolDefinition`（不经 define_tool 的对象校验包装），参数空 schema 接受任何形态。
-fn recorder_def(name: &str, log: Rc<RefCell<Vec<Value>>>, conclude: bool) -> dsh_tools::ToolDefinition {
+fn recorder_def(name: &str, log: Arc<Mutex<Vec<Value>>>, conclude: bool) -> dsh_tools::ToolDefinition {
     dsh_tools::types::ToolDefinition {
         name: name.to_string(),
         description: "record arguments".into(),
         parameters: json!({}),
         output: dsh_tools::types::ToolOutputDefinition {
             schema: dsh_tools::value_schema_spec_to_json_schema(&json!({ "type": "json" })).unwrap(),
-            render: Rc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
+            render: Arc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
             presentation_meta: None,
         },
         timeout_ms: None,
-        execute: Rc::new(move |args, ctx| {
-            log.borrow_mut().push(args.clone());
+        execute: Arc::new(move |args, ctx| {
+            log.lock().unwrap().push(args.clone());
             if conclude {
                 ctx.conclude_turn();
             }
@@ -85,7 +83,7 @@ fn call(id: &str, name: &str, arguments: &str) -> ToolCallBlock {
     }
 }
 
-fn registry(defs: Vec<Rc<dsh_tools::ToolDefinition>>) -> ToolRegistry {
+fn registry(defs: Vec<Arc<dsh_tools::ToolDefinition>>) -> ToolRegistry {
     let r = ToolRegistry::new(dsh_tools::ToolExecutionMode::Native);
     for d in defs {
         r.register_global(d).unwrap();
@@ -139,7 +137,7 @@ fn run_resume(
 #[test]
 fn single_parallel_call_commits_events_with_source_seq() {
     let s = session();
-    let tools = registry(vec![Rc::new(parallel_echo_def("echo"))]);
+    let tools = registry(vec![Arc::new(parallel_echo_def("echo"))]);
     let (concluded, accepted) = run(&s, &tools, 1, 1, &[call("c1", "echo", r#"{"text":"hi"}"#)]);
     assert!(!concluded);
     assert!(accepted.is_empty());
@@ -180,7 +178,7 @@ fn single_parallel_call_commits_events_with_source_seq() {
 fn exclusive_default_tool_executes_sequentially() {
     // 无 is_concurrency_safe → exclusive；两个调用各自成组，仍按模型顺序提交。
     let s = session();
-    let tools = registry(vec![Rc::new(echo_def("echo"))]);
+    let tools = registry(vec![Arc::new(echo_def("echo"))]);
     let (_, _) = run(
         &s,
         &tools,
@@ -219,8 +217,8 @@ fn mixed_parallel_and_exclusive_commit_all_in_model_order() {
     // p 并行、x 独占：p,x 同组时 x 成为新屏障，但仍完整提交；顺序模型序。
     let s = session();
     let tools = registry(vec![
-        Rc::new(parallel_echo_def("p")),
-        Rc::new(echo_def("x")),
+        Arc::new(parallel_echo_def("p")),
+        Arc::new(echo_def("x")),
     ]);
     let (_, _) = run(
         &s,
@@ -250,8 +248,8 @@ fn mixed_parallel_and_exclusive_commit_all_in_model_order() {
 #[test]
 fn parse_arguments_empty_means_empty_object_invalid_json_is_raw_string() {
     let s = session();
-    let log = Rc::new(RefCell::new(Vec::new()));
-    let tools = registry(vec![Rc::new(recorder_def("rec", log.clone(), false))]);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let tools = registry(vec![Arc::new(recorder_def("rec", log.clone(), false))]);
     let (_, _) = run(
         &s,
         &tools,
@@ -262,18 +260,18 @@ fn parse_arguments_empty_means_empty_object_invalid_json_is_raw_string() {
             call("c2", "rec", "{bad json"),  // 坏 JSON → 原样字符串
         ],
     );
-    assert_eq!(log.borrow().len(), 2);
-    assert_eq!(log.borrow()[0], json!({}));
-    assert_eq!(log.borrow()[1], json!("{bad json"));
+    assert_eq!(log.lock().unwrap().len(), 2);
+    assert_eq!(log.lock().unwrap()[0], json!({}));
+    assert_eq!(log.lock().unwrap()[1], json!("{bad json"));
 }
 
 #[test]
 fn concluded_true_when_any_result_carries_concludes_turn() {
     let s = session();
-    let log = Rc::new(RefCell::new(Vec::new()));
+    let log = Arc::new(Mutex::new(Vec::new()));
     let tools = registry(vec![
-        Rc::new(recorder_def("finish", log.clone(), true)),
-        Rc::new(recorder_def("plain", log.clone(), false)),
+        Arc::new(recorder_def("finish", log.clone(), true)),
+        Arc::new(recorder_def("plain", log.clone(), false)),
     ]);
     let (concluded, _) = run(
         &s,
@@ -291,7 +289,7 @@ fn concluded_true_when_any_result_carries_concludes_turn() {
 #[test]
 fn unknown_tool_produces_error_result_event() {
     let s = session();
-    let tools = registry(vec![Rc::new(echo_def("echo"))]);
+    let tools = registry(vec![Arc::new(echo_def("echo"))]);
     let (_, _) = run(&s, &tools, 1, 1, &[call("c1", "nope", "{}")]);
     let results = event(&s, EventKind::ToolResult);
     assert_eq!(results.len(), 1);
@@ -314,16 +312,16 @@ fn unknown_tool_produces_error_result_event() {
 fn tool_call_payload_ignores_unused_agent_and_max_parallel() {
     // ToolExecutionInput 把 agent 归因传给工具（记入 call 的 agent 字段）。
     let s = session();
-    let seen_agent = Rc::new(RefCell::new(None::<String>));
-    let tools = registry(vec![Rc::new(define_tool(DefineToolOptions {
+    let seen_agent = Arc::new(Mutex::new(None::<String>));
+    let tools = registry(vec![Arc::new(define_tool(DefineToolOptions {
         name: "who".into(),
         description: "whoami".into(),
         output_schema: json!({ "type": "json" }),
-        render: Rc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
+        render: Arc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
         execute: {
             let seen_agent = seen_agent.clone();
-            Rc::new(move |_, ctx| {
-                *seen_agent.borrow_mut() = ctx.agent.clone();
+            Arc::new(move |_, ctx| {
+                *seen_agent.lock().unwrap() = ctx.agent.clone();
                 Ok(json!(ctx.agent))
             })
         },
@@ -331,7 +329,7 @@ fn tool_call_payload_ignores_unused_agent_and_max_parallel() {
     })
     .unwrap())]);
     let (_, _) = run(&s, &tools, 1, 1, &[call("c1", "who", "{}")]);
-    assert_eq!(seen_agent.borrow().as_deref(), Some("agent-1"));
+    assert_eq!(seen_agent.lock().unwrap().as_deref(), Some("agent-1"));
 }
 
 // ---------------------------------------------------------------------------
@@ -341,7 +339,7 @@ fn tool_call_payload_ignores_unused_agent_and_max_parallel() {
 #[test]
 fn emit_pending_calls_then_resume_appends_result_without_duplicate_call() {
     let s = session();
-    let tools = registry(vec![Rc::new(parallel_echo_def("echo"))]);
+    let tools = registry(vec![Arc::new(parallel_echo_def("echo"))]);
     let block = call("c1", "echo", r#"{"text":"hi"}"#);
 
     // 暂停步：宿主把 c1 判待审批 → 落 tool/call、拿 seq、不执行。

@@ -25,7 +25,6 @@ use dsh_subagent::{
     PromptAddress, PromptError,
 };
 use serde_json::{json, Value};
-use std::rc::Rc;
 use std::sync::Arc;
 
 /// 子代理运行时错误（web 侧转 wire：bad-request / internal 两档）。
@@ -316,7 +315,7 @@ pub fn history(
 /// 真实 Rust loop 的测试模板）。
 pub fn prompt(
     host: &Arc<SessionHost>,
-    agent_loop: &Option<Rc<AgentLoopHost>>,
+    agent_loop: &Option<Arc<AgentLoopHost>>,
     parent: &str,
     child: &str,
     content: &str,

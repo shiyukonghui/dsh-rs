@@ -5,8 +5,7 @@
 #![allow(clippy::type_complexity)] // Rc<dyn Fn> hook 与 seam 自洽
 #![allow(clippy::result_large_err)]
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use dsh_llm::ContentBlock;
 use dsh_tools::{
@@ -19,7 +18,7 @@ const AGENT: &str = "agent-1";
 
 fn registry() -> ToolRegistry {
     let r = ToolRegistry::new(ToolExecutionMode::Native);
-    r.register_global(Rc::new(
+    r.register_global(Arc::new(
         define_tool(DefineToolOptions {
             name: "echo".to_string(),
             description: "echo".into(),
@@ -27,9 +26,9 @@ fn registry() -> ToolRegistry {
                 "text": { "type": "string", "required": true },
             }),
             output_schema: json!({ "type": "json" }),
-            render: Rc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
-            execute: Rc::new(|_, _| Ok(json!("ran"))),
-            is_concurrency_safe: Some(Rc::new(|_| true)),
+            render: Arc::new(|_, v| vec![ContentBlock::text(v.to_string())]),
+            execute: Arc::new(|_, _| Ok(json!("ran"))),
+            is_concurrency_safe: Some(Arc::new(|_| true)),
             ..Default::default()
         })
         .unwrap(),
@@ -55,7 +54,7 @@ fn pre_decision_deny_materializes_error_result() {
     let r = registry();
     let _d = r
         .add_pre_decision(
-            Rc::new(|_e: &ToolExecution| Some(PreToolDecision::Deny {
+            Arc::new(|_e: &ToolExecution| Some(PreToolDecision::Deny {
                 reason: "policy says no".to_string(),
             })),
             None,
@@ -77,10 +76,10 @@ fn pre_decision_deny_materializes_error_result() {
 fn pre_decisions_waterfall_to_allow_and_first_non_allow_wins() {
     let r = registry();
     // 第一个 pass-through（None），第二个 deny → deny 生效
-    let _a = r.add_pre_decision(Rc::new(|_e: &ToolExecution| None), None).unwrap();
+    let _a = r.add_pre_decision(Arc::new(|_e: &ToolExecution| None), None).unwrap();
     let _b = r
         .add_pre_decision(
-            Rc::new(|_e: &ToolExecution| Some(PreToolDecision::Deny {
+            Arc::new(|_e: &ToolExecution| Some(PreToolDecision::Deny {
                 reason: "second wins".to_string(),
             })),
             None,
@@ -99,13 +98,13 @@ fn guards_still_enforce_after_allow() {
     let r = registry();
     let _pre = r
         .add_pre_decision(
-            Rc::new(|_e: &ToolExecution| Some(PreToolDecision::Allow)),
+            Arc::new(|_e: &ToolExecution| Some(PreToolDecision::Allow)),
             None,
         )
         .unwrap();
     let _guard = r
         .add_guard(
-            Rc::new(|name, _| (name == "echo").then(|| "hard-guarded".to_string())),
+            Arc::new(|name, _| (name == "echo").then(|| "hard-guarded".to_string())),
             None,
         )
         .unwrap();
@@ -126,7 +125,7 @@ fn ask_without_provider_denies_not_yet_supported() {
     let r = registry();
     let _pre = r
         .add_pre_decision(
-            Rc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask { reason: None })),
+            Arc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask { reason: None })),
             None,
         )
         .unwrap();
@@ -143,7 +142,7 @@ fn ask_without_provider_uses_custom_reason() {
     let r = registry();
     let _pre = r
         .add_pre_decision(
-            Rc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask {
+            Arc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask {
                 reason: Some("needs a human".to_string()),
             })),
             None,
@@ -160,12 +159,12 @@ fn ask_without_provider_uses_custom_reason() {
 #[test]
 fn ask_allowed_once_runs_body() {
     let r = registry();
-    r.set_approval_provider(Some(Rc::new(|_e: &ToolExecution, _r: Option<&str>| {
+    r.set_approval_provider(Some(Arc::new(|_e: &ToolExecution, _r: Option<&str>| {
         ApprovalOutcome::AllowedOnce
     })));
     let _pre = r
         .add_pre_decision(
-            Rc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask { reason: None })),
+            Arc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask { reason: None })),
             None,
         )
         .unwrap();
@@ -177,15 +176,15 @@ fn ask_allowed_once_runs_body() {
 #[test]
 fn ask_rejected_denies_with_verbatim_reason() {
     let r = registry();
-    let saw = Rc::new(RefCell::new(None::<(String, Option<String>)>));
+    let saw = Arc::new(Mutex::new(None::<(String, Option<String>)>));
     let saw2 = saw.clone();
-    r.set_approval_provider(Some(Rc::new(move |e: &ToolExecution, reason: Option<&str>| {
-        saw2.replace(Some((e.call.name.clone(), reason.map(String::from))));
+    r.set_approval_provider(Some(Arc::new(move |e: &ToolExecution, reason: Option<&str>| {
+        *saw2.lock().unwrap() = Some((e.call.name.clone(), reason.map(String::from)));
         ApprovalOutcome::Rejected
     })));
     let _pre = r
         .add_pre_decision(
-            Rc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask {
+            Arc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask {
                 reason: Some("confirm interaction".to_string()),
             })),
             None,
@@ -199,7 +198,7 @@ fn ask_rejected_denies_with_verbatim_reason() {
     );
     // 决策者收到 tool 名与 ask reason
     assert_eq!(
-        saw.borrow().clone(),
+        saw.lock().unwrap().clone(),
         Some(("echo".to_string(), Some("confirm interaction".to_string())))
     );
 }
@@ -207,12 +206,12 @@ fn ask_rejected_denies_with_verbatim_reason() {
 #[test]
 fn ask_cancelled_denies_with_verbatim_reason() {
     let r = registry();
-    r.set_approval_provider(Some(Rc::new(|_e: &ToolExecution, _r: Option<&str>| {
+    r.set_approval_provider(Some(Arc::new(|_e: &ToolExecution, _r: Option<&str>| {
         ApprovalOutcome::Cancelled
     })));
     let _pre = r
         .add_pre_decision(
-            Rc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask { reason: None })),
+            Arc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask { reason: None })),
             None,
         )
         .unwrap();
@@ -227,12 +226,12 @@ fn ask_cancelled_denies_with_verbatim_reason() {
 #[test]
 fn ask_unavailable_denies_with_verbatim_reason() {
     let r = registry();
-    r.set_approval_provider(Some(Rc::new(|_e: &ToolExecution, _r: Option<&str>| {
+    r.set_approval_provider(Some(Arc::new(|_e: &ToolExecution, _r: Option<&str>| {
         ApprovalOutcome::Unavailable
     })));
     let _pre = r
         .add_pre_decision(
-            Rc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask { reason: None })),
+            Arc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask { reason: None })),
             None,
         )
         .unwrap();
@@ -247,12 +246,12 @@ fn ask_unavailable_denies_with_verbatim_reason() {
 #[test]
 fn ask_with_no_agent_denies_routing() {
     let r = registry();
-    r.set_approval_provider(Some(Rc::new(|_e: &ToolExecution, _r: Option<&str>| {
+    r.set_approval_provider(Some(Arc::new(|_e: &ToolExecution, _r: Option<&str>| {
         ApprovalOutcome::AllowedOnce
     })));
     let _pre = r
         .add_pre_decision(
-            Rc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask { reason: None })),
+            Arc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask { reason: None })),
             None,
         )
         .unwrap();
@@ -273,7 +272,7 @@ fn ask_with_no_agent_denies_routing() {
 fn set_approval_provider_returns_previous_and_can_clear() {
     let r = registry();
     assert!(r.approval_provider().is_none());
-    let p = Rc::new(|_e: &ToolExecution, _r: Option<&str>| ApprovalOutcome::Rejected);
+    let p = Arc::new(|_e: &ToolExecution, _r: Option<&str>| ApprovalOutcome::Rejected);
     let previous = r.set_approval_provider(Some(p.clone()));
     assert!(previous.is_none());
     assert!(r.approval_provider().is_some());
@@ -293,7 +292,7 @@ fn ask_without_provider_in_loop_produces_tool_error_result() {
     let r = registry();
     let _pre = r
         .add_pre_decision(
-            Rc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask { reason: None })),
+            Arc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask { reason: None })),
             None,
         )
         .unwrap();

@@ -5392,6 +5392,104 @@ dsh-cli web `session_cancel_accepted_idempotent_and_keeps_turns_driving` 经取�
 
 ---
 
+## D-115（实施·Phase 3）：dsh-scope store/dsh-system-prompt/dsh-llm(+deepseek)/dsh-tools/dsh-agent-loop 整体 Send 化——LoopDeps/监听器/适配器/工具族 Arc + Send+Sync（round 4）
+
+**触发问题**：Phase 2 只覆盖 dsh-agent 的公开句柄/监听器。Phase 4 的 worker 线程
+要把「整条请求面」（LoopDeps 五个闭包 + 其捕获的服务句柄）送过线程边界，故依赖图
+上游的三个库（dsh-scope store / dsh-system-prompt / dsh-llm / dsh-tools）与
+dsh-agent-loop 自身内部仍是 `Rc`/`RefCell`/`Cell` 的面必须一起 Send 化（自下而上
+约束：LoopDeps 闭包若要 `+ Send + Sync`，捕获的 `Rc<SystemPrompt>`/`Rc<LlmRuntime>`/
+`Rc<ToolRegistry>` 必须先变 Arc——D-115 库存清单里「dsh-system-prompt Phase 3 预算外」
+的注记经自下而上发现**不可行**，实际必须入局）。
+
+**考虑的选项**：
+- (a) 只 Send 化 LoopDeps/agent-loop 表面，dsh-system-prompt/llm/tools 保持 Rc 作为
+   worker 内创建的「本线程服务」（worker 自建服务、Rc 不出线程）。——被否决：
+   服务装配（host 建 loop）发生在主线程/accept 线程，worker 需要拿到同一实例或重建
+   整个服务树；重建则失去全局注册（tools/prompt）与共享 store 语义，等于两套状态。
+- (b) 三个上游库整面 Rc→Arc（闭包族 `Rc<dyn Fn>` → `Arc<dyn Fn + Send + Sync>`、
+   `Rc<RefCell<X>>` → `Arc<Mutex<X>>`/Atomic、句柄 `Rc<T>` → `Arc<T>`），agent-loop
+   内部同理 + LoopDeps 五个闭包 Arc。——**选定**。破坏性换型一次性在此关闸消化。
+
+**决策事项**（TDD：先按 `cargo check` 红面逐 crate 收敛，再测试绿，最后 clippy 0）：
+1. `dsh-scope/src/store.rs`：`ScopedLayers` 的 `create_layer`/`on_change` →
+   `Arc<dyn Fn + Send + Sync>`；`Shared<K,V> = Arc<Mutex<Table>>`；`Undo =
+   Arc<dyn Fn() + Send + Sync>`；`NamedEntries`/`AnonymousEntries`/`ScopedLayers` 泛型
+   bound `V/L: Send + Sync`（闭包捕获共享表要求）；`make_undo` 幂等 `AtomicBool`；
+   `anon_uid` 仍 thread_local（匿名条目 uid 不需要跨线程；worker 里每个线程自己计数，
+   匿名条目本身不跨层共享）；Iter 族基于 lock 快照。**实验教训**：effect 的 action/
+   工厂闭包是「用户可 panic」代码——Rc/RefCell 时代借出随 unwind 释放不污染后续；
+   `Mutex` 若在持锁期 panic 会毒化锁使恢复路径（`cleans_up_failed_factories` 测试）
+   全 panic。故 `effect` 先**锁外**建层（查缺短锁 → 工厂锁外执行 → 成功后再短锁插入），
+   保 panic 恢复语义（测试 `scoped_layers_cleans_up_failed_factories...` 存活）。
+2. `dsh-system-prompt`：`ToolProvider`/`VariableProvider`/`AssembleNext`/
+   `AssembleListener`/`PromptSectionText::Fn`/`PromptContextText::Fn` 全 Arc+Send+Sync；
+   `SystemPrompt{change_notify: Arc<dyn Fn()+Send+Sync>}`、`listeners: Arc<Mutex<Vec>>`；
+   `new(config, change_notify)` 签名换 Arc（连锁 host/m2d/m2c/standing 调用点）；
+   `install`（invariant.rs）监听器 Arc。
+3. `dsh-llm`：`adapters: RefCell<HashMap>` → `Mutex<HashMap>`；`register_adapter(..,
+   adapter: Arc<dyn LlmAdapter + Send + Sync>)`；`get_registration` 返回
+   `Arc<AdapterRegistration>`（克隆出表释放锁）；`clone_rc` → `clone_registration`；
+   `PreparedCallStream = Box<dyn FnMut(..)>` 保持非 Send（prepared 流只在 worker 内
+   构造/消费，无需跨线程）。
+4. `dsh-llm-deepseek`：`PayloadsResolver`/`resolve_connection` → Arc+Send+Sync。
+5. `dsh-tools`：闭包族 `ToolRender/Execute/Finalize/IsConcurrencySafe/PresentCall/
+   PresentResult/Disposer/Guard/PreDecision/ApprovalProvider` 全 Arc+Send+Sync；
+   `ToolSignal{aborted: AtomicBool, reason: Arc<Mutex<Option<String>>>}`、
+   `ToolRunContext.concludes_turn: Arc<AtomicBool>`；`ToolLayer` 的
+   `mode/restrictions/guards/pre_decisions: Rc<RefCell<..>>` → `Arc<Mutex<..>>`、
+   `tools: NamedEntries<Arc<ToolDefinition>>`（值 Rc→Arc，随容器 Send）；
+   `ToolRegistry{on_change: Arc<dyn Fn+Send+Sync>, approval/run_code_executor:
+   Arc<Mutex<Option<..>>>}`；`register(_global)` 取 `Arc<ToolDefinition>`；
+   `M4Tool`/`M5Tool` slot `Arc<Mutex<Option<ToolExecute>>>` + `Arc<ToolDefinition>`；
+   `schema.rs` `define_tool` 包裹闭包全 Arc。
+6. `dsh-agent-loop`：`LoopDeps` 五个闭包 → `Arc<dyn Fn + Send + Sync>`（assemble/
+   prepare_call/stream/project_context/tool_exec）；`RuntimeContextProjection` 捕获
+   `Arc<Mutex>`；`ReactLoopAgent{phase: Mutex<Phase>, request_header_logged:
+   AtomicBool, approval_pending: Mutex<Vec<PendingCall>>, propose: Arc<dyn Fn+Send+Sync>}`
+   `new()` → `Arc<Self>`；`AgentLoopHost{agents/runtime_agents/disposers/joins/
+   tool_exec_factory: Mutex, llm/tools/prompt: Arc, disposers: Arc<dyn Fn+Send+Sync>}`、
+   `with_store/new` → `Arc<Self>`；`ToolExecFactory` → `dyn Fn(..) -> Arc<..> + Send
+   + Sync`（host 要跨 worker 持有工厂）。**关键死锁修复**：
+   `pending_by_call_id` 原来 `for id in self.agents.lock().unwrap().keys()..` ——for 头部
+   临时 `MutexGuard` 活到循环体结束，循环内 `self.agent(&id)` 重复锁同一非重入 Mutex →
+   任何非空 agents 表必死锁（dsh-cli 子代理在跑全量测试时抓到 `plan_approval_respond_
+   routes_to_per_session_agent` 挂起；这也会挂生产 `session.approval.decide` RPC）。
+   修复：先物化 `let ids: Vec<String> = lock().keys().cloned().collect()` 再遍历（短锁）。
+7. `dsh-cli`（最大消费面）：llm/tools/prompt/host/ReactLoopAgent 句柄 Rc→Arc；
+   dsh_cli_host 的 `RefCell`→`Mutex`；全部 M4/M5 工具执行器/系统提示 Fn/审批钩子 Arc；
+   `GoalsRoundPort` 持 `Arc<ReactLoopAgent>`；boot 的 `plan_session` → `Arc<Mutex>`。
+   **自下而上发现**：`dsh_jobs::JobRegistry`（含 `Box<dyn Fn>`）、`dsh_shell::Shell
+   Process`（Box）、`dsh_terminal::TerminalSessionService`（Box<dyn TerminalBackend>）
+   是 !Send，且其 crate 不在本关闸批次 —— `Arc<Mutex<T>>` 不可能。方案：小 `ThreadCell
+   <T>` thread-local 桥（per-instance id + keepalive Arc 入 thread_local 状态池；
+   Drop 清；复用仓库既有 CURRENT_CTX 纪律），句柄 Send+Sync 而底物仍单线程驻留
+   serve/测试线程（Phase 4 worker 化顺延——这些底物的 worker 化是 Phase 4 范围）。
+8. 测试连锁（全部子代理并行机械转换，行为/断言逐字保留）：dsh-tools 5 文件（m2b_
+   tools/m2b_tools_runtime/m2f_approval/m3_guard/m4_tools）+ m2b_tools.rs（补），
+   dsh-agent-loop 5 文件（m2e2_driver/m2e3_scheduler/m2e3_service/m2f_interaction/
+   m2g_host），dsh-cli web 内 ~57 处 + m6_llm + standing；dsh-agent m2d_agent 的
+   `sp()` → Arc + `install_model_selection(sp: &SystemPrompt)`（上游签名已换）。
+
+**最终选择**：上述 1-8。粗锁 + Send+Sync 全链；`ThreadCell` 仅用于三个 !Send 底物
+（最小、与既有 thread_local 纪律一致），不扩大为通用并发抽象。
+**被否决**：(a) worker 自建服务树（两套状态、丢共享注册）；为 !Send 底物改其 crate
+（超出本关闸破坏半径，Phase 4 再议）；把 `PreparedCallStream` 强 Send（无跨线程需要，
+徒增约束）。
+**预期影响与回滚点**：dsh-scope store 泛型 bound 收紧为 `V/L: Send+Sync`、dsh-system
+-prompt/llm/tools/agent-loop/dsh-cli 全部公开句柄与闭包类型 Rc→Arc（破坏性换型，
+编译期一次消化）；add_guard/present_as 等的 effect 锁外建层保 panic 恢复。回滚 =
+git revert 本提交（型面回到 Rc 即失效，需协同回滚整批）。
+**验证（Phase 3 关闸）**：`cargo test --workspace` 全绿 EXIT=0（191 套 ok；本关闸新增
+/增强覆盖：dsh-scope 24 / dsh-system-prompt 42 / dsh-tools 28+27+9+11+12+22+16 /
+dsh-llm 29 / dsh-llm-deepseek 34+4 / dsh-agent-loop 1+18+16+7+9+3+2+12 / dsh-cli
+212+18；dsh-cli web 全量含 `plan_approval_respond_routes_to_per_session_agent` 经
+`pending_by_call_id` 短锁修复通过）；`cargo clippy --workspace --all-targets` EXIT=0
+零告警（收尾修 3 处：m2_scope unused `Cell`、m2c type_complexity allow、
+ToolExecFactory `+Send+Sync`）。
+
+---
+
 
 
 

@@ -635,10 +635,9 @@ fn invariant_rejects_noop_status_transition() {
 use dsh_agent::{install_model_selection, ModelSelection, ModelSelectionRef};
 use dsh_brand::ReasoningEffortId;
 use dsh_system_prompt::{AssembleContext, Config, SystemPrompt};
-use std::rc::Rc;
 
-fn sp() -> Rc<SystemPrompt> {
-    Rc::new(SystemPrompt::new(&Config::default(), Rc::new(|| {})).unwrap())
+fn sp() -> Arc<SystemPrompt> {
+    Arc::new(SystemPrompt::new(&Config::default(), Arc::new(|| {})).unwrap())
 }
 
 #[test]

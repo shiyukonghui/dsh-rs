@@ -77,7 +77,8 @@ pub struct Boot {
     pub refresh: Rc<dyn Fn() -> Result<(), CordisError>>,
     /// M2g：可选的 Rust AgentLoopHost（装配了真实 agent-loop 服务；Some 时
     /// `session.prompt`/`agent.run` 改驱 Rust loop，None 保留 M1 WASM loop 路径）。
-    pub agent_loop: Option<Rc<dsh_agent_loop::AgentLoopHost>>,
+    /// `Arc`：Phase 3 起 `AgentLoopHost` 为 Arc 句柄（Send+Sync）。
+    pub agent_loop: Option<Arc<dsh_agent_loop::AgentLoopHost>>,
     /// M6（step8，D-087）：装配 loop 的真实 provider catalog 视图
     /// （`server_catalog_view`：models 目录 + 容量默认 + 重试策略）。`llm.models`
     /// 以此做 provider caps 列录；None（未启用 agent_loop）→ 回退既有 Boot.llm 目录。
@@ -112,7 +113,8 @@ pub struct Boot {
     /// L1（D-105）：plan-mode 折叠的「当前计划会话」（single-active GUI：最后一次
     /// agentPreset.select 的会话；standings 按 preset-id 挂载且单活跃，折叠取其事件
     /// 日志）。web serve 装配时 Some 并注入 standing 折叠源；None（未启 loop）→ 无源。
-    pub plan_session: Option<Rc<std::cell::RefCell<String>>>,
+    /// `Arc<Mutex>`：被 Send+Sync 的 standing plan-mode 折叠源闭包捕获。
+    pub plan_session: Option<Arc<std::sync::Mutex<String>>>,
     /// D-108/G：approval wire 注册表（前端 `approval/requested`/`resolved` 帧 +
     /// `POST /api/respond` 答复）。serve 装配 agent-loop 时 Some；None（未启 loop /
     /// 测试口）→ 不推 wire 帧、respond 一律 not-pending（无决可答，诚实）。

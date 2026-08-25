@@ -13,8 +13,7 @@
 //! 成功。`todo_write` 自包含（to_todo_list 校验 + 规范化输出，无需宿主）；
 //! `workflow` M4 为桩（meta 校验后恒 `UNSUPPORTED_OPTION` isError）。
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
@@ -28,27 +27,27 @@ use crate::types::{
 pub const CODE_NOT_BOUND: &str = "NOT_BOUND";
 
 /// 一个可绑定宿主执行器的 M4 工具定义。注册的是 [`M4Tool::definition`] 返回的
-/// `Rc<ToolDefinition>`；`execute` 从共享槽读入：已绑定 → 委托真实宿主句柄，
-/// 未绑定 → 结构化 `NOT_BOUND` 错误。`bind` 在注册后随时可调（同 `Rc` 生效）。
+/// `Arc<ToolDefinition>`；`execute` 从共享槽读入：已绑定 → 委托真实宿主句柄，
+/// 未绑定 → 结构化 `NOT_BOUND` 错误。`bind` 在注册后随时可调（同 `Arc` 生效）。
 pub struct M4Tool {
-    def: Rc<ToolDefinition>,
-    slot: Rc<RefCell<Option<ToolExecute>>>,
+    def: Arc<ToolDefinition>,
+    slot: Arc<Mutex<Option<ToolExecute>>>,
 }
 
 impl M4Tool {
-    /// 待注册/已注册的定义（`Rc`，`bind` 后同一定义即刻委托宿主）。
-    pub fn definition(&self) -> Rc<ToolDefinition> {
+    /// 待注册/已注册的定义（`Arc`，`bind` 后同一定义即刻委托宿主）。
+    pub fn definition(&self) -> Arc<ToolDefinition> {
         self.def.clone()
     }
 
     /// 绑定真实宿主执行器（JobRegistry / schedule 域 / plan-mode 服务句柄）。
     pub fn bind(&self, executor: ToolExecute) {
-        *self.slot.borrow_mut() = Some(executor);
+        *self.slot.lock().unwrap() = Some(executor);
     }
 
     /// 当前是否已绑定宿主执行器。
     pub fn is_bound(&self) -> bool {
-        self.slot.borrow().is_some()
+        self.slot.lock().unwrap().is_some()
     }
 }
 
@@ -61,11 +60,11 @@ fn define_bound(
     render: ToolRender,
     host_kind: &str,
 ) -> Result<M4Tool, ToolDefinitionError> {
-    let slot: Rc<RefCell<Option<ToolExecute>>> = Rc::new(RefCell::new(None));
+    let slot: Arc<Mutex<Option<ToolExecute>>> = Arc::new(Mutex::new(None));
     let slot_for_execute = slot.clone();
     let unbound = not_bound_failure(name, host_kind);
-    let execute: ToolExecute = Rc::new(move |args, ctx| {
-        let executor = slot_for_execute.borrow().clone();
+    let execute: ToolExecute = Arc::new(move |args, ctx| {
+        let executor = slot_for_execute.lock().unwrap().clone();
         match executor {
             Some(f) => f(args, ctx),
             None => Err(unbound.clone()),
@@ -81,7 +80,7 @@ fn define_bound(
         ..Default::default()
     })?;
     Ok(M4Tool {
-        def: Rc::new(def),
+        def: Arc::new(def),
         slot,
     })
 }
@@ -180,9 +179,9 @@ fn todo_describe(allow_parallel: bool) -> String {
 /// 对齐参考 Config，而非模型参数）。
 pub fn todo_write(
     allow_parallel_in_progress: bool,
-) -> Result<Rc<ToolDefinition>, ToolDefinitionError> {
+) -> Result<Arc<ToolDefinition>, ToolDefinitionError> {
     let allow_parallel = allow_parallel_in_progress;
-    let render: ToolRender = Rc::new(|_, value| {
+    let render: ToolRender = Arc::new(|_, value| {
         let counts = &value["counts"];
         let pending = counts["pending"].as_i64().unwrap_or(0);
         let in_progress = counts["inProgress"].as_i64().unwrap_or(0);
@@ -191,7 +190,7 @@ pub fn todo_write(
             "Updated todo list: {pending} pending, {in_progress} in progress, {completed} completed."
         ))]
     });
-    let execute: ToolExecute = Rc::new(move |args, ctx| {
+    let execute: ToolExecute = Arc::new(move |args, ctx| {
         if ctx.agent.is_none() {
             // 对齐参考：拒绝无 agent 调用者（无处写入清单），绝不静默 no-op。
             return Err(ToolFailureData::new(
@@ -281,7 +280,7 @@ pub fn todo_write(
         execute,
         ..Default::default()
     })?;
-    Ok(Rc::new(def))
+    Ok(Arc::new(def))
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +289,7 @@ pub fn todo_write(
 
 /// `job_output` 工具（宿主 JobRegistry 注入：read/wait；未注入 → `NOT_BOUND`）。
 pub fn job_output() -> Result<M4Tool, ToolDefinitionError> {
-    let render: ToolRender = Rc::new(|_, value| {
+    let render: ToolRender = Arc::new(|_, value| {
         let text = value["text"].as_str().unwrap_or_default();
         let body = if text.is_empty() {
             "(no new output)".to_string()
@@ -338,7 +337,7 @@ pub fn job_output() -> Result<M4Tool, ToolDefinitionError> {
 
 /// `job_list` 工具（宿主 JobRegistry 注入：list；未注入 → `NOT_BOUND`）。
 pub fn job_list() -> Result<M4Tool, ToolDefinitionError> {
-    let render: ToolRender = Rc::new(|_, value| {
+    let render: ToolRender = Arc::new(|_, value| {
         let jobs = value.as_array().cloned().unwrap_or_default();
         if jobs.is_empty() {
             return vec![ContentBlock::text("(no background jobs)".to_string())];
@@ -371,7 +370,7 @@ pub fn job_list() -> Result<M4Tool, ToolDefinitionError> {
 
 /// `job_kill` 工具（宿主 JobRegistry 注入：kill；未注入 → `NOT_BOUND`）。
 pub fn job_kill() -> Result<M4Tool, ToolDefinitionError> {
-    let render: ToolRender = Rc::new(|_, value| {
+    let render: ToolRender = Arc::new(|_, value| {
         let outcome = value["outcome"].as_str().unwrap_or_default();
         let id = value["job"]["id"].as_str().unwrap_or_default();
         let line = if outcome == "already-finished" {
@@ -505,7 +504,7 @@ pub fn schedule_delete() -> Result<M4Tool, ToolDefinitionError> {
 
 /// schedule 输出 render：正则 JSON 序列化（对齐参考 renderValue）。
 fn schedule_render() -> ToolRender {
-    Rc::new(|_, value| {
+    Arc::new(|_, value| {
         vec![ContentBlock::text(
             serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
         )]
@@ -519,7 +518,7 @@ fn schedule_render() -> ToolRender {
 /// `exit_plan_mode` 工具（宿主注入「离开 plan mode + 写 command 事件」；
 /// 未注入 → `NOT_BOUND`）。
 pub fn exit_plan_mode() -> Result<M4Tool, ToolDefinitionError> {
-    let render: ToolRender = Rc::new(|_, _| {
+    let render: ToolRender = Arc::new(|_, _| {
         vec![ContentBlock::text(
             "Plan approved — plan mode exited; carry out the plan starting with your next step."
                 .to_string(),
@@ -558,10 +557,10 @@ pub fn exit_plan_mode() -> Result<M4Tool, ToolDefinitionError> {
 /// `workflow` 工具（M4 桩定义）。参数级 meta 校验走 `dsh-workflow::validate_meta`；
 /// 校验失败 → `META_INVALID`；否则恒 `UNSUPPORTED_OPTION` 结构化 isError，绝不伪装
 /// 成功。宿主无需注入（JS 引擎属后续里程碑）。
-pub fn workflow() -> Result<Rc<ToolDefinition>, ToolDefinitionError> {
+pub fn workflow() -> Result<Arc<ToolDefinition>, ToolDefinitionError> {
     let description = "Run a JavaScript workflow script that orchestrates subagents at scale. Use this for work that fans out across many independent pieces — an audit over many files, a migration, multi-angle research, adversarial verification of findings — where you write the orchestration as a script instead of delegating turn by turn.\n\nThe workflow's identity rides the `meta` parameter as JSON: required `name` (short kebab-case) and `description` strings, optional `whenToUse` string and `phases` array (`{title, detail?, provider?, model?}`). The `script` parameter is the plain JavaScript body ONLY (NOT TypeScript, and NO `export const meta` statement — meta is a parameter, not code), running with top-level await; end with `return <value>` — the value must be JSON-serializable and is this tool's result.\n\nScript-body hooks:\n- `agent(prompt, opts?): Promise<any>` — run one subagent to completion. Without `opts.schema` it resolves to the child's final text; with `opts.schema` (an object-rooted JSON Schema using ONLY type/properties/required/additionalProperties/items/enum/const/oneOf — no pattern/format/numeric bounds) it resolves to the validated object. Resolves `null` when the child fails (filter with `.filter(Boolean)`). Other opts: `label` (display), `phase` (progress group), and independent `provider`/`model` LLM target overrides (either may be provided alone). Anything else (`effort`/`isolation`/`agentType`) is rejected loudly.\n- `pipeline(items, ...stages): Promise<any[]>` — run each item through the stages independently with NO barrier between stages (prefer this for multi-stage work). Each stage receives `(prev, item, index)`. An ordinary stage throw drops that ITEM to `null` and skips its remaining stages.\n- `parallel(thunks): Promise<any[]>` — run zero-argument functions concurrently and await ALL of them (a barrier; use only when a stage genuinely needs every prior result together). A throwing thunk resolves to `null`.\n- `phase(title)` — start a progress phase; `log(message)` — narrate progress; `args` — the tool call's `args` input, verbatim.\n\nMisused hooks (bad arguments, unknown options, unsupported schemas, tripped caps) throw errors that ALWAYS kill the script — they never dissolve into a per-item `null`.\n\nConstraints: concurrency and total-agent caps apply; no filesystem, network, timers, or Node.js APIs are provided — the agents do the work, the script only coordinates them. The run executes in the foreground: this call returns when the whole script finishes.";
 
-    let render: ToolRender = Rc::new(|args, value| {
+    let render: ToolRender = Arc::new(|args, value| {
         let name = args["meta"]["name"].as_str().unwrap_or_default();
         let started = value["agentsStarted"].as_i64().unwrap_or(0);
         let result = &value["result"];
@@ -573,7 +572,7 @@ pub fn workflow() -> Result<Rc<ToolDefinition>, ToolDefinitionError> {
         ))]
     });
 
-    let execute: ToolExecute = Rc::new(|args, _| {
+    let execute: ToolExecute = Arc::new(|args, _| {
         let meta = args.get("meta").unwrap_or(&Value::Null);
         match dsh_workflow::validate_meta(meta) {
             Err(e) => {
@@ -643,7 +642,7 @@ pub fn workflow() -> Result<Rc<ToolDefinition>, ToolDefinitionError> {
         execute,
         ..Default::default()
     })?;
-    Ok(Rc::new(def))
+    Ok(Arc::new(def))
 }
 
 /// 渲染截断上限（对齐 tool-workflow Config.maxResultChars 默认 50000）。

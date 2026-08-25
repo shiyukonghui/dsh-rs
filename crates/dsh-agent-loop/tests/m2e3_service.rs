@@ -5,10 +5,9 @@
 #![allow(clippy::type_complexity)]
 #![allow(clippy::result_large_err)]
 
-use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use dsh_agent::{Agent, AgentBus, AgentRegistry, AgentOptions, AgentStatus};
 use dsh_agent_loop::create_loop_agent;
@@ -48,20 +47,20 @@ fn count_of(s: &Arc<Session>, kind: EventKind) -> usize {
 // ---------------------------------------------------------------------------
 
 struct MockAdapter {
-    script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>,
-    calls: Rc<Cell<u32>>,
+    script: Arc<Mutex<VecDeque<Vec<StreamChunk>>>>,
+    calls: Arc<AtomicU32>,
 }
 
 impl MockAdapter {
-    fn new(script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>, calls: Rc<Cell<u32>>) -> Self {
+    fn new(script: Arc<Mutex<VecDeque<Vec<StreamChunk>>>>, calls: Arc<AtomicU32>) -> Self {
         MockAdapter { script, calls }
     }
 }
 
 impl LlmAdapter for MockAdapter {
     fn stream(&self, _options: GenerateOptions) -> Box<dyn Iterator<Item = StreamChunk>> {
-        self.calls.set(self.calls.get() + 1);
-        let next = self.script.borrow_mut().pop_front().unwrap_or_else(|| {
+        self.calls.store(self.calls.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+        let next = self.script.lock().unwrap().pop_front().unwrap_or_else(|| {
             vec![StreamChunk::Finish {
                 reason: FinishReason::Error {
                     failure: LlmFailure {
@@ -112,9 +111,9 @@ fn tool_call_chunks(id: &str, name: &str, arguments: &str) -> Vec<StreamChunk> {
     ]
 }
 
-fn stream(script: &[Vec<StreamChunk>]) -> (Rc<RefCell<VecDeque<Vec<StreamChunk>>>>, Rc<Cell<u32>>) {
-    let q = Rc::new(RefCell::new(VecDeque::from_iter(script.iter().cloned())));
-    let calls = Rc::new(Cell::new(0u32));
+fn stream(script: &[Vec<StreamChunk>]) -> (Arc<Mutex<VecDeque<Vec<StreamChunk>>>>, Arc<AtomicU32>) {
+    let q = Arc::new(Mutex::new(VecDeque::from_iter(script.iter().cloned())));
+    let calls = Arc::new(AtomicU32::new(0));
     (q, calls)
 }
 
@@ -155,8 +154,8 @@ fn agent(store: &Arc<SessionStore>, id: &str, bus: &AgentBus) -> Arc<Agent> {
     )
 }
 
-fn echo_tool() -> Rc<dsh_tools::ToolDefinition> {
-    Rc::new(
+fn echo_tool() -> Arc<dsh_tools::ToolDefinition> {
+    Arc::new(
         define_tool(DefineToolOptions {
             name: "echo".into(),
             description: "echo the given text".into(),
@@ -164,9 +163,9 @@ fn echo_tool() -> Rc<dsh_tools::ToolDefinition> {
                 "text": { "type": "string", "required": true },
             }),
             output_schema: json!({ "type": "json" }),
-            render: Rc::new(|_, value| vec![ContentBlock::text(serde_json::to_string(value).unwrap())]),
-            execute: Rc::new(|args, _| Ok(args["text"].clone())),
-            is_concurrency_safe: Some(Rc::new(|_| true)),
+            render: Arc::new(|_, value| vec![ContentBlock::text(serde_json::to_string(value).unwrap())]),
+            execute: Arc::new(|args, _| Ok(args["text"].clone())),
+            is_concurrency_safe: Some(Arc::new(|_| true)),
             ..Default::default()
         })
         .unwrap(),
@@ -183,14 +182,14 @@ fn real_loop_tool_call_then_answer_closes_turn() {
         tool_call_chunks("c1", "echo", r#"{"text":"hi"}"#),
         text_chunks("Done: hi"),
     ]);
-    let llm = Rc::new(LlmRuntime::new());
-    llm.register_adapter(&["mock"], Rc::new(MockAdapter::new(q, calls.clone())))
+    let llm = Arc::new(LlmRuntime::new());
+    llm.register_adapter(&["mock"], Arc::new(MockAdapter::new(q, calls.clone())))
         .unwrap();
 
-    let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+    let tools = Arc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
     tools.register_global(echo_tool()).unwrap();
 
-    let prompt = Rc::new(SystemPrompt::new(&Config::default(), Rc::new(|| {})).unwrap());
+    let prompt = Arc::new(SystemPrompt::new(&Config::default(), Arc::new(|| {})).unwrap());
 
     let bus = AgentBus::new();
     let reg = Arc::new(AgentRegistry::new(bus.clone()));
@@ -200,7 +199,7 @@ fn real_loop_tool_call_then_answer_closes_turn() {
     driver.followup(user_msg("m1", "Use the echo tool on 'hi' then answer.")).expect("loop must run");
     assert_eq!(count_of(&a.session, EventKind::TurnEnd), 1);
     assert_eq!(turn_end_reason(&a.session)["kind"], "completed");
-    assert_eq!(calls.get(), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 
     // 会话事件链（过滤 chunk/上下文噪声事件，只保留规范事件）：turn/start → step/start →
     // [step 内 fused 认领的 user] → request/header → assistant(tool-call) → tool/call →
@@ -284,11 +283,11 @@ fn real_loop_tool_call_then_answer_closes_turn() {
 #[test]
 fn real_loop_direct_answer_without_tools() {
     let (q, calls) = stream(&[text_chunks("hello from mock")]);
-    let llm = Rc::new(LlmRuntime::new());
-    llm.register_adapter(&["mock"], Rc::new(MockAdapter::new(q, calls.clone())))
+    let llm = Arc::new(LlmRuntime::new());
+    llm.register_adapter(&["mock"], Arc::new(MockAdapter::new(q, calls.clone())))
         .unwrap();
-    let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
-    let prompt = Rc::new(SystemPrompt::new(&Config::default(), Rc::new(|| {})).unwrap());
+    let tools = Arc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+    let prompt = Arc::new(SystemPrompt::new(&Config::default(), Arc::new(|| {})).unwrap());
     let bus = AgentBus::new();
     let reg = Arc::new(AgentRegistry::new(bus.clone()));
     let a = agent(&store(), "b", &bus);
@@ -297,7 +296,7 @@ fn real_loop_direct_answer_without_tools() {
     driver.followup(user_msg("m1", "say hello")).expect("loop must run");
     assert_eq!(count_of(&a.session, EventKind::TurnEnd), 1);
     assert_eq!(turn_end_reason(&a.session)["kind"], "completed");
-    assert_eq!(calls.get(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(count_of(&a.session, EventKind::ToolCall), 0, "no tool calls when the model answers directly");
 }
 
@@ -305,11 +304,11 @@ fn real_loop_direct_answer_without_tools() {
 fn real_loop_exhausted_script_emits_turn_error() {
     // 脚本耗尽 → Finish Error → turn/end 以失败终止（不发 assistant/message）
     let (q, calls) = stream(&[]);
-    let llm = Rc::new(LlmRuntime::new());
-    llm.register_adapter(&["mock"], Rc::new(MockAdapter::new(q, calls.clone())))
+    let llm = Arc::new(LlmRuntime::new());
+    llm.register_adapter(&["mock"], Arc::new(MockAdapter::new(q, calls.clone())))
         .unwrap();
-    let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
-    let prompt = Rc::new(SystemPrompt::new(&Config::default(), Rc::new(|| {})).unwrap());
+    let tools = Arc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+    let prompt = Arc::new(SystemPrompt::new(&Config::default(), Arc::new(|| {})).unwrap());
     let bus = AgentBus::new();
     let reg = Arc::new(AgentRegistry::new(bus.clone()));
     let a = agent(&store(), "c", &bus);
@@ -319,5 +318,5 @@ fn real_loop_exhausted_script_emits_turn_error() {
     assert_eq!(count_of(&a.session, EventKind::TurnEnd), 1, "turn ends even on failure");
     assert_ne!(turn_end_reason(&a.session)["kind"], "completed");
     // 请求按默认 normal 重试策略有界重试；至少一次请求被发送
-    assert!(calls.get() >= 1);
+    assert!(calls.load(Ordering::SeqCst) >= 1);
 }

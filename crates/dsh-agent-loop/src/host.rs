@@ -14,10 +14,8 @@
 //! sync 差值（D-035）：agent 懒创建（首次 `ensure_agent`），等效 TS 启动期热切
 //! 创建但决策/事件语义一致；`resumeSessionId` 恢复（持久化挂载）留 M3。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use dsh_agent::{Agent, AgentBus, AgentOptions, AgentRegistry};
 use dsh_llm::{LlmRuntime, Message};
@@ -39,13 +37,16 @@ use crate::ReactLoopAgent;
 /// D-106：宿主「工具执行工厂」缝——按每个 driver 绑定事实（session/tools/scope/agent/
 /// max_parallel）产出一个 `tool_exec` 实现。缺省 `None` → `service` 直通路径
 /// （永不暂停审批）。宿主（web）注入 approval 策略包装即经此缝。
+///
+/// D-115（Phase 3）：缝本身 `+ Send + Sync`——`AgentLoopHost` 持有 `Arc<ToolExecFactory>`
+/// 并要跨 worker（Phase 4），工厂闭包须可跨线程构造/持有。
 pub type ToolExecFactory = dyn Fn(
     Arc<Session>,
-    Rc<ToolRegistry>,
+    Arc<ToolRegistry>,
     Option<ScopeKey>,
     Option<String>,
     usize,
-) -> Rc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome>;
+) -> Arc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome + Send + Sync> + Send + Sync;
 
 /// 组合配置形态的 agent 身份（对齐 `AgentLoop.Config.agents` 条）。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -153,44 +154,44 @@ pub struct AgentLoopHost {
     pub store: Arc<SessionStore>,
     pub bus: AgentBus,
     pub registry: Arc<AgentRegistry>,
-    pub llm: Rc<LlmRuntime>,
-    pub tools: Rc<ToolRegistry>,
-    pub prompt: Rc<SystemPrompt>,
-    agents: RefCell<HashMap<String, Rc<ReactLoopAgent>>>,
+    pub llm: Arc<LlmRuntime>,
+    pub tools: Arc<ToolRegistry>,
+    pub prompt: Arc<SystemPrompt>,
+    agents: Mutex<HashMap<String, Arc<ReactLoopAgent>>>,
     /// 运行时注册的配置 agent（D-101：`session.create`/`fork` 铸新会话时按需挂接）。
     /// 与 `config.agents`（静态配置）并列做会话→agent 发现；`config` 保持装配期
     /// 校验语义不变（validate 只在 with_store 一次）。
-    runtime_agents: RefCell<Vec<ConfiguredAgent>>,
+    runtime_agents: Mutex<Vec<ConfiguredAgent>>,
     /// 宿主持有的 disposer（工具注册/守卫等；teardown 时按序执行）。
-    disposers: RefCell<Vec<Rc<dyn Fn()>>>,
+    disposers: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
     /// P4：每 agent 的 standing 父绑定（agent scope → preset standing scope）。
     /// select 回调 join/rebind；随 agent 生命周期（host 持有）。
-    joins: RefCell<HashMap<String, ScopeParentBinding>>,
+    joins: Mutex<HashMap<String, ScopeParentBinding>>,
     /// D-106：宿主工具执行工厂（approval 策略包装注入缝；须在 `ensure_agent` 之前设）。
-    tool_exec_factory: RefCell<Option<Rc<ToolExecFactory>>>,
+    tool_exec_factory: Mutex<Option<Arc<ToolExecFactory>>>,
 }
 
 impl AgentLoopHost {
     /// 自建 store 的宿主（用于独立测试/命令行路径）。
-    pub fn new(config: AgentLoopConfig, llm: Rc<LlmRuntime>, tools: Rc<ToolRegistry>) -> Result<Rc<Self>, String> {
+    pub fn new(config: AgentLoopConfig, llm: Arc<LlmRuntime>, tools: Arc<ToolRegistry>) -> Result<Arc<Self>, String> {
         Self::with_store(config, llm, tools, Arc::new(SessionStore::new()))
     }
 
     /// 登记一个宿主 disposer（teardown 时按序执行；如工具注册/守卫的 disposer）。
-    pub fn add_disposer(&self, disposer: Rc<dyn Fn()>) {
-        self.disposers.borrow_mut().push(disposer);
+    pub fn add_disposer(&self, disposer: Arc<dyn Fn() + Send + Sync>) {
+        self.disposers.lock().unwrap().push(disposer);
     }
 
     /// 与外部 SessionStore 共享的宿主（web 集成：事件直接落前端读模型）。
     pub fn with_store(
         config: AgentLoopConfig,
-        llm: Rc<LlmRuntime>,
-        tools: Rc<ToolRegistry>,
+        llm: Arc<LlmRuntime>,
+        tools: Arc<ToolRegistry>,
         store: Arc<SessionStore>,
-    ) -> Result<Rc<Self>, String> {
+    ) -> Result<Arc<Self>, String> {
         config.validate()?;
-        let prompt = Rc::new(
-            SystemPrompt::new(&PromptConfig::default(), Rc::new(|| {}))
+        let prompt = Arc::new(
+            SystemPrompt::new(&PromptConfig::default(), Arc::new(|| {}))
                 .map_err(|e| e.to_string())?,
         );
         // M6W（D-093，真实端点 agent 冒烟发现）：把 ToolRegistry 注册为 system-prompt
@@ -201,7 +202,7 @@ impl AgentLoopHost {
         // （`ctx.scope`），受 restrict/作用域过滤，与 dsh-tools 注册语义一致。
         {
             let tools = tools.clone();
-            let provider: ToolProvider = Rc::new(move |ctx: &AssembleContext| ToolProviderResult {
+            let provider: ToolProvider = Arc::new(move |ctx: &AssembleContext| ToolProviderResult {
                 schemas: tools.schemas(ctx.scope.as_ref()),
                 known_names: Some(tools.known_names(ctx.scope.as_ref())),
             });
@@ -209,7 +210,7 @@ impl AgentLoopHost {
         }
         let bus = AgentBus::new();
         let registry = Arc::new(AgentRegistry::new(bus.clone()));
-        Ok(Rc::new(AgentLoopHost {
+        Ok(Arc::new(AgentLoopHost {
             config,
             store,
             bus,
@@ -217,18 +218,18 @@ impl AgentLoopHost {
             llm,
             tools,
             prompt,
-            agents: RefCell::new(HashMap::new()),
-            runtime_agents: RefCell::new(Vec::new()),
-            disposers: RefCell::new(Vec::new()),
-            joins: RefCell::new(HashMap::new()),
-            tool_exec_factory: RefCell::new(None),
+            agents: Mutex::new(HashMap::new()),
+            runtime_agents: Mutex::new(Vec::new()),
+            disposers: Mutex::new(Vec::new()),
+            joins: Mutex::new(HashMap::new()),
+            tool_exec_factory: Mutex::new(None),
         }))
     }
 
     /// D-106：设置（或清除）宿主工具执行工厂。必须在该工厂要覆盖的 agent 被
     /// `ensure_agent` 创建**之前**调用（agents 懒创建）。
-    pub fn set_tool_exec_factory(&self, factory: Option<Rc<ToolExecFactory>>) {
-        *self.tool_exec_factory.borrow_mut() = factory;
+    pub fn set_tool_exec_factory(&self, factory: Option<Arc<ToolExecFactory>>) {
+        *self.tool_exec_factory.lock().unwrap() = factory;
     }
 
     /// 当前配置身份列表（`CONFIGURED_AGENT_IDENTITIES_KEY` 的宿主侧值）。
@@ -253,7 +254,8 @@ impl AgentLoopHost {
             .cloned()
             .or_else(|| {
                 self.runtime_agents
-                    .borrow()
+                    .lock()
+                    .unwrap()
                     .iter()
                     .find(|a| a.matches_session(session_id))
                     .cloned()
@@ -266,7 +268,7 @@ impl AgentLoopHost {
     pub fn register_session_agent(
         &self,
         configured: ConfiguredAgent,
-    ) -> Result<Rc<ReactLoopAgent>, String> {
+    ) -> Result<Arc<ReactLoopAgent>, String> {
         let session_key = configured
             .session_id
             .clone()
@@ -276,18 +278,18 @@ impl AgentLoopHost {
             return self.ensure_agent(&existing);
         }
         let agent = self.ensure_agent(&configured)?;
-        self.runtime_agents.borrow_mut().push(configured);
+        self.runtime_agents.lock().unwrap().push(configured);
         Ok(agent)
     }
 
     /// 已装配的 agent（按配置 id）；未知 → None。
-    pub fn agent(&self, id: &str) -> Option<Rc<ReactLoopAgent>> {
-        self.agents.borrow().get(id).cloned()
+    pub fn agent(&self, id: &str) -> Option<Arc<ReactLoopAgent>> {
+        self.agents.lock().unwrap().get(id).cloned()
     }
 
     /// 装配（或取已装配的）一个配置 agent：mint 会话 → Agent → driver。
     /// 幂等：同一 id 已装配则原样返回。
-    pub fn ensure_agent(&self, configured: &ConfiguredAgent) -> Result<Rc<ReactLoopAgent>, String> {
+    pub fn ensure_agent(&self, configured: &ConfiguredAgent) -> Result<Arc<ReactLoopAgent>, String> {
         if let Some(existing) = self.agent(&configured.id) {
             return Ok(existing);
         }
@@ -330,7 +332,7 @@ impl AgentLoopHost {
         );
 
         let max_parallel = self.config.resolved_max_parallel_tool_calls()? as usize;
-        let driver = match self.tool_exec_factory.borrow().clone() {
+        let driver = match self.tool_exec_factory.lock().unwrap().clone() {
             Some(factory) => {
                 // D-106：宿主注入工具执行工厂（approval 策略等）——按 driver 事实产
                 // 出 tool_exec 覆盖 service 直通路径。
@@ -361,7 +363,7 @@ impl AgentLoopHost {
             ),
         };
         let id = configured.id.clone();
-        self.agents.borrow_mut().insert(id, driver.clone());
+        self.agents.lock().unwrap().insert(id, driver.clone());
         Ok(driver)
     }
 
@@ -400,7 +402,10 @@ impl AgentLoopHost {
         &self,
         call_id: &str,
     ) -> Option<(String, Arc<Session>)> {
-        for id in self.agents.borrow().keys().cloned().collect::<Vec<_>>() {
+        // D-115：for 头部临时 MutexGuard 会活到循环体结束 → 在循环内 self.agent()
+        // 重复锁同一非重入 Mutex 必然死锁；先物化 id 集再遍历（短锁）。
+        let ids: Vec<String> = self.agents.lock().unwrap().keys().cloned().collect();
+        for id in ids {
             if let Some(driver) = self.agent(&id) {
                 if driver.pending_calls().iter().any(|p| p.block.id.raw() == call_id) {
                     return Some((id, driver.agent.session.clone()));
@@ -424,7 +429,7 @@ impl AgentLoopHost {
             .agent(agent_id)
             .ok_or_else(|| format!("host: no agent \"{agent_id}\""))?;
         let scope = agent.agent.scope.clone();
-        let mut joins = self.joins.borrow_mut();
+        let mut joins = self.joins.lock().unwrap();
         if let Some(binding) = joins.get(agent_id) {
             binding
                 .rebind(standing.clone())
@@ -448,11 +453,11 @@ impl AgentLoopHost {
 
     /// 生命周期 teardown：detach 全部登记 agent + 执行宿主 disposer、清空装配表。
     pub fn teardown(&self) {
-        let disposers = std::mem::take(&mut *self.disposers.borrow_mut());
+        let disposers = std::mem::take(&mut *self.disposers.lock().unwrap());
         for d in disposers {
             d();
         }
-        self.agents.borrow_mut().clear();
+        self.agents.lock().unwrap().clear();
     }
 }
 
@@ -466,7 +471,7 @@ mod tests {
     use super::*;
     use dsh_scope::scope_chain_of;
 
-    fn host() -> Rc<AgentLoopHost> {
+    fn host() -> Arc<AgentLoopHost> {
         let config = AgentLoopConfig {
             max_parallel_tool_calls: None,
             agents: vec![ConfiguredAgent {
@@ -481,8 +486,8 @@ mod tests {
         };
         AgentLoopHost::with_store(
             config,
-            Rc::new(dsh_llm::LlmRuntime::new()),
-            Rc::new(dsh_tools::ToolRegistry::new(dsh_tools::ToolExecutionMode::Native)),
+            Arc::new(dsh_llm::LlmRuntime::new()),
+            Arc::new(dsh_tools::ToolRegistry::new(dsh_tools::ToolExecutionMode::Native)),
             Arc::new(SessionStore::new()),
         )
         .unwrap()

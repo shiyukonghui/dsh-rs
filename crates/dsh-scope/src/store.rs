@@ -5,10 +5,15 @@
 //! - `AnonymousEntries<V>`：匿名条目表（每次 append 唯一键；相等值独立条目）。
 //! - `ScopedLayers<L>`：全局/精确作用域 layer 聚合（惰性创建、只回收空聚合、
 //!   远→近 chain 合并、effect 集成 + 通知/回滚语义）。
+//!
+//! D-115（请求面并发化）：`Shared = Rc<RefCell<Table>>` → `Arc<Mutex<Table>>`、
+//! `Undo = Rc<dyn Fn>` → `Arc<dyn Fn + Send + Sync>`、`LayerCreate/ChangeNotify`
+//! `Rc<dyn Fn>` → `Arc<dyn Fn + Send + Sync>`——使 `ScopedLayers`/`NamedEntries`/
+//! `AnonymousEntries` 成为 Send+Sync（dsh-system-prompt 的 `SystemPrompt` 嵌入
+//! `ScopedLayers`，D-115 Phase 3 连锁外延）。
 
-use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::{scope_chain_of, ScopeKey};
 
@@ -28,22 +33,22 @@ impl<K, V> Table<K, V> {
     }
 }
 
-type Shared<K, V> = Rc<RefCell<Table<K, V>>>;
+type Shared<K, V> = Arc<Mutex<Table<K, V>>>;
 
 /// 精确幂等的 undo 闭包（对齐 TS：首次删除 + `active=false`；之后 no-op）。
-pub type Undo = Rc<dyn Fn()>;
+pub type Undo = Arc<dyn Fn() + Send + Sync>;
 
-fn make_undo<K: Clone + PartialEq + 'static, V: 'static>(
+fn make_undo<K: Clone + PartialEq + Send + Sync + 'static, V: Send + Sync + 'static>(
     shared: &Shared<K, V>,
     key: K,
 ) -> Undo {
     let shared = shared.clone();
-    let active = Rc::new(Cell::new(true));
-    Rc::new(move || {
-        if !active.replace(false) {
+    let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    Arc::new(move || {
+        if !active.swap(false, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        let mut t = shared.borrow_mut();
+        let mut t = shared.lock().unwrap();
         if let Some(i) = t.items.iter().position(|(k, _)| *k == key) {
             t.items.remove(i);
         }
@@ -61,21 +66,21 @@ fn make_undo<K: Clone + PartialEq + 'static, V: 'static>(
 /// 命名条目表（`Map<string, V>` 的 Rust 形态）。
 pub struct NamedEntries<V> {
     data: Shared<String, V>,
-    duplicate_error: Rc<dyn Fn(&str) -> String>,
+    duplicate_error: Arc<dyn Fn(&str) -> String + Send + Sync>,
 }
 
-impl<V: 'static> NamedEntries<V> {
+impl<V: Send + Sync + 'static> NamedEntries<V> {
     /// `duplicate_error(name)`：调用方自有重复诊断（本类不造错误）。
-    pub fn new(duplicate_error: impl Fn(&str) -> String + 'static) -> Self {
+    pub fn new(duplicate_error: impl Fn(&str) -> String + Send + Sync + 'static) -> Self {
         NamedEntries {
-            data: Rc::new(RefCell::new(Table::new())),
-            duplicate_error: Rc::new(duplicate_error),
+            data: Arc::new(Mutex::new(Table::new())),
+            duplicate_error: Arc::new(duplicate_error),
         }
     }
 
     /// 插入命名条目。已有同名 → Err(调用方重复诊断)。返回精确幂等 undo。
     pub fn insert(&self, name: &str, value: V) -> Result<Undo, String> {
-        let mut t = self.data.borrow_mut();
+        let mut t = self.data.lock().unwrap();
         if t.items.iter().any(|(k, _)| k == name) {
             return Err((self.duplicate_error)(name));
         }
@@ -88,7 +93,7 @@ impl<V: 'static> NamedEntries<V> {
     where
         V: Clone,
     {
-        let t = self.data.borrow();
+        let t = self.data.lock().unwrap();
         t.items
             .iter()
             .find(|(k, _)| k == name)
@@ -96,18 +101,18 @@ impl<V: 'static> NamedEntries<V> {
     }
 
     pub fn has(&self, name: &str) -> bool {
-        let t = self.data.borrow();
+        let t = self.data.lock().unwrap();
         t.items.iter().any(|(k, _)| k == name)
     }
 
     pub fn is_empty(&self) -> bool {
-        let t = self.data.borrow();
+        let t = self.data.lock().unwrap();
         t.items.is_empty()
     }
 
     /// 命名字符串（插入序）。
     pub fn keys(&self) -> Vec<String> {
-        let t = self.data.borrow();
+        let t = self.data.lock().unwrap();
         t.items.iter().map(|(k, _)| k.clone()).collect()
     }
 
@@ -116,7 +121,7 @@ impl<V: 'static> NamedEntries<V> {
     where
         V: Clone,
     {
-        let t = self.data.borrow();
+        let t = self.data.lock().unwrap();
         t.items.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 
@@ -124,7 +129,7 @@ impl<V: 'static> NamedEntries<V> {
     pub fn values(&self) -> IterKeyed<V> {
         IterKeyed {
             data: self.data.clone(),
-            gen: self.data.borrow().gen,
+            gen: self.data.lock().unwrap().gen,
             cursor: 0,
         }
     }
@@ -134,7 +139,7 @@ impl<V: 'static> NamedEntries<V> {
     pub fn entries_live(&self) -> IterKeyedPair<String, V> {
         IterKeyedPair {
             data: self.data.clone(),
-            gen: self.data.borrow().gen,
+            gen: self.data.lock().unwrap().gen,
             cursor: 0,
         }
     }
@@ -153,7 +158,7 @@ where
 {
     type Item = V;
     fn next(&mut self) -> Option<V> {
-        let t = self.data.borrow();
+        let t = self.data.lock().unwrap();
         if t.gen != self.gen {
             return None; // 已换新代 → 脱离
         }
@@ -180,7 +185,7 @@ where
 {
     type Item = (K, V);
     fn next(&mut self) -> Option<(K, V)> {
-        let t = self.data.borrow();
+        let t = self.data.lock().unwrap();
         if t.gen != self.gen {
             return None; // 已换新代 → 脱离
         }
@@ -201,7 +206,7 @@ where
 // ---------------------------------------------------------------------------
 
 thread_local! {
-    static ANON_UID: Cell<u64> = const { Cell::new(0) };
+    static ANON_UID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn anon_uid() -> u64 {
@@ -217,22 +222,22 @@ pub struct AnonymousEntries<V> {
     data: Shared<u64, V>,
 }
 
-impl<V: 'static> AnonymousEntries<V> {
+impl<V: Send + Sync + 'static> AnonymousEntries<V> {
     pub fn new() -> Self {
-        AnonymousEntries { data: Rc::new(RefCell::new(Table::new())) }
+        AnonymousEntries { data: Arc::new(Mutex::new(Table::new())) }
     }
 
     /// 追加匿名条目，返回精确幂等 undo。每次新建唯一 id（相等值独立注册）。
     pub fn append(&self, value: V) -> Undo {
         let uid = anon_uid();
-        let mut t = self.data.borrow_mut();
+        let mut t = self.data.lock().unwrap();
         t.items.push((uid, value));
         drop(t);
         make_undo(&self.data, uid)
     }
 
     pub fn is_empty(&self) -> bool {
-        let t = self.data.borrow();
+        let t = self.data.lock().unwrap();
         t.items.is_empty()
     }
 
@@ -240,13 +245,13 @@ impl<V: 'static> AnonymousEntries<V> {
     pub fn values(&self) -> IterAnon<V> {
         IterAnon {
             data: self.data.clone(),
-            gen: self.data.borrow().gen,
+            gen: self.data.lock().unwrap().gen,
             cursor: 0,
         }
     }
 }
 
-impl<V: 'static> Default for AnonymousEntries<V> {
+impl<V: Send + Sync + 'static> Default for AnonymousEntries<V> {
     fn default() -> Self {
         Self::new()
     }
@@ -265,7 +270,7 @@ where
 {
     type Item = V;
     fn next(&mut self) -> Option<V> {
-        let t = self.data.borrow();
+        let t = self.data.lock().unwrap();
         if t.gen != self.gen {
             return None;
         }
@@ -287,29 +292,29 @@ pub trait ScopeLayer {
     fn is_empty(&self) -> bool;
 }
 
-type LayerCreate<L> = Rc<dyn Fn(Option<&ScopeKey>) -> L>;
-type ChangeNotify = Rc<dyn Fn()>;
+type LayerCreate<L> = Arc<dyn Fn(Option<&ScopeKey>) -> L + Send + Sync>;
+type ChangeNotify = Arc<dyn Fn() + Send + Sync>;
 
 /// 全局/精确作用域 layer 聚合。
 pub struct ScopedLayers<L> {
     global: L,
-    scoped: Rc<RefCell<HashMap<ScopeKey, Rc<L>>>>,
+    scoped: Arc<Mutex<HashMap<ScopeKey, Arc<L>>>>,
     create_layer: LayerCreate<L>,
     on_change: ChangeNotify,
 }
 
-impl<L: 'static> ScopedLayers<L> {
+impl<L: Send + Sync + 'static> ScopedLayers<L> {
     /// 构造：**贪婪创建**全局层（`create_layer(None)` 立即执行一次）。
     pub fn new(
-        create_layer: impl Fn(Option<&ScopeKey>) -> L + 'static,
-        on_change: impl Fn() + 'static,
+        create_layer: impl Fn(Option<&ScopeKey>) -> L + Send + Sync + 'static,
+        on_change: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         let global = create_layer(None);
         ScopedLayers {
             global,
-            scoped: Rc::new(RefCell::new(HashMap::new())),
-            create_layer: Rc::new(create_layer),
-            on_change: Rc::new(on_change),
+            scoped: Arc::new(Mutex::new(HashMap::new())),
+            create_layer: Arc::new(create_layer),
+            on_change: Arc::new(on_change),
         }
     }
 
@@ -318,15 +323,15 @@ impl<L: 'static> ScopedLayers<L> {
     }
 
     /// 精确层查询：**绝不创建**、**chain-blind**（不静默取祖先层）。
-    pub fn peek(&self, scope: Option<&ScopeKey>) -> Option<Rc<L>> {
+    pub fn peek(&self, scope: Option<&ScopeKey>) -> Option<Arc<L>> {
         let key = scope?;
-        self.scoped.borrow().get(key).cloned()
+        self.scoped.lock().unwrap().get(key).cloned()
     }
 
     /// 远→近祖先层链（farthest-first，exact-scope-last），跳过不存在的层。
-    pub fn chain_layers(&self, scope: Option<&ScopeKey>) -> Vec<Rc<L>> {
+    pub fn chain_layers(&self, scope: Option<&ScopeKey>) -> Vec<Arc<L>> {
         let chain = scope_chain_of(scope);
-        let scoped = self.scoped.borrow();
+        let scoped = self.scoped.lock().unwrap();
         chain
             .iter()
             .rev()
@@ -363,7 +368,7 @@ impl<L: 'static> ScopedLayers<L> {
     /// - 通知失败：先跑已收集 disposer（含回收）再重抛（对齐 Cordis effect，
     ///   事件序 `['notify','undo','notify']`）。
     ///
-    /// 差异：Rust 的 disposer 以 `Rc` 克隆共享同一目标（可观察为同一 disposer
+    /// 差异：Rust 的 disposer 以 `Arc` 克隆共享同一目标（可观察为同一 disposer
     /// 引用由调用方保管；无「精确同一函数 identity」概念）。
     pub fn effect(
         &self,
@@ -376,13 +381,26 @@ impl<L: 'static> ScopedLayers<L> {
         L: ScopeLayer,
     {
         // 目标：全局层 or 精确层（惰性创建）
+        // D-115：工厂可能在锁外调用——Rc<RefCell> 时代借出在 unwind 时自动释放，
+        // 不污染后续 effect；Mutex 在持有期间 panic 会毒化锁，使恢复路径全部 panic。
+        // 因此**创建不持锁**：先查缺（短锁），工厂在锁外执行，成功后再短锁插入。
         let target_key: Option<ScopeKey> = scope.cloned();
         let created;
         if let Some(key) = &target_key {
-            let mut scoped = self.scoped.borrow_mut();
-            if !scoped.contains_key(key) {
-                scoped.insert(key.clone(), Rc::new((self.create_layer)(scope)));
-                created = true;
+            let needs_create = {
+                let scoped = self.scoped.lock().unwrap();
+                !scoped.contains_key(key)
+            };
+            if needs_create {
+                let layer = Arc::new((self.create_layer)(scope));
+                let mut scoped = self.scoped.lock().unwrap();
+                if !scoped.contains_key(key) {
+                    scoped.insert(key.clone(), layer);
+                    created = true;
+                } else {
+                    // 竞争（并发下另一线程已建）——用他人层，不自认为创建
+                    created = false;
+                }
             } else {
                 created = false;
             }
@@ -402,7 +420,8 @@ impl<L: 'static> ScopedLayers<L> {
             Some(key) => {
                 let layer = self
                     .scoped
-                    .borrow()
+                    .lock()
+                    .unwrap()
                     .get(key)
                     .cloned()
                     .expect("scoped layer present");
@@ -411,14 +430,15 @@ impl<L: 'static> ScopedLayers<L> {
                     Err(payload) => {
                         // action 失败：新建且空 → 回收；重抛
                         if created {
-                            let empty = self
-                                .scoped
-                                .borrow()
-                                .get(&target_key.clone().unwrap())
-                                .map(|l| l.is_empty())
-                                .unwrap_or(true);
+                            let empty = {
+                                let scoped = self.scoped.lock().unwrap();
+                                scoped
+                                    .get(&target_key.clone().unwrap())
+                                    .map(|l| l.is_empty())
+                                    .unwrap_or(true)
+                            };
                             if empty {
-                                self.scoped.borrow_mut().remove(key);
+                                self.scoped.lock().unwrap().remove(key);
                             }
                         }
                         std::panic::resume_unwind(payload);
@@ -442,9 +462,9 @@ impl<L: 'static> ScopedLayers<L> {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     undo_rollback();
                     if let Some(k) = &key {
-                        let empty = data.borrow().get(k).map(|l| l.is_empty()).unwrap_or(false);
+                        let empty = data.lock().unwrap().get(k).map(|l| l.is_empty()).unwrap_or(false);
                         if empty {
-                            data.borrow_mut().remove(k);
+                            data.lock().unwrap().remove(k);
                         }
                     }
                     notify2();
@@ -455,20 +475,20 @@ impl<L: 'static> ScopedLayers<L> {
 
         // 精确 disposer：undo → 回收空精确层 → 通知；**幂等单发**（对齐 Cordis
         // disposer 第二/再次调用 no-op）。
-        let disposed = Rc::new(Cell::new(true));
+        let disposed = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let undo_final = undo;
         let data = self.scoped.clone();
         let key = target_key;
         let on_change = self.on_change.clone();
-        Rc::new(move || {
-            if !disposed.replace(false) {
+        Arc::new(move || {
+            if !disposed.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
             undo_final();
             if let Some(k) = &key {
-                let empty = data.borrow().get(k).map(|l| l.is_empty()).unwrap_or(false);
+                let empty = data.lock().unwrap().get(k).map(|l| l.is_empty()).unwrap_or(false);
                 if empty {
-                    data.borrow_mut().remove(k);
+                    data.lock().unwrap().remove(k);
                 }
             }
             if notify {

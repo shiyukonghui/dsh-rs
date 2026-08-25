@@ -6,8 +6,7 @@
 //! （`Rc<Cell<bool>>` 取消令牌 + reason）。这些差异连同其它 M2 差异记入 DECISIONS.md。
 
 use serde_json::Value;
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 /// 工具执行失败/取消的数据载体（对齐 TS `ToolFailure { message, info? }`，
 /// `info.code` 即稳定路由 code）。
@@ -38,49 +37,51 @@ pub enum ToolResult {
 }
 
 // —— 工具钩子的闭包类型别名（收敛 clippy type_complexity，同时给出公开 API 面）——
+// D-115（请求面并发化）：全部 `Rc<dyn Fn>` → `Arc<dyn Fn + Send + Sync>`。
 /// 输出纯渲染：`(args, canonical value)` → model-facing ContentBlock。
-pub type ToolRender = Rc<dyn Fn(&Value, &Value) -> Vec<ContentBlock>>;
+pub type ToolRender = Arc<dyn Fn(&Value, &Value) -> Vec<ContentBlock> + Send + Sync>;
 /// 直接顶层调用的纯可重放呈现元数据。
-pub type ToolPresentationMeta = Rc<dyn Fn(&Value, &Value) -> Value>;
+pub type ToolPresentationMeta = Arc<dyn Fn(&Value, &Value) -> Value + Send + Sync>;
 /// 参数校验后的本体执行（同步）。
-pub type ToolExecute = Rc<dyn Fn(&Value, &ToolRunContext) -> Result<Value, ToolFailureData>>;
+pub type ToolExecute = Arc<dyn Fn(&Value, &ToolRunContext) -> Result<Value, ToolFailureData> + Send + Sync>;
 /// 每个归一化结果的最后内容变换（返回 None 保留原内容）。
 pub type ToolFinalize =
-    Rc<dyn Fn(&ToolExecution, &ToolExecutionSnapshot) -> Option<Vec<ContentBlock>>>;
+    Arc<dyn Fn(&ToolExecution, &ToolExecutionSnapshot) -> Option<Vec<ContentBlock>> + Send + Sync>;
 /// 仅返回 `true` 才允许并行。
-pub type ToolIsConcurrencySafe = Rc<dyn Fn(&Value) -> bool>;
+pub type ToolIsConcurrencySafe = Arc<dyn Fn(&Value) -> bool + Send + Sync>;
 /// 待执行态呈现。
-pub type ToolPresentCall = Rc<dyn Fn(&Value) -> Option<ToolCallView>>;
+pub type ToolPresentCall = Arc<dyn Fn(&Value) -> Option<ToolCallView> + Send + Sync>;
 /// 已完成态呈现。
-pub type ToolPresentResult = Rc<dyn Fn(&Value, &ToolResult) -> Option<ToolResultView>>;
+pub type ToolPresentResult = Arc<dyn Fn(&Value, &ToolResult) -> Option<ToolResultView> + Send + Sync>;
 
-/// 取消/调度信号（模拟 TS `AbortSignal` 的最小单线程面）。
+/// 取消/调度信号（对齐 TS `AbortSignal`）。
 #[derive(Clone, Default)]
 pub struct ToolSignal {
-    aborted: Rc<Cell<bool>>,
-    reason: Rc<RefCell<Option<String>>>,
+    aborted: Arc<std::sync::atomic::AtomicBool>,
+    reason: Arc<Mutex<Option<String>>>,
 }
 
 impl ToolSignal {
     pub fn new() -> Self {
         ToolSignal {
-            aborted: Rc::new(Cell::new(false)),
-            reason: Rc::new(RefCell::new(None)),
+            aborted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reason: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn abort(&self, reason: impl Into<String>) {
-        self.aborted.set(true);
-        *self.reason.borrow_mut() = Some(reason.into());
+        self.aborted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *self.reason.lock().unwrap() = Some(reason.into());
     }
 
     pub fn aborted(&self) -> bool {
-        self.aborted.get()
+        self.aborted.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 取消原因（未取消为 None）。
     pub fn reason(&self) -> Option<String> {
-        self.reason.borrow().clone()
+        self.reason.lock().unwrap().clone()
     }
 
     /// 级联取消（跟随外层 signal）——run 作用域、sub-call 等共用。
@@ -112,7 +113,7 @@ pub struct ToolRunContext {
     pub agent: Option<String>,
     pub signal: ToolSignal,
     /// `concludesTurn` 标记（对偶 TS `exec.concludeTurn()`，interior-mutable）。
-    pub(crate) concludes_turn: std::cell::Cell<bool>,
+    pub(crate) concludes_turn: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ToolRunContext {
@@ -128,18 +129,19 @@ impl ToolRunContext {
             name: name.into(),
             agent,
             signal: ToolSignal::new(),
-            concludes_turn: std::cell::Cell::new(false),
+            concludes_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     /// 用 `concludesTurn` 标记该执行在其 step 结束时关停 turn。
     pub fn conclude_turn(&self) {
-        self.concludes_turn.set(true);
+        self.concludes_turn
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 该执行是否携带 `concludesTurn`。
     pub fn concludes_turn(&self) -> bool {
-        self.concludes_turn.get()
+        self.concludes_turn.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 

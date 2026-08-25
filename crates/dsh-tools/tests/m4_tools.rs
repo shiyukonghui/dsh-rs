@@ -7,7 +7,7 @@
 
 use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolExecute, ToolRegistry};
 use serde_json::{json, Value};
-use std::rc::Rc;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -28,7 +28,7 @@ fn registered(r: &ToolRegistry, name: &str) -> dsh_llm::ToolSchema {
 
 /// 一个返回固定值的最小 fake executor（验证注入正路）。
 fn fake_executor(value: Value) -> ToolExecute {
-    Rc::new(move |_, _| Ok(value.clone()))
+    Arc::new(move |_, _| Ok(value.clone()))
 }
 
 // ---------------------------------------------------------------------------

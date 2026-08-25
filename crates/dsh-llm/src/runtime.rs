@@ -8,10 +8,13 @@
 //!   中途/下游失败保持为插件/消费方错误（对齐 `adapterStream`）。
 //! - 注册表提供 registerAdapter/listProviders/provideRetryPolicy/prepareCall/stream，
 //!   all-or-nothing 原子注册。
+//!
+//! D-115（请求面并发化）：`adapters: RefCell<HashMap>` → `Mutex<HashMap>`、
+//! `Rc<dyn LlmAdapter>` → `Arc<dyn LlmAdapter + Send + Sync>`、registeration 克隆
+//! `Rc` → `Arc`——使 `LlmRuntime` 成为 Send+Sync（Phase 3：LoopDeps 闭包捕获跨线程）。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::assembler::BlockAssembler;
 use crate::call_config::{call_config_equals, CallConfig, CallConfigAdapterDefaults};
@@ -105,7 +108,7 @@ pub trait LlmAdapter {
 }
 
 struct AdapterRegistration {
-    adapter: Rc<dyn LlmAdapter>,
+    adapter: Arc<dyn LlmAdapter + Send + Sync>,
     provider: LlmProviderInfo,
     retry_policy: ResolvedRetryPolicy,
 }
@@ -133,7 +136,7 @@ pub struct PreparedLlmCall {
 /// 因此 `Result<_, LlmError>` 的 Err 变体超过 128 字节；这是规范化失败携带量的合理代价。
 #[allow(clippy::result_large_err)]
 pub struct LlmRuntime {
-    adapters: RefCell<HashMap<String, AdapterRegistration>>,
+    adapters: Mutex<HashMap<String, AdapterRegistration>>,
 }
 
 impl Default for LlmRuntime {
@@ -146,34 +149,34 @@ impl Default for LlmRuntime {
 #[allow(clippy::result_large_err)]
 impl LlmRuntime {
     pub fn new() -> Self {
-        LlmRuntime { adapters: RefCell::new(HashMap::new()) }
+        LlmRuntime { adapters: Mutex::new(HashMap::new()) }
     }
 
-    fn get_registration(&self, provider: &str) -> Result<std::cell::Ref<'_, AdapterRegistration>, LlmError> {
-        let borrow = self.adapters.borrow();
+    fn get_registration(&self, provider: &str) -> Result<Arc<AdapterRegistration>, LlmError> {
+        let borrow = self.adapters.lock().unwrap();
         if !borrow.contains_key(provider) {
             return Err(LlmError::new(
                 format!("no adapter registered for provider \"{provider}\""),
                 NO_ADAPTER,
             ));
         }
-        // 借出冲洗问题：需要返回 Ref<AdapterRegistration> 但 map 借出整体。
-        // 用 id 键查找再换取；这里直接返回整表借出（结构简单，单表注册场景足够）。
-        Ok(std::cell::Ref::map(borrow, |m| m.get(provider).expect("present")))
+        // 借出冲洗问题：Mutex 守卫无法跨返回；克隆 Arc 出表后释放锁（单表注册场景，
+        // 每次查询克隆一次 Arc，成本可忽略；换表由让出锁后的下一次查询可见）。
+        Ok(borrow.get(provider).expect("present").clone_registration())
     }
 
     /// all-or-nothing 注册一个适配器的若干 provider 路由。
     pub fn register_adapter(
         &self,
         providers: &[&str],
-        adapter: Rc<dyn LlmAdapter>,
+        adapter: Arc<dyn LlmAdapter + Send + Sync>,
     ) -> Result<(), LlmError> {
         if providers.is_empty() {
             return Err(LlmError::new("an adapter must register at least one provider", INVALID_ADAPTER));
         }
         let mut unique = std::collections::HashSet::new();
         let mut registrations = Vec::new();
-        let mut borrow = self.adapters.borrow_mut();
+        let mut borrow = self.adapters.lock().unwrap();
         for provider in providers {
             if provider.is_empty() {
                 return Err(LlmError::new("adapter provider names must be non-empty", INVALID_ADAPTER));
@@ -207,7 +210,7 @@ impl LlmRuntime {
 
     /// 展示有适配器的 provider 路由（按注册顺序）。
     pub fn list_providers(&self) -> Vec<LlmProviderInfo> {
-        self.adapters.borrow().values().map(|r| r.provider.clone()).collect()
+        self.adapters.lock().unwrap().values().map(|r| r.provider.clone()).collect()
     }
 
     /// 解析注册于某路由的重试策略（normal 默认已解析）。
@@ -341,7 +344,7 @@ impl LlmRuntime {
         let adapter_defaults = CallConfigAdapterDefaults {
             reasoning_effort: (config.reasoning_effort.is_none() && resolved_config.reasoning_effort.is_some()).then_some(true),
             max_tokens: (config.max_tokens.is_none() && resolved_config.max_tokens.is_some()).then_some(true),
-        };        let registration_raw = Rc::new(registration.clone_rc());
+        };        let registration_raw = registration.clone_registration();
         let resolved_config_clone = resolved_config.clone();
         let mut dispatched = false;
         let stream: Option<PreparedCallStream> =
@@ -367,7 +370,7 @@ impl LlmRuntime {
     /// 直接流式调用（`options.provider` 选定适配器）。
     pub fn stream(&self, options: GenerateOptions) -> Box<dyn Iterator<Item = StreamChunk>> {
         let registration = match self.get_registration(&options.provider) {
-            Ok(r) => r.clone_rc(),
+            Ok(r) => r,
             Err(err) => {
                 return Box::new(std::iter::once(finish_chunk(
                     FinishReason::Error { failure: failure_from_llm_error(&err) },
@@ -380,8 +383,8 @@ impl LlmRuntime {
 }
 
 impl AdapterRegistration {
-    fn clone_rc(&self) -> Rc<AdapterRegistration> {
-        Rc::new(AdapterRegistration {
+    fn clone_registration(&self) -> Arc<AdapterRegistration> {
+        Arc::new(AdapterRegistration {
             adapter: self.adapter.clone(),
             provider: self.provider.clone(),
             retry_policy: self.retry_policy.clone(),
@@ -455,7 +458,7 @@ fn validate_resolved_info(
 /// 最终适配器边界：直接派发到注册表捕获的适配器（对齐 `adapterStream` 的同步核）。
 /// 真实 HTTP/SSE IO 在 M1e 由服务层线程桥驱动，失败在服务层归一为终末 failure chunk。
 fn adapter_stream_final(
-    registration: &Rc<AdapterRegistration>,
+    registration: &Arc<AdapterRegistration>,
     options: &GenerateOptions,
 ) -> Box<dyn Iterator<Item = StreamChunk>> {
     // forAdapter：去掉归属另一适配器的重放状态
@@ -568,7 +571,7 @@ mod tests {
 
     fn rt() -> LlmRuntime {
         let rt = LlmRuntime::new();
-        let adapter: Rc<dyn LlmAdapter> = Rc::new(FakeAdapter {
+        let adapter: Arc<dyn LlmAdapter + Send + Sync> = Arc::new(FakeAdapter {
             models: vec![
                 LlmModelInfo::new("deepseek", "deepseek-chat", "DeepSeek Chat"),
                 LlmModelInfo::new("deepseek", "deepseek-reasoner", "DeepSeek Reasoner"),
@@ -590,7 +593,7 @@ mod tests {
     #[test]
     fn duplicate_registration_rejected_all_or_nothing() {
         let rt = rt();
-        let adapter: Rc<dyn LlmAdapter> = Rc::new(FakeAdapter { models: vec![] });
+        let adapter: Arc<dyn LlmAdapter + Send + Sync> = Arc::new(FakeAdapter { models: vec![] });
         let err = rt.register_adapter(&["deepseek", "other"], adapter).unwrap_err();
         assert_eq!(err.code, DUPLICATE_ADAPTER);
         assert_eq!(rt.list_providers().len(), 1);
@@ -738,7 +741,7 @@ mod tests {
 
     fn streaming_rt() -> LlmRuntime {
         let rt = LlmRuntime::new();
-        let adapter: Rc<dyn LlmAdapter> = Rc::new(StreamingAdapter);
+        let adapter: Arc<dyn LlmAdapter + Send + Sync> = Arc::new(StreamingAdapter);
         rt.register_adapter(&["deepseek"], adapter).unwrap();
         rt
     }
@@ -757,7 +760,7 @@ mod tests {
     #[test]
     fn adapter_stream_finishes_with_replay_and_usage() {
         let rt = LlmRuntime::new();
-        let adapter: Rc<dyn LlmAdapter> = Rc::new(StreamWithDetails);
+        let adapter: Arc<dyn LlmAdapter + Send + Sync> = Arc::new(StreamWithDetails);
         rt.register_adapter(&["deepseek"], adapter).unwrap();
         let options = GenerateOptions {
             provider: "deepseek".into(),

@@ -1,16 +1,20 @@
-//! M2c: dsh-system-prompt 行为测试（移植 system-prompt.spec / scoped.spec /
-//! tool-order.spec / invariant.spec 的可观察行为；消息逐字）。
+//! M2c：system-prompt 服务（水岭监听器注册/拆除、section/context/variable/tools
+//! 注册、scoped shadowing、渲染、invariant 安装）。
+//!
+//! D-115（请求面并发化）：`SystemPrompt` 句柄 `Rc` → `Arc`；闭包族全部
+//! `Arc<dyn Fn + Send + Sync>`（provider/listener/Fn 文本）；被捕获的测试计数器
+//! `Rc<Cell>` → `Arc<AtomicX>`、`Rc<RefCell<Vec>>` → `Arc<Mutex<Vec>>`。
 
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use dsh_llm::ToolSchema;
 use dsh_scope::{bind_scope_parent, ScopeKey, Undo};
 use dsh_system_prompt::{
     render_context_snapshot, render_prompt, validate_tool_order, AssembleContext,
-    AssembledContext, AssembledSection, Config, PromptAssembly, PromptContext, PromptContextText,
-    PromptSection, PromptSectionText, SystemPrompt, ToolProviderResult, PERSONA_ORDER,
-    PERSONA_SECTION, TOOL_ORDER_REST,
+    AssembledContext, AssembledSection, Config, PromptAssembly, PromptContext,
+    PromptContextText, PromptSection, PromptSectionText, SystemPrompt, ToolProviderResult,
+    TOOL_ORDER_REST, PERSONA_ORDER, PERSONA_SECTION,
 };
 
 fn sec(name: &str, order: f64, text: &str) -> PromptSection {
@@ -30,10 +34,12 @@ fn ctx(name: &str, order: f64, text: &str) -> PromptContext {
     }
 }
 
-fn new_sp(cfg: Config) -> Rc<SystemPrompt> {
-    let changes = Rc::new(Cell::new(0usize));
+fn new_sp(cfg: Config) -> Arc<SystemPrompt> {
+    let changes = Arc::new(AtomicUsize::new(0));
     let notify = changes.clone();
-    Rc::new(SystemPrompt::new(&cfg, Rc::new(move || notify.set(notify.get() + 1))).unwrap())
+    Arc::new(SystemPrompt::new(&cfg, Arc::new(move || {
+        notify.fetch_add(1, Ordering::SeqCst);
+    })).unwrap())
 }
 
 fn tool(name: &str) -> ToolSchema {
@@ -46,7 +52,7 @@ fn tool(name: &str) -> ToolSchema {
 
 fn var(sp: &SystemPrompt, name: &str, value: &str) -> Undo {
     let v = value.to_string();
-    sp.variable(None, name, Rc::new(move |_| Some(v.clone())))
+    sp.variable(None, name, Arc::new(move |_| Some(v.clone())))
         .unwrap()
 }
 
@@ -119,12 +125,12 @@ fn sections_and_contexts_are_order_sorted_and_render_exactly() {
 
 #[test]
 fn section_text_provider_evaluated_per_assemble_call() {
-    let calls = Rc::new(Cell::new(0u32));
+    let calls = Arc::new(AtomicU32::new(0));
     let c = calls.clone();
     let sp = new_sp(Config::default());
-    let provider = PromptSectionText::Fn(Rc::new(move |_| {
-        c.set(c.get() + 1);
-        format!("call {}", c.get())
+    let provider = PromptSectionText::Fn(Arc::new(move |_| {
+        let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+        format!("call {}", n)
     }));
     sp.section(
         None,
@@ -144,14 +150,14 @@ fn section_text_provider_evaluated_per_assemble_call() {
 
 #[test]
 fn include_runtime_context_false_suppresses_and_skips_provider() {
-    let calls = Rc::new(Cell::new(0u32));
+    let calls = Arc::new(AtomicU32::new(0));
     let c = calls.clone();
     let sp = new_sp(Config {
         include_runtime_context: false,
         ..Config::default()
     });
-    let provider = PromptContextText::Fn(Rc::new(move |_| {
-        c.set(c.get() + 1);
+    let provider = PromptContextText::Fn(Arc::new(move |_| {
+        c.fetch_add(1, Ordering::SeqCst);
         "should never be evaluated".to_string()
     }));
     sp.context(
@@ -165,7 +171,7 @@ fn include_runtime_context_false_suppresses_and_skips_provider() {
     .unwrap();
     let a = sp.assemble(&AssembleContext::default()).unwrap();
     assert!(a.contexts.is_empty());
-    assert_eq!(calls.get(), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +194,7 @@ fn duplicate_and_invalid_registrations_fail() {
         err,
         "prompt context \"c\" is already registered (for a per-agent override, register through that agent's `agent.ctx` instead)"
     );
-    let err = sp.variable(None, "Bad", Rc::new(|_: &AssembleContext| None)).err().unwrap();
+    let err = sp.variable(None, "Bad", Arc::new(|_: &AssembleContext| None)).err().unwrap();
     assert_eq!(
         err,
         "invalid prompt variable name \"Bad\" (must match /^[a-z][a-z0-9_]*$/)"
@@ -232,21 +238,23 @@ fn scoped_duplicate_uses_scope_message_and_global_shadowing() {
 
 #[test]
 fn register_and_dispose_each_emit_exactly_one_change() {
-    let changes = Rc::new(Cell::new(0usize));
+    let changes = Arc::new(AtomicUsize::new(0));
     let n = changes.clone();
-    let sp = SystemPrompt::new(&Config::default(), Rc::new(move || n.set(n.get() + 1))).unwrap();
-    let before = changes.get();
+    let sp = SystemPrompt::new(&Config::default(), Arc::new(move || {
+        n.fetch_add(1, Ordering::SeqCst);
+    })).unwrap();
+    let before = changes.load(Ordering::SeqCst);
     let d = sp.context(None, &ctx("c", 1.0, "x")).unwrap();
-    assert_eq!(changes.get() - before, 1, "register → one change");
+    assert_eq!(changes.load(Ordering::SeqCst) - before, 1, "register → one change");
     d();
-    assert_eq!(changes.get() - before, 2, "dispose → one change");
-    let b2 = changes.get();
-    let v = sp.variable(None, "v", Rc::new(|_| None)).unwrap();
-    assert_eq!(changes.get() - b2, 1);
+    assert_eq!(changes.load(Ordering::SeqCst) - before, 2, "dispose → one change");
+    let b2 = changes.load(Ordering::SeqCst);
+    let v = sp.variable(None, "v", Arc::new(|_| None)).unwrap();
+    assert_eq!(changes.load(Ordering::SeqCst) - b2, 1);
     v();
     // dispose 幂等：再次调用不加
     v();
-    assert_eq!(changes.get() - b2, 2);
+    assert_eq!(changes.load(Ordering::SeqCst) - b2, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -254,14 +262,13 @@ fn register_and_dispose_each_emit_exactly_one_change() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[allow(clippy::type_complexity)]
 fn tools_members_snapshot_between_assemblies() {
-    let registered: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec!["first".to_string()]));
+    let registered: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec!["first".to_string()]));
     let names = registered.clone();
     let sp = new_sp(Config::default());
-    let provider: Rc<dyn Fn(&AssembleContext) -> ToolProviderResult> =
-        Rc::new(move |_: &AssembleContext| {
-            let n = names.borrow();
+    let provider: Arc<dyn Fn(&AssembleContext) -> ToolProviderResult + Send + Sync> =
+        Arc::new(move |_: &AssembleContext| {
+            let n = names.lock().unwrap();
             ToolProviderResult {
                 schemas: n.iter().map(|s| tool(s)).collect(),
                 known_names: None,
@@ -274,7 +281,7 @@ fn tools_members_snapshot_between_assemblies() {
         vec!["first"]
     );
     // 运行中新增 provider → 本轮不见、下轮见
-    registered.borrow_mut().push("late".to_string());
+    registered.lock().unwrap().push("late".to_string());
     let a2 = sp.assemble(&AssembleContext::default()).unwrap();
     assert_eq!(
         a2.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
@@ -285,11 +292,11 @@ fn tools_members_snapshot_between_assemblies() {
 #[test]
 fn tools_lexicographic_without_tool_order() {
     let sp = new_sp(Config::default());
-    let names = Rc::new(vec!["charlie", "alpha", "bravo"]);
+    let names = Arc::new(vec!["charlie", "alpha", "bravo"]);
     let names2 = names.clone();
     sp.tools(
         None,
-        Rc::new(move |_| ToolProviderResult {
+        Arc::new(move |_| ToolProviderResult {
             schemas: names2.iter().map(|s| tool(s)).collect(),
             known_names: None,
         }),
@@ -312,7 +319,7 @@ fn tool_order_applies_rest_marker_and_keeps_stable_order() {
         ..Config::default()
     };
     let sp = new_sp(cfg);
-    let covered = Rc::new(vec![
+    let covered = Arc::new(vec![
         "echo_a".to_string(),
         "bash".to_string(),
         "todo_write".to_string(),
@@ -321,7 +328,7 @@ fn tool_order_applies_rest_marker_and_keeps_stable_order() {
     let c = covered.clone();
     sp.tools(
         None,
-        Rc::new(move |_| ToolProviderResult {
+        Arc::new(move |_| ToolProviderResult {
             schemas: c.iter().map(|s| tool(s)).collect(),
             known_names: None,
         }),
@@ -344,11 +351,11 @@ fn tool_order_typo_reports_singular_and_known_sorted() {
         ..Config::default()
     };
     let sp = new_sp(cfg);
-    let covered = Rc::new(vec!["read".to_string(), "bash".to_string()]);
+    let covered = Arc::new(vec!["read".to_string(), "bash".to_string()]);
     let c = covered.clone();
     sp.tools(
         None,
-        Rc::new(move |_| ToolProviderResult {
+        Arc::new(move |_| ToolProviderResult {
             schemas: c.iter().map(|s| tool(s)).collect(),
             known_names: None,
         }),
@@ -371,11 +378,11 @@ fn tool_order_plural_unknowns_and_missing_known_is_absent() {
         ..Config::default()
     };
     let sp = new_sp(cfg);
-    let covered = Rc::new(vec!["bash".to_string(), "todo_write".to_string()]);
+    let covered = Arc::new(vec!["bash".to_string(), "todo_write".to_string()]);
     let c = covered.clone();
     sp.tools(
         None,
-        Rc::new(move |_| ToolProviderResult {
+        Arc::new(move |_| ToolProviderResult {
             schemas: c.iter().map(|s| tool(s)).collect(),
             known_names: None,
         }),
@@ -394,11 +401,11 @@ fn tool_order_known_but_scoped_absent_is_not_an_error() {
         ..Config::default()
     };
     let sp = new_sp(cfg);
-    let covered = Rc::new(vec!["read".to_string()]);
+    let covered = Arc::new(vec!["read".to_string()]);
     let c = covered.clone();
     sp.tools(
         None,
-        Rc::new(move |_| ToolProviderResult {
+        Arc::new(move |_| ToolProviderResult {
             schemas: c.iter().map(|s| tool(s)).collect(),
             known_names: Some(vec!["bash".to_string(), "read".to_string()]),
         }),
@@ -414,11 +421,11 @@ fn tool_order_known_but_scoped_absent_is_not_an_error() {
 #[test]
 fn tool_provider_reserved_name_fails() {
     let sp = new_sp(Config::default());
-    let names = Rc::new(vec![TOOL_ORDER_REST.to_string()]);
+    let names = Arc::new(vec![TOOL_ORDER_REST.to_string()]);
     let n = names.clone();
     sp.tools(
         None,
-        Rc::new(move |_| ToolProviderResult {
+        Arc::new(move |_| ToolProviderResult {
             schemas: n.iter().map(|s| tool(s)).collect(),
             known_names: None,
         }),
@@ -458,17 +465,17 @@ fn canonical_order_precedes_waterfall_and_extra_is_appended() {
         ..Config::default()
     };
     let sp = new_sp(cfg);
-    let covered = Rc::new(vec!["zulu".to_string(), "alpha".to_string()]);
+    let covered = Arc::new(vec!["zulu".to_string(), "alpha".to_string()]);
     let c = covered.clone();
     sp.tools(
         None,
-        Rc::new(move |_| ToolProviderResult {
+        Arc::new(move |_| ToolProviderResult {
             schemas: c.iter().map(|s| tool(s)).collect(),
             known_names: None,
         }),
     );
     // 监听器看到已排序 ['alpha','zulu']；随后添加 aardvark 不重排
-    sp.register_assemble_listener(None, false, Rc::new(move |mut a, _, next| {
+    sp.register_assemble_listener(None, false, Arc::new(move |mut a, _, next| {
         assert_eq!(
             a.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
             vec!["alpha", "zulu"]
@@ -522,10 +529,10 @@ fn multiple_complete_sections_fail() {
 #[test]
 fn waterfall_composes_in_registration_order() {
     let sp = new_sp(Config::default());
-    let seen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let s1 = seen.clone();
-    sp.register_assemble_listener(None, false, Rc::new(move |mut a, _, next| {
-        s1.borrow_mut().push("A".to_string());
+    sp.register_assemble_listener(None, false, Arc::new(move |mut a, _, next| {
+        s1.lock().unwrap().push("A".to_string());
         a.sections.push(AssembledSection {
             name: "fromA".to_string(),
             text: "A text".to_string(),
@@ -533,21 +540,21 @@ fn waterfall_composes_in_registration_order() {
         next(a)
     }));
     let s2 = seen.clone();
-    sp.register_assemble_listener(None, false, Rc::new(move |a, _, next| {
-        s2.borrow_mut().push("B".to_string());
+    sp.register_assemble_listener(None, false, Arc::new(move |a, _, next| {
+        s2.lock().unwrap().push("B".to_string());
         // B 看到 A 的 section
         assert!(a.sections.iter().any(|s| s.name == "fromA"));
         next(a)
     }));
     let a = sp.assemble(&AssembleContext::default()).unwrap();
-    assert_eq!(*seen.borrow(), vec!["A".to_string(), "B".to_string()]);
+    assert_eq!(*seen.lock().unwrap(), vec!["A".to_string(), "B".to_string()]);
     assert!(a.sections.iter().any(|s| s.name == "fromA"));
 }
 
 #[test]
 fn waterfall_short_circuit_replaces_assembly() {
     let sp = new_sp(Config::default());
-    sp.register_assemble_listener(None, false, Rc::new(move |_a, _, _next| {
+    sp.register_assemble_listener(None, false, Arc::new(move |_a, _, _next| {
         // 不调 next → 短路（整体替换）
         Ok(PromptAssembly {
             sections: vec![],
@@ -574,7 +581,7 @@ fn complete_section_restored_after_waterfall() {
     )
     .unwrap();
     // 水岭试图改写 complete section / 加 section → 均被丢弃
-    sp.register_assemble_listener(None, false, Rc::new(move |mut a, _, next| {
+    sp.register_assemble_listener(None, false, Arc::new(move |mut a, _, next| {
         a.sections.push(AssembledSection {
             name: "tamper".to_string(),
             text: "should vanish".to_string(),
@@ -603,7 +610,7 @@ fn scoped_assemble_listener_only_affects_own_scope() {
     let s2 = ScopeKey::new();
     // 监听器持有自己的 scope 键副本（key 本身是身份句柄，克隆保留同一身份）
     let listener_key = s2.clone();
-    sp.register_assemble_listener(Some(listener_key), false, Rc::new(move |mut a, _, next| {
+    sp.register_assemble_listener(Some(listener_key), false, Arc::new(move |mut a, _, next| {
         a.sections.push(AssembledSection {
             name: "scopedOnly".to_string(),
             text: "scope2".to_string(),
@@ -642,20 +649,20 @@ fn mutating_returned_assembly_does_not_leak() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[allow(clippy::type_complexity)]
 fn variables_live_iteration_new_registration_visible_same_round() {
     let sp = new_sp(Config::default());
-    let register_late: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let register_late: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let done = register_late.clone();
     let sp2 = sp.clone();
     // early provider 首次求值时注册 late —— live 迭代下本轮即见
-    let p: Rc<dyn Fn(&AssembleContext) -> Option<String>> =
-        Rc::new(move |_: &AssembleContext| {
-            if !done.replace(true) {
+    #[allow(clippy::type_complexity)]
+    let p: Arc<dyn Fn(&AssembleContext) -> Option<String> + Send + Sync> =
+        Arc::new(move |_: &AssembleContext| {
+            if !done.swap(true, Ordering::SeqCst) {
                 let _ = sp2.variable(
                     None,
                     "latevar",
-                    Rc::new(|_: &AssembleContext| Some("late".to_string())),
+                    Arc::new(|_: &AssembleContext| Some("late".to_string())),
                 );
             }
             Some("early".to_string())
@@ -664,13 +671,13 @@ fn variables_live_iteration_new_registration_visible_same_round() {
     let a = sp.assemble(&AssembleContext::default()).unwrap();
     let names: Vec<String> = a.variables.iter().map(|(k, _)| k.clone()).collect();
     assert_eq!(names, vec!["early".to_string(), "latevar".to_string()]);
-    assert!(register_late.get());
+    assert!(register_late.load(Ordering::SeqCst));
 }
 
 #[test]
 fn variable_undefined_provider_and_render_no_value() {
     let sp = new_sp(Config::default());
-    let _ = sp.variable(None, "cwd", Rc::new(|_| None));
+    let _ = sp.variable(None, "cwd", Arc::new(|_| None));
     let a = sp.assemble(&AssembleContext::default()).unwrap();
     // 已注册但无值 → 存在（own-property）
     assert_eq!(a.variables, vec![("cwd".to_string(), None)]);
@@ -799,7 +806,7 @@ fn constructor_prototype_poisoned_name_is_unknown_then_registerable() {
         "unknown prompt variable \"{{constructor}}\" in section \"s\"; registered variables: (none)"
     );
     // 注册后可变数插值
-    let _ = sp.variable(None, "constructor", Rc::new(|_| Some("v".to_string()))).unwrap();
+    let _ = sp.variable(None, "constructor", Arc::new(|_| Some("v".to_string()))).unwrap();
     let a2 = sp.assemble(&AssembleContext::default()).unwrap();
     let out = render_prompt(&PromptAssembly {
         sections: vec![AssembledSection {
@@ -835,7 +842,7 @@ fn substituted_values_are_not_rescanned() {
 #[test]
 fn waterfall_can_add_variables_before_render() {
     let sp = new_sp(Config::default());
-    sp.register_assemble_listener(None, false, Rc::new(move |mut a, _, next| {
+    sp.register_assemble_listener(None, false, Arc::new(move |mut a, _, next| {
         a.variables.push(("added".to_string(), Some("yes".to_string())));
         next(a)
     }));
@@ -915,7 +922,7 @@ fn scoped_section_goes_away_after_dispose_and_global_returns() {
 
 #[test]
 fn scoped_shadowing_wins_before_evaluation() {
-    let calls = Rc::new(Cell::new(0u32));
+    let calls = Arc::new(AtomicU32::new(0));
     let c = calls.clone();
     let sp = new_sp(Config::default());
     let scope_key = ScopeKey::new();
@@ -926,8 +933,8 @@ fn scoped_shadowing_wins_before_evaluation() {
             &PromptSection {
                 name: "shadowme".to_string(),
                 order: 5.0,
-                text: PromptSectionText::Fn(Rc::new(move |_| {
-                    c.set(c.get() + 1);
+                text: PromptSectionText::Fn(Arc::new(move |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
                     "global".to_string()
                 })),
                 complete: false,
@@ -945,13 +952,13 @@ fn scoped_shadowing_wins_before_evaluation() {
         sc.sections.iter().find(|s| s.name == "shadowme").unwrap().text,
         "scoped"
     );
-    assert_eq!(calls.get(), 0, "global provider must not run under shadowing");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "global provider must not run under shadowing");
     let g = sp.assemble(&AssembleContext::default()).unwrap();
     assert_eq!(
         g.sections.iter().find(|s| s.name == "shadowme").unwrap().text,
         "global"
     );
-    assert_eq!(calls.get(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -960,7 +967,7 @@ fn scoped_variable_shadows_global_and_dispose_restores() {
     let scope_key = ScopeKey::new();
     let _ = var(&sp, "mode", "normal");
     let d = sp
-        .variable(Some(&scope_key), "mode", Rc::new(|_| Some("strict".to_string())))
+        .variable(Some(&scope_key), "mode", Arc::new(|_| Some("strict".to_string())))
         .unwrap();
     let a = sp
         .assemble(&AssembleContext{
@@ -1060,7 +1067,7 @@ fn scope_chain_nearest_wins_and_ancestor_visible() {
     let parent = ScopeKey::new();
     let child = ScopeKey::new();
     bind_scope_parent(child.clone(), parent.clone()).unwrap();
-    let _ = sp.variable(Some(&parent), "mode", Rc::new(|_| Some("ancestor".to_string())));
+    let _ = sp.variable(Some(&parent), "mode", Arc::new(|_| Some("ancestor".to_string())));
     let a_child = sp
         .assemble(&AssembleContext{
             scope: Some(child.clone()),
@@ -1069,7 +1076,7 @@ fn scope_chain_nearest_wins_and_ancestor_visible() {
         .unwrap();
     let names: Vec<&str> = a_child.variables.iter().map(|(k, _)| k.as_str()).collect();
     assert!(names.contains(&"mode"), "ancestor variable visible to child");
-    let _ = sp.variable(Some(&child), "mode", Rc::new(|_| Some("nearest".to_string())));
+    let _ = sp.variable(Some(&child), "mode", Arc::new(|_| Some("nearest".to_string())));
     let a_child2 = sp
         .assemble(&AssembleContext{
             scope: Some(child),
@@ -1178,7 +1185,7 @@ fn invariant_install_wraps_waterfall_and_validates_authority() {
     let a = sp.assemble(&AssembleContext::default()).unwrap();
     assert_eq!(a.sections.len(), 2);
     // 水岭把权威物改成非法（空 section 名）→ 安装的 invariant 报错
-    sp.register_assemble_listener(None, false, Rc::new(move |mut a, _, next| {
+    sp.register_assemble_listener(None, false, Arc::new(move |mut a, _, next| {
         a.sections = vec![AssembledSection {
             name: String::new(),
             text: "x".to_string(),

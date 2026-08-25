@@ -19,10 +19,9 @@
 //! str_replace_editor）；多工具行（fs-local/terminal）与 pwsh 执行器留 P3-b/A。
 //! standing 是注册面里的一个作用域子树；真实 isolate 服务隔离是 C 段收敛目标。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use dsh_agent_presets::parse::{row_disabled_with, CompositionRow};
 use dsh_core::{Cordis, CordisError, EffectOutcome, FiberHandle, Plugin, ScopeId};
@@ -116,14 +115,15 @@ impl Plugin for PresetRecordPlugin {
 }
 
 /// L1（D-105）/S3（D-107）：plan-mode 折叠 Fn——组装会话身份 `Some(sid)` 按该会话
-/// 折叠（per-agent 保真），`None` 回退全局/上次 select 会话。
-type PlanModeProbe = Rc<dyn Fn(Option<&str>) -> bool>;
+/// 折叠（per-agent 保真），`None` 回退全局/上次 select 会话。Send+Sync（注入
+/// `PromptSectionText::Fn` 的 Send+Sync 段闭包）。
+type PlanModeProbe = Arc<dyn Fn(Option<&str>) -> bool + Send + Sync>;
 
-/// L1（D-105）/S3（D-107）：plan-mode 折叠源句柄——`Rc<RefCell<Option<…>>>` 便于宿主在
+/// L1（D-105）/S3（D-107）：plan-mode 折叠源句柄——`Arc<Mutex<Option<…>>>` 便于宿主在
 /// standings 重建后注入/替换；Fn 段组装期经 `active(session_id)` 判定（单一权威态 =
 /// 会话 `plan/mode` 事件折叠；**per-agent**：携带组装会话身份则按该会话折叠，`None`
 /// 回退全局/上次 select 会话）。`None` = 永不注入（无 loop/未接）。
-type PlanModeSource = Rc<RefCell<Option<PlanModeProbe>>>;
+type PlanModeSource = Arc<Mutex<Option<PlanModeProbe>>>;
 
 /// 一个 standing 挂载。
 pub struct Standing {
@@ -144,10 +144,10 @@ pub struct Standing {
 /// accept，无锁纪律）。
 pub struct StandingRegistry {
     /// 共享的 SystemPrompt 注册面（**同一实例** —— join 后 agent 的 assemble 走它）。
-    system_prompt: Rc<SystemPrompt>,
+    system_prompt: Arc<SystemPrompt>,
     /// 共享的 ToolRegistry（P3-a 工具行桥用；None = 该 host 未装配工具注册面 →
     /// 工具行一律 guarded，诚实）。
-    tools: Option<Rc<ToolRegistry>>,
+    tools: Option<Arc<ToolRegistry>>,
     standings: HashMap<String, Standing>,
     /// K3/C：组合运行时（dsh-core）——每个挂载铸造真实 agent-scope 子树，生存期/
     /// 泄漏审计本体（组合权威归位 dsh-core 的收敛载体）。
@@ -170,8 +170,8 @@ impl Default for StandingRegistry {
     /// 工具注册面。web serve 装配 agent-loop 后以 `host.prompt` + `host.tools` 重建
     /// （见 web.rs `boot.standings`），保证 standing 贡献落进 loop 实际组装的注册面。
     fn default() -> Self {
-        let placeholder = Rc::new(
-            SystemPrompt::new(&dsh_system_prompt::Config::default(), Rc::new(|| {}))
+        let placeholder = Arc::new(
+            SystemPrompt::new(&dsh_system_prompt::Config::default(), Arc::new(|| {}))
                 .expect("standing placeholder system prompt"),
         );
         StandingRegistry::new(placeholder, None)
@@ -179,7 +179,7 @@ impl Default for StandingRegistry {
 }
 
 impl StandingRegistry {
-    pub fn new(system_prompt: Rc<SystemPrompt>, tools: Option<Rc<ToolRegistry>>) -> Self {
+    pub fn new(system_prompt: Arc<SystemPrompt>, tools: Option<Arc<ToolRegistry>>) -> Self {
         let (combo, combo_wasm) = match WasmComboEvaluator::from_default_build() {
             Ok(w) => (
                 Rc::new(FallbackEval::new(
@@ -198,7 +198,7 @@ impl StandingRegistry {
             fault_root_leak: false,
             combo,
             combo_wasm,
-            plan_mode_source: Rc::new(RefCell::new(None)),
+            plan_mode_source: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -207,13 +207,13 @@ impl StandingRegistry {
     /// 读取。**组装者会话身份**参数：`Some(sid)` = 按该会话折叠（per-agent 保真），
     /// `None` = 无身份组装（回退全局/上次 select 会话）。
     pub fn set_plan_mode_source(&self, source: Option<PlanModeProbe>) {
-        *self.plan_mode_source.borrow_mut() = source;
+        *self.plan_mode_source.lock().unwrap() = source;
     }
 
     /// 注入组合求值引擎（测试替身 / 宿主自选）。
     pub fn with_combo(
-        system_prompt: Rc<SystemPrompt>,
-        tools: Option<Rc<ToolRegistry>>,
+        system_prompt: Arc<SystemPrompt>,
+        tools: Option<Arc<ToolRegistry>>,
         combo: Rc<dyn ComboEvaluator>,
         combo_wasm: bool,
     ) -> Self {
@@ -225,7 +225,7 @@ impl StandingRegistry {
             fault_root_leak: false,
             combo,
             combo_wasm,
-            plan_mode_source: Rc::new(RefCell::new(None)),
+            plan_mode_source: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -465,12 +465,13 @@ impl StandingRegistry {
                         let pc = PromptSection {
                             name: format!("preset:{id}:plan-mode"),
                             order: PLAN_MODE_ORDER,
-                            text: PromptSectionText::Fn(Rc::new(move |ctx: &AssembleContext| {
+                            text: PromptSectionText::Fn(Arc::new(move |ctx: &AssembleContext| {
                                 // S3（D-107）：折叠源按**组装者自身会话**判定——身份在场
                                 // 时 per-agent 保真（多会话共享 standing 各看各的
                                 // plan/mode），无身份（None）回退全局源。
                                 let active = source
-                                    .borrow()
+                                    .lock()
+                                    .unwrap()
                                     .as_ref()
                                     .is_some_and(|f| f(ctx.session_id.as_deref()));
                                 if active {
@@ -565,7 +566,7 @@ impl StandingRegistry {
                             def.timeout_ms = Some(t);
                         }
                         let undo = home
-                            .register(Rc::new(def), Some(&scope))
+                            .register(Arc::new(def), Some(&scope))
                             .map_err(|e| format!("preset {id}: tool {}: {e}", row.name))?;
                         undos.push(undo);
                         report.bridged.push(format!("{} (tool {tool})", row.name));
@@ -838,8 +839,8 @@ mod tests {
     }
 
     /// 测试用最小工具定义（object-rooted schema，register 的 schema 断言可过）。
-    fn tool_def(name: &str, description: &str, timeout: f64) -> Rc<dsh_tools::ToolDefinition> {
-        Rc::new(dsh_tools::ToolDefinition {
+    fn tool_def(name: &str, description: &str, timeout: f64) -> Arc<dsh_tools::ToolDefinition> {
+        Arc::new(dsh_tools::ToolDefinition {
             name: name.to_string(),
             description: description.to_string(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
@@ -848,11 +849,11 @@ mod tests {
                     r#type: Some(dsh_tools::json_schema::JsonSchemaType::Object),
                     ..Default::default()
                 },
-                render: Rc::new(|_: &Value, _: &Value| Vec::new()),
+                render: Arc::new(|_: &Value, _: &Value| Vec::new()),
                 presentation_meta: None,
             },
             timeout_ms: Some(timeout),
-            execute: Rc::new(|_: &Value, _: &dsh_tools::ToolRunContext| {
+            execute: Arc::new(|_: &Value, _: &dsh_tools::ToolRunContext| {
                 Err(dsh_tools::ToolFailureData::new("stub", "stub", "stub"))
             }),
             finalize_content: None,
@@ -862,8 +863,8 @@ mod tests {
         })
     }
 
-    fn new_sp() -> Rc<SystemPrompt> {
-        Rc::new(
+    fn new_sp() -> Arc<SystemPrompt> {
+        Arc::new(
             SystemPrompt::new(
                 &Config {
                     include_harness_identity: false,
@@ -871,7 +872,7 @@ mod tests {
                     persona: String::new(),
                     tool_order: None,
                 },
-                Rc::new(|| {}),
+                Arc::new(|| {}),
             )
             .unwrap(),
         )
@@ -1095,7 +1096,7 @@ mod tests {
     #[test]
     fn tool_rows_re_present_into_standing_scope_for_joined_only() {
         let sp = new_sp();
-        let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+        let tools = Arc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
         tools
             .register_global(tool_def("bash", "GLOBAL-BASH-DESC", 111.0))
             .unwrap();
@@ -1154,7 +1155,7 @@ mod tests {
     #[test]
     fn unbridged_tool_rows_guarded_with_specific_reasons() {
         let sp = new_sp();
-        let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+        let tools = Arc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
         // 只注册 str_replace_editor（无 bash）。
         tools
             .register_global(tool_def("str_replace_editor", "EDIT", 1.0))
@@ -1218,7 +1219,7 @@ mod tests {
     #[test]
     fn fs_and_terminal_groups_resolve_when_host_toolset_present() {
         let sp = new_sp();
-        let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+        let tools = Arc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
         for name in [
             "read",
             "write",
@@ -1295,8 +1296,8 @@ mod tests {
     // 刻意 broken / 未实现面的诚实降级 → 仅报告、不否决（D-103 兼容）。
     /// 生产等同宿主工具集（web_m5 注册面：fs 六件套 + terminal 六件套 + bash/pwsh
     /// + str_replace_editor）。
-    fn realistic_tools() -> Rc<ToolRegistry> {
-        let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+    fn realistic_tools() -> Arc<ToolRegistry> {
+        let tools = Arc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
         for name in [
             "read",
             "write",
@@ -1636,9 +1637,11 @@ mod tests {
         // 折叠源替身：单一权威态应从 `dsh_plan::fold_plan_mode(events)` 折叠；这里
         // 注入可控闭包验证段对 folding 结果的响应（真实 fold 由 dsh-plan 测试与
         // PlanModeHost 测试覆盖）。
-        let state = Rc::new(RefCell::new(false));
+        let state = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let src = state.clone();
-        reg.set_plan_mode_source(Some(Rc::new(move |_sid| *src.borrow())));
+        reg.set_plan_mode_source(Some(Arc::new(move |_sid| {
+            src.load(std::sync::atomic::Ordering::SeqCst)
+        })));
         let comp = "
 - id: plan-mode
   name: '@deepseek-ai/dsh-plan-mode'
@@ -1656,15 +1659,15 @@ mod tests {
         );
         let scope = ScopeKey::new();
         reg.join("l1", &scope).unwrap();
-        let has_marker = |sp: &Rc<SystemPrompt>, sc: &ScopeKey| {
+        let has_marker = |sp: &Arc<SystemPrompt>, sc: &ScopeKey| {
             sect_texts(sp, sc)
                 .iter()
                 .any(|t| t.contains("YOU-ARE-IN-PLAN-MODE-MARKER"))
         };
         assert!(!has_marker(&sp, &scope), "inactive: no plan-mode section");
-        *state.borrow_mut() = true; // 会话进入 plan mode（fold active）
+        state.store(true, std::sync::atomic::Ordering::SeqCst); // 会话进入 plan mode（fold active）
         assert!(has_marker(&sp, &scope), "active: plan-mode section injected");
-        *state.borrow_mut() = false; // 会话退出 plan mode（fold inactive）
+        state.store(false, std::sync::atomic::Ordering::SeqCst); // 会话退出 plan mode（fold inactive）
         assert!(!has_marker(&sp, &scope), "left: section removed again");
 
         // 无源 → 永不注入（未接 loop 的诚实面）。
@@ -1689,7 +1692,7 @@ mod tests {
         let sp = new_sp();
         let mut reg = StandingRegistry::new(sp.clone(), Some(realistic_tools()));
         // 折叠源 = 按会话判定（模拟宿主解析器：会话 "alice" 处于 plan，其它否）。
-        reg.set_plan_mode_source(Some(Rc::new(|sid| sid == Some("alice"))));
+        reg.set_plan_mode_source(Some(Arc::new(|sid| sid == Some("alice"))));
         let comp = "
 - id: plan-mode
   name: '@deepseek-ai/dsh-plan-mode'
@@ -1726,7 +1729,7 @@ mod tests {
     fn unusable_rows_flags_mapped_tool_missing_from_host() {
         let sp = new_sp();
         // linux 门面：bash 行不被平台判禁 → 活化 → 需宿主 "bash"（缺失）。
-        let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+        let tools = Arc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
         let comp = "- id: t\n  name: '@deepseek-ai/dsh-tool-bash'\n";
         let rows = dsh_agent_presets::parse::parse_composition(comp).unwrap();
         let mut reg = StandingRegistry::new(sp.clone(), Some(tools));
@@ -1745,7 +1748,7 @@ mod tests {
     fn unusable_rows_flags_group_and_backend_stuck_dependencies() {
         let sp = new_sp();
         // 宿主只有 bash：fs/terminal 组缺失，且 terminal-bash 后端行无解析组。
-        let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+        let tools = Arc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
         tools.register_global(tool_def("bash", "bash", 1000.0)).unwrap();
         let comp = "
 - id: fs

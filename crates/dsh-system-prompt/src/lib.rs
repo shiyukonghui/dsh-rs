@@ -10,11 +10,13 @@
 //!   行为的语义不变。
 //! - `PromptAssembly.variables` 用 `Vec<(String, Option<String>)>` 保序（对齐 JS
 //!   `Record` 的 own-property 语义与错误消息里的注册名插入序；无原型穿透）。
-//! - 水岭监听器注册/拆除在本服务内 `Rc<RefCell<Vec<..>>>`；`prepend` 插到最前。
-//! - `system-prompt/change` 为调用方提供的 `Rc<dyn Fn()>` 通知（全局、unfiltered）。
+//! - 水岭监听器注册/拆除在本服务内 `Arc<Mutex<Vec<..>>>`；`prepend` 插到最前。
+//! - `system-prompt/change` 为调用方提供的 `Arc<dyn Fn() + Send + Sync>` 通知（全局、unfiltered）。
+//! - D-115（请求面并发化）：全部闭包族 `Rc<dyn Fn>` → `Arc<dyn Fn + Send + Sync>`、
+//!   `listeners: Rc<RefCell<Vec>>` → `Arc<Mutex<Vec>>`——使 `SystemPrompt` 成为
+//!   Send+Sync（Phase 3 连锁：dsh-agent-loop 的 LoopDeps 闭包捕获它须跨线程）。
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use dsh_llm::{ContextSnapshotSection, ToolSchema};
 use dsh_scope::{AnonymousEntries, NamedEntries, ScopeKey, ScopeLayer, ScopedLayers, Undo};
@@ -71,7 +73,7 @@ pub struct AssembleContext {
 #[derive(Clone)]
 pub enum PromptSectionText {
     Static(String),
-    Fn(Rc<dyn Fn(&AssembleContext) -> String>),
+    Fn(Arc<dyn Fn(&AssembleContext) -> String + Send + Sync>),
 }
 
 impl PromptSectionText {
@@ -99,7 +101,7 @@ pub struct PromptSection {
 #[derive(Clone)]
 pub enum PromptContextText {
     Static(String),
-    Fn(Rc<dyn Fn(&AssembleContext) -> String>),
+    Fn(Arc<dyn Fn(&AssembleContext) -> String + Send + Sync>),
 }
 
 impl PromptContextText {
@@ -130,9 +132,9 @@ pub struct ToolProviderResult {
 }
 
 /// 工具 schema provider。
-pub type ToolProvider = Rc<dyn Fn(&AssembleContext) -> ToolProviderResult>;
+pub type ToolProvider = Arc<dyn Fn(&AssembleContext) -> ToolProviderResult + Send + Sync>;
 /// 变量 provider（返回 `None` = 注册但本组装无值，渲染引用到即失败）。
-pub type VariableProvider = Rc<dyn Fn(&AssembleContext) -> Option<String>>;
+pub type VariableProvider = Arc<dyn Fn(&AssembleContext) -> Option<String> + Send + Sync>;
 
 /// 组装里的一个 section（已解析、未插值）。
 #[derive(Debug, Clone, PartialEq)]
@@ -274,11 +276,11 @@ impl ScopeLayer for PromptLayer {
 // ---------------------------------------------------------------------------
 
 /// 剩余链回调（`next`）：跑余下监听器；`None` 层无监听器时为恒等。
-pub type AssembleNext = Rc<dyn Fn(PromptAssembly) -> Result<PromptAssembly, String>>;
+pub type AssembleNext = Arc<dyn Fn(PromptAssembly) -> Result<PromptAssembly, String> + Send + Sync>;
 /// 一条 assemble 水岭监听器：`(assembly, context, next) -> Result`；不调 `next`
 /// 即短路。
 pub type AssembleListener =
-    Rc<dyn Fn(PromptAssembly, &AssembleContext, AssembleNext) -> Result<PromptAssembly, String>>;
+    Arc<dyn Fn(PromptAssembly, &AssembleContext, AssembleNext) -> Result<PromptAssembly, String> + Send + Sync>;
 
 struct WaterfallItem {
     scope: Option<ScopeKey>,
@@ -293,21 +295,21 @@ struct WaterfallItem {
 pub struct SystemPrompt {
     layers: ScopedLayers<PromptLayer>,
     tool_order: Option<Vec<String>>,
-    listeners: Rc<RefCell<Vec<WaterfallItem>>>,
-    change_notify: Rc<dyn Fn()>,
+    listeners: Arc<Mutex<Vec<WaterfallItem>>>,
+    change_notify: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl SystemPrompt {
     /// 构造并注册内建 section（harness 身份 + persona）+ 可选全局上下文抑制。
     /// `tool_order` 无效（重复/缺 rest）→ Err。
-    pub fn new(config: &Config, change_notify: Rc<dyn Fn()>) -> Result<Self, String> {
+    pub fn new(config: &Config, change_notify: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
         let tool_order = validate_tool_order(config.tool_order.clone())?;
         let notify = change_notify.clone();
         let layers = ScopedLayers::new(PromptLayer::new, move || notify());
         let service = SystemPrompt {
             layers,
             tool_order,
-            listeners: Rc::new(RefCell::new(Vec::new())),
+            listeners: Arc::new(Mutex::new(Vec::new())),
             change_notify,
         };
         if config.include_harness_identity {
@@ -337,7 +339,7 @@ impl SystemPrompt {
     }
 
     /// `system-prompt/change` 通知回调（注册/注销各触发一次；全局 unfiltered）。
-    pub fn change_notify(&self) -> &Rc<dyn Fn()> {
+    pub fn change_notify(&self) -> &Arc<dyn Fn() + Send + Sync> {
         &self.change_notify
     }
 
@@ -348,7 +350,7 @@ impl SystemPrompt {
         prepend: bool,
         cb: AssembleListener,
     ) {
-        let mut list = self.listeners.borrow_mut();
+        let mut list = self.listeners.lock().unwrap();
         let item = WaterfallItem { scope, cb };
         if prepend {
             list.insert(0, item);
@@ -640,7 +642,7 @@ impl SystemPrompt {
         context: &AssembleContext,
     ) -> Result<PromptAssembly, String> {
         let adopted: Vec<AssembleListener> = {
-            let list = self.listeners.borrow();
+            let list = self.listeners.lock().unwrap();
             let chain = dsh_scope::scope_chain_of(context.scope.as_ref());
             list.iter()
                 .filter(|item| match &item.scope {
@@ -702,7 +704,7 @@ fn dispatch_slice(
         session_id: context.session_id.clone(),
     };
     let tail: Vec<AssembleListener> = list[i + 1..].iter().cloned().collect();
-    let next: AssembleNext = Rc::new(move |a| dispatch_slice(&tail, 0, a, &owned));
+    let next: AssembleNext = Arc::new(move |a| dispatch_slice(&tail, 0, a, &owned));
     (list[i])(assembly, context, next)
 }
 

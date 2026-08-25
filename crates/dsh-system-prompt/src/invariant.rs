@@ -62,7 +62,7 @@ pub fn validate_assembly(assembly: &PromptAssembly, fail: &mut dyn FnMut(String)
 /// 安装：把 `validate_assembly` 以 `{global:true, prepend:true}` 包在其它监听器外，
 /// 校验**瀑布最终返回**的权威物。所有违规以 `; ` 连接为一个 Err。
 pub fn install(sp: &SystemPrompt) {
-    let listener: crate::AssembleListener = Rc::new(move |assembly, _, next| {
+    let listener: crate::AssembleListener = std::sync::Arc::new(move |assembly, _, next| {
         let assembled = next(assembly)?;
         let mut failures: Vec<String> = Vec::new();
         {
@@ -76,5 +76,3 @@ pub fn install(sp: &SystemPrompt) {
     });
     sp.register_assemble_listener(None, true, listener);
 }
-
-use std::rc::Rc;

@@ -8,8 +8,7 @@
 //! 执行器；未绑定 → 结构化 `NOT_BOUND` 错误（复用 [`crate::m4::not_bound_failure`]），
 //! 绝不伪装成功（D-052 同款承诺；M5-DESIGN §8）。后续宿主句柄装配经 web.rs 注入。
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
@@ -18,26 +17,26 @@ use crate::schema::{define_tool, DefineToolOptions, ToolDefinitionError};
 use crate::types::{ToolDefinition, ToolExecute, ToolRender};
 
 /// 一个可绑定宿主执行器的 M5 工具定义。注册的是 [`M5Tool::definition`]。
-/// `bind` 在注册后随时可调（同 `Rc` 生效）。
+/// `bind` 在注册后随时可调（同 `Arc` 生效）。
 pub struct M5Tool {
-    def: Rc<ToolDefinition>,
-    slot: Rc<RefCell<Option<ToolExecute>>>,
+    def: Arc<ToolDefinition>,
+    slot: Arc<Mutex<Option<ToolExecute>>>,
 }
 
 impl M5Tool {
-    /// 待注册/已注册的定义（`Rc`，`bind` 后同一定义即刻委托宿主）。
-    pub fn definition(&self) -> Rc<ToolDefinition> {
+    /// 待注册/已注册的定义（`Arc`，`bind` 后同一定义即刻委托宿主）。
+    pub fn definition(&self) -> Arc<ToolDefinition> {
         self.def.clone()
     }
 
     /// 绑定真实宿主执行器（web.rs 接线时注入）。
     pub fn bind(&self, executor: ToolExecute) {
-        *self.slot.borrow_mut() = Some(executor);
+        *self.slot.lock().unwrap() = Some(executor);
     }
 
     /// 当前是否已绑定宿主执行器。
     pub fn is_bound(&self) -> bool {
-        self.slot.borrow().is_some()
+        self.slot.lock().unwrap().is_some()
     }
 }
 
@@ -50,11 +49,11 @@ pub fn define_m5_tool(
     output_schema: Value,
     render: ToolRender,
 ) -> Result<M5Tool, ToolDefinitionError> {
-    let slot: Rc<RefCell<Option<ToolExecute>>> = Rc::new(RefCell::new(None));
+    let slot: Arc<Mutex<Option<ToolExecute>>> = Arc::new(Mutex::new(None));
     let slot_for_execute = slot.clone();
     let unbound = not_bound_failure(name, "M5");
-    let execute: ToolExecute = Rc::new(move |args, ctx| {
-        let executor = slot_for_execute.borrow().clone();
+    let execute: ToolExecute = Arc::new(move |args, ctx| {
+        let executor = slot_for_execute.lock().unwrap().clone();
         match executor {
             Some(f) => f(args, ctx),
             None => Err(unbound.clone()),
@@ -70,7 +69,7 @@ pub fn define_m5_tool(
         ..Default::default()
     })?;
     Ok(M5Tool {
-        def: Rc::new(def),
+        def: Arc::new(def),
         slot,
     })
 }

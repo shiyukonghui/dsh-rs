@@ -5,10 +5,9 @@
 #![allow(clippy::type_complexity)]
 #![allow(clippy::result_large_err)]
 
-use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use dsh_agent::{Agent, AgentBus, AgentRegistry, AgentOptions, AgentStatus};
 use dsh_agent_loop::create_loop_agent;
@@ -44,20 +43,20 @@ fn count_of(s: &Arc<Session>, kind: EventKind) -> usize {
 }
 
 struct MockAdapter {
-    script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>,
-    calls: Rc<Cell<u32>>,
+    script: Arc<Mutex<VecDeque<Vec<StreamChunk>>>>,
+    calls: Arc<AtomicU32>,
 }
 
 impl MockAdapter {
-    fn new(script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>, calls: Rc<Cell<u32>>) -> Self {
+    fn new(script: Arc<Mutex<VecDeque<Vec<StreamChunk>>>>, calls: Arc<AtomicU32>) -> Self {
         MockAdapter { script, calls }
     }
 }
 
 impl LlmAdapter for MockAdapter {
     fn stream(&self, _options: GenerateOptions) -> Box<dyn Iterator<Item = StreamChunk>> {
-        self.calls.set(self.calls.get() + 1);
-        let next = self.script.borrow_mut().pop_front().unwrap_or_else(|| {
+        self.calls.store(self.calls.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+        let next = self.script.lock().unwrap().pop_front().unwrap_or_else(|| {
             vec![StreamChunk::Finish {
                 reason: FinishReason::Error {
                     failure: LlmFailure {
@@ -104,16 +103,16 @@ fn tool_call_chunks(arguments: &str) -> Vec<StreamChunk> {
     ]
 }
 
-fn stream(script: &[Vec<StreamChunk>]) -> (Rc<RefCell<VecDeque<Vec<StreamChunk>>>>, Rc<Cell<u32>>) {
-    let q = Rc::new(RefCell::new(VecDeque::from_iter(script.iter().cloned())));
-    let calls = Rc::new(Cell::new(0u32));
+fn stream(script: &[Vec<StreamChunk>]) -> (Arc<Mutex<VecDeque<Vec<StreamChunk>>>>, Arc<AtomicU32>) {
+    let q = Arc::new(Mutex::new(VecDeque::from_iter(script.iter().cloned())));
+    let calls = Arc::new(AtomicU32::new(0));
     (q, calls)
 }
 
 struct World {
     a: Arc<Agent>,
-    driver: Rc<dsh_agent_loop::ReactLoopAgent>,
-    ran: Rc<Cell<bool>>,
+    driver: Arc<dsh_agent_loop::ReactLoopAgent>,
+    ran: Arc<AtomicBool>,
 }
 
 fn build(
@@ -122,25 +121,25 @@ fn build(
     outcome: Option<ApprovalOutcome>,
 ) -> World {
     let (q, calls) = stream(script);
-    let llm = Rc::new(LlmRuntime::new());
-    llm.register_adapter(&["mock"], Rc::new(MockAdapter::new(q, calls))).unwrap();
+    let llm = Arc::new(LlmRuntime::new());
+    llm.register_adapter(&["mock"], Arc::new(MockAdapter::new(q, calls))).unwrap();
 
-    let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
-    let ran = Rc::new(Cell::new(false));
+    let tools = Arc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+    let ran = Arc::new(AtomicBool::new(false));
     let ran2 = ran.clone();
     tools
-        .register_global(Rc::new(
+        .register_global(Arc::new(
             define_tool(DefineToolOptions {
                 name: "echo".into(),
                 description: "echo the given text".into(),
                 parameters: json!({ "text": { "type": "string", "required": true } }),
                 output_schema: json!({ "type": "json" }),
-                render: Rc::new(|_, v| vec![ContentBlock::text(serde_json::to_string(v).unwrap())]),
-                execute: Rc::new(move |args, _| {
-                    ran2.set(true);
+                render: Arc::new(|_, v| vec![ContentBlock::text(serde_json::to_string(v).unwrap())]),
+                execute: Arc::new(move |args, _| {
+                    ran2.store(true, Ordering::SeqCst);
                     Ok(args["text"].clone())
                 }),
-                is_concurrency_safe: Some(Rc::new(|_| true)),
+                is_concurrency_safe: Some(Arc::new(|_| true)),
                 ..Default::default()
             })
             .unwrap(),
@@ -149,16 +148,16 @@ fn build(
     if ask {
         tools
             .add_pre_decision(
-                Rc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask { reason: None })),
+                Arc::new(|_e: &ToolExecution| Some(PreToolDecision::Ask { reason: None })),
                 None,
             )
             .unwrap();
     }
     if let Some(outcome) = outcome {
-        tools.set_approval_provider(Some(Rc::new(move |_e: &ToolExecution, _r: Option<&str>| outcome)));
+        tools.set_approval_provider(Some(Arc::new(move |_e: &ToolExecution, _r: Option<&str>| outcome)));
     }
 
-    let prompt = Rc::new(SystemPrompt::new(&Config::default(), Rc::new(|| {})).unwrap());
+    let prompt = Arc::new(SystemPrompt::new(&Config::default(), Arc::new(|| {})).unwrap());
     let bus = AgentBus::new();
     let reg = Arc::new(AgentRegistry::new(bus.clone()));
     let store = Arc::new(SessionStore::new());
@@ -230,7 +229,7 @@ fn hard_guard_denial_lands_in_tool_result_and_body_does_not_run() {
         .expect("loop must run");
     assert_eq!(count_of(&w.a.session, EventKind::TurnEnd), 1);
     assert_eq!(turn_end_reason(&w.a.session)["kind"], "completed");
-    assert!(!w.ran.get(), "echo body must not run when approval is denied");
+    assert!(!w.ran.load(Ordering::SeqCst), "echo body must not run when approval is denied");
 
     // tool/result 携带逐字拒绝内容与 isError（守卫拒绝 = 普通 error 结果，无 failure
     // info——对齐 TS serviceAsk 的 `error: { message }` 且 error.info 缺省）
@@ -268,7 +267,7 @@ fn approved_once_lets_tool_body_run() {
         .expect("loop must run");
     assert_eq!(count_of(&w.a.session, EventKind::TurnEnd), 1);
     assert_eq!(turn_end_reason(&w.a.session)["kind"], "completed");
-    assert!(w.ran.get(), "echo body must run after an allowed-once grant");
+    assert!(w.ran.load(Ordering::SeqCst), "echo body must run after an allowed-once grant");
 
     // tool/result 非错误、携带 echo 渲染值，模型看到的是结果
     let tr = tool_result_of(&w.a.session);

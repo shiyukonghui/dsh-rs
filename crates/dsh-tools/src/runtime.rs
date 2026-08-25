@@ -20,9 +20,8 @@ use crate::json_schema::validate_json_schema_value;
 use crate::types::*;
 use dsh_scope::{NamedEntries, ScopeKey, ScopedLayers};
 use serde_json::Value;
-use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 /// 执行模式（TS `ToolExecutionMode`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,10 +58,10 @@ pub enum ToolExecutionClass {
 }
 
 /// 一个 effect 返回的拆除器。
-pub type ToolDisposer = Rc<dyn Fn()>;
+pub type ToolDisposer = Arc<dyn Fn() + Send + Sync>;
 
 /// guard 谓词：`(name, args)` → 拒绝理由（None = 放行）。单调拒绝（无 allow 结果）。
-pub type ToolGuard = Rc<dyn Fn(&str, &Value) -> Option<String>>;
+pub type ToolGuard = Arc<dyn Fn(&str, &Value) -> Option<String> + Send + Sync>;
 
 /// pre-dispatch 决策（对齐 TS `PreToolDecision`）：`allow` 放行、`deny` 物化错误、
 /// `ask` 仅在审批通道返回 `allowed-once` 后才放行、否则按原因拒绝。
@@ -84,10 +83,10 @@ pub enum ApprovalOutcome {
 }
 
 /// pre-execute 等价钩子：返回 None = 放行（delegate 到 allow）；首个非 None 即最终决策。
-pub type ToolPreDecision = Rc<dyn Fn(&ToolExecution) -> Option<PreToolDecision>>;
+pub type ToolPreDecision = Arc<dyn Fn(&ToolExecution) -> Option<PreToolDecision> + Send + Sync>;
 
 /// 审批决策者（同步；宿主以回调把「ask」解析为 allow/deny——UI 往返在 loop 之外，M3）。
-pub type ApprovalProvider = Rc<dyn Fn(&ToolExecution, Option<&str>) -> ApprovalOutcome>;
+pub type ApprovalProvider = Arc<dyn Fn(&ToolExecution, Option<&str>) -> ApprovalOutcome + Send + Sync>;
 
 /// 限制谓词（allow/deny ReadonlySet；`admits` 语义对齐 TS）。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -122,38 +121,38 @@ impl ToolRestriction {
 
 /// 一个作用域的工具层（对齐 TS `ToolLayer implements ScopeLayer`）。
 ///
-/// 可变字段用 `Rc<RefCell<...>>`（dsh-scope philosophy：effect 的 action 与 undo
+/// 可变字段用 `Arc<Mutex<...>>`（dsh-scope philosophy：effect 的 action 与 undo
 /// 都只拿 `&L`，经内部共享句柄写入/回滚）。
 pub struct ToolLayer {
-    tools: NamedEntries<Rc<ToolDefinition>>,
-    mode: Rc<RefCell<Option<ToolExecutionMode>>>,
-    restrictions: Rc<RefCell<Vec<ToolRestriction>>>,
-    guards: Rc<RefCell<Vec<ToolGuard>>>,
-    pre_decisions: Rc<RefCell<Vec<ToolPreDecision>>>,
+    tools: NamedEntries<Arc<ToolDefinition>>,
+    mode: Arc<Mutex<Option<ToolExecutionMode>>>,
+    restrictions: Arc<Mutex<Vec<ToolRestriction>>>,
+    guards: Arc<Mutex<Vec<ToolGuard>>>,
+    pre_decisions: Arc<Mutex<Vec<ToolPreDecision>>>,
 }
 
 impl ToolLayer {
     fn new() -> Self {
         ToolLayer {
             tools: NamedEntries::new(|name| format!("tool \"{name}\" is already registered")),
-            mode: Rc::new(RefCell::new(None)),
-            restrictions: Rc::new(RefCell::new(Vec::new())),
-            guards: Rc::new(RefCell::new(Vec::new())),
-            pre_decisions: Rc::new(RefCell::new(Vec::new())),
+            mode: Arc::new(Mutex::new(None)),
+            restrictions: Arc::new(Mutex::new(Vec::new())),
+            guards: Arc::new(Mutex::new(Vec::new())),
+            pre_decisions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn admits(&self, name: &str) -> bool {
-        self.restrictions.borrow().iter().all(|r| r.admits(name))
+        self.restrictions.lock().unwrap().iter().all(|r| r.admits(name))
     }
 }
 
 impl dsh_scope::ScopeLayer for ToolLayer {
     fn is_empty(&self) -> bool {
         self.tools.is_empty()
-            && self.mode.borrow().is_none()
-            && self.restrictions.borrow().is_empty()
-            && self.guards.borrow().is_empty()
+            && self.mode.lock().unwrap().is_none()
+            && self.restrictions.lock().unwrap().is_empty()
+            && self.guards.lock().unwrap().is_empty()
     }
 }
 
@@ -215,13 +214,13 @@ pub struct ToolExecutionResult {
 
 /// 视图结果：可见工具（保插入序）+ 限制前全名集 + 可限制名（全局层名）。
 pub struct ToolView {
-    pub visible: Vec<(String, Rc<ToolDefinition>)>,
+    pub visible: Vec<(String, Arc<ToolDefinition>)>,
     pub known_names: BTreeSet<String>,
     pub restrictable_names: Vec<String>,
 }
 
 impl ToolView {
-    pub fn get(&self, name: &str) -> Option<&Rc<ToolDefinition>> {
+    pub fn get(&self, name: &str) -> Option<&Arc<ToolDefinition>> {
         self.visible.iter().find(|(n, _)| n == name).map(|(_, d)| d)
     }
 }
@@ -230,11 +229,11 @@ impl ToolView {
 pub struct ToolRegistry {
     layers: ScopedLayers<ToolLayer>,
     default_mode: ToolExecutionMode,
-    on_change: Rc<dyn Fn()>,
+    on_change: Arc<dyn Fn() + Send + Sync>,
     /// 审批决策者（全局，M2f；TS `ctx.get('approval')` 等价——缺省 = 无通道，ask 即拒绝）。
-    approval: Rc<RefCell<Option<ApprovalProvider>>>,
+    approval: Arc<Mutex<Option<ApprovalProvider>>>,
     /// Code Mode run_code 注入传输的 execute 覆盖（M5 真实执行；缺省 = 占位桩，D-073）。
-    run_code_executor: Rc<RefCell<Option<ToolExecute>>>,
+    run_code_executor: Arc<Mutex<Option<ToolExecute>>>,
 }
 
 impl ToolRegistry {
@@ -242,15 +241,15 @@ impl ToolRegistry {
         Self::with_change(default_mode, || {})
     }
 
-    pub fn with_change(default_mode: ToolExecutionMode, on_change: impl Fn() + 'static) -> Self {
-        let on_change: Rc<dyn Fn()> = Rc::new(on_change);
-        let change = Rc::clone(&on_change);
+    pub fn with_change(default_mode: ToolExecutionMode, on_change: impl Fn() + Send + Sync + 'static) -> Self {
+        let on_change: Arc<dyn Fn() + Send + Sync> = Arc::new(on_change);
+        let change = Arc::clone(&on_change);
         ToolRegistry {
             layers: ScopedLayers::new(|_| ToolLayer::new(), move || change()),
             default_mode,
             on_change,
-            approval: Rc::new(RefCell::new(None)),
-            run_code_executor: Rc::new(RefCell::new(None)),
+            approval: Arc::new(Mutex::new(None)),
+            run_code_executor: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -261,7 +260,7 @@ impl ToolRegistry {
     /// 注册一个工具；返回 disposer。`scope`：`None` → 全局；`Some(k)` → 该作用域层。
     pub fn register(
         &self,
-        def: Rc<ToolDefinition>,
+        def: Arc<ToolDefinition>,
         scope: Option<&ScopeKey>,
     ) -> Result<ToolDisposer, String> {
         // 1. output schema 重新断言（防御 raw 构造的 definition）。
@@ -317,14 +316,15 @@ impl ToolRegistry {
     }
 
     /// 注册到全局层。
-    pub fn register_global(&self, def: Rc<ToolDefinition>) -> Result<ToolDisposer, String> {
+    pub fn register_global(&self, def: Arc<ToolDefinition>) -> Result<ToolDisposer, String> {
+        let _ = &self.on_change;
         self.register(def, None)
     }
 
     /// 覆盖 Code Mode run_code 注入传输的 execute（M5 真实执行；D-073）。命名/schema
     /// 注入与保留名守卫不变；返回先前覆盖（None = 之前是占位桩）。全局幂等设置。
     pub fn set_run_code_executor(&self, executor: ToolExecute) -> Option<ToolExecute> {
-        self.run_code_executor.borrow_mut().replace(executor)
+        self.run_code_executor.lock().unwrap().replace(executor)
     }
 
     // -----------------------------------------------------------------------
@@ -333,9 +333,9 @@ impl ToolRegistry {
 
     /// 视图：全局基 + 祖先链遮蔽 → 全链限制交集过滤 → 自有层覆盖 → run_code 注入。
     fn view(&self, scope: Option<&ScopeKey>) -> ToolView {
-        let mut visible: Vec<(String, Rc<ToolDefinition>)> = Vec::new();
+        let mut visible: Vec<(String, Arc<ToolDefinition>)> = Vec::new();
         let mut known: BTreeSet<String> = BTreeSet::new();
-        let put = |visible: &mut Vec<(String, Rc<ToolDefinition>)>, name: &str, def: Rc<ToolDefinition>| {
+        let put = |visible: &mut Vec<(String, Arc<ToolDefinition>)>, name: &str, def: Arc<ToolDefinition>| {
             match visible.iter_mut().find(|(n, _)| n == name) {
                 Some(slot) => slot.1 = def,
                 None => visible.push((name.to_string(), def)),
@@ -383,11 +383,11 @@ impl ToolRegistry {
         //    `set_run_code_executor` 覆盖 execute 为真实执行（D-073）。
         if self.mode_for(scope) != ToolExecutionMode::Native {
             known.insert(RUN_CODE_NAME.to_string());
-            let def = match self.run_code_executor.borrow().as_ref() {
+            let def = match self.run_code_executor.lock().unwrap().as_ref() {
                 Some(exec) => run_code_def(exec.clone()),
                 None => placeholder_run_code(),
             };
-            put(&mut visible, RUN_CODE_NAME, Rc::new(def));
+            put(&mut visible, RUN_CODE_NAME, Arc::new(def));
         }
 
         let restrictable_names = self
@@ -405,7 +405,7 @@ impl ToolRegistry {
         }
     }
 
-    pub fn get(&self, name: &str, scope: Option<&ScopeKey>) -> Option<Rc<ToolDefinition>> {
+    pub fn get(&self, name: &str, scope: Option<&ScopeKey>) -> Option<Arc<ToolDefinition>> {
         self.view(scope).get(name).cloned()
     }
 
@@ -440,7 +440,7 @@ impl ToolRegistry {
             let chain = dsh_scope::scope_chain_of(Some(key));
             for k in &chain {
                 if let Some(l) = self.layers.peek(Some(k)) {
-                    if let Some(m) = *l.mode.borrow() {
+                    if let Some(m) = *l.mode.lock().unwrap() {
                         return m;
                     }
                 }
@@ -503,12 +503,12 @@ impl ToolRegistry {
             Some(scope),
             move |layer| {
                 let restrictions = layer.restrictions.clone();
-                let mut buf = restrictions.borrow_mut();
+                let mut buf = restrictions.lock().unwrap();
                 buf.push(restriction.clone());
                 let idx = buf.len() - 1;
                 drop(buf);
-                Rc::new(move || {
-                    let mut buf = restrictions.borrow_mut();
+                Arc::new(move || {
+                    let mut buf = restrictions.lock().unwrap();
                     if idx < buf.len() {
                         buf.remove(idx);
                     }
@@ -526,7 +526,7 @@ impl ToolRegistry {
         mode: ToolExecutionMode,
         scope: &ScopeKey,
     ) -> Result<ToolDisposer, String> {
-        let existing_mode = self.layers.peek(Some(scope)).and_then(|l| *l.mode.borrow());
+        let existing_mode = self.layers.peek(Some(scope)).and_then(|l| *l.mode.lock().unwrap());
         if let Some(other) = existing_mode {
             return Err(format!(
                 "tools.presentAs(\"{}\") conflicts with \"{}\" already declared for this scope; one composition selects one presentation",
@@ -537,10 +537,10 @@ impl ToolRegistry {
         let disposer = self.layers.effect(
             Some(scope),
             move |layer| {
-                *layer.mode.borrow_mut() = Some(mode);
+                *layer.mode.lock().unwrap() = Some(mode);
                 let mode_handle = layer.mode.clone();
-                Rc::new(move || {
-                    *mode_handle.borrow_mut() = None;
+                Arc::new(move || {
+                    *mode_handle.lock().unwrap() = None;
                 })
             },
             "tools.presentAs()",
@@ -560,12 +560,12 @@ impl ToolRegistry {
             scope,
             move |layer| {
                 let guards = layer.guards.clone();
-                let mut buf = guards.borrow_mut();
+                let mut buf = guards.lock().unwrap();
                 buf.push(guard.clone());
                 let idx = buf.len() - 1;
                 drop(buf);
-                Rc::new(move || {
-                    let mut buf = guards.borrow_mut();
+                Arc::new(move || {
+                    let mut buf = guards.lock().unwrap();
                     if idx < buf.len() {
                         buf.remove(idx);
                     }
@@ -588,12 +588,12 @@ impl ToolRegistry {
             scope,
             move |layer| {
                 let pre_decisions = layer.pre_decisions.clone();
-                let mut buf = pre_decisions.borrow_mut();
+                let mut buf = pre_decisions.lock().unwrap();
                 buf.push(pre.clone());
                 let idx = buf.len() - 1;
                 drop(buf);
-                Rc::new(move || {
-                    let mut buf = pre_decisions.borrow_mut();
+                Arc::new(move || {
+                    let mut buf = pre_decisions.lock().unwrap();
                     if idx < buf.len() {
                         buf.remove(idx);
                     }
@@ -608,12 +608,12 @@ impl ToolRegistry {
     /// 设置审批决策者（`None` 清除通道——ask 退化为「not yet supported」拒绝）。
     /// 返回被替换的前值（便于宿主回滚组合）。
     pub fn set_approval_provider(&self, provider: Option<ApprovalProvider>) -> Option<ApprovalProvider> {
-        std::mem::replace(&mut *self.approval.borrow_mut(), provider)
+        std::mem::replace(&mut *self.approval.lock().unwrap(), provider)
     }
 
     /// 当前审批决策者。
     pub fn approval_provider(&self) -> Option<ApprovalProvider> {
-        self.approval.borrow().clone()
+        self.approval.lock().unwrap().clone()
     }
 
     // -----------------------------------------------------------------------
@@ -664,7 +664,7 @@ impl ToolRegistry {
                 name: input.name.clone(),
                 agent: input.agent.clone(),
                 signal: input.signal.clone(),
-                concludes_turn: std::cell::Cell::new(false),
+                concludes_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             args: input.arguments.clone(),
         };
@@ -723,7 +723,7 @@ impl ToolRegistry {
             name: name.clone(),
             agent: exec.call.agent.clone(),
             signal: exec.call.signal.clone(),
-            concludes_turn: std::cell::Cell::new(false),
+            concludes_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         // M3e（timeout-policy 最小 executor 路径）：声明了 timeoutMs 的工具按
         // wall-clock 判定（同步执行无可抢占信号——对齐 TS `deadline`+`exec.signal`
@@ -797,7 +797,7 @@ impl ToolRegistry {
     fn guard_reason(&self, name: &str, args: &Value, scope: Option<&ScopeKey>) -> Option<String> {
         let chain = self.layers.chain_layers(scope);
         for layer in std::iter::once(self.layers.global()).chain(chain.iter().map(|l| l.as_ref())) {
-            for g in layer.guards.borrow().iter() {
+            for g in layer.guards.lock().unwrap().iter() {
                 if let Some(reason) = g(name, args) {
                     return Some(reason);
                 }
@@ -810,7 +810,7 @@ impl ToolRegistry {
     fn first_pre_decision(&self, exec: &ToolExecution, scope: Option<&ScopeKey>) -> PreToolDecision {
         let chain = self.layers.chain_layers(scope);
         for layer in std::iter::once(self.layers.global()).chain(chain.iter().map(|l| l.as_ref())) {
-            for pre in layer.pre_decisions.borrow().iter() {
+            for pre in layer.pre_decisions.lock().unwrap().iter() {
                 if let Some(decision) = pre(exec) {
                     return decision;
                 }
@@ -989,11 +989,11 @@ fn placeholder_run_code() -> ToolDefinition {
         parameters: serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         output: ToolOutputDefinition {
             schema: crate::json_schema::JsonSchemaNode::default(),
-            render: Rc::new(|_, _| vec![ContentBlock::text("(run_code completed with no output)")]),
+            render: Arc::new(|_, _| vec![ContentBlock::text("(run_code completed with no output)")]),
             presentation_meta: None,
         },
         timeout_ms: None,
-        execute: Rc::new(move |_, _| {
+        execute: Arc::new(move |_, _| {
             Err(ToolFailureData::new(msg, TOOL_ABORTED_BEFORE_DISPATCH, "Error"))
         }),
         finalize_content: None,
@@ -1020,7 +1020,7 @@ fn run_code_def(exec: ToolExecute) -> ToolDefinition {
         }),
         output: ToolOutputDefinition {
             schema: crate::json_schema::JsonSchemaNode::default(),
-            render: Rc::new(|_, v| vec![ContentBlock::text(render_run_code_value(v))]),
+            render: Arc::new(|_, v| vec![ContentBlock::text(render_run_code_value(v))]),
             presentation_meta: None,
         },
         timeout_ms: None,

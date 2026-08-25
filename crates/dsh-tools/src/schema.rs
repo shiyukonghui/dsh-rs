@@ -6,7 +6,7 @@
 //! [`assert_supported_json_schema`](crate::json_schema) 全量断言。
 
 use serde_json::{Map, Value};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::json_schema::{
     assert_supported_json_schema, parse_asserted_schema, JsonSchemaError, JsonSchemaNode,
@@ -326,10 +326,10 @@ impl Default for DefineToolOptions {
             description: String::new(),
             parameters: Value::Object(Map::new()),
             output_schema: Value::Object(Map::new()),
-            render: Rc::new(|_, _| Vec::new()),
+            render: Arc::new(|_, _| Vec::new()),
             presentation_meta: None,
             timeout_ms: None,
-            execute: Rc::new(|_, _| Err(ToolFailureData::new("unimplemented", CODE_INVALID_ARGS, "Error"))),
+            execute: Arc::new(|_, _| Err(ToolFailureData::new("unimplemented", CODE_INVALID_ARGS, "Error"))),
             finalize_content: None,
             is_concurrency_safe: None,
             present_call: None,
@@ -364,7 +364,7 @@ pub fn define_tool(options: DefineToolOptions) -> Result<ToolDefinition, ToolDef
     let is_concurrency_safe = options.is_concurrency_safe;
 
     let execute_node = parameters_node.clone();
-    let wrapped_execute = Rc::new(move |args: &Value, ctx: &ToolRunContext| {
+    let wrapped_execute = Arc::new(move |args: &Value, ctx: &ToolRunContext| {
         let violations = validate_json_schema_value(&execute_node, args, "");
         if !violations.is_empty() {
             return Err(ToolFailureData::new(
@@ -378,7 +378,7 @@ pub fn define_tool(options: DefineToolOptions) -> Result<ToolDefinition, ToolDef
 
     let wrapped_present_call = present_call.map(|f| {
         let node = parameters_node.clone();
-        let out: ToolPresentCall = Rc::new(move |args: &Value| {
+        let out: ToolPresentCall = Arc::new(move |args: &Value| {
             if !validate_json_schema_value(&node, args, "").is_empty() {
                 return None;
             }
@@ -388,7 +388,7 @@ pub fn define_tool(options: DefineToolOptions) -> Result<ToolDefinition, ToolDef
     });
     let wrapped_present_result = present_result.map(|f| {
         let node = parameters_node.clone();
-        let out: ToolPresentResult = Rc::new(move |args: &Value, result: &ToolResult| {
+        let out: ToolPresentResult = Arc::new(move |args: &Value, result: &ToolResult| {
             if !validate_json_schema_value(&node, args, "").is_empty() {
                 return None;
             }
@@ -398,7 +398,7 @@ pub fn define_tool(options: DefineToolOptions) -> Result<ToolDefinition, ToolDef
     });
     let wrapped_is_concurrency_safe = is_concurrency_safe.map(|f| {
         let node = parameters_node.clone();
-        let out: ToolIsConcurrencySafe = Rc::new(move |args: &Value| {
+        let out: ToolIsConcurrencySafe = Arc::new(move |args: &Value| {
             if !validate_json_schema_value(&node, args, "").is_empty() {
                 return false;
             }

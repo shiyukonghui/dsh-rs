@@ -11,7 +11,7 @@ use dsh_tools::{
     ToolRegistry, ToolRunContext,
 };
 use serde_json::{json, Value};
-use std::rc::Rc;
+use std::sync::Arc;
 
 fn echo_def(name: &str) -> dsh_tools::ToolDefinition {
     define_tool(DefineToolOptions {
@@ -19,8 +19,8 @@ fn echo_def(name: &str) -> dsh_tools::ToolDefinition {
         description: format!("{name} a value"),
         parameters: json!({ "text": { "type": "string", "required": true } }),
         output_schema: json!({ "type": "json" }),
-        render: Rc::new(|_, value| vec![ContentBlock::text(serde_json::to_string(value).unwrap())]),
-        execute: Rc::new(|args, _| Ok(args["text"].clone())),
+        render: Arc::new(|_, value| vec![ContentBlock::text(serde_json::to_string(value).unwrap())]),
+        execute: Arc::new(|args, _| Ok(args["text"].clone())),
         ..Default::default()
     })
     .unwrap()
@@ -34,8 +34,8 @@ fn slow_def(name: &str, timeout_ms: f64, sleep_ms: u64) -> dsh_tools::ToolDefini
         parameters: json!({}),
         output_schema: json!({ "type": "json" }),
         timeout_ms: Some(timeout_ms),
-        render: Rc::new(|_, value| vec![ContentBlock::text(serde_json::to_string(value).unwrap())]),
-        execute: Rc::new(move |_, _| {
+        render: Arc::new(|_, value| vec![ContentBlock::text(serde_json::to_string(value).unwrap())]),
+        execute: Arc::new(move |_, _| {
             std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
             Ok(json!({ "done": true }))
         }),
@@ -95,7 +95,7 @@ fn timeout_exceeded_pure_decision() {
 #[test]
 fn executor_substitutes_on_timeout() {
     let r = registry();
-    r.register_global(Rc::new(slow_def("slow", 20.0, 200))).unwrap();
+    r.register_global(Arc::new(slow_def("slow", 20.0, 200))).unwrap();
     let out = r.execute(&input("slow", json!({})), None);
     assert!(out.is_error);
     assert_eq!(
@@ -110,7 +110,7 @@ fn executor_substitutes_on_timeout() {
 #[test]
 fn executor_keeps_fast_budgeted_result() {
     let r = registry();
-    r.register_global(Rc::new(slow_def("fast", 10_000.0, 0))).unwrap();
+    r.register_global(Arc::new(slow_def("fast", 10_000.0, 0))).unwrap();
     let out = r.execute(&input("fast", json!({})), None);
     assert!(!out.is_error);
     assert_eq!(
@@ -123,7 +123,7 @@ fn executor_keeps_fast_budgeted_result() {
 #[test]
 fn executor_delegates_unbudgeted() {
     let r = registry();
-    r.register_global(Rc::new(echo_def("echo"))).unwrap();
+    r.register_global(Arc::new(echo_def("echo"))).unwrap();
     let out = r.execute(&input("echo", json!({ "text": "x" })), None);
     assert!(!out.is_error);
     assert_eq!(out.content[0].as_text().map(|t| t.text()), Some("\"x\""));

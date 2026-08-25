@@ -4,7 +4,7 @@
 //! 差异记录（DECISIONS D-023）：create_scope 的 dispose 为同步幂等（无异步
 //! quiescence）；事件派发经迷你 ScopedContext 总线（非完整 Cordis）。
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -365,11 +365,11 @@ fn pick_named(layer: &NamedLayer) -> Vec<(String, u8)> {
 
 #[test]
 fn scoped_layers_constructs_global_eagerly_reads_non_creating_merge_shadows_in_order() {
-    let created = Rc::new(RefCell::new(Vec::new()));
+    let created = Arc::new(Mutex::new(Vec::new()));
     let cr = created.clone();
     let layers = ScopedLayers::new(
         move |scope: Option<&ScopeKey>| {
-            cr.borrow_mut().push(scope.cloned());
+            cr.lock().unwrap().push(scope.cloned());
             NamedLayer::new()
         },
         || {},
@@ -379,10 +379,10 @@ fn scoped_layers_constructs_global_eagerly_reads_non_creating_merge_shadows_in_o
     ins(&global.named, "a", 1);
     ins(&global.named, "shared", 2);
 
-    let created_count = |c: &Rc<RefCell<Vec<Option<ScopeKey>>>>| c.borrow().len();
+    let created_count = |c: &Arc<Mutex<Vec<Option<ScopeKey>>>>| c.lock().unwrap().len();
     assert_eq!(created_count(&created), 1, "global created eagerly once");
     assert_eq!(
-        created.borrow().iter().filter(|s| s.is_none()).count(),
+        created.lock().unwrap().iter().filter(|s| s.is_none()).count(),
         1,
         "first create is global"
     );
@@ -399,11 +399,11 @@ fn scoped_layers_constructs_global_eagerly_reads_non_creating_merge_shadows_in_o
 
 #[test]
 fn scoped_layers_uses_same_scoped_context_for_visibility_and_reclaims_only_empty_aggregate() {
-    let created = Rc::new(RefCell::new(Vec::new()));
+    let created = Arc::new(Mutex::new(Vec::new()));
     let cr = created.clone();
     let layers = ScopedLayers::new(
         move |scope: Option<&ScopeKey>| {
-            cr.borrow_mut().push(scope.cloned());
+            cr.lock().unwrap().push(scope.cloned());
             NamedLayer::new()
         },
         || {},
@@ -424,7 +424,7 @@ fn scoped_layers_uses_same_scoped_context_for_visibility_and_reclaims_only_empty
     let _ = (&scope, &layer_key);
 
     // 惰性创建恰好一次 scoped 层
-    assert_eq!(created.borrow().iter().filter(|s| s.is_some()).count(), 1);
+    assert_eq!(created.lock().unwrap().iter().filter(|s| s.is_some()).count(), 1);
     // 全局层 + 一个 scoped 层
     // merge: 全局 a:1/shared:1 被 scoped shared:2 遮蔽 + c:3
     let mut merged = layers.merge(Some(&key), &pick_named);
@@ -463,31 +463,31 @@ fn scoped_layers_uses_same_scoped_context_for_visibility_and_reclaims_only_empty
 
 #[test]
 fn scoped_layers_runs_action_notify_undo_notify_in_order() {
-    let events = Rc::new(RefCell::new(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
     let ev = events.clone();
     let layers = ScopedLayers::new(
         |_| NamedLayer::new(),
-        move || ev.borrow_mut().push("notify".to_string()),
+        move || ev.lock().unwrap().push("notify".to_string()),
     );
     let ev = events.clone();
     let disposer = layers.effect(None, |l| {
         let ev2 = ev.clone();
-        ev.borrow_mut().push("action".to_string());
+        ev.lock().unwrap().push("action".to_string());
         let undo = ins(&l.named, "x", 1);
-        Rc::new(move || {
-            ev2.borrow_mut().push("undo".to_string());
+        Arc::new(move || {
+            ev2.lock().unwrap().push("undo".to_string());
             undo();
         })
     }, "store.order", true);
-    assert_eq!(*events.borrow(), vec!["action".to_string(), "notify".to_string()]);
+    assert_eq!(*events.lock().unwrap(), vec!["action".to_string(), "notify".to_string()]);
     disposer();
     assert_eq!(
-        *events.borrow(),
+        *events.lock().unwrap(),
         vec!["action".to_string(), "notify".to_string(), "undo".to_string(), "notify".to_string()]
     );
     disposer(); // Cordis 幂等：再次 dispose no-op
     assert_eq!(
-        *events.borrow(),
+        *events.lock().unwrap(),
         vec!["action".to_string(), "notify".to_string(), "undo".to_string(), "notify".to_string()]
     );
     assert!(layers.global().named.is_empty(), "x removed by undo");
@@ -496,11 +496,11 @@ fn scoped_layers_runs_action_notify_undo_notify_in_order() {
 #[test]
 fn scoped_layers_cleans_up_failed_factories_and_actions_without_discarding_existing_layer() {
     // a) 工厂仅对 scoped 层失败 → 层从未放入 map（global 贪婪创建不失败）
-    let fail_factory = Rc::new(Cell::new(true));
+    let fail_factory = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let ff = fail_factory.clone();
     let layers_a = ScopedLayers::new(
         move |selected: Option<&ScopeKey>| -> NamedLayer {
-            if selected.is_some() && ff.get() {
+            if selected.is_some() && ff.load(std::sync::atomic::Ordering::SeqCst) {
                 panic!("factory failed");
             }
             NamedLayer::new()
@@ -509,11 +509,11 @@ fn scoped_layers_cleans_up_failed_factories_and_actions_without_discarding_exist
     );
     let key_a = k();
     let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        layers_a.effect(Some(&key_a), |_l| Rc::new(|| {}), "a", false)
+        layers_a.effect(Some(&key_a), |_l| Arc::new(|| {}), "a", false)
     }));
     assert!(err.is_err(), "factory failed propagates");
     assert!(layers_a.peek(Some(&key_a)).is_none(), "layer never put in map");
-    fail_factory.set(false);
+    fail_factory.store(false, std::sync::atomic::Ordering::SeqCst);
     // 工厂恢复后同层 effect 成功创建
     let _ok = layers_a.effect(Some(&key_a), |l| ins(&l.named, "later", 1), "a2", false);
     assert!(layers_a.peek(Some(&key_a)).is_some(), "factory recovers");
@@ -558,20 +558,19 @@ fn scoped_layers_cleans_up_failed_factories_and_actions_without_discarding_exist
 
 #[test]
 fn scoped_layers_rolls_back_scoped_insertion_when_notification_throws() {
-    let events = Rc::new(RefCell::new(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
     let ev = events.clone();
-    let first_notify = Rc::new(RefCell::new(true));
+    let first_notify = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let fst = first_notify.clone();
     let action_ev = ev.clone();
     let layers = ScopedLayers::new(
         |_| NamedLayer::new(),
         move || {
-            if *fst.borrow() {
-                *fst.borrow_mut() = false;
-                ev.borrow_mut().push("notify".to_string());
+            if fst.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                ev.lock().unwrap().push("notify".to_string());
                 panic!("change failed");
             }
-            ev.borrow_mut().push("notify".to_string());
+            ev.lock().unwrap().push("notify".to_string());
         },
     );
     let key = k();
@@ -579,15 +578,15 @@ fn scoped_layers_rolls_back_scoped_insertion_when_notification_throws() {
         layers.effect(Some(&key), |l| {
             let undo = ins(&l.named, "rollback", 9);
             let ev2 = action_ev.clone();
-            Rc::new(move || {
-                ev2.borrow_mut().push("undo".to_string());
+            Arc::new(move || {
+                ev2.lock().unwrap().push("undo".to_string());
                 undo();
             })
         }, "r", true)
     }));
     assert!(err.is_err(), "notification failure propagates");
     assert_eq!(
-        *events.borrow(),
+        *events.lock().unwrap(),
         vec!["notify".to_string(), "undo".to_string(), "notify".to_string()],
         "rollback order [notify, undo, notify]"
     );

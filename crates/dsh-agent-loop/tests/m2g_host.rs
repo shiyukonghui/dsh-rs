@@ -4,9 +4,9 @@
 #![allow(clippy::type_complexity)]
 #![allow(clippy::result_large_err)]
 
-use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use dsh_agent_loop::{
     AgentLoopConfig, AgentLoopHost, ConfiguredAgent, CONFIGURED_AGENT_IDENTITIES_KEY,
@@ -25,20 +25,20 @@ use serde_json::json;
 // ---------------------------------------------------------------------------
 
 struct MockAdapter {
-    script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>,
-    calls: Rc<Cell<u32>>,
+    script: Arc<Mutex<VecDeque<Vec<StreamChunk>>>>,
+    calls: Arc<AtomicU32>,
 }
 
 impl MockAdapter {
-    fn new(script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>, calls: Rc<Cell<u32>>) -> Self {
+    fn new(script: Arc<Mutex<VecDeque<Vec<StreamChunk>>>>, calls: Arc<AtomicU32>) -> Self {
         MockAdapter { script, calls }
     }
 }
 
 impl LlmAdapter for MockAdapter {
     fn stream(&self, _options: GenerateOptions) -> Box<dyn Iterator<Item = StreamChunk>> {
-        self.calls.set(self.calls.get() + 1);
-        let next = self.script.borrow_mut().pop_front().unwrap_or_else(|| {
+        self.calls.store(self.calls.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+        let next = self.script.lock().unwrap().pop_front().unwrap_or_else(|| {
             vec![StreamChunk::Finish {
                 reason: FinishReason::Error {
                     failure: LlmFailure {
@@ -89,25 +89,25 @@ fn user_msg(text: &str) -> Message {
     Message::user(MessageId::from_raw("m1"), vec![ContentBlock::text(text)])
 }
 
-fn host_with(script: &[Vec<StreamChunk>]) -> (Rc<AgentLoopHost>, Rc<Cell<u32>>) {
-    let llm = Rc::new(LlmRuntime::new());
+fn host_with(script: &[Vec<StreamChunk>]) -> (Arc<AgentLoopHost>, Arc<AtomicU32>) {
+    let llm = Arc::new(LlmRuntime::new());
     let (q, calls) = {
-        let q = Rc::new(RefCell::new(VecDeque::from_iter(script.iter().cloned())));
-        let calls = Rc::new(Cell::new(0u32));
+        let q = Arc::new(Mutex::new(VecDeque::from_iter(script.iter().cloned())));
+        let calls = Arc::new(AtomicU32::new(0));
         (q, calls)
     };
-    llm.register_adapter(&["mock"], Rc::new(MockAdapter::new(q, calls.clone()))).unwrap();
-    let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+    llm.register_adapter(&["mock"], Arc::new(MockAdapter::new(q, calls.clone()))).unwrap();
+    let tools = Arc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
     tools
-        .register_global(Rc::new(
+        .register_global(Arc::new(
             define_tool(DefineToolOptions {
                 name: "echo".into(),
                 description: "echo".into(),
                 parameters: json!({ "text": { "type": "string", "required": true } }),
                 output_schema: json!({ "type": "json" }),
-                render: Rc::new(|_, v| vec![ContentBlock::text(serde_json::to_string(v).unwrap())]),
-                execute: Rc::new(|args, _| Ok(args["text"].clone())),
-                is_concurrency_safe: Some(Rc::new(|_| true)),
+                render: Arc::new(|_, v| vec![ContentBlock::text(serde_json::to_string(v).unwrap())]),
+                execute: Arc::new(|args, _| Ok(args["text"].clone())),
+                is_concurrency_safe: Some(Arc::new(|_| true)),
                 ..Default::default()
             })
             .unwrap(),
@@ -202,7 +202,7 @@ fn host_drives_configured_agent_loop_to_completed() {
     assert_eq!(turn_end.data["reason"]["kind"], "completed");
 
     // 两次流式请求（tool-call + 续答），驱动 idle。
-    assert_eq!(calls.get(), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     use dsh_agent::AgentStatus;
     assert_eq!(driver.status(), AgentStatus::Idle);
 }
@@ -214,7 +214,7 @@ fn ensure_agent_is_idempotent_and_uses_given_session_id() {
     assert!(host.ensure_agent(&a1).is_ok());
     let first = host.ensure_agent(&a1).unwrap();
     let second = host.ensure_agent(&a1).unwrap();
-    assert!(Rc::ptr_eq(&first, &second), "ensure is idempotent");
+    assert!(Arc::ptr_eq(&first, &second), "ensure is idempotent");
     // 显式 sessionId 生效（换一个配置 id，避免命中 a1 的幂等分支）。
     let mut a2 = a1.clone();
     a2.id = "a2".to_string();
@@ -261,7 +261,7 @@ fn register_session_agent_is_routable_idempotent_and_drives_turn() {
     assert_eq!(resolved.cwd.as_deref(), Some(r"C:\work"));
     // 幂等：重复注册 → 同一装配实例，不重复登记。
     let second = host.register_session_agent(cfg).unwrap();
-    assert!(Rc::ptr_eq(&first, &second), "register_session_agent is idempotent");
+    assert!(Arc::ptr_eq(&first, &second), "register_session_agent is idempotent");
     // followup 经 agent id 驱动真实 turn；事件落共享 store（会话键 = sessionId）。
     host.followup("session-s9", user_msg("hi")).unwrap();
     let evs = host.events("s9");
@@ -279,7 +279,7 @@ fn register_session_agent_reuses_existing_agent_for_reserved_session() {
     };
     let agent = host.register_session_agent(cfg).unwrap();
     assert!(
-        Rc::ptr_eq(&agent, &host.agent("a1").unwrap()),
+        Arc::ptr_eq(&agent, &host.agent("a1").unwrap()),
         "reserved session reuses existing agent"
     );
     assert!(host.configured_for_session("agent-a1").is_some());
@@ -312,14 +312,14 @@ fn configured_identities_match_key_contract() {
 fn teardown_disposes_registered_disposers_and_clears_agents() {
     let (host, _) = host_with(&[text_chunks("x")]);
     host.ensure_agent(&host.config.agents[0]).unwrap();
-    let disposed = Rc::new(Cell::new(false));
+    let disposed = Arc::new(AtomicBool::new(false));
     let disposed2 = disposed.clone();
-    host.add_disposer(Rc::new(move || disposed2.set(true)));
+    host.add_disposer(Arc::new(move || disposed2.store(true, Ordering::SeqCst)));
 
     assert!(host.agent("a1").is_some());
     host.teardown();
     assert!(host.agent("a1").is_none(), "teardown clears configured agents");
-    assert!(disposed.get(), "teardown runs registered disposers");
+    assert!(disposed.load(Ordering::SeqCst), "teardown runs registered disposers");
     // teardown 后 followup fail loud。
     let err = host.followup("a1", user_msg("hi")).unwrap_err();
     assert!(err.contains("no configured agent \"a1\""), "{err}");

@@ -7,9 +7,7 @@
 #![allow(clippy::type_complexity)]
 #![allow(clippy::result_large_err)]
 
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use dsh_agent::{Agent, AgentRegistry};
 use dsh_llm::{
@@ -41,27 +39,27 @@ fn invariant_error(message: String) -> LlmError {
 #[allow(clippy::too_many_arguments)]
 pub fn build_loop_deps(
     agent: &Arc<Agent>,
-    prompt: Rc<SystemPrompt>,
-    llm: Rc<LlmRuntime>,
-    tools: Rc<ToolRegistry>,
+    prompt: Arc<SystemPrompt>,
+    llm: Arc<LlmRuntime>,
+    tools: Arc<ToolRegistry>,
     max_parallel_tool_calls: usize,
 ) -> LoopDeps {
     let session = agent.session.clone();
     let agent_id: Option<String> = Some(agent.id.raw().to_string());
     let scope = agent.scope.clone();
 
-    let assemble: Rc<dyn Fn(&AssembleContext) -> Result<PromptAssembly, String>> = {
+    let assemble: Arc<dyn Fn(&AssembleContext) -> Result<PromptAssembly, String> + Send + Sync> = {
         let prompt = prompt.clone();
-        Rc::new(move |ctx: &AssembleContext| {
+        Arc::new(move |ctx: &AssembleContext| {
             let p = prompt.clone();
             p.assemble(ctx)
         })
     };
 
-    let prepare_call: Rc<dyn Fn(CallConfig) -> Result<PreparedLlmCall, LlmError>> = {
+    let prepare_call: Arc<dyn Fn(CallConfig) -> Result<PreparedLlmCall, LlmError> + Send + Sync> = {
         let llm = llm.clone();
         let session = session.clone();
-        Rc::new(move |config: CallConfig| {
+        Arc::new(move |config: CallConfig| {
             let mut prepared = llm.prepare_call(&config)?;
             if let Some(mut inner) = prepared.stream.take() {
                 let session = session.clone();
@@ -75,32 +73,32 @@ pub fn build_loop_deps(
         })
     };
 
-    let stream: Rc<dyn Fn(&GenerateOptions) -> Result<Vec<StreamChunk>, LlmError>> = {
+    let stream: Arc<dyn Fn(&GenerateOptions) -> Result<Vec<StreamChunk>, LlmError> + Send + Sync> = {
         let llm = llm.clone();
         let session = session.clone();
-        Rc::new(move |request: &GenerateOptions| {
+        Arc::new(move |request: &GenerateOptions| {
             check_loop_request(&AgentLoopRequest(request.clone()), Some(&session))
                 .map_err(invariant_error)?;
             Ok(llm.stream(request.clone()).collect())
         })
     };
 
-    let projection = Rc::new(RefCell::new(RuntimeContextProjection::new()));
-    let project_context: Rc<dyn Fn(&PromptAssembly) -> Option<Message>> = {
+    let projection = Arc::new(Mutex::new(RuntimeContextProjection::new()));
+    let project_context: Arc<dyn Fn(&PromptAssembly) -> Option<Message> + Send + Sync> = {
         let session = session.clone();
         let projection = projection.clone();
-        Rc::new(move |assembly: &PromptAssembly| {
+        Arc::new(move |assembly: &PromptAssembly| {
             let sections = render_context_sections(assembly).unwrap_or_default();
             let current = join_context_sections(&sections);
-            projection.borrow_mut().project(&session, &current, &sections)
+            projection.lock().unwrap().project(&session, &current, &sections)
         })
     };
 
-    let tool_exec: Rc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome> = {
+    let tool_exec: Arc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome + Send + Sync> = {
         let session = session.clone();
         let tools = tools.clone();
         let agent_id = agent_id.clone();
-        Rc::new(move |ctx: &ToolExecCtx| {
+        Arc::new(move |ctx: &ToolExecCtx| {
             let mut context: Vec<Message> = Vec::new();
             let mut accept = |m: Message| context.push(m);
             let concluded = execute_tool_calls(
@@ -138,11 +136,11 @@ pub fn build_loop_deps(
 pub fn create_loop_agent(
     agent: Arc<Agent>,
     registry: Arc<AgentRegistry>,
-    prompt: Rc<SystemPrompt>,
-    llm: Rc<LlmRuntime>,
-    tools: Rc<ToolRegistry>,
+    prompt: Arc<SystemPrompt>,
+    llm: Arc<LlmRuntime>,
+    tools: Arc<ToolRegistry>,
     max_parallel_tool_calls: usize,
-) -> Rc<ReactLoopAgent> {
+) -> Arc<ReactLoopAgent> {
     let deps = build_loop_deps(&agent, prompt, llm, tools, max_parallel_tool_calls);
     ReactLoopAgent::new(agent, registry, deps)
 }
@@ -153,12 +151,12 @@ pub fn create_loop_agent(
 pub fn create_loop_agent_with_tool_exec(
     agent: Arc<Agent>,
     registry: Arc<AgentRegistry>,
-    prompt: Rc<SystemPrompt>,
-    llm: Rc<LlmRuntime>,
-    tools: Rc<ToolRegistry>,
+    prompt: Arc<SystemPrompt>,
+    llm: Arc<LlmRuntime>,
+    tools: Arc<ToolRegistry>,
     max_parallel_tool_calls: usize,
-    tool_exec: Rc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome>,
-) -> Rc<ReactLoopAgent> {
+    tool_exec: Arc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome + Send + Sync>,
+) -> Arc<ReactLoopAgent> {
     let mut deps = build_loop_deps(&agent, prompt, llm, tools, max_parallel_tool_calls);
     deps.tool_exec = tool_exec;
     ReactLoopAgent::new(agent, registry, deps)

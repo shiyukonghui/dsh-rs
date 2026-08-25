@@ -9,7 +9,9 @@ use dsh_tools::{
     ToolRunContext,
 };
 use serde_json::{json, Value};
-use std::rc::Rc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // schema 编译产物
@@ -439,8 +441,8 @@ fn echo_tool_options() -> DefineToolOptions {
             "text": { "type": "string", "required": true },
         }),
         output_schema: json!({ "type": "json" }),
-        render: Rc::new(|_, value| vec![dsh_llm::ContentBlock::text(serde_json::to_string(value).unwrap())]),
-        execute: Rc::new(|args, _| Ok(args["text"].clone())),
+        render: Arc::new(|_, value| vec![dsh_llm::ContentBlock::text(serde_json::to_string(value).unwrap())]),
+        execute: Arc::new(|args, _| Ok(args["text"].clone())),
         ..Default::default()
     }
 }
@@ -496,25 +498,25 @@ fn define_tool_rejects_bad_timeout() {
 #[test]
 fn define_tool_soft_validation_on_presenters() {
     // 非法参数 → present_call/present_result 回退 None；is_concurrency_safe 回退 false
-    let present_count = Rc::new(std::cell::Cell::new(0));
+    let present_count = Arc::new(AtomicUsize::new(0));
     let pc = present_count.clone();
     let opts = DefineToolOptions {
-        present_call: Some(Rc::new(move |_args| {
-            pc.set(pc.get() + 1);
+        present_call: Some(Arc::new(move |_args| {
+            pc.fetch_add(1, Ordering::SeqCst);
             Some(dsh_tools::ToolCallView::generic("echo"))
         })),
-        is_concurrency_safe: Some(Rc::new(|_| true)),
+        is_concurrency_safe: Some(Arc::new(|_| true)),
         ..echo_tool_options()
     };
     let tool = define_tool(opts).unwrap();
     let view = (tool.present_call.as_ref().unwrap())(&json!({ "text": 42 }));
     assert!(view.is_none(), "soft validation suppresses present_call");
-    assert_eq!(present_count.get(), 0, "user presenter not invoked on invalid args");
+    assert_eq!(present_count.load(Ordering::SeqCst), 0, "user presenter not invoked on invalid args");
     assert!(!(tool.is_concurrency_safe.as_ref().unwrap())(&json!({ "text": 42 })));
 
     let view = (tool.present_call.as_ref().unwrap())(&json!({ "text": "ok" }));
     assert!(view.is_some(), "valid args reach user presenter");
-    assert_eq!(present_count.get(), 1);
+    assert_eq!(present_count.load(Ordering::SeqCst), 1);
     assert!((tool.is_concurrency_safe.as_ref().unwrap())(&json!({ "text": "ok" })));
 }
 

@@ -7,7 +7,7 @@
 // transport thunk 的 Err 变体为此买单。
 #![allow(clippy::result_large_err)]
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_llm::types::{FinishReason, GenerateOptions, Message, MessageId, TextBlock, ContentBlock};
 use dsh_llm::{BlockAssembler, CallConfig, LlmRuntime};
@@ -27,10 +27,10 @@ fn connection() -> DeepSeekConnection {
     }
 }
 
-fn adapter_with(payloads: Vec<String>) -> Rc<dyn dsh_llm::LlmAdapter> {
-    let conn: Rc<dyn Fn() -> DeepSeekConnection> = Rc::new(connection);
-    let resolver: PayloadsResolver = Rc::new(move |_conn, _req, _ops| Ok(payloads.clone()));
-    Rc::new(DeepSeekAdapter::new(DeepSeekAdapterOptions {
+fn adapter_with(payloads: Vec<String>) -> Arc<dyn dsh_llm::LlmAdapter + Send + Sync> {
+    let conn: Arc<dyn Fn() -> DeepSeekConnection + Send + Sync> = Arc::new(connection);
+    let resolver: PayloadsResolver = Arc::new(move |_conn, _req, _ops| Ok(payloads.clone()));
+    Arc::new(DeepSeekAdapter::new(DeepSeekAdapterOptions {
         resolve_connection: conn,
         resolve_payloads: resolver,
     }))

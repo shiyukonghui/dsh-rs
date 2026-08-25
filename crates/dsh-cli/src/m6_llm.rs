@@ -14,7 +14,7 @@
 // retry 透传），与 dsh-llm-deepseek 的 crate 级 allow 对齐。
 #![allow(clippy::result_large_err)]
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_llm::{LlmError, LlmRuntime, StreamChunk};
 use dsh_llm_deepseek::{
@@ -41,15 +41,15 @@ fn deepseek_connection(base_url: &str, model: &str) -> DeepSeekConnection {
 
 /// 装配 LlmRuntime + deepseek 适配器；key 显式传入（测试用，不进进程环境）。
 /// 空/None key **不**报错——首个回合 fail-loud（诚实降级，P3）。
-pub fn server_llm_runtime_with_key(base_url: &str, model: &str, key: Option<&str>) -> Rc<LlmRuntime> {
+pub fn server_llm_runtime_with_key(base_url: &str, model: &str, key: Option<&str>) -> Arc<LlmRuntime> {
     let base_url = base_url.to_string();
     let model = model.to_string();
     let key = key.map(|s| s.to_string());
-    let conn: Rc<dyn Fn() -> DeepSeekConnection> = {
+    let conn: Arc<dyn Fn() -> DeepSeekConnection + Send + Sync> = {
         let (b, m) = (base_url.clone(), model.clone());
-        Rc::new(move || deepseek_connection(&b, &m))
+        Arc::new(move || deepseek_connection(&b, &m))
     };
-    let resolve: PayloadsResolver = Rc::new(move |_conn, wire, _opts| {
+    let resolve: PayloadsResolver = Arc::new(move |_conn, wire, _opts| {
         let Some(k) = &key else {
             return Err(LlmError::new(
                 format!(
@@ -78,13 +78,13 @@ pub fn server_llm_runtime_with_key(base_url: &str, model: &str, key: Option<&str
         resolve_payloads: resolve,
     });
     let rt = LlmRuntime::new();
-    rt.register_adapter(&["deepseek"], Rc::new(adapter))
+    rt.register_adapter(&["deepseek"], Arc::new(adapter))
         .expect("deepseek adapter registers on a fresh runtime");
-    Rc::new(rt)
+    Arc::new(rt)
 }
 
 /// 装配入口（生产）：key 仅从 `DEEPSEEK_API_KEY` 环境变量读取。
-pub fn server_llm_runtime(base_url: &str, model: &str) -> Rc<LlmRuntime> {
+pub fn server_llm_runtime(base_url: &str, model: &str) -> Arc<LlmRuntime> {
     let key = std::env::var(DEEPSEEK_API_KEY_ENV).ok();
     server_llm_runtime_with_key(base_url, model, key.as_deref())
 }

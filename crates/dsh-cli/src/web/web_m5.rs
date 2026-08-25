@@ -10,12 +10,12 @@
 //! run_in_background 诚实拒绝（jobs producer 桥/tick 后续轮）；read_image 待解码服务；
 //! run_code 交注册表保留传输（D-068/D-069/D-070 记录待办）。
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use dsh_code_runtime::run_code::parse_run_code_args;
@@ -67,14 +67,93 @@ const M5_RENDER_MAX_BYTES: usize = 256 * 1024;
 /// 结构化错误 code：宿主句柄缺失（复用 M4 NOT_BOUND 词表）。
 pub use dsh_tools::m4::CODE_NOT_BOUND;
 
+// ---------------------------------------------------------------------------
+// D-115（请求面 Send+Sync 化）：单线程宿主状态线程本地桥。
+//
+// dsh-terminal / dsh-jobs / dsh-shell 的宿主值（`TerminalSessionService` /
+// `JobRegistry` / `ShellProcess`，内含 `Box<dyn Fn>`、`Rc<RefCell>`）是**非 Send**
+// 底层类型，无法直接捕获进 Send+Sync 的工具执行闭包。按 D-115/Phase 0 既有纪律
+// （`CURRENT_CTX` thread_local 桥接）：状态放**创建线程**的本地池，句柄只持 id +
+// 保活 `Arc` → 自身 Send+Sync；`.`with` 须在创建线程调用（单线程宿主纪律——serve
+// 主循环 / 测试线程，与既有 Rc/RefCell 语义完全一致）。最后一个句柄 Drop 时按 id
+// 清理池条目（测试线程短活 → 无泄漏）。
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static TLOCAL_STATES: RefCell<HashMap<u64, Box<dyn std::any::Any>>> =
+        RefCell::new(HashMap::new());
+}
+
+static NEXT_TLOCAL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// 非 Send 宿主状态的 Send+Sync 句柄（见上）。`T` 仅在 `with` 时保类型安全（池内在位
+/// 由 id 唯一寻址），句柄自身不持数据 → 自动 Send+Sync。非重入：`with` 的闭包内不得
+/// 再调另一个 `with`（本模块无嵌套用法）。
+pub struct ThreadCell<T> {
+    id: u64,
+    _keepalive: Arc<()>,
+    _marker: std::marker::PhantomData<fn(T) -> T>,
+}
+
+impl<T> Clone for ThreadCell<T> {
+    fn clone(&self) -> Self {
+        ThreadCell {
+            id: self.id,
+            _keepalive: Arc::clone(&self._keepalive),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: 'static> ThreadCell<T> {
+    /// 把非 Send 状态放入当前线程本地池，返回 Send+Sync 句柄。
+    pub fn new(state: T) -> ThreadCell<T> {
+        let id = NEXT_TLOCAL_ID.fetch_add(1, Ordering::Relaxed);
+        TLOCAL_STATES.with(|m| {
+            m.borrow_mut().insert(id, Box::new(state));
+        });
+        ThreadCell {
+            id,
+            _keepalive: Arc::new(()),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// 在创建线程上访问状态（单线程纪律；跨线程调用 panic——不会被错误静默）。
+    pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        TLOCAL_STATES.with(|m| {
+            let mut m = m.borrow_mut();
+            let slot = m.get_mut(&self.id).unwrap_or_else(|| {
+                panic!("ThreadCell state missing (accessed from a different thread?)")
+            });
+            let state = slot
+                .downcast_mut::<T>()
+                .expect("ThreadCell state type mismatch");
+            f(state)
+        })
+    }
+}
+
+impl<T> Drop for ThreadCell<T> {
+    fn drop(&mut self) {
+        // 最后一个句柄（保活 Arc strong_count 含本副本）→ 清理线程本地池条目。
+        if Arc::strong_count(&self._keepalive) == 1 {
+            TLOCAL_STATES.with(|m| {
+                m.borrow_mut().remove(&self.id);
+            });
+        }
+    }
+}
+
 /// fs 宿主：LocalFileSystem（root 解析）+ observation gate（owner 写/编守卫）+ agent→OwnerId
 /// 稳定登记（Web 无 WeakMap；宿主会话结束时需清理——本轮接线不装会话清理钩子，D-069 记录）。
+/// Send+Sync（工具执行闭包捕获）：gate/owners 落 Mutex、next_owner 原子化（OwnerId=u64）。
 pub struct FsHost {
     pub fs: LocalFileSystem,
     pub root: PathBuf,
-    gate: RefCell<ObservationGate>,
-    owners: RefCell<HashMap<String, OwnerId>>,
-    next_owner: Cell<OwnerId>,
+    gate: Mutex<ObservationGate>,
+    owners: Mutex<HashMap<String, OwnerId>>,
+    next_owner: AtomicU64,
 }
 
 impl FsHost {
@@ -82,20 +161,22 @@ impl FsHost {
         Self {
             fs: LocalFileSystem::new(root.clone()),
             root,
-            gate: RefCell::new(ObservationGate::new()),
-            owners: RefCell::new(HashMap::new()),
-            next_owner: Cell::new(1),
+            gate: Mutex::new(ObservationGate::new()),
+            owners: Mutex::new(HashMap::new()),
+            next_owner: AtomicU64::new(1),
         }
     }
 
     /// agent → 稳定 OwnerId（memoize；时间序单调分配）。
     pub fn owner_id(&self, agent: &str) -> OwnerId {
-        if let Some(id) = self.owners.borrow().get(agent) {
-            return *id;
+        {
+            let owners = self.owners.lock().unwrap();
+            if let Some(id) = owners.get(agent) {
+                return *id;
+            }
         }
-        let id = self.next_owner.get();
-        self.next_owner.set(id + 1);
-        self.owners.borrow_mut().insert(agent.to_string(), id);
+        let id = self.next_owner.fetch_add(1, Ordering::SeqCst);
+        self.owners.lock().unwrap().insert(agent.to_string(), id);
         id
     }
 
@@ -112,7 +193,8 @@ impl FsHost {
     /// 写意图（observed-present → replace-if-version；否则 create-if-absent）。
     pub fn write_intent(&self, owner: &str, target: &FsTarget) -> FsWriteIntent {
         self.gate
-            .borrow()
+            .lock()
+            .unwrap()
             .write_intent(self.owner_id(owner), target)
     }
 
@@ -123,7 +205,8 @@ impl FsHost {
         target: &FsTarget,
     ) -> Result<dsh_fs::FsVersion, FsError> {
         self.gate
-            .borrow()
+            .lock()
+            .unwrap()
             .edit_intent(self.owner_id(owner), target)
             .map(|v| v.version)
     }
@@ -131,7 +214,8 @@ impl FsHost {
     /// 记录一次权威观察（读/写/编成功后）。
     pub fn record(&self, owner: &str, target: &FsTarget, obs: Observation) {
         self.gate
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .record(self.owner_id(owner), target, obs);
     }
 }
@@ -172,18 +256,28 @@ impl ShellHost {
 /// 完成结算由**宿主合作泵**驱动（`pump()`：M5g tick/服务线程调之；测试直接调）——
 /// 单线程注册表不自驱动 settle（D-004 诚实降级）。注册成功前不 spawn（producer 延迟
 /// start 在 jobs.start 内）；`start_bash` 失败由调用方掐掉进程。
+///
+/// Send+Sync（工具执行闭包捕获）：`JobRegistry`/`ShellProcess` 为非 Send 底层类型 →
+/// 整份状态经 [`ThreadCell`] 落创建线程本地池，桥自身只持句柄。
 pub struct BashJobsBridge {
-    registry: RefCell<JobRegistry>,
-    processes: RefCell<HashMap<String, Rc<ShellProcess>>>,
-    outputs: RefCell<HashMap<String, String>>,
+    state: ThreadCell<BashJobsState>,
+}
+
+/// `BashJobsBridge` 的单线程状态（仅经 `ThreadCell` 在创建线程可见）。
+struct BashJobsState {
+    registry: JobRegistry,
+    processes: HashMap<String, Rc<ShellProcess>>,
+    outputs: HashMap<String, String>,
 }
 
 impl Default for BashJobsBridge {
     fn default() -> Self {
         Self {
-            registry: RefCell::new(JobRegistry::new(JobRegistryConfig::default())),
-            processes: RefCell::new(HashMap::new()),
-            outputs: RefCell::new(HashMap::new()),
+            state: ThreadCell::new(BashJobsState {
+                registry: JobRegistry::new(JobRegistryConfig::default()),
+                processes: HashMap::new(),
+                outputs: HashMap::new(),
+            }),
         }
     }
 }
@@ -203,90 +297,92 @@ impl BashJobsBridge {
         label: &str,
         process: Rc<ShellProcess>,
     ) -> Result<String, JobStartError> {
-        let proc = process.clone();
-        let id = self.registry.borrow_mut().start(StartSpec {
-            kind,
-            label,
-            owner: Some(owner.to_string()),
-            producer: Box::new(move || {
-                let killer = proc.clone();
-                ProducerHooks {
-                    on_cancel: Box::new(move |_reason| {
-                        killer.kill();
-                    }),
-                    read_output: None, // final-output 语义：终态 settle 携全文，不流式滚入
-                }
-            }),
-        })?;
-        self.processes.borrow_mut().insert(id.clone(), process);
-        Ok(id)
+        self.state.with(|s| {
+            let proc = process.clone();
+            let id = s.registry.start(StartSpec {
+                kind,
+                label,
+                owner: Some(owner.to_string()),
+                producer: Box::new(move || {
+                    let killer = proc.clone();
+                    ProducerHooks {
+                        on_cancel: Box::new(move |_reason| {
+                            killer.kill();
+                        }),
+                        read_output: None, // final-output 语义：终态 settle 携全文，不流式滚入
+                    }
+                }),
+            })?;
+            s.processes.insert(id.clone(), process);
+            Ok(id)
+        })
     }
 
     /// 合作推进泵：滚动增量（终态走私全文）+ 探测终态 + settle + 移除。
     /// 返回本次结算条数。由宿主 tick（M5g）或测试循环调用；幂等。
     pub fn pump(&self) -> usize {
-        let mut finished: Vec<(String, ShellProcessStatus, Option<i32>)> = Vec::new();
-        {
-            let procs = self.processes.borrow();
-            for (id, proc) in procs.iter() {
-                // 先 done() 等到退出（collector 已 join，管道缓冲已全部落盘），
-                // 再 read_output() 收尾增量：终态轮拿到的是全文（含此前 running 轮
-                // 已消费的首段——offset 消费性，累计即完整终态输出）。
-                proc.done();
-                let delta = proc.read_output().delta;
-                if !delta.is_empty() {
-                    self.outputs
-                        .borrow_mut()
-                        .entry(id.clone())
-                        .or_default()
-                        .push_str(&delta);
-                }
-                let st = proc.status();
-                if st == ShellProcessStatus::Completed || st == ShellProcessStatus::Killed {
-                    finished.push((id.clone(), st, proc.exit_code()));
+        self.state.with(|s| {
+            let mut finished: Vec<(String, ShellProcessStatus, Option<i32>)> = Vec::new();
+            {
+                let procs = &s.processes;
+                for (id, proc) in procs.iter() {
+                    // 先 done() 等到退出（collector 已 join，管道缓冲已全部落盘），
+                    // 再 read_output() 收尾增量：终态轮拿到的是全文（含此前 running 轮
+                    // 已消费的首段——offset 消费性，累计即完整终态输出）。
+                    proc.done();
+                    let delta = proc.read_output().delta;
+                    if !delta.is_empty() {
+                        s.outputs.entry(id.clone()).or_default().push_str(&delta);
+                    }
+                    let st = proc.status();
+                    if st == ShellProcessStatus::Completed || st == ShellProcessStatus::Killed {
+                        finished.push((id.clone(), st, proc.exit_code()));
+                    }
                 }
             }
-        }
-        for (id, st, code) in &finished {
-            let status = if *st == ShellProcessStatus::Killed {
-                JobStatus::Killed
-            } else {
-                JobStatus::Completed
-            };
-            let output = self.outputs.borrow_mut().remove(id).unwrap_or_default();
-            let detail = code
-                .map(|c| format!("exit code {c}"))
-                .unwrap_or_else(|| "killed".to_string());
-            self.registry.borrow_mut().settle(
-                id,
-                JobSettlement {
-                    status,
-                    detail: Some(detail),
-                    output: Some(output),
-                },
-            );
-            self.processes.borrow_mut().remove(id);
-        }
-        finished.len()
+            for (id, st, code) in &finished {
+                let status = if *st == ShellProcessStatus::Killed {
+                    JobStatus::Killed
+                } else {
+                    JobStatus::Completed
+                };
+                let output = s.outputs.remove(id).unwrap_or_default();
+                let detail = code
+                    .map(|c| format!("exit code {c}"))
+                    .unwrap_or_else(|| "killed".to_string());
+                s.registry.settle(
+                    id,
+                    JobSettlement {
+                        status,
+                        detail: Some(detail),
+                        output: Some(output),
+                    },
+                );
+                s.processes.remove(id);
+            }
+            finished.len()
+        })
     }
 
     /// job 只读投影（caller 授权围栏由注册表执行）。
     pub fn read(&self, id: &str, caller: Option<&str>) -> Result<JobRead, dsh_jobs::JobOpsError> {
-        self.registry.borrow_mut().read(id, caller)
+        self.state.with(|s| s.registry.read(id, caller))
     }
 
     /// M6 step2（D-082）：关停全部后台 bash job——kill 进程树 + 合作泵结算（Killed）。
     /// 幂等：无存活进程/已结算 → no-op。宿主生命周期清理（`M5Host::shutdown`）调用，
     /// 保证 serve 退出时不遗留孤儿进程（验收 #3）。
     pub fn kill_all(&self) {
-        let ids: Vec<String> = self.processes.borrow().keys().cloned().collect();
-        let procs: Vec<Rc<ShellProcess>> = ids
-            .iter()
-            .filter_map(|id| self.processes.borrow().get(id).cloned())
-            .collect();
-        for p in procs {
-            p.kill();
-        }
+        self.state.with(|s| {
+            let ids: Vec<String> = s.processes.keys().cloned().collect();
+            let procs: Vec<Rc<ShellProcess>> = ids
+                .iter()
+                .filter_map(|id| s.processes.get(id).cloned())
+                .collect();
+            for p in procs {
+                p.kill();
+            }
+        });
         // settle：kill 后 `pump()` 的 done() 等在进程退出（collector join）再 settle Killed。
         self.pump();
     }
@@ -339,7 +435,7 @@ impl Drop for M5gTick {
 /// 主线程 tick_once：ScheduleHost 到期注入（dispatch_due）+ jobs 桥合作结算（pump）。
 /// 返回 (framing 文本, 派发的 schedule id)。由 M5g 主循环消费服务线程的 tick 调用。
 pub fn m5g_tick_once(
-    sched: &Rc<crate::web::dsh_cli_host::ScheduleHost>,
+    sched: &Arc<crate::web::dsh_cli_host::ScheduleHost>,
     bridge: Option<&BashJobsBridge>,
     now_epoch: i64,
 ) -> Result<(Vec<String>, Vec<String>), String> {
@@ -358,16 +454,17 @@ pub fn m5g_tick_once(
 /// （D-068/D-069/D-070）。
 #[derive(Default)]
 pub struct M5HostServices {
-    /// 终端会话注册表（terminal_open/send/read/signal/close/list 的真实句柄）。
-    pub terminal: Option<Rc<RefCell<TerminalSessionService>>>,
+    /// 终端会话注册表（terminal_open/send/read/signal/close/list 的真实句柄。
+    /// 内部 `TerminalSessionService` 为非 Send 底层值 → `ThreadCell` 桥（创建线程可见）。
+    pub terminal: Option<ThreadCell<TerminalSessionService>>,
     /// fs 宿主（read/write/edit/glob/grep/str_replace_editor 的真实句柄）。
-    pub fs: Option<Rc<FsHost>>,
+    pub fs: Option<Arc<FsHost>>,
     /// shell 宿主（bash 工具前台执行的真实句柄）。
-    pub shell: Option<Rc<ShellHost>>,
+    pub shell: Option<Arc<ShellHost>>,
     /// bash 后台 jobs producer 桥（bash run_in_background 的真实句柄；缺省 → 诚实拒绝）。
-    pub bash_jobs: Option<Rc<BashJobsBridge>>,
+    pub bash_jobs: Option<Arc<BashJobsBridge>>,
     /// code runtime（run_code 传输的真实 execute 覆盖；缺省 → 注册表占位桩诚实报错）。
-    pub code: Option<Rc<PythonCodeRuntime>>,
+    pub code: Option<Arc<PythonCodeRuntime>>,
 }
 
 /// M5 宿主生产装配（M5-DESIGN §8；验收 #9）：一次构造全部宿主句柄，root 为工作区。
@@ -381,7 +478,7 @@ pub struct M5Host {
 impl M5Host {
     pub fn assemble(root: PathBuf) -> Result<Self, String> {
         let root_abs = root.canonicalize().unwrap_or(root);
-        let terminal = Rc::new(RefCell::new(TerminalSessionService::new()));
+        let terminal = ThreadCell::new(TerminalSessionService::new());
         // P3-e（A 并行收口）：真实 PTY 后端在册——bash（resolve_bash_program）与
         // pwsh（resolve_pwsh_program，win32 = powershell.exe 5.1 兜底）。terminal_open
         // 按 `type` 后端名开真实会话；spawn 失败 → 诚实 NoBackend。
@@ -389,45 +486,47 @@ impl M5Host {
             let bash_program = dsh_shell::resolve_bash_program(&BashConfig::default());
             let pwsh_program = dsh_shell::resolve_pwsh_program(&BashConfig::default());
             terminal
-                .borrow_mut()
-                .register_backend(
-                    dsh_terminal::BackendDefinition {
-                        id: "bash".into(),
-                        kind: dsh_terminal::TerminalBackendKind::Bash,
-                        label: format!("bash pty ({bash_program})"),
-                    },
-                    Box::new(move |_cfg| {
-                        Box::new(dsh_terminal::PtyBackend::new(
-                            "bash",
-                            &bash_program,
-                            dsh_terminal::TerminalBackendKind::Bash,
-                        ))
-                    }),
-                )
+                .with(|t| {
+                    t.register_backend(
+                        dsh_terminal::BackendDefinition {
+                            id: "bash".into(),
+                            kind: dsh_terminal::TerminalBackendKind::Bash,
+                            label: format!("bash pty ({bash_program})"),
+                        },
+                        Box::new(move |_cfg| {
+                            Box::new(dsh_terminal::PtyBackend::new(
+                                "bash",
+                                &bash_program,
+                                dsh_terminal::TerminalBackendKind::Bash,
+                            ))
+                        }),
+                    )
+                })
                 .map_err(|e| format!("register terminal backend bash: {e}"))?;
             terminal
-                .borrow_mut()
-                .register_backend(
-                    dsh_terminal::BackendDefinition {
-                        id: "pwsh".into(),
-                        kind: dsh_terminal::TerminalBackendKind::PowerShell,
-                        label: format!("pwsh pty ({pwsh_program})"),
-                    },
-                    Box::new(move |_cfg| {
-                        Box::new(dsh_terminal::PtyBackend::new(
-                            "pwsh",
-                            &pwsh_program,
-                            dsh_terminal::TerminalBackendKind::PowerShell,
-                        ))
-                    }),
-                )
+                .with(|t| {
+                    t.register_backend(
+                        dsh_terminal::BackendDefinition {
+                            id: "pwsh".into(),
+                            kind: dsh_terminal::TerminalBackendKind::PowerShell,
+                            label: format!("pwsh pty ({pwsh_program})"),
+                        },
+                        Box::new(move |_cfg| {
+                            Box::new(dsh_terminal::PtyBackend::new(
+                                "pwsh",
+                                &pwsh_program,
+                                dsh_terminal::TerminalBackendKind::PowerShell,
+                            ))
+                        }),
+                    )
+                })
                 .map_err(|e| format!("register terminal backend pwsh: {e}"))?;
         }
-        let fs = Rc::new(FsHost::new(root_abs.clone()));
-        let shell = Rc::new(ShellHost::new(root_abs.clone())?);
-        let bash_jobs = Rc::new(BashJobsBridge::new());
+        let fs = Arc::new(FsHost::new(root_abs.clone()));
+        let shell = Arc::new(ShellHost::new(root_abs.clone())?);
+        let bash_jobs = Arc::new(BashJobsBridge::new());
         let code = dsh_code_runtime::python_available()
-            .then(|| Rc::new(PythonCodeRuntime::new(PythonConfig::default())));
+            .then(|| Arc::new(PythonCodeRuntime::new(PythonConfig::default())));
         Ok(M5Host {
             services: M5HostServices {
                 terminal: Some(terminal),
@@ -454,7 +553,7 @@ impl M5Host {
             b.kill_all();
         }
         if let Some(t) = &self.services.terminal {
-            t.borrow_mut().dispose();
+            t.with(|t| t.dispose());
         }
     }
 }
@@ -559,7 +658,8 @@ pub fn register_prompt_section(
 }
 
 /// M6 step9（D-088）：宿主否决谓词——`(tool_name) -> Option<reason>`；`Some` → deny。
-pub type HostVeto = dyn Fn(&str) -> Option<String>;
+/// Send+Sync（`dsh-tools` pre-decision 缝为 Arc<dyn Fn+Send+Sync>）。
+pub type HostVeto = dyn Fn(&str) -> Option<String> + Send + Sync;
 
 /// M6 step9（D-088）：hooks = pre-execute 宿主钩子——dsh-tools pre-decision 缝延伸。
 /// 每次工具执行前调用：先向 `session` 记录 `hookInvoked`（tool/callId/agent，与 TS
@@ -569,14 +669,14 @@ pub type HostVeto = dyn Fn(&str) -> Option<String>;
 pub fn register_pre_execute_hook(
     registry: &dsh_tools::ToolRegistry,
     session: Arc<dsh_session::Session>,
-    veto: Rc<HostVeto>,
+    veto: Arc<HostVeto>,
 ) -> Result<(), String> {
     use dsh_session::types::EventKind;
     let sess = session.clone();
     let veto2 = veto.clone();
     registry
         .add_pre_decision(
-            Rc::new(move |exec| {
+            Arc::new(move |exec| {
                 let _ = sess.append(
                     EventKind::HookInvoked,
                     serde_json::json!({
@@ -600,7 +700,7 @@ pub fn wire_recording_pre_execute_hook(
     registry: &dsh_tools::ToolRegistry,
     session: Arc<dsh_session::Session>,
 ) -> Result<(), String> {
-    register_pre_execute_hook(registry, session, Rc::new(|_name| None))
+    register_pre_execute_hook(registry, session, Arc::new(|_name| None))
 }
 
 /// M6 step4（D-084）：沙箱投影——把动态 `sandbox:policy` 段（order 110，Fn provider）
@@ -617,7 +717,7 @@ pub fn register_sandbox_policy_section(
 ) -> Result<(), String> {
     use dsh_session::types::SessionId;
     let sid = SessionId::from_raw(default_session.to_string());
-    let text = PromptSectionText::Fn(Rc::new(move |_ctx| {
+    let text = PromptSectionText::Fn(Arc::new(move |_ctx| {
         let events: Vec<serde_json::Value> = session_store
             .get(&sid)
             .map(|s| {
@@ -688,7 +788,7 @@ pub fn register_m5_tools_with_host(
         bash.bind(shell_executor("bash", shost, false, bridge));
     }
     registry
-        .register_global(Rc::clone(&bash.definition()))
+        .register_global(Arc::clone(&bash.definition()))
         .expect("register bash");
 
     // ---- pwsh（A 并行）：PowerShell 方言工具，绑 shost.pwsh 执行器 ----
@@ -698,7 +798,7 @@ pub fn register_m5_tools_with_host(
         pwsh.bind(shell_executor("pwsh", shost, true, bridge));
     }
     registry
-        .register_global(Rc::clone(&pwsh.definition()))
+        .register_global(Arc::clone(&pwsh.definition()))
         .expect("register pwsh");
 
     // ---- fs 六件套 + 搜索 + sr-editor：纯面定义（schema + 渲染）+ 宿主 bind ----
@@ -746,8 +846,8 @@ pub fn register_m5_tools_with_host(
 /// run_code executor：parse（code/description 必填）→ `PythonCodeRuntime::run` →
 /// 规范化值 `{language, value?, logs[], error?}`。嵌套工具派发（bindings）本轮为空——
 /// 诚实空命名空间（程序调 tools.* 得未注入错误），D-073 记录渐进。
-fn run_code_executor_with(runtime: Rc<PythonCodeRuntime>) -> ToolExecute {
-    Rc::new(move |args, _ctx| {
+fn run_code_executor_with(runtime: Arc<PythonCodeRuntime>) -> ToolExecute {
+    Arc::new(move |args, _ctx| {
         let (code, _description) =
             parse_run_code_args(args).map_err(|m| invalid_args("run_code", m))?;
         let request = CodeRunRequest {
@@ -805,7 +905,7 @@ fn shell_tool(name: &str, description: String) -> M5Tool {
         description,
         bash_tool_parameters(true, &[]),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(move |_a, v| {
+        Arc::new(move |_a, v| {
             if let Some(id) = v["jobId"].as_str() {
                 // 后台启动：值只含 jobId（final-output 语义，job_read 消费终态输出）。
                 return vec![ContentBlock::text(format!(
@@ -834,11 +934,11 @@ fn shell_tool(name: &str, description: String) -> M5Tool {
 /// （bash）。后台路径：`bridge` 在场 → 起 job（jobId）；否则诚实 `UNSUPPORTED_OPTION`。
 fn shell_executor(
     name: &'static str,
-    shost: Rc<ShellHost>,
+    shost: Arc<ShellHost>,
     use_pwsh: bool,
-    bridge: Option<Rc<BashJobsBridge>>,
+    bridge: Option<Arc<BashJobsBridge>>,
 ) -> ToolExecute {
-    Rc::new(move |args, ctx| {
+    Arc::new(move |args, ctx| {
         let parsed = parse_bash_args(args).map_err(|m| invalid_args(name, m))?;
         if let Some(perms) = &parsed.sandbox_permissions {
             if !perms.is_empty() {
@@ -966,7 +1066,7 @@ fn terminal_open_tool() -> M5Tool {
         "Start a terminal session attached to the requested backend (e.g. bash), ready for later send/read.".into(),
         terminal_open_schema(),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| {
+        Arc::new(|_a, v| {
             let text = render_terminal_spawn(
                 v["sessionId"].as_str().unwrap_or("?"),
                 v["name"].as_str(),
@@ -986,7 +1086,7 @@ fn terminal_send_tool() -> M5Tool {
         "Send text to a terminal session and wait for delivery (viewport + wait reason).".into(),
         terminal_send_schema(false),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| {
+        Arc::new(|_a, v| {
             let status = render_status_from_value(&v["sessionStatus"]);
             let text = render_terminal_send(
                 v["viewport"].as_str().unwrap_or(""),
@@ -1007,7 +1107,7 @@ fn terminal_read_tool() -> M5Tool {
         "Read retained output from a terminal session (optionally a line window).".into(),
         terminal_read_schema(),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| {
+        Arc::new(|_a, v| {
             let text = render_terminal_read(
                 v["text"].as_str().unwrap_or(""),
                 v["totalLines"].as_u64().unwrap_or(0) as usize,
@@ -1028,7 +1128,7 @@ fn terminal_signal_tool() -> M5Tool {
         "Deliver a signal to a terminal session's process (best-effort on this platform).".into(),
         terminal_signal_schema(),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| {
+        Arc::new(|_a, v| {
             // ConPTY/Windows 无前台进程组（D-064 DIV）→ 不声称虚构 pgid（参考 render
             // 的 "to foreground process group N" 在此平台为假，改用诚实短句）。
             let sig = v["signal"].as_str().unwrap_or("?");
@@ -1044,7 +1144,7 @@ fn terminal_close_tool() -> M5Tool {
         "Close a terminal session owned by the caller.".into(),
         terminal_close_schema(),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| {
+        Arc::new(|_a, v| {
             let text = render_terminal_close(
                 v["sessionId"].as_str().unwrap_or("?"),
                 TerminalCloseOutcome::Closed,
@@ -1061,7 +1161,7 @@ fn terminal_list_tool() -> M5Tool {
         "List terminal sessions owned by the caller (id, name, backend, status).".into(),
         terminal_list_schema(),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| {
+        Arc::new(|_a, v| {
             let sessions: Vec<RenderedTerminalSession> = v["sessions"]
                 .as_array()
                 .map(|arr| {
@@ -1083,14 +1183,13 @@ fn terminal_list_tool() -> M5Tool {
     .expect("terminal_list defines")
 }
 
-fn terminal_open_executor(svc: Rc<RefCell<TerminalSessionService>>) -> ToolExecute {
-    Rc::new(move |args, ctx| {
+fn terminal_open_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecute {
+    Arc::new(move |args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "terminal_open")?;
         let (backend, name, _cwd) =
             parse_terminal_open_args(args).map_err(|m| invalid_args("terminal_open", m))?;
         let id = svc
-            .borrow_mut()
-            .open(owner, &backend, name.as_deref(), TerminalConfig::default())
+            .with(|s| s.open(owner, &backend, name.as_deref(), TerminalConfig::default()))
             .map_err(|e| terminal_failure("terminal_open", e))?;
         Ok(json!({
             "sessionId": id.as_str(),
@@ -1100,8 +1199,8 @@ fn terminal_open_executor(svc: Rc<RefCell<TerminalSessionService>>) -> ToolExecu
     })
 }
 
-fn terminal_send_executor(svc: Rc<RefCell<TerminalSessionService>>) -> ToolExecute {
-    Rc::new(move |args, ctx| {
+fn terminal_send_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecute {
+    Arc::new(move |args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "terminal_send")?;
         let (id, text, submit, background) =
             parse_terminal_send_args(args).map_err(|e| terminal_failure("terminal_send", e))?;
@@ -1116,8 +1215,7 @@ fn terminal_send_executor(svc: Rc<RefCell<TerminalSessionService>>) -> ToolExecu
             signal: None,
         };
         let res = svc
-            .borrow_mut()
-            .send(owner, &TerminalSessionId::from_raw(id.clone()), &req)
+            .with(|s| s.send(owner, &TerminalSessionId::from_raw(id.clone()), &req))
             .map_err(|e| terminal_failure("terminal_send", e))?;
         Ok(json!({
             "sessionId": id,
@@ -1129,14 +1227,13 @@ fn terminal_send_executor(svc: Rc<RefCell<TerminalSessionService>>) -> ToolExecu
     })
 }
 
-fn terminal_read_executor(svc: Rc<RefCell<TerminalSessionService>>) -> ToolExecute {
-    Rc::new(move |args, ctx| {
+fn terminal_read_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecute {
+    Arc::new(move |args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "terminal_read")?;
         let (id, offset, count) =
             parse_terminal_read_args(args).map_err(|e| terminal_failure("terminal_read", e))?;
         let text = svc
-            .borrow_mut()
-            .read(owner, &TerminalSessionId::from_raw(id.clone()))
+            .with(|s| s.read(owner, &TerminalSessionId::from_raw(id.clone())))
             .map_err(|e| terminal_failure("terminal_read", e))?;
         let total = text.matches('\n').count() + usize::from(!text.is_empty());
         let begin = offset.map(|o| o as usize).unwrap_or(0).min(total);
@@ -1152,15 +1249,14 @@ fn terminal_read_executor(svc: Rc<RefCell<TerminalSessionService>>) -> ToolExecu
     })
 }
 
-fn terminal_signal_executor(svc: Rc<RefCell<TerminalSessionService>>) -> ToolExecute {
-    Rc::new(move |args, ctx| {
+fn terminal_signal_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecute {
+    Arc::new(move |args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "terminal_signal")?;
         let (id, sig) =
             parse_terminal_signal_args(args).map_err(|e| terminal_failure("terminal_signal", e))?;
         let parsed = parse_signal(&sig)
             .ok_or_else(|| invalid_args("terminal_signal", format!("unknown signal: {sig}")))?;
-        svc.borrow_mut()
-            .signal(owner, &TerminalSessionId::from_raw(id.clone()), parsed)
+        svc.with(|s| s.signal(owner, &TerminalSessionId::from_raw(id.clone()), parsed))
             .map_err(|e| terminal_failure("terminal_signal", e))?;
         Ok(json!({
             "sessionId": id,
@@ -1170,24 +1266,22 @@ fn terminal_signal_executor(svc: Rc<RefCell<TerminalSessionService>>) -> ToolExe
     })
 }
 
-fn terminal_close_executor(svc: Rc<RefCell<TerminalSessionService>>) -> ToolExecute {
-    Rc::new(move |args, ctx| {
+fn terminal_close_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecute {
+    Arc::new(move |args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "terminal_close")?;
         let id =
             parse_terminal_close_args(args).map_err(|e| terminal_failure("terminal_close", e))?;
-        svc.borrow_mut()
-            .close(owner, &TerminalSessionId::from_raw(id.clone()))
+        svc.with(|s| s.close(owner, &TerminalSessionId::from_raw(id.clone())))
             .map_err(|e| terminal_failure("terminal_close", e))?;
         Ok(json!({ "sessionId": id, "outcome": "closed" }))
     })
 }
 
-fn terminal_list_executor(svc: Rc<RefCell<TerminalSessionService>>) -> ToolExecute {
-    Rc::new(move |_args, ctx| {
+fn terminal_list_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecute {
+    Arc::new(move |_args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "terminal_list")?;
         let sessions: Vec<Value> = svc
-            .borrow()
-            .list()
+            .with(|s| s.list())
             .into_iter()
             .filter(|v| v.owner == owner)
             .map(|v| {
@@ -1218,7 +1312,7 @@ fn fs_read_tool() -> M5Tool {
             "limit": {"type":"integer"},
         }),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| {
+        Arc::new(|_a, v| {
             let outcome = FileReadOutcome {
                 offset: v["offset"].as_u64().unwrap_or(1) as usize,
                 lines: v["lines"]
@@ -1252,7 +1346,7 @@ fn fs_write_tool() -> M5Tool {
             "description": {"type":"string"},
         }),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| {
+        Arc::new(|_a, v| {
             let text = format_write_output(
                 v["file_path"].as_str().unwrap_or("?"),
                 v["operation"].as_str().unwrap_or("create"),
@@ -1275,7 +1369,7 @@ fn fs_edit_tool() -> M5Tool {
             "description": {"type":"string"},
         }),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| {
+        Arc::new(|_a, v| {
             let text = format_edit_output(
                 v["file_path"].as_str().unwrap_or("?"),
                 v["replace_all"].as_bool().unwrap_or(false),
@@ -1293,7 +1387,7 @@ fn fs_read_image_tool() -> M5Tool {
             .into(),
         json!({"file_path": {"type":"string","required":true}}),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| vec![ContentBlock::text(render_passthrough(v))]),
+        Arc::new(|_a, v| vec![ContentBlock::text(render_passthrough(v))]),
     )
     .expect("read_image defines")
 }
@@ -1307,7 +1401,7 @@ fn glob_tool() -> M5Tool {
             "path": {"type":"string"},
         }),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| {
+        Arc::new(|_a, v| {
             let matches: Vec<String> = v["matches"]
                 .as_array()
                 .map(|a| {
@@ -1337,7 +1431,7 @@ fn grep_tool() -> M5Tool {
             "include": {"type":"string"},
         }),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| {
+        Arc::new(|_a, v| {
             let items: Vec<GrepMatch> = v["matches"]
                 .as_array()
                 .map(|a| {
@@ -1375,7 +1469,7 @@ fn sr_editor_tool() -> M5Tool {
             "new_str": {"type":"string"},
         }),
         json!({"type":"object","additionalProperties":true}),
-        Rc::new(|_a, v| {
+        Arc::new(|_a, v| {
             let text = format_file_view(
                 v["file_path"].as_str().unwrap_or("?"),
                 v["content"].as_str().unwrap_or(""),
@@ -1389,8 +1483,8 @@ fn sr_editor_tool() -> M5Tool {
     .expect("str_replace_editor defines")
 }
 
-fn fs_read_executor(fsh: Rc<FsHost>) -> ToolExecute {
-    Rc::new(move |args, ctx| {
+fn fs_read_executor(fsh: Arc<FsHost>) -> ToolExecute {
+    Arc::new(move |args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "read")?;
         let input = parse_read_args(
             args["file_path"].as_str().unwrap_or(""),
@@ -1440,8 +1534,8 @@ fn fs_read_executor(fsh: Rc<FsHost>) -> ToolExecute {
     })
 }
 
-fn fs_write_executor(fsh: Rc<FsHost>) -> ToolExecute {
-    Rc::new(move |args, ctx| {
+fn fs_write_executor(fsh: Arc<FsHost>) -> ToolExecute {
+    Arc::new(move |args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "write")?;
         let input = parse_write_args(
             args["file_path"].as_str().unwrap_or(""),
@@ -1470,8 +1564,8 @@ fn fs_write_executor(fsh: Rc<FsHost>) -> ToolExecute {
     })
 }
 
-fn fs_edit_executor(fsh: Rc<FsHost>) -> ToolExecute {
-    Rc::new(move |args, ctx| {
+fn fs_edit_executor(fsh: Arc<FsHost>) -> ToolExecute {
+    Arc::new(move |args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "edit")?;
         let input = parse_edit_args(
             args["file_path"].as_str().unwrap_or(""),
@@ -1509,8 +1603,8 @@ fn fs_edit_executor(fsh: Rc<FsHost>) -> ToolExecute {
     })
 }
 
-fn glob_executor(fsh: Rc<FsHost>) -> ToolExecute {
-    Rc::new(move |args, _ctx| {
+fn glob_executor(fsh: Arc<FsHost>) -> ToolExecute {
+    Arc::new(move |args, _ctx| {
         let input = parse_glob_args(
             args["pattern"].as_str().unwrap_or(""),
             args.get("path").and_then(Value::as_str),
@@ -1521,8 +1615,8 @@ fn glob_executor(fsh: Rc<FsHost>) -> ToolExecute {
     })
 }
 
-fn grep_executor(fsh: Rc<FsHost>) -> ToolExecute {
-    Rc::new(move |args, _ctx| {
+fn grep_executor(fsh: Arc<FsHost>) -> ToolExecute {
+    Arc::new(move |args, _ctx| {
         let input = parse_grep_args(
             args["pattern"].as_str().unwrap_or(""),
             args.get("path").and_then(Value::as_str),
@@ -1540,8 +1634,8 @@ fn grep_executor(fsh: Rc<FsHost>) -> ToolExecute {
     })
 }
 
-fn sr_editor_executor(fsh: Rc<FsHost>) -> ToolExecute {
-    Rc::new(move |args, ctx| {
+fn sr_editor_executor(fsh: Arc<FsHost>) -> ToolExecute {
+    Arc::new(move |args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "str_replace_editor")?;
         let file_path = args["file_path"].as_str().unwrap_or("").to_string();
         if file_path.trim().is_empty() {

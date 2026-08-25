@@ -4,9 +4,8 @@
 #![allow(clippy::type_complexity)] // mock 闭包（Rc<dyn Fn>）与驱动泥合 seam 一致，显式类型
 #![allow(clippy::result_large_err)] // mock stream 的 Result Err 携带 LlmError（设计）
 
-use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dsh_agent::{Agent, AgentBus, AgentRegistry, AgentStatus, InboxTarget, NextFn};
@@ -112,9 +111,9 @@ fn turn_end_reason(s: &Arc<Session>) -> Value {
 
 // ---- mock deps ----
 
-fn mock_assemble(system: &str) -> Rc<dyn Fn(&AssembleContext) -> Result<PromptAssembly, String>> {
+fn mock_assemble(system: &str) -> Arc<dyn Fn(&AssembleContext) -> Result<PromptAssembly, String> + Send + Sync> {
     let system = system.to_string();
-    Rc::new(move |_ctx: &AssembleContext| {
+    Arc::new(move |_ctx: &AssembleContext| {
         Ok(PromptAssembly {
             sections: vec![AssembledSection {
                 name: "mock".into(),
@@ -127,10 +126,10 @@ fn mock_assemble(system: &str) -> Rc<dyn Fn(&AssembleContext) -> Result<PromptAs
     })
 }
 
-fn mock_prepare(provider: &str, model: &str) -> Rc<dyn Fn(CallConfig) -> Result<PreparedLlmCall, LlmError>> {
+fn mock_prepare(provider: &str, model: &str) -> Arc<dyn Fn(CallConfig) -> Result<PreparedLlmCall, LlmError> + Send + Sync> {
     let provider = provider.to_string();
     let model = model.to_string();
-    Rc::new(move |_c: CallConfig| {
+    Arc::new(move |_c: CallConfig| {
         Ok(PreparedLlmCall {
             config: CallConfig {
                 provider: provider.clone(),
@@ -152,26 +151,28 @@ fn mock_prepare(provider: &str, model: &str) -> Rc<dyn Fn(CallConfig) -> Result<
 }
 
 fn mock_stream(
-    script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>,
-    calls: Rc<Cell<u32>>,
-) -> Rc<dyn Fn(&GenerateOptions) -> Result<Vec<StreamChunk>, LlmError>> {
-    Rc::new(move |_req: &GenerateOptions| -> Result<Vec<StreamChunk>, LlmError> {
-        calls.set(calls.get() + 1);
-        let next = script.borrow_mut().pop_front().unwrap_or_default();
+    script: Arc<Mutex<VecDeque<Vec<StreamChunk>>>>,
+    calls: Arc<AtomicU32>,
+) -> Arc<dyn Fn(&GenerateOptions) -> Result<Vec<StreamChunk>, LlmError> + Send + Sync> {
+    Arc::new(move |_req: &GenerateOptions| -> Result<Vec<StreamChunk>, LlmError> {
+        calls.store(calls.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+        let next = script.lock().unwrap().pop_front().unwrap_or_default();
         Ok(next)
     })
 }
 
 fn mock_tool(
     concluded_seq: &[bool],
-    contexts: Rc<RefCell<VecDeque<Vec<Message>>>>,
-) -> Rc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome> {
+    contexts: Arc<Mutex<VecDeque<Vec<Message>>>>,
+) -> Arc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome + Send + Sync> {
     let concluded_seq: Vec<bool> = concluded_seq.to_vec();
-    let idx = Rc::new(Cell::new(0usize));
-    Rc::new(move |_ctx: &ToolExecCtx| {
-        let i = idx.get().min(concluded_seq.len().saturating_sub(1));
-        idx.set(idx.get() + 1);
-        let context = contexts.borrow_mut().pop_front().unwrap_or_default();
+    let idx = Arc::new(AtomicUsize::new(0usize));
+    Arc::new(move |_ctx: &ToolExecCtx| {
+        let i = idx
+            .load(Ordering::SeqCst)
+            .min(concluded_seq.len().saturating_sub(1));
+        idx.store(idx.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+        let context = contexts.lock().unwrap().pop_front().unwrap_or_default();
         ToolExecOutcome {
             concluded: concluded_seq[i],
             context,
@@ -180,8 +181,8 @@ fn mock_tool(
     })
 }
 
-fn mock_tool_never() -> Rc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome> {
-    Rc::new(|_ctx: &ToolExecCtx| ToolExecOutcome {
+fn mock_tool_never() -> Arc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome + Send + Sync> {
+    Arc::new(|_ctx: &ToolExecCtx| ToolExecOutcome {
         concluded: true,
         context: vec![],
         pending: Vec::new(),
@@ -189,15 +190,15 @@ fn mock_tool_never() -> Rc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome> {
 }
 
 fn deps(
-    assemble: Rc<dyn Fn(&AssembleContext) -> Result<PromptAssembly, String>>,
-    stream: Rc<dyn Fn(&GenerateOptions) -> Result<Vec<StreamChunk>, LlmError>>,
-    tool: Rc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome>,
+    assemble: Arc<dyn Fn(&AssembleContext) -> Result<PromptAssembly, String> + Send + Sync>,
+    stream: Arc<dyn Fn(&GenerateOptions) -> Result<Vec<StreamChunk>, LlmError> + Send + Sync>,
+    tool: Arc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome + Send + Sync>,
 ) -> LoopDeps {
     LoopDeps {
         assemble,
         prepare_call: mock_prepare("litellm", "deepseek-r1"),
         stream,
-        project_context: Rc::new(|_a: &PromptAssembly| None),
+        project_context: Arc::new(|_a: &PromptAssembly| None),
         tool_exec: tool,
     }
 }
@@ -289,11 +290,11 @@ fn send_runs_one_turn_completed() {
     let w = TestWorld::new();
     let a = w.agent("a");
     let status = listen_status(&w.bus);
-    let script = Rc::new(RefCell::new(VecDeque::from(vec![text_chunks(
+    let script = Arc::new(Mutex::new(VecDeque::from(vec![text_chunks(
         "hello there",
         FinishReason::Stop,
     )])));
-    let calls = Rc::new(Cell::new(0u32));
+    let calls = Arc::new(AtomicU32::new(0));
     let driver = ReactLoopAgent::new(
         a.clone(),
         w.reg.clone(),
@@ -307,7 +308,7 @@ fn send_runs_one_turn_completed() {
     assert_eq!(count_of(&a.session, EventKind::StepStart), 1);
     assert_eq!(count_of(&a.session, EventKind::TurnEnd), 1);
     assert_eq!(turn_end_reason(&a.session)["kind"], "completed");
-    assert_eq!(calls.get(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(driver.status(), AgentStatus::Idle);
     // derive：user + assistant（模型可见 ⟺ 已登录）
     let msgs = a.session.derive_messages().unwrap();
@@ -321,11 +322,11 @@ fn send_runs_one_turn_completed() {
 fn stable_prompt_logs_single_initial_header() {
     let w = TestWorld::new();
     let a = w.agent("a");
-    let script = Rc::new(RefCell::new(VecDeque::from(vec![
+    let script = Arc::new(Mutex::new(VecDeque::from(vec![
         text_chunks("one", FinishReason::Stop),
         text_chunks("two", FinishReason::Stop),
     ])));
-    let calls = Rc::new(Cell::new(0u32));
+    let calls = Arc::new(AtomicU32::new(0));
     let driver = ReactLoopAgent::new(
         a.clone(),
         w.reg.clone(),
@@ -342,7 +343,7 @@ fn stable_prompt_logs_single_initial_header() {
         .collect::<Vec<_>>();
     assert_eq!(headers.len(), 1);
     assert_eq!(headers[0].data["reason"], "initial");
-    assert_eq!(calls.get(), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -351,9 +352,9 @@ fn steer_continues_same_turn_until_concluded() {
     let a = w.agent("a");
     let step1_chunks = tool_call_chunks("c1");
     let step2_chunks = text_chunks("done", FinishReason::Stop);
-    let script = Rc::new(RefCell::new(VecDeque::from(vec![step1_chunks, step2_chunks])));
-    let calls = Rc::new(Cell::new(0u32));
-    let contexts = Rc::new(RefCell::new(VecDeque::from(vec![vec![user_msg(
+    let script = Arc::new(Mutex::new(VecDeque::from(vec![step1_chunks, step2_chunks])));
+    let calls = Arc::new(AtomicU32::new(0));
+    let contexts = Arc::new(Mutex::new(VecDeque::from(vec![vec![user_msg(
         "steer",
         "use the tool result",
     )]])));
@@ -380,11 +381,11 @@ fn steer_continues_same_turn_until_concluded() {
 fn followup_runs_second_turn() {
     let w = TestWorld::new();
     let a = w.agent("a");
-    let script = Rc::new(RefCell::new(VecDeque::from(vec![
+    let script = Arc::new(Mutex::new(VecDeque::from(vec![
         text_chunks("one", FinishReason::Stop),
         text_chunks("two", FinishReason::Stop),
     ])));
-    let calls = Rc::new(Cell::new(0u32));
+    let calls = Arc::new(AtomicU32::new(0));
     let driver = ReactLoopAgent::new(
         a.clone(),
         w.reg.clone(),
@@ -402,7 +403,7 @@ fn followup_runs_second_turn() {
         .map(|e| e.data["turn"].as_u64().unwrap())
         .collect();
     assert_eq!(turns, vec![1, 2]);
-    assert_eq!(calls.get(), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -415,8 +416,8 @@ fn reject_closes_turn_blocked() {
         None,
         Arc::new(|_payload: Value, _next: NextFn| json!({ "kind": "reject" })),
     );
-    let script = Rc::new(RefCell::new(VecDeque::new()));
-    let calls = Rc::new(Cell::new(0u32));
+    let script = Arc::new(Mutex::new(VecDeque::new()));
+    let calls = Arc::new(AtomicU32::new(0));
     let driver = ReactLoopAgent::new(
         a.clone(),
         w.reg.clone(),
@@ -425,7 +426,7 @@ fn reject_closes_turn_blocked() {
     driver.followup(user_msg("m1", "hi")).unwrap();
     assert_eq!(turn_end_reason(&a.session)["kind"], "blocked");
     assert_eq!(count_of(&a.session, EventKind::StepStart), 0);
-    assert_eq!(calls.get(), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -438,8 +439,8 @@ fn empty_prestep_completes_without_step() {
         None,
         Arc::new(|_payload: Value, _next: NextFn| json!({ "kind": "enter", "messages": [] })),
     );
-    let script = Rc::new(RefCell::new(VecDeque::new()));
-    let calls = Rc::new(Cell::new(0u32));
+    let script = Arc::new(Mutex::new(VecDeque::new()));
+    let calls = Arc::new(AtomicU32::new(0));
     let driver = ReactLoopAgent::new(
         a.clone(),
         w.reg.clone(),
@@ -448,18 +449,18 @@ fn empty_prestep_completes_without_step() {
     driver.followup(user_msg("m1", "hi")).unwrap();
     assert_eq!(turn_end_reason(&a.session)["kind"], "completed");
     assert_eq!(count_of(&a.session, EventKind::StepStart), 0);
-    assert_eq!(calls.get(), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
 fn max_tokens_sticky_keeps_turn_reason() {
     let w = TestWorld::new();
     let a = w.agent("a");
-    let script = Rc::new(RefCell::new(VecDeque::from(vec![
+    let script = Arc::new(Mutex::new(VecDeque::from(vec![
         text_chunks("cut", FinishReason::MaxTokens),
         text_chunks("done", FinishReason::Stop),
     ])));
-    let calls = Rc::new(Cell::new(0u32));
+    let calls = Arc::new(AtomicU32::new(0));
     let driver = ReactLoopAgent::new(
         a.clone(),
         w.reg.clone(),
@@ -469,7 +470,7 @@ fn max_tokens_sticky_keeps_turn_reason() {
     // （D-115：监听器须 Send+Sync → 经 Send 的 agent.inbox 直注同效应；
     //  与 steer（splice+wake）对当前正在排空的 turn 等价——主循环按 next_step 续跑）
     let steer_agent = a.clone();
-    let injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let injected = Arc::new(AtomicBool::new(false));
     let inj = injected.clone();
     w.bus.on_chain(
         "agent/pre-step",
@@ -477,7 +478,7 @@ fn max_tokens_sticky_keeps_turn_reason() {
         None,
         Arc::new(move |payload: Value, next: NextFn| {
             let decision = next(payload);
-            if !inj.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if !inj.swap(true, Ordering::SeqCst) {
                 let _ = steer_agent
                     .inbox
                     .append_msg(InboxTarget::NextStep, user_msg("s1", "keep going"));
@@ -503,7 +504,7 @@ fn cancel_before_turn_start_leaves_no_records() {
         w.reg.clone(),
         deps(
             mock_assemble("sys"),
-            mock_stream(Rc::new(RefCell::new(VecDeque::new())), Rc::new(Cell::new(0u32))),
+            mock_stream(Arc::new(Mutex::new(VecDeque::new())), Arc::new(AtomicU32::new(0))),
             mock_tool_never(),
         ),
     );
@@ -529,12 +530,12 @@ fn cancel_before_turn_start_leaves_no_records() {
 fn cancel_mid_turn_aborts_without_error_event() {
     let w = TestWorld::new();
     let a = w.agent("a");
-    let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let errors = Arc::new(AtomicUsize::new(0));
     let err_log = errors.clone();
     w.bus.on("agent/error", true, None, Arc::new(move |_n, _p| {
-        err_log.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        err_log.fetch_add(1, Ordering::SeqCst);
     }));
-    let script = Rc::new(RefCell::new(VecDeque::from(vec![text_chunks(
+    let script = Arc::new(Mutex::new(VecDeque::from(vec![text_chunks(
         "partial",
         FinishReason::Stop,
     )])));
@@ -543,19 +544,19 @@ fn cancel_mid_turn_aborts_without_error_event() {
         w.reg.clone(),
         deps(
             mock_assemble("sys"),
-            mock_stream(script, Rc::new(Cell::new(0u32))),
+            mock_stream(script, Arc::new(AtomicU32::new(0))),
             mock_tool_never(),
         ),
     );
     let cancel = driver.cancel_token();
-    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
     let c = cancelled.clone();
     w.bus.on_chain(
         "agent/pre-step",
         true,
         None,
         Arc::new(move |payload: Value, next: NextFn| {
-            if !c.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if !c.swap(true, Ordering::SeqCst) {
                 *cancel.lock().unwrap() = Some(AgentCancelCause::User);
             }
             next(payload)
@@ -568,31 +569,31 @@ fn cancel_mid_turn_aborts_without_error_event() {
     assert_eq!(reason["kind"], "aborted");
     assert_eq!(reason["reason"]["kind"], "user");
     // 无 agent/error（abort 路径静默）
-    assert_eq!(errors.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(errors.load(Ordering::SeqCst), 0);
 }
 
 #[test]
 fn request_error_retry_once_then_succeeds() {
     let w = TestWorld::new();
     let a = w.agent("a");
-    let script = Rc::new(RefCell::new(VecDeque::from(vec![
+    let script = Arc::new(Mutex::new(VecDeque::from(vec![
         error_chunks("server boom", "SERVER"),
         text_chunks("recovered", FinishReason::Stop),
     ])));
-    let calls = Rc::new(Cell::new(0u32));
+    let calls = Arc::new(AtomicU32::new(0));
     let driver = ReactLoopAgent::new(
         a.clone(),
         w.reg.clone(),
         deps(mock_assemble("sys"), mock_stream(script, calls.clone()), mock_tool_never()),
     );
-    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts = Arc::new(AtomicUsize::new(0));
     let at = attempts.clone();
     w.bus.on_chain(
         "agent/request-error",
         true,
         None,
         Arc::new(move |_payload: Value, _next: NextFn| {
-            let i = at.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let i = at.fetch_add(1, Ordering::SeqCst);
             if i == 0 {
                 json!({ "kind": "retry" })
             } else {
@@ -602,8 +603,8 @@ fn request_error_retry_once_then_succeeds() {
     );
     driver.followup(user_msg("m1", "go")).unwrap();
 
-    assert_eq!(calls.get(), 2);
-    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
     assert_eq!(turn_end_reason(&a.session)["kind"], "completed");
     // 失败 attempt 的 chunk 已登录（无 assistant/message 关闭），成功 attempt 的消息在：
     // error_chunks 产 1 个 Finish chunk；text_chunks 产 4 个 → 共 5 个 assistant/chunk
@@ -631,11 +632,11 @@ fn turn_stopping_serial_dispatched_on_close() {
             next(payload)
         }),
     );
-    let script = Rc::new(RefCell::new(VecDeque::from(vec![text_chunks(
+    let script = Arc::new(Mutex::new(VecDeque::from(vec![text_chunks(
         "bye",
         FinishReason::Stop,
     )])));
-    let calls = Rc::new(Cell::new(0u32));
+    let calls = Arc::new(AtomicU32::new(0));
     let driver = ReactLoopAgent::new(
         a.clone(),
         w.reg.clone(),
@@ -652,8 +653,8 @@ fn inbox_live_events_emitted() {
     let inserted = Arc::new(Mutex::new(0usize));
     let log = inserted.clone();
     w.bus.on("agent/inbox/inserted", true, None, Arc::new(move |_n, _p| *log.lock().unwrap() += 1));
-    let script = Rc::new(RefCell::new(VecDeque::new()));
-    let calls = Rc::new(Cell::new(0u32));
+    let script = Arc::new(Mutex::new(VecDeque::new()));
+    let calls = Arc::new(AtomicU32::new(0));
     let driver = ReactLoopAgent::new(
         a.clone(),
         w.reg.clone(),
@@ -682,11 +683,11 @@ fn pre_step_payload_shows_claimed_messages_and_agent_fusion() {
             next(payload)
         }),
     );
-    let script = Rc::new(RefCell::new(VecDeque::from(vec![text_chunks(
+    let script = Arc::new(Mutex::new(VecDeque::from(vec![text_chunks(
         "hi",
         FinishReason::Stop,
     )])));
-    let calls = Rc::new(Cell::new(0u32));
+    let calls = Arc::new(AtomicU32::new(0));
     let driver = ReactLoopAgent::new(
         a.clone(),
         w.reg.clone(),
@@ -722,11 +723,11 @@ fn demo_block(id: &str) -> ToolCallBlock {
 fn approval_pending_pauses_turn_with_approval_pending_reason() {
     let w = TestWorld::new();
     let a = w.agent("a");
-    let script = Rc::new(RefCell::new(VecDeque::from(vec![tool_call_chunks("c1")])));
-    let calls = Rc::new(Cell::new(0u32));
+    let script = Arc::new(Mutex::new(VecDeque::from(vec![tool_call_chunks("c1")])));
+    let calls = Arc::new(AtomicU32::new(0));
     let block = demo_block("c1");
-    let tool: Rc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome> =
-        Rc::new(move |_ctx: &ToolExecCtx| ToolExecOutcome {
+    let tool: Arc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome + Send + Sync> =
+        Arc::new(move |_ctx: &ToolExecCtx| ToolExecOutcome {
             concluded: false,
             context: vec![],
             pending: vec![PendingCall {
@@ -744,7 +745,7 @@ fn approval_pending_pauses_turn_with_approval_pending_reason() {
     // 暂停：turn/end = approval-pending；不续发 LLM；Idle 停车；pending 留驻；无 result。
     assert_eq!(turn_end_reason(&a.session)["kind"], "approval-pending");
     assert_eq!(count_of(&a.session, EventKind::TurnEnd), 1);
-    assert_eq!(calls.get(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(driver.status(), AgentStatus::Idle);
     assert_eq!(driver.pending_calls().len(), 1);
     assert_eq!(driver.pending_calls()[0].block.id, CallId::from_raw("c1"));
@@ -756,19 +757,20 @@ fn kick_resume_reruns_pending_then_continues() {
     let w = TestWorld::new();
     let a = w.agent("a");
     // 第 1 次 LLM → tool call c1；恢复后第 2 次 LLM → 纯文本收尾。
-    let script = Rc::new(RefCell::new(VecDeque::from(vec![
+    let script = Arc::new(Mutex::new(VecDeque::from(vec![
         tool_call_chunks("c1"),
         text_chunks("done", FinishReason::Stop),
     ])));
-    let calls = Rc::new(Cell::new(0u32));
+    let calls = Arc::new(AtomicU32::new(0));
     let block = demo_block("c1");
-    let invocations = Rc::new(Cell::new(0u32));
-    let resume_seen = Rc::new(RefCell::new(Vec::<String>::new()));
+    let invocations = Arc::new(AtomicU32::new(0));
+    let resume_seen = Arc::new(Mutex::new(Vec::<String>::new()));
     let inv = invocations.clone();
     let seen = resume_seen.clone();
-    let tool: Rc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome> = Rc::new(move |ctx: &ToolExecCtx| {
-        let i = inv.get();
-        inv.set(i + 1);
+    let tool: Arc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome + Send + Sync> =
+        Arc::new(move |ctx: &ToolExecCtx| {
+        let i = inv.load(Ordering::SeqCst);
+        inv.store(i + 1, Ordering::SeqCst);
         if i == 0 {
             ToolExecOutcome {
                 concluded: false,
@@ -781,7 +783,7 @@ fn kick_resume_reruns_pending_then_continues() {
         } else {
             // 恢复：必须收到 resume 集（绝不在正常路径断言的直观信号）。
             for p in &ctx.resume {
-                seen.borrow_mut().push(p.block.id.raw().to_string());
+                seen.lock().unwrap().push(p.block.id.raw().to_string());
             }
             ToolExecOutcome {
                 concluded: false,
@@ -797,14 +799,17 @@ fn kick_resume_reruns_pending_then_continues() {
     );
     driver.followup(user_msg("m1", "go")).unwrap();
     assert_eq!(turn_end_reason(&a.session)["kind"], "approval-pending");
-    assert_eq!(calls.get(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     // fail-loud：无操作触发不了恢复（空踢不臆造入口）——先断言正常恢复路径。
     driver.kick_resume().unwrap();
 
-    assert_eq!(invocations.get(), 2, "恢复必须重跑 tool_exec");
-    assert_eq!(resume_seen.borrow().as_slice(), &["c1".to_string()]);
-    assert_eq!(calls.get(), 2, "恢复后模型续发请求");
+    assert_eq!(invocations.load(Ordering::SeqCst), 2, "恢复必须重跑 tool_exec");
+    assert_eq!(
+        resume_seen.lock().unwrap().as_slice(),
+        &["c1".to_string()]
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "恢复后模型续发请求");
     let ends: Vec<String> = a
         .session
         .events()
@@ -827,7 +832,7 @@ fn kick_resume_fails_loud_without_pending() {
         w.reg.clone(),
         deps(
             mock_assemble("sys"),
-            mock_stream(Rc::new(RefCell::new(VecDeque::new())), Rc::new(Cell::new(0u32))),
+            mock_stream(Arc::new(Mutex::new(VecDeque::new())), Arc::new(AtomicU32::new(0))),
             mock_tool_never(),
         ),
     );

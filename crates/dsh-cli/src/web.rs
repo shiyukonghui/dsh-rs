@@ -20,6 +20,8 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use dsh_core::*;
@@ -235,8 +237,8 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
     // serve 主线程（非 Send 宿主纪律）；工具注册与 tick 共享同一 schedule/bash_jobs
     // 实例（ServerLoopBundle）。不启用 agent_loop 时 tick 上下文为空，循环等价于阻塞
     // 接收（仅多 ≤tick 间隔的轮询唤醒）。
-    let mut tick_schedule: Option<Rc<crate::web::dsh_cli_host::ScheduleHost>> = None;
-    let mut tick_bridge: Option<Rc<web_m5::BashJobsBridge>> = None;
+    let mut tick_schedule: Option<Arc<crate::web::dsh_cli_host::ScheduleHost>> = None;
+    let mut tick_bridge: Option<Arc<web_m5::BashJobsBridge>> = None;
 
     // M6（step1b）：装配服务器执行闭环并写入 boot.agent_loop。
     if cfg.enable_agent_loop {
@@ -282,13 +284,13 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
         // 按组装会话身份折叠（多会话共享 standing 各看各的）；None 回退 `plan_session`
         // （single-active GUI 的「最后一次 agentPreset.select」会话，无身份组装路径）。
         // 进入/退出经事件驱动（exit_plan_mode 执行器 + 宿主 enter 入口）。
-        let plan_session = std::rc::Rc::new(std::cell::RefCell::new("default".to_string()));
+        let plan_session = std::sync::Arc::new(std::sync::Mutex::new("default".to_string()));
         boot.plan_session = Some(plan_session.clone());
         {
             let resolver = plan_mode_resolver(plan_session.clone(), bundle.host.store.clone());
             boot.standings
                 .borrow()
-                .set_plan_mode_source(Some(std::rc::Rc::new(resolver)));
+                .set_plan_mode_source(Some(std::sync::Arc::new(resolver)));
         }
         // D-108/G：approval wire 注册表（前端 requested/resolved 帧 + respond 答复）。
         // 与执行层审批门共用：mutation 挂起 → push_requested（mux 下推）；respond/
@@ -377,13 +379,13 @@ fn hmr_events_plan(path: &str, method: &Method) -> Option<HmrEventsPlan> {
 /// 各的）；`None` = 回退 `plan_session`（single-active GUI 的「最后一次 select」会话）。
 /// 折叠权威恒为会话事件（`dsh_plan::fold_plan_mode` 纯重放，无第二状态源）。
 fn plan_mode_resolver(
-    plan_session: std::rc::Rc<std::cell::RefCell<String>>,
+    plan_session: std::sync::Arc<std::sync::Mutex<String>>,
     store: std::sync::Arc<dsh_session::store::SessionStore>,
 ) -> impl Fn(Option<&str>) -> bool {
     move |sid: Option<&str>| {
         let target = sid
             .map(str::to_string)
-            .unwrap_or_else(|| plan_session.borrow().clone());
+            .unwrap_or_else(|| plan_session.lock().unwrap().clone());
         let s = dsh_session::types::SessionId::from_raw(target);
         store
             .get(&s)
@@ -398,7 +400,7 @@ fn plan_state_active_on(boot: &crate::Boot, sid: Option<&str>) -> bool {
     let sid = sid.map(str::to_string).unwrap_or_else(|| {
         boot.plan_session
             .as_ref()
-            .map(|ps| ps.borrow().clone())
+            .map(|ps| ps.lock().unwrap().clone())
             .unwrap_or_else(|| "default".to_string())
     });
     match boot.agent_loop.as_ref().and_then(|h| {
@@ -416,7 +418,7 @@ fn plan_session_ref_on(boot: &crate::Boot, sid: Option<&str>) -> Option<Arc<dsh_
     let sid = sid.map(str::to_string).unwrap_or_else(|| {
         boot.plan_session
             .as_ref()
-            .map(|ps| ps.borrow().clone())
+            .map(|ps| ps.lock().unwrap().clone())
             .unwrap_or_else(|| "default".to_string())
     });
     boot.agent_loop.as_ref().and_then(|h| {
@@ -503,7 +505,7 @@ fn commands_execute(boot: &crate::Boot, agent_id: Option<&str>, line: &str, imag
                 None => boot
                     .plan_session
                     .as_ref()
-                    .map(|ps| ps.borrow().clone())
+                    .map(|ps| ps.lock().unwrap().clone())
                     .unwrap_or_else(|| "default".to_string()),
             };
             if let Err(e) = crate::run_rust_loop(boot, &target_sid, message) {
@@ -1955,17 +1957,21 @@ fn subagent_dispatch(
 /// `register_m4_tools` 接受可选的 `&M4HostServices`：有句柄 → 宿主工具 bind 到真实
 /// 宿主（fail loud 不再 NOT_BOUND）；无句柄 → 注册定义但保持 `NOT_BOUND`（诚实：
 /// 宿主未装配时绝不伪装成功，D-052 已记录）。
+///
+/// 句柄均 Send+Sync（被 Send+Sync 工具执行闭包捕获）：JobRegistry 为非 Send 底层值 →
+/// `ThreadCell` 桥；schedule/todo/plan-mode 宿主为 `Arc` + 内部 Mutex。
 #[derive(Default)]
 pub struct M4HostServices {
-    /// 共享 JobRegistry（真实生命周期状态机）。
-    pub jobs: Option<Rc<std::cell::RefCell<dsh_jobs::registry::JobRegistry>>>,
+    /// 共享 JobRegistry（真实生命周期状态机；`ThreadCell` 桥——JobRegistry 内含
+    /// `Box<dyn Fn>` 为非 Send，单线程纪律不变）。
+    pub jobs: Option<crate::web::web_m5::ThreadCell<dsh_jobs::registry::JobRegistry>>,
     /// schedule 域：`schedule/change` 事件 fold 与到期注入（挂在会话事件上）。
-    pub schedule: Option<Rc<dsh_cli_host::ScheduleHost>>,
+    pub schedule: Option<Arc<dsh_cli_host::ScheduleHost>>,
     /// todo 域：把 `todo/write` 事件落到属主 agent 的会话（todo 工具的真实句柄）。
-    pub todo: Option<Rc<dsh_cli_host::TodoWriteHost>>,
+    pub todo: Option<Arc<dsh_cli_host::TodoWriteHost>>,
     /// L1（D-105）：plan-mode 域——`plan/mode` 事件追加/折叠 + exit_plan_mode 前置
     /// 校验与落事件（exit_plan_mode 绑定的真实句柄；None → NOT_BOUND 诚实）。
-    pub plan_mode: Option<Rc<dsh_cli_host::PlanModeHost>>,
+    pub plan_mode: Option<Arc<dsh_cli_host::PlanModeHost>>,
 }
 
 /// M4h 补实：TodoWriteHost —— `todo_write` 工具写入属主会话的真实句柄。
@@ -1974,9 +1980,8 @@ pub struct M4HostServices {
 /// （{todos, counts}），也落 `todo/write` 事件到当前会话（`todos` 投影据此折叠）。
 /// agent→session 的归属由宿主装配时登记（web 集成中与 AgentLoopHost 共享 store）。
 pub mod dsh_cli_host {
-    use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use dsh_session::types::EventKind;
     use dsh_session::runtime::Session;
@@ -1984,10 +1989,10 @@ pub mod dsh_cli_host {
 
     /// todo 写宿主：登记 agent→session 归属 + 把规范化 todo 表落为 `todo/write` 事件
     /// （对齐 `packages/todo/tool-todo`：写入既产出模型可见输出，也落事件到属主会话，
-    /// `todos` 投影据此折叠）。
+    /// `todos` 投影据此折叠）。Send+Sync（`todo_write` 执行闭包捕获）——归属表落 Mutex。
     pub struct TodoWriteHost {
         host: Arc<crate::session_host::SessionHost>,
-        agent_to_session: RefCell<HashMap<String, String>>,
+        agent_to_session: Mutex<HashMap<String, String>>,
         default_session: String,
     }
 
@@ -1995,7 +2000,7 @@ pub mod dsh_cli_host {
         pub fn new(host: Arc<crate::session_host::SessionHost>, default_session: String) -> Self {
             Self {
                 host,
-                agent_to_session: RefCell::new(HashMap::new()),
+                agent_to_session: Mutex::new(HashMap::new()),
                 default_session,
             }
         }
@@ -2003,14 +2008,15 @@ pub mod dsh_cli_host {
         /// 登记 agent id 的属主会话（web 集成装配时由宿主调用）。
         pub fn bind_agent(&self, agent: &str, session_id: &str) {
             self.agent_to_session
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .insert(agent.to_string(), session_id.to_string());
         }
 
         /// 解析属主会话 id（agent 登记优先；未登记回退默认会话）。
         pub fn session_id_for(&self, agent: Option<&str>) -> String {
             agent
-                .and_then(|a| self.agent_to_session.borrow().get(a).cloned())
+                .and_then(|a| self.agent_to_session.lock().unwrap().get(a).cloned())
                 .unwrap_or_else(|| self.default_session.clone())
         }
 
@@ -2198,10 +2204,11 @@ pub mod dsh_cli_host {
     /// L1（D-105）：plan-mode 宿主——`plan/mode` 会话事件的追加 + 折叠（单一权威态 =
     /// 会话事件日志，`dsh_plan::fold_plan_mode` 纯重放；对齐 `packages/plan/plan-mode`）。
     /// `exit_plan_mode` 执行器的前置校验（`dsh_plan::exit_plan_mode_check`：in-plan-mode
-    /// / plan 以 `# 标题` 开头 / 评审通道可用）与落事件都走这里。
+    /// / plan 以 `# 标题` 开头 / 评审通道可用）与落事件都走这里。Send+Sync（`exit_plan_mode`
+    /// 执行闭包捕获）——归属表落 Mutex。
     pub struct PlanModeHost {
         host: Arc<crate::session_host::SessionHost>,
-        agent_to_session: RefCell<HashMap<String, String>>,
+        agent_to_session: Mutex<HashMap<String, String>>,
         default_session: String,
         /// 宿主是否装配 user-questions 评审通道（`exit_plan_mode_check` 第三前置）。
         review_channel: bool,
@@ -2215,7 +2222,7 @@ pub mod dsh_cli_host {
         ) -> Self {
             Self {
                 host,
-                agent_to_session: RefCell::new(HashMap::new()),
+                agent_to_session: Mutex::new(HashMap::new()),
                 default_session,
                 review_channel,
             }
@@ -2224,7 +2231,8 @@ pub mod dsh_cli_host {
         /// 登记 agent id 的属主会话（与 TodoWriteHost 同模式；未登记回退 default）。
         pub fn bind_agent(&self, agent: &str, session_id: &str) {
             self.agent_to_session
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .insert(agent.to_string(), session_id.to_string());
         }
 
@@ -2232,7 +2240,7 @@ pub mod dsh_cli_host {
         /// 默认会话。
         pub fn session_id_for(&self, agent: Option<&str>) -> String {
             agent
-                .and_then(|a| self.agent_to_session.borrow().get(a).cloned())
+                .and_then(|a| self.agent_to_session.lock().unwrap().get(a).cloned())
                 .or_else(|| agent.map(str::to_string))
                 .unwrap_or_else(|| self.default_session.clone())
         }
@@ -2377,10 +2385,10 @@ pub fn register_m4_tools_with_host(
 /// 事件并返回 `{approved: true}`（对齐工具输出 schema const）；失败 → 结构化失败
 /// （诚实报出具体原因，非 NOT_BOUND）。
 fn exit_plan_mode_with_host_executor(
-    pm: Rc<dsh_cli_host::PlanModeHost>,
+    pm: Arc<dsh_cli_host::PlanModeHost>,
 ) -> dsh_tools::types::ToolExecute {
     use dsh_tools::types::ToolFailureData;
-    Rc::new(move |args, ctx| {
+    Arc::new(move |args, ctx| {
         let plan = args
             .get("plan")
             .and_then(|v| v.as_str())
@@ -2402,9 +2410,11 @@ fn exit_plan_mode_with_host_executor(
 /// todo_write 宿主绑定版：校验/规范化（不变，复用 to_todo_list）+ 把规范表落为
 /// `todo/write` 事件到属主会话，并返回模型可见 `{todos, counts}`（对齐
 /// `packages/todo/tool-todo`：写入即事件，todos 投影据此折叠）。
-fn todo_write_with_host_executor(todo_host: Rc<dsh_cli_host::TodoWriteHost>) -> Rc<dsh_tools::ToolDefinition> {
+fn todo_write_with_host_executor(
+    todo_host: Arc<dsh_cli_host::TodoWriteHost>,
+) -> Arc<dsh_tools::ToolDefinition> {
     use dsh_tools::types::{ToolExecute, ToolFailureData, CODE_INVALID_ARGS};
-    let execute: ToolExecute = Rc::new(move |args, ctx| {
+    let execute: ToolExecute = Arc::new(move |args, ctx| {
         let agent = ctx.agent.as_deref();
         if agent.is_none() {
             // 对齐参考：拒绝无 agent 调用者（无处归属），绝不静默 no-op。
@@ -2441,22 +2451,22 @@ fn todo_write_with_host_executor(todo_host: Rc<dsh_cli_host::TodoWriteHost>) -> 
         }
     });
     // 复用 SA-4 todo_write 的 schema/输出/描述，仅换执行器（消重，语义不漂移）。
-    // 刚构造的 base refcount==1 → Rc::try_unwrap 拿回本体直接改 execute。
+    // 刚构造的 base refcount==1 → Arc::try_unwrap 拿回本体直接改 execute。
     let base = dsh_tools::m4::todo_write(false).expect("todo_write defines");
-    let mut def = Rc::try_unwrap(base).unwrap_or_else(|_| {
+    let mut def = Arc::try_unwrap(base).unwrap_or_else(|_| {
         panic!("todo_write def freshly created must be refcount 1")
     });
     def.execute = execute;
-    Rc::new(def)
+    Arc::new(def)
 }
 
 // ---- job_* 宿主 executor（bind 目标） ----
 
 fn job_output_executor(
-    jobs: Rc<std::cell::RefCell<dsh_jobs::registry::JobRegistry>>,
+    jobs: crate::web::web_m5::ThreadCell<dsh_jobs::registry::JobRegistry>,
 ) -> dsh_tools::types::ToolExecute {
     use dsh_tools::types::{ToolFailureData, CODE_INVALID_ARGS};
-    Rc::new(move |args, _ctx| {
+    Arc::new(move |args, _ctx| {
         let id = args
             .get("job_id")
             .and_then(|v| v.as_str())
@@ -2464,61 +2474,61 @@ fn job_output_executor(
                 ToolFailureData::new("job_output requires job_id", CODE_INVALID_ARGS, "JobError")
             })?;
         let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
-        let mut reg = jobs.borrow_mut();
-        // wait=true → 等终态（本宿主纯内存、单线程：非终态即返回当前快照）；
-        // wait=false → read（text + snapshot）。
-        let read = reg.read(id, None);
-        let (text, job_view) = match read {
-            Ok(r) => {
-                let view = dsh_jobs::snapshot_to_view(&r.snapshot);
-                (r.text.clone(), view)
-            }
-            Err(e) => {
-                return Err(ToolFailureData::new(
-                    format!("job read failed: {e:?}"),
-                    dsh_tools::CODE_INVALID_TOOL_OUTPUT,
-                    "JobError",
-                ));
-            }
-        };
-        if wait {
-            match reg.wait(id, None) {
-                Ok(s) => {
-                    let view = dsh_jobs::snapshot_to_view(&s);
-                    let text2 = view["detail"]
-                        .as_str()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| text.clone());
-                    return Ok(serde_json::json!({ "text": text2, "job": view }));
+        jobs.with(|reg| {
+            // wait=true → 等终态（本宿主纯内存、单线程：非终态即返回当前快照）；
+            // wait=false → read（text + snapshot）。
+            let read = reg.read(id, None);
+            let (text, job_view) = match read {
+                Ok(r) => {
+                    let view = dsh_jobs::snapshot_to_view(&r.snapshot);
+                    (r.text.clone(), view)
                 }
                 Err(e) => {
                     return Err(ToolFailureData::new(
-                        format!("job wait failed: {e:?}"),
+                        format!("job read failed: {e:?}"),
                         dsh_tools::CODE_INVALID_TOOL_OUTPUT,
                         "JobError",
                     ));
                 }
+            };
+            if wait {
+                match reg.wait(id, None) {
+                    Ok(s) => {
+                        let view = dsh_jobs::snapshot_to_view(&s);
+                        let text2 = view["detail"]
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| text.clone());
+                        return Ok(serde_json::json!({ "text": text2, "job": view }));
+                    }
+                    Err(e) => {
+                        return Err(ToolFailureData::new(
+                            format!("job wait failed: {e:?}"),
+                            dsh_tools::CODE_INVALID_TOOL_OUTPUT,
+                            "JobError",
+                        ));
+                    }
+                }
             }
-        }
-        Ok(serde_json::json!({ "text": text, "job": job_view }))
+            Ok(serde_json::json!({ "text": text, "job": job_view }))
+        })
     })
 }
 
 fn job_list_executor(
-    jobs: Rc<std::cell::RefCell<dsh_jobs::registry::JobRegistry>>,
+    jobs: crate::web::web_m5::ThreadCell<dsh_jobs::registry::JobRegistry>,
 ) -> dsh_tools::types::ToolExecute {
-    Rc::new(move |_args, _ctx| {
-        let reg = jobs.borrow();
-        let snaps = reg.list(None);
+    Arc::new(move |_args, _ctx| {
+        let snaps = jobs.with(|reg| reg.list(None));
         Ok(dsh_jobs::jobs_frame(&snaps))
     })
 }
 
 fn job_kill_executor(
-    jobs: Rc<std::cell::RefCell<dsh_jobs::registry::JobRegistry>>,
+    jobs: crate::web::web_m5::ThreadCell<dsh_jobs::registry::JobRegistry>,
 ) -> dsh_tools::types::ToolExecute {
     use dsh_tools::types::CODE_INVALID_ARGS;
-    Rc::new(move |args, _ctx| {
+    Arc::new(move |args, _ctx| {
         let id = args
             .get("job_id")
             .and_then(|v| v.as_str())
@@ -2530,12 +2540,12 @@ fn job_kill_executor(
                 )
             })?;
         let reason = args.get("reason").and_then(|v| v.as_str()).map(str::to_string);
-        let outcome = jobs.borrow_mut().kill(id, None, reason.as_deref());
+        let outcome = jobs.with(|reg| reg.kill(id, None, reason.as_deref()));
         match outcome {
             Ok(kill_outcome) => {
                 let (outcome_str, job) = match kill_outcome {
                     dsh_jobs::KillOutcome::AlreadyFinished => {
-                        let snap = jobs.borrow().get(id, None).unwrap_or_else(|_| {
+                        let snap = jobs.with(|reg| reg.get(id, None)).unwrap_or_else(|_| {
                             // 极端：kill 后瞬时不可达 → 最小 view（不应发生；防御）。
                             dsh_jobs::JobSnapshot {
                                 id: id.to_string(),
@@ -2552,7 +2562,7 @@ fn job_kill_executor(
                         ("already-finished", dsh_jobs::snapshot_to_view(&snap))
                     }
                     dsh_jobs::KillOutcome::Requested => {
-                        let snap = jobs.borrow().get(id, None).unwrap_or_else(|_| {
+                        let snap = jobs.with(|reg| reg.get(id, None)).unwrap_or_else(|_| {
                             dsh_jobs::JobSnapshot {
                                 id: id.to_string(),
                                 kind: String::new(),
@@ -2581,16 +2591,16 @@ fn job_kill_executor(
 
 // ---- goal-round-driver 实配端口（M4i 验收 #3） ----
 
-/// goal-round-driver 的宿主端口：把 `Rc<ReactLoopAgent>` 实配到 `StatusPort`
+/// goal-round-driver 的宿主端口：把 `Arc<ReactLoopAgent>` 实配到 `StatusPort`
 /// （status_idle / has_pending_inbox / followup）。装配好后，宿主在每轮结束时调用
 /// `drive_once`（或 `round_driver_outcome` 判定 + `followup` 投递），让 armed 目标
 /// 自动续跑下一轮（单线程同步：followup 即时驱动该轮直至空闲）。
 pub struct GoalRoundPort {
-    agent: Rc<dsh_agent_loop::ReactLoopAgent>,
+    agent: Arc<dsh_agent_loop::ReactLoopAgent>,
 }
 
 impl GoalRoundPort {
-    pub fn new(agent: Rc<dsh_agent_loop::ReactLoopAgent>) -> Self {
+    pub fn new(agent: Arc<dsh_agent_loop::ReactLoopAgent>) -> Self {
         Self { agent }
     }
 }
@@ -2616,10 +2626,10 @@ impl dsh_goal::round_driver::StatusPort for GoalRoundPort {
 // ---- schedule_* 宿主 executor（bind 目标） ----
 
 fn schedule_create_executor(
-    sched: Rc<dsh_cli_host::ScheduleHost>,
+    sched: Arc<dsh_cli_host::ScheduleHost>,
 ) -> dsh_tools::types::ToolExecute {
     use dsh_tools::types::CODE_INVALID_ARGS;
-    Rc::new(move |args, _ctx| {
+    Arc::new(move |args, _ctx| {
         let prompt = args
             .get("prompt")
             .and_then(|v| v.as_str())
@@ -2656,9 +2666,9 @@ fn schedule_create_executor(
 }
 
 fn schedule_list_executor(
-    sched: Rc<dsh_cli_host::ScheduleHost>,
+    sched: Arc<dsh_cli_host::ScheduleHost>,
 ) -> dsh_tools::types::ToolExecute {
-    Rc::new(move |_args, _ctx| match sched.list() {
+    Arc::new(move |_args, _ctx| match sched.list() {
         Ok(v) => Ok(v),
         Err(e) => Err(dsh_tools::ToolFailureData::new(
             e,
@@ -2669,10 +2679,10 @@ fn schedule_list_executor(
 }
 
 fn schedule_delete_executor(
-    sched: Rc<dsh_cli_host::ScheduleHost>,
+    sched: Arc<dsh_cli_host::ScheduleHost>,
 ) -> dsh_tools::types::ToolExecute {
     use dsh_tools::types::CODE_INVALID_ARGS;
-    Rc::new(move |args, _ctx| {
+    Arc::new(move |args, _ctx| {
         let id = args
             .get("id")
             .and_then(|v| v.as_str())
@@ -2713,13 +2723,13 @@ pub fn register_m4_tools(registry: &dsh_tools::ToolRegistry) {
 pub fn assemble_server_loop(
     session_store: Arc<dsh_session::store::SessionStore>,
     workspace_root: std::path::PathBuf,
-    llm: Rc<dsh_llm::LlmRuntime>,
+    llm: Arc<dsh_llm::LlmRuntime>,
     provider: &str,
     model: &str,
     m4: M4HostServices,
     m5: web_m5::M5Host,
-) -> Result<Rc<dsh_agent_loop::AgentLoopHost>, String> {
-    let tools = Rc::new(dsh_tools::ToolRegistry::new(
+) -> Result<Arc<dsh_agent_loop::AgentLoopHost>, String> {
+    let tools = Arc::new(dsh_tools::ToolRegistry::new(
         dsh_tools::ToolExecutionMode::Native,
     ));
     register_m4_tools_with_host(&tools, Some(&m4));
@@ -2763,7 +2773,7 @@ pub fn assemble_server_loop(
     )?;
     // M6 step2（D-082）：宿主生命周期清理——`host.teardown()` 时执行 M5 关停
     // （bash bg 树 kill + settle Killed；terminal dispose），无孤儿进程。
-    host.add_disposer(Rc::new(move || m5.shutdown()));
+    host.add_disposer(Arc::new(move || m5.shutdown()));
     Ok(host)
 }
 
@@ -2780,11 +2790,11 @@ fn system_now_ms() -> i64 {
 /// `m5g_tick_once`（调度到期 + jobs 合作泵）与 agent 工具执行推进同一状态。
 pub struct ServerLoopBundle {
     /// 服务器执行闭环（真实 M4+M5 注册 + 共享 store）。
-    pub host: Rc<dsh_agent_loop::AgentLoopHost>,
+    pub host: Arc<dsh_agent_loop::AgentLoopHost>,
     /// 调度宿主（tick `dispatch_due` 的目标；与工具 schedule_create 同实例）。
-    pub schedule: Rc<crate::web::dsh_cli_host::ScheduleHost>,
+    pub schedule: Arc<crate::web::dsh_cli_host::ScheduleHost>,
     /// bash 后台 jobs 桥（tick `pump()` 结算；与 bash run_in_background 同实例）。
-    pub bash_jobs: Option<Rc<web_m5::BashJobsBridge>>,
+    pub bash_jobs: Option<Arc<web_m5::BashJobsBridge>>,
 }
 
 /// M6 step1b（D-081）/step3（D-083）/step6（D-085）：serve 接线编排——在 SessionHost 上
@@ -2810,24 +2820,26 @@ pub fn assemble_server_runtime(
 pub fn assemble_server_runtime_with_llm(
     host: &Arc<crate::session_host::SessionHost>,
     workspace_root: std::path::PathBuf,
-    llm: Rc<dsh_llm::LlmRuntime>,
+    llm: Arc<dsh_llm::LlmRuntime>,
     provider: &str,
     model: &str,
 ) -> Result<ServerLoopBundle, String> {
     let session = host.session("default").map_err(|e| e.to_string())?;
-    let jobs = Rc::new(std::cell::RefCell::new(dsh_jobs::registry::JobRegistry::new(
+    // JobRegistry 为非 Send 底层类型（`now` 为 `Box<dyn Fn>`）→ `ThreadCell` 桥（单线程
+    // 纪律不变；被 Send+Sync 的 job_* 执行闭包捕获时才需要该桥）。
+    let jobs = crate::web::web_m5::ThreadCell::new(dsh_jobs::registry::JobRegistry::new(
         dsh_jobs::registry::JobRegistryConfig {
             max_concurrent_per_owner: 8,
             now: Box::new(system_now_ms),
         },
-    )));
-    let schedule = Rc::new(dsh_cli_host::ScheduleHost::new(session));
-    let todo = Rc::new(dsh_cli_host::TodoWriteHost::new(host.clone(), "default".into()));
+    ));
+    let schedule = Arc::new(dsh_cli_host::ScheduleHost::new(session));
+    let todo = Arc::new(dsh_cli_host::TodoWriteHost::new(host.clone(), "default".into()));
     todo.bind_agent("default", "default");
     // L1（D-105）：plan-mode 宿主。「评审通道」= 宿主 user-questions 面（GUI
     // ask_user_question RPC 在场——U2 守卫已把 ask-user 归为既有 UI/approval RPC）；
     // loop 级 ApprovalProvider 往返属 M3 后续，不影响 exit 前置的通道存在性判定。
-    let plan_mode = Rc::new(dsh_cli_host::PlanModeHost::new(
+    let plan_mode = Arc::new(dsh_cli_host::PlanModeHost::new(
         host.clone(),
         "default".into(),
         true,
@@ -2859,7 +2871,7 @@ pub fn assemble_server_runtime_with_llm(
         let v = value.clone();
         loop_host
             .prompt
-            .variable(None, name, Rc::new(move |_| Some(v.clone())))
+            .variable(None, name, Arc::new(move |_| Some(v.clone())))
             .map_err(|e| format!("serve runtime prompt variable {name}: {e}"))?;
     }
     Ok(ServerLoopBundle {
@@ -3499,7 +3511,7 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
             }
             // L1（D-105）：记录「当前计划会话」——standing 折叠源读取它的事件日志。
             if let Some(ps) = &boot.plan_session {
-                *ps.borrow_mut() = session.clone();
+                *ps.lock().unwrap() = session.clone();
             }
             serde_json::json!({"ok": true, "value": {"agentPreset": preset, "agent": agent_id}})
         }
@@ -3949,7 +3961,7 @@ mod tests {
         }
         std::fs::create_dir_all(&root).unwrap();
         let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
-        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
         let loop_host = assemble_server_loop(
             session_host.store.clone(),
             root.clone(),
@@ -3962,7 +3974,7 @@ mod tests {
         .expect("assemble ok");
         let mut boot = boot_with_sessions();
         boot.agent_loop = Some(loop_host.clone());
-        boot.plan_session = Some(std::rc::Rc::new(std::cell::RefCell::new("default".to_string())));
+        boot.plan_session = Some(std::sync::Arc::new(std::sync::Mutex::new("default".to_string())));
 
         // 进入（宿主动作，无前置）。
         assert!(crate::web::approval::set_plan_mode(&boot, true, Some("investigate")).unwrap());
@@ -4009,7 +4021,7 @@ mod tests {
         }
         std::fs::create_dir_all(&root).unwrap();
         let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
-        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
         let loop_host = assemble_server_loop(
             session_host.store.clone(),
             root.clone(),
@@ -4022,7 +4034,7 @@ mod tests {
         .expect("assemble ok");
         let mut boot = boot_with_sessions();
         boot.agent_loop = Some(loop_host.clone());
-        boot.plan_session = Some(std::rc::Rc::new(std::cell::RefCell::new("default".to_string())));
+        boot.plan_session = Some(std::sync::Arc::new(std::sync::Mutex::new("default".to_string())));
         let sid = dsh_session::types::SessionId::from_raw("default".to_string());
         let img = serde_json::json!([{"type": "image", "url": "x"}]);
 
@@ -4096,14 +4108,14 @@ mod tests {
         if root.exists() { let _ = std::fs::remove_dir_all(&root); }
         std::fs::create_dir_all(&root).unwrap();
         let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
-        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
         let loop_host = assemble_server_loop(
             session_host.store.clone(), root.clone(), llm, "mock", "mock-model", m4, m5,
         )
         .expect("assemble ok");
         let mut boot = boot_with_sessions();
         boot.agent_loop = Some(loop_host.clone());
-        boot.plan_session = Some(std::rc::Rc::new(std::cell::RefCell::new("default".to_string())));
+        boot.plan_session = Some(std::sync::Arc::new(std::sync::Mutex::new("default".to_string())));
         let sid_default = dsh_session::types::SessionId::from_raw("default".to_string());
         let sid_s2 = dsh_session::types::SessionId::from_raw("s2".to_string());
         // GUI 的 session.create 会给 s2 挂 agent；镜像之，使 /plan <message> 的 steer 可路由。
@@ -4142,14 +4154,14 @@ mod tests {
         if root.exists() { let _ = std::fs::remove_dir_all(&root); }
         std::fs::create_dir_all(&root).unwrap();
         let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
-        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
         let loop_host = assemble_server_loop(
             session_host.store.clone(), root.clone(), llm, "mock", "mock-model", m4, m5,
         )
         .expect("assemble ok");
         let mut boot = boot_with_sessions();
         boot.agent_loop = Some(loop_host.clone());
-        boot.plan_session = Some(std::rc::Rc::new(std::cell::RefCell::new("default".to_string())));
+        boot.plan_session = Some(std::sync::Arc::new(std::sync::Mutex::new("default".to_string())));
         let sid_s2 = dsh_session::types::SessionId::from_raw("s2".to_string());
         // GUI 的 session.create 会给 s2 挂 agent；镜像之，使 /plan <message> 的 steer 可路由。
         crate::ensure_session_agent(&boot, "s2", None).expect("agent for s2");
@@ -4196,7 +4208,7 @@ mod tests {
         alice
             .append(EventKind::PlanMode, json!({ "active": true }), None)
             .unwrap();
-        let plan_session = Rc::new(std::cell::RefCell::new("default".to_string()));
+        let plan_session = Arc::new(std::sync::Mutex::new("default".to_string()));
         let res = plan_mode_resolver(plan_session, store);
         assert!(res(Some("alice")), "per-agent: alice (in plan) folds active");
         assert!(!res(Some("bob")), "per-agent: bob (not in plan) folds inactive — must NOT leak alice's plan state");
@@ -4678,9 +4690,7 @@ mod tests {
     /// 路径）；未创建的会话仍诚实报 internal（不因修复而全局放行）。
     #[test]
     fn session_create_registers_agent_and_prompt_routes() {
-        use std::cell::RefCell;
         use std::collections::VecDeque;
-        use std::rc::Rc;
         let session_host = SessionHost::in_memory();
         let _ = session_host.session("default");
         let root = std::env::temp_dir().join(format!("dsh-d101-{}", std::process::id()));
@@ -4689,7 +4699,7 @@ mod tests {
         }
         std::fs::create_dir_all(&root).unwrap();
 
-        let script = Rc::new(RefCell::new(VecDeque::from_iter([
+        let script = Arc::new(Mutex::new(VecDeque::from_iter([
             vec![
                 dsh_llm::StreamChunk::BlockStart {
                     index: 0,
@@ -4722,19 +4732,19 @@ mod tests {
             ],
         ])));
         struct Adapter {
-            script: Rc<RefCell<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
+            script: Arc<Mutex<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
         }
         impl dsh_llm::LlmAdapter for Adapter {
             fn stream(
                 &self,
                 _options: dsh_llm::GenerateOptions,
             ) -> Box<dyn Iterator<Item = dsh_llm::StreamChunk>> {
-                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                let next = self.script.lock().unwrap().pop_front().unwrap_or_default();
                 Box::new(next.into_iter())
             }
         }
-        let llm = Rc::new(dsh_llm::LlmRuntime::new());
-        llm.register_adapter(&["mock"], Rc::new(Adapter { script })).unwrap();
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Arc::new(Adapter { script })).unwrap();
 
         let bundle = match crate::web::assemble_server_runtime_with_llm(
             &session_host,
@@ -5480,12 +5490,12 @@ mod tests {
     /// 事件直接落共享 SessionHost store（前端历史读模型 + EventSink 下链同一事实源）。
     #[test]
     fn rpc_prompt_routes_to_rust_agent_loop_shared_store() {
-        use std::cell::{Cell, RefCell};
         use std::collections::VecDeque;
-        use std::rc::Rc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
 
         // Mock adapter：一段文本回答（模拟模型应答；Rust loop 真实驱动）。
-        let script = Rc::new(RefCell::new(VecDeque::from_iter([vec![
+        let script = Arc::new(Mutex::new(VecDeque::from_iter([vec![
             dsh_llm::StreamChunk::BlockStart {
                 index: 0,
                 block_type: "text".parse().unwrap(),
@@ -5500,30 +5510,31 @@ mod tests {
                 replay_state: None,
             },
         ]])));
-        let calls = Rc::new(Cell::new(0u32));
+        let calls = Arc::new(AtomicU32::new(0));
         struct Adapter {
-            script: Rc<RefCell<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
-            calls: Rc<Cell<u32>>,
+            script: Arc<Mutex<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
+            calls: Arc<AtomicU32>,
         }
         impl dsh_llm::LlmAdapter for Adapter {
             fn stream(
                 &self,
                 _options: dsh_llm::GenerateOptions,
             ) -> Box<dyn Iterator<Item = dsh_llm::StreamChunk>> {
-                self.calls.set(self.calls.get() + 1);
+                self.calls.fetch_add(1, Ordering::SeqCst);
                 let next = self
                     .script
-                    .borrow_mut()
+                    .lock()
+                    .unwrap()
                     .pop_front()
                     .unwrap_or_default();
                 Box::new(next.into_iter())
             }
         }
-        let llm = Rc::new(dsh_llm::LlmRuntime::new());
-        llm.register_adapter(&["mock"], Rc::new(Adapter { script, calls }))
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Arc::new(Adapter { script, calls }))
             .unwrap();
 
-        let tools = Rc::new(dsh_tools::ToolRegistry::new(
+        let tools = Arc::new(dsh_tools::ToolRegistry::new(
             dsh_tools::ToolExecutionMode::Native,
         ));
         // 配置 agent：provider mock → 映射到注册的 mock adapter；sessionId = default。
@@ -5870,8 +5881,8 @@ mod tests {
         };
         let loop_host = AgentLoopHost::with_store(
             config,
-            std::rc::Rc::new(dsh_llm::LlmRuntime::new()),
-            std::rc::Rc::new(dsh_tools::ToolRegistry::new(dsh_tools::ToolExecutionMode::Native)),
+            std::sync::Arc::new(dsh_llm::LlmRuntime::new()),
+            std::sync::Arc::new(dsh_tools::ToolRegistry::new(dsh_tools::ToolExecutionMode::Native)),
             session_host.store.clone(),
         )
         .unwrap();
@@ -5996,8 +6007,8 @@ mod tests {
         // 真实 loop + **空**工具注册面（生产 M5 注册面恒在，此处人为缺失以推 K2）。
         let loop_host = AgentLoopHost::with_store(
             config,
-            std::rc::Rc::new(dsh_llm::LlmRuntime::new()),
-            std::rc::Rc::new(dsh_tools::ToolRegistry::new(dsh_tools::ToolExecutionMode::Native)),
+            std::sync::Arc::new(dsh_llm::LlmRuntime::new()),
+            std::sync::Arc::new(dsh_tools::ToolRegistry::new(dsh_tools::ToolExecutionMode::Native)),
             session_host.store.clone(),
         )
         .unwrap();
@@ -6087,8 +6098,8 @@ mod tests {
         };
         let loop_host = AgentLoopHost::with_store(
             config,
-            std::rc::Rc::new(dsh_llm::LlmRuntime::new()),
-            std::rc::Rc::new(dsh_tools::ToolRegistry::new(dsh_tools::ToolExecutionMode::Native)),
+            std::sync::Arc::new(dsh_llm::LlmRuntime::new()),
+            std::sync::Arc::new(dsh_tools::ToolRegistry::new(dsh_tools::ToolExecutionMode::Native)),
             session_host.store.clone(),
         )
         .unwrap();
@@ -6487,14 +6498,13 @@ mod tests {
     /// 事件 → 返回真实 messageId → subagent.history 可回读 assistant 内容。
     #[test]
     fn rpc_subagent_prompt_drives_real_child_agent_round() {
-        use std::cell::{Cell, RefCell};
         use std::collections::VecDeque;
-        use std::rc::Rc;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         use crate::subagent_runtime::{self as sa, SpawnMode, SpawnOptions};
 
         // Mock adapter（fake-loop：模型应答脚本；Rust loop 真实整轮驱动）。
-        let script = Rc::new(RefCell::new(VecDeque::from_iter([vec![
+        let script = Arc::new(Mutex::new(VecDeque::from_iter([vec![
             dsh_llm::StreamChunk::BlockStart {
                 index: 0,
                 block_type: "text".parse().unwrap(),
@@ -6512,26 +6522,26 @@ mod tests {
                 replay_state: None,
             },
         ]])));
-        let calls = Rc::new(Cell::new(0u32));
+        let calls = Arc::new(AtomicU32::new(0));
         struct Adapter {
-            script: Rc<RefCell<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
-            calls: Rc<Cell<u32>>,
+            script: Arc<Mutex<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
+            calls: Arc<AtomicU32>,
         }
         impl dsh_llm::LlmAdapter for Adapter {
             fn stream(&self, _o: dsh_llm::GenerateOptions) -> Box<dyn Iterator<Item = dsh_llm::StreamChunk>> {
-                self.calls.set(self.calls.get() + 1);
-                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let next = self.script.lock().unwrap().pop_front().unwrap_or_default();
                 Box::new(next.into_iter())
             }
         }
-        let llm = Rc::new(dsh_llm::LlmRuntime::new());
-        llm.register_adapter(&["mock"], Rc::new(Adapter {
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Arc::new(Adapter {
             script: script.clone(),
             calls: calls.clone(),
         }))
         .unwrap();
 
-        let tools = Rc::new(dsh_tools::ToolRegistry::new(
+        let tools = Arc::new(dsh_tools::ToolRegistry::new(
             dsh_tools::ToolExecutionMode::Native,
         ));
         let session_host = SessionHost::in_memory();
@@ -6581,7 +6591,7 @@ mod tests {
         assert!(message_id.starts_with(&format!("pmsg-{child}:")), "真实 messageId: {message_id}");
 
         // child 会话被真实驱动：user/message + assistant/message 落共享 store。
-        assert!(calls.get() == 1, "mock adapter invoked exactly once");
+        assert!(calls.load(Ordering::SeqCst) == 1, "mock adapter invoked exactly once");
         let evs = session_host.events(&child);
         assert!(evs.iter().any(|e| e.kind.as_str() == "user/message"), "user/message in child");
         assert!(evs.iter().any(|e| e.kind.as_str() == "assistant/message"), "assistant/message in child");
@@ -6756,7 +6766,7 @@ mod tests {
         use crate::web::dsh_cli_host::PlanModeHost;
         let host_store = SessionHost::in_memory();
         let _ = host_store.session("default");
-        let pm = Rc::new(PlanModeHost::new(host_store.clone(), "default".into(), true));
+        let pm = Arc::new(PlanModeHost::new(host_store.clone(), "default".into(), true));
         // 初始：无 plan/mode 事件 → inactive。
         assert!(!pm.active(None), "no events -> inactive");
         // 进入：落 plan/mode{active:true}。
@@ -6780,7 +6790,7 @@ mod tests {
         let e = pm.exit(None, "# Again").unwrap_err();
         assert!(e.contains("not in plan mode"), "NotInPlanMode: {e}");
         // 无评审通道 → NoReviewChannel。
-        let pm2 = Rc::new(PlanModeHost::new(host_store.clone(), "default".into(), false));
+        let pm2 = Arc::new(PlanModeHost::new(host_store.clone(), "default".into(), false));
         pm2.enter(None).unwrap();
         let e = pm2.exit(None, "# Ok").unwrap_err();
         assert!(e.contains("review channel"), "NoReviewChannel: {e}");
@@ -6795,7 +6805,7 @@ mod tests {
         let registry = ToolRegistry::new(ToolExecutionMode::Native);
         let host_store = SessionHost::in_memory();
         let _ = host_store.session("default");
-        let pm = Rc::new(dsh_cli_host::PlanModeHost::new(
+        let pm = Arc::new(dsh_cli_host::PlanModeHost::new(
             host_store.clone(),
             "default".into(),
             true,
@@ -6862,12 +6872,12 @@ mod tests {
     fn register_m4_tools_with_job_registry_binds_really() {
         use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
         let registry = ToolRegistry::new(ToolExecutionMode::Native);
-        let jobs = Rc::new(std::cell::RefCell::new(dsh_jobs::registry::JobRegistry::new(
+        let jobs = crate::web::web_m5::ThreadCell::new(dsh_jobs::registry::JobRegistry::new(
             dsh_jobs::registry::JobRegistryConfig {
                 max_concurrent_per_owner: 10,
                 now: Box::new(|| 1000),
             },
-        )));
+        ));
         let host = M4HostServices {
             jobs: Some(jobs.clone()),
             schedule: None,
@@ -6882,9 +6892,15 @@ mod tests {
                 on_cancel: Box::new(|_| {}),
                 read_output: None,
             };
-            jobs.borrow_mut()
-                .start(StartSpec { kind: "bash", label: "echo hi", owner: None, producer: Box::new(producer) })
+            jobs.with(|r| {
+                r.start(StartSpec {
+                    kind: "bash",
+                    label: "echo hi",
+                    owner: None,
+                    producer: Box::new(producer),
+                })
                 .unwrap()
+            })
         };
         assert_eq!(id, "bash-1");
         // job_list：真实 frame（taskViewSchema），含刚起的 job。
@@ -6896,14 +6912,16 @@ mod tests {
         assert_eq!(arr[0]["kind"], "bash");
         assert_eq!(arr[0]["status"], "running");
         // settle completed → job_output 真实 read。
-        jobs.borrow_mut().settle(
-            &id,
-            dsh_jobs::JobSettlement {
-                status: dsh_jobs::JobStatus::Completed,
-                detail: Some("exit 0".into()),
-                output: Some("done".into()),
-            },
-        );
+        jobs.with(|r| {
+            r.settle(
+                &id,
+                dsh_jobs::JobSettlement {
+                    status: dsh_jobs::JobStatus::Completed,
+                    detail: Some("exit 0".into()),
+                    output: Some("done".into()),
+                },
+            )
+        });
         let input = ToolExecutionInput::new("o1", "job_output", serde_json::json!({ "job_id": id }), Some("agent-1".into()));
         let res = registry.execute(&input, None);
         assert!(!res.is_error, "job_output ok: {:?}", res.error);
@@ -6924,7 +6942,7 @@ mod tests {
         let host_store = SessionHost::in_memory();
         let _ = host_store.session("default");
         let sched_session = host_store.session("default").expect("default live");
-        let sched = Rc::new(dsh_cli_host::ScheduleHost::new(sched_session));
+        let sched = Arc::new(dsh_cli_host::ScheduleHost::new(sched_session));
         let host = M4HostServices {
             jobs: None,
             schedule: Some(sched.clone()),
@@ -7004,7 +7022,7 @@ mod tests {
         // 宿主：SessionStore + todo host（默认会话 "default"）。
         let host_store = SessionHost::in_memory();
         let _ = host_store.session("default");
-        let todo_host = Rc::new(dsh_cli_host::TodoWriteHost::new(
+        let todo_host = Arc::new(dsh_cli_host::TodoWriteHost::new(
             host_store.clone(),
             "default".to_string(),
         ));
@@ -7062,17 +7080,17 @@ mod tests {
         assert!(res.is_error, "无 agent 拒绝");
     }
 
-    /// M4i 验收 #3：#GoalRoundPort 把真实 `Rc<ReactLoopAgent>` 实配到 goal-round-driver；
+    /// M4i 验收 #3：#GoalRoundPort 把真实 `Arc<ReactLoopAgent>` 实配到 goal-round-driver；
     /// armed 目标 + agent 空闲 + 空 inbox → drive_once 经 followup 驱动一个真实 Rust
     /// 轮次（fake-loop：mock adapter 应答脚本），Rust loop 该轮结束回到 idle 后判定
     /// 仍 Continue（未超 cap）。
     #[test]
     fn goal_round_driver_drives_real_agent_round() {
-        use std::cell::{Cell, RefCell};
         use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         // Mock adapter（fake-loop：每次 stream 应答一轮文本）。
-        let script = Rc::new(RefCell::new(VecDeque::from_iter([
+        let script = Arc::new(Mutex::new(VecDeque::from_iter([
             vec![
                 dsh_llm::StreamChunk::BlockStart {
                     index: 0,
@@ -7110,29 +7128,29 @@ mod tests {
                 },
             ],
         ])));
-        let calls = Rc::new(Cell::new(0u32));
+        let calls = Arc::new(AtomicU32::new(0));
         struct Adapter {
-            script: Rc<RefCell<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
-            calls: Rc<Cell<u32>>,
+            script: Arc<Mutex<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
+            calls: Arc<AtomicU32>,
         }
         impl dsh_llm::LlmAdapter for Adapter {
             fn stream(&self, _o: dsh_llm::GenerateOptions) -> Box<dyn Iterator<Item = dsh_llm::StreamChunk>> {
-                self.calls.set(self.calls.get() + 1);
-                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let next = self.script.lock().unwrap().pop_front().unwrap_or_default();
                 Box::new(next.into_iter())
             }
         }
-        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
         llm.register_adapter(
             &["mock"],
-            Rc::new(Adapter {
+            Arc::new(Adapter {
                 script: script.clone(),
                 calls: calls.clone(),
             }),
         )
         .unwrap();
 
-        let tools = Rc::new(dsh_tools::ToolRegistry::new(
+        let tools = Arc::new(dsh_tools::ToolRegistry::new(
             dsh_tools::ToolExecutionMode::Native,
         ));
         let session_host = SessionHost::in_memory();
@@ -7185,7 +7203,7 @@ mod tests {
             .expect("drive ok");
         assert!(matches!(out, dsh_goal::round_driver::RoundOutcome::Continue));
         assert_eq!(goal.rounds_started(), 1, "第 1 轮已准入");
-        assert_eq!(calls.get(), 1, "mock adapter 驱动了真实一轮");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "mock adapter 驱动了真实一轮");
         // 该轮落 user/assistant（fake-loop 全局 store）。
         let evs = session_host.events("default");
         assert!(evs.iter().any(|e| e.kind.as_str() == "user/message"), "user/message 落会话");
@@ -7209,7 +7227,7 @@ mod tests {
             .expect("drive second");
         assert!(matches!(out2, dsh_goal::round_driver::RoundOutcome::Continue));
         assert_eq!(goal.rounds_started(), 2, "第 2 轮已准入");
-        assert_eq!(calls.get(), 2, "second real round driven");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "second real round driven");
         // 已到 cap（2）→ 不再 eligible。
         assert_eq!(
             dsh_goal::round_driver::round_driver_outcome(&goal, &gr.id, &port),
@@ -7327,11 +7345,9 @@ mod tests {
     fn register_m5_tools_with_terminal_host_binds_really() {
         use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
         let registry = ToolRegistry::new(ToolExecutionMode::Native);
-        let term = Rc::new(std::cell::RefCell::new(
-            dsh_terminal::TerminalSessionService::new(),
-        ));
-        term.borrow_mut()
-            .register_backend(
+        let term = crate::web::web_m5::ThreadCell::new(dsh_terminal::TerminalSessionService::new());
+        term.with(|s| {
+            s.register_backend(
                 dsh_terminal::BackendDefinition {
                     id: "bash".into(),
                     kind: dsh_terminal::TerminalBackendKind::Bash,
@@ -7339,7 +7355,8 @@ mod tests {
                 },
                 Box::new(|_cfg| Box::new(M5FakeBackend::default())),
             )
-            .expect("register fake backend");
+        })
+        .expect("register fake backend");
         let host = M5HostServices { terminal: Some(term), fs: None, shell: None, bash_jobs: None, code: None };
         register_m5_tools_with_host(&registry, Some(&host));
 
@@ -7471,7 +7488,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap(); // w4 写入需要父目录
         let registry = ToolRegistry::new(ToolExecutionMode::Native);
-        let fsh = Rc::new(web_m5::FsHost::new(root.clone()));
+        let fsh = Arc::new(web_m5::FsHost::new(root.clone()));
         register_m5_tools_with_host(
             &registry,
             Some(&M5HostServices { terminal: None, fs: Some(fsh), shell: None, bash_jobs: None, code: None }),
@@ -7639,7 +7656,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let registry = ToolRegistry::new(ToolExecutionMode::Native);
-        let shost = Rc::new(web_m5::ShellHost::new(root.clone()).expect("shell host"));
+        let shost = Arc::new(web_m5::ShellHost::new(root.clone()).expect("shell host"));
         register_m5_tools_with_host(
             &registry,
             Some(&M5HostServices { terminal: None, fs: None, shell: Some(shost), bash_jobs: None, code: None }),
@@ -7735,8 +7752,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let registry = ToolRegistry::new(ToolExecutionMode::Native);
-        let shost = Rc::new(web_m5::ShellHost::new(root.clone()).expect("shell host"));
-        let bridge = Rc::new(web_m5::BashJobsBridge::new());
+        let shost = Arc::new(web_m5::ShellHost::new(root.clone()).expect("shell host"));
+        let bridge = Arc::new(web_m5::BashJobsBridge::new());
         register_m5_tools_with_host(
             &registry,
             Some(&M5HostServices {
@@ -7817,7 +7834,7 @@ mod tests {
         let host_store = SessionHost::in_memory();
         let _ = host_store.session("default");
         let sched_session = host_store.session("default").expect("default live");
-        let sched = Rc::new(dsh_cli_host::ScheduleHost::new(sched_session));
+        let sched = Arc::new(dsh_cli_host::ScheduleHost::new(sched_session));
         let now = m5g_epoch_now_ms();
         let id = sched
             .create("after", "m5g automation ping", Some(1), None, None, now)
@@ -7877,8 +7894,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let registry = ToolRegistry::new(ToolExecutionMode::Native);
-        let shost = Rc::new(web_m5::ShellHost::new(root.clone()).expect("shell host"));
-        let bridge = Rc::new(web_m5::BashJobsBridge::new());
+        let shost = Arc::new(web_m5::ShellHost::new(root.clone()).expect("shell host"));
+        let bridge = Arc::new(web_m5::BashJobsBridge::new());
         register_m5_tools_with_host(
             &registry,
             Some(&M5HostServices {
@@ -7909,7 +7926,7 @@ mod tests {
         // 主循环：只 eat tick → tick_once(sched, bridge)（内建 pump），绝不手工 pump。
         let host_store = SessionHost::in_memory();
         let _ = host_store.session("default");
-        let sched = Rc::new(dsh_cli_host::ScheduleHost::new(
+        let sched = Arc::new(dsh_cli_host::ScheduleHost::new(
             host_store.session("default").expect("sess"),
         ));
         let tick = web_m5::M5gTick::start(15);
@@ -7949,7 +7966,7 @@ mod tests {
             return;
         }
         let registry = ToolRegistry::new(ToolExecutionMode::Code);
-        let cr = Rc::new(PythonCodeRuntime::new(PythonConfig::default()));
+        let cr = Arc::new(PythonCodeRuntime::new(PythonConfig::default()));
         register_m5_tools_with_host(
             &registry,
             Some(&M5HostServices {
@@ -8166,7 +8183,6 @@ mod tests {
     #[test]
     fn assemble_server_loop_builds_loop_host_with_m4_m5_and_drives_a_turn() {
         use dsh_llm::{CallId, ContentBlock, FinishReason, StreamChunk, ToolCallBlock};
-        use std::cell::RefCell;
         use std::collections::VecDeque;
 
         fn todo_chunks(id: &str) -> Vec<StreamChunk> {
@@ -8215,29 +8231,29 @@ mod tests {
         }
 
         struct Adapter {
-            script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>,
+            script: Arc<Mutex<VecDeque<Vec<StreamChunk>>>>,
         }
         impl dsh_llm::LlmAdapter for Adapter {
             fn stream(
                 &self,
                 _options: dsh_llm::GenerateOptions,
             ) -> Box<dyn Iterator<Item = StreamChunk>> {
-                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                let next = self.script.lock().unwrap().pop_front().unwrap_or_default();
                 Box::new(next.into_iter())
             }
         }
-        let script = Rc::new(RefCell::new(VecDeque::from_iter([
+        let script = Arc::new(Mutex::new(VecDeque::from_iter([
             todo_chunks("t1"),
             text_chunks("todo tracked"),
         ])));
-        let llm = Rc::new(dsh_llm::LlmRuntime::new());
-        llm.register_adapter(&["mock"], Rc::new(Adapter { script }))
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Arc::new(Adapter { script }))
             .unwrap();
 
         // 会话宿主（共享 store）+ todo 宿主（bind agent "default" → session "default"）。
         let session_host = SessionHost::in_memory();
         let _ = session_host.session("default");
-        let todo = Rc::new(crate::web::dsh_cli_host::TodoWriteHost::new(
+        let todo = Arc::new(crate::web::dsh_cli_host::TodoWriteHost::new(
             session_host.clone(),
             "default".into(),
         ));
@@ -8327,7 +8343,6 @@ mod tests {
     #[test]
     fn plan_approval_respond_routes_to_per_session_agent() {
         use dsh_llm::{CallId, ContentBlock, FinishReason, StreamChunk, ToolCallBlock};
-        use std::cell::RefCell;
         use std::collections::VecDeque;
 
         fn bash_call(id: &str) -> Vec<StreamChunk> {
@@ -8376,23 +8391,23 @@ mod tests {
         }
 
         struct Adapter {
-            script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>,
+            script: Arc<Mutex<VecDeque<Vec<StreamChunk>>>>,
         }
         impl dsh_llm::LlmAdapter for Adapter {
             fn stream(
                 &self,
                 _options: dsh_llm::GenerateOptions,
             ) -> Box<dyn Iterator<Item = StreamChunk>> {
-                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                let next = self.script.lock().unwrap().pop_front().unwrap_or_default();
                 Box::new(next.into_iter())
             }
         }
-        let script = Rc::new(RefCell::new(VecDeque::from_iter([
+        let script = Arc::new(Mutex::new(VecDeque::from_iter([
             bash_call("c1"),
             text_chunks("approved-s2 done"),
         ])));
-        let llm = Rc::new(dsh_llm::LlmRuntime::new());
-        llm.register_adapter(&["mock"], Rc::new(Adapter { script }))
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Arc::new(Adapter { script }))
             .unwrap();
 
         let session_host = SessionHost::in_memory();
@@ -8494,7 +8509,6 @@ mod tests {
     #[test]
     fn session_running_frames_follow_turn_boundaries_per_turn() {
         use dsh_llm::{ContentBlock, FinishReason, StreamChunk};
-        use std::cell::RefCell;
         use std::collections::VecDeque;
 
         fn text_chunks(text: &str) -> Vec<StreamChunk> {
@@ -8519,23 +8533,23 @@ mod tests {
         }
 
         struct Adapter {
-            script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>,
+            script: Arc<Mutex<VecDeque<Vec<StreamChunk>>>>,
         }
         impl dsh_llm::LlmAdapter for Adapter {
             fn stream(
                 &self,
                 _options: dsh_llm::GenerateOptions,
             ) -> Box<dyn Iterator<Item = StreamChunk>> {
-                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                let next = self.script.lock().unwrap().pop_front().unwrap_or_default();
                 Box::new(next.into_iter())
             }
         }
-        let script = Rc::new(RefCell::new(VecDeque::from_iter([
+        let script = Arc::new(Mutex::new(VecDeque::from_iter([
             text_chunks("first"),
             text_chunks("second"),
         ])));
-        let llm = Rc::new(dsh_llm::LlmRuntime::new());
-        llm.register_adapter(&["mock"], Rc::new(Adapter { script }))
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Arc::new(Adapter { script }))
             .unwrap();
 
         let session_host = SessionHost::in_memory();
@@ -8601,7 +8615,6 @@ mod tests {
     #[test]
     fn session_cancel_accepted_idempotent_and_keeps_turns_driving() {
         use dsh_llm::{ContentBlock, FinishReason, StreamChunk};
-        use std::cell::RefCell;
         use std::collections::VecDeque;
 
         fn text_chunks(text: &str) -> Vec<StreamChunk> {
@@ -8626,23 +8639,23 @@ mod tests {
         }
 
         struct Adapter {
-            script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>,
+            script: Arc<Mutex<VecDeque<Vec<StreamChunk>>>>,
         }
         impl dsh_llm::LlmAdapter for Adapter {
             fn stream(
                 &self,
                 _options: dsh_llm::GenerateOptions,
             ) -> Box<dyn Iterator<Item = StreamChunk>> {
-                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                let next = self.script.lock().unwrap().pop_front().unwrap_or_default();
                 Box::new(next.into_iter())
             }
         }
-        let script = Rc::new(RefCell::new(VecDeque::from_iter([
+        let script = Arc::new(Mutex::new(VecDeque::from_iter([
             text_chunks("ok"),
             text_chunks("ok2"),
         ])));
-        let llm = Rc::new(dsh_llm::LlmRuntime::new());
-        llm.register_adapter(&["mock"], Rc::new(Adapter { script }))
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Arc::new(Adapter { script }))
             .unwrap();
 
         let session_host = SessionHost::in_memory();
@@ -8842,9 +8855,9 @@ mod tests {
         };
         // 终端：注册 FakeBackend（生产 PTY backend 装配属后续里程碑；此处确定性验证
         // dispose 清空会话表）。bash 保持真实桥（孤儿杀验证）。
-        let term = Rc::new(std::cell::RefCell::new(dsh_terminal::TerminalSessionService::new()));
-        term.borrow_mut()
-            .register_backend(
+        let term = crate::web::web_m5::ThreadCell::new(dsh_terminal::TerminalSessionService::new());
+        term.with(|s| {
+            s.register_backend(
                 dsh_terminal::BackendDefinition {
                     id: "bash".into(),
                     kind: dsh_terminal::TerminalBackendKind::Bash,
@@ -8852,7 +8865,8 @@ mod tests {
                 },
                 Box::new(|_cfg| Box::new(M5FakeBackend::default())),
             )
-            .expect("register fake backend");
+        })
+        .expect("register fake backend");
         m5.services.terminal = Some(term);
         let registry = ToolRegistry::new(ToolExecutionMode::Native);
         m5.register(&registry);
@@ -8899,7 +8913,11 @@ mod tests {
         );
         assert!(!tres.is_error, "terminal_open: {:?}", tres.error);
         let terminal_svc = m5.services.terminal.clone().unwrap();
-        assert_eq!(terminal_svc.borrow().list().len(), 1, "one terminal session before shutdown");
+        assert_eq!(
+            terminal_svc.with(|s| s.list().len()),
+            1,
+            "one terminal session before shutdown"
+        );
 
         // 生命周期关停。
         m5.shutdown();
@@ -8916,7 +8934,7 @@ mod tests {
 
         // 终端会话全部 dispose（list 空）。
         assert!(
-            terminal_svc.borrow().list().is_empty(),
+            terminal_svc.with(|s| s.list().is_empty()),
             "terminal sessions disposed on shutdown"
         );
 
@@ -9047,7 +9065,7 @@ mod tests {
         use dsh_system_prompt::{Config as PromptConfig, SystemPrompt};
         use dsh_session::store::SessionStore;
         use dsh_session::types::{EventKind, SessionId};
-        let prompt = SystemPrompt::new(&PromptConfig::default(), Rc::new(|| {})).expect("prompt");
+        let prompt = SystemPrompt::new(&PromptConfig::default(), Arc::new(|| {})).expect("prompt");
         let store = Arc::new(SessionStore::new());
         let session = store
             .create(
@@ -9111,9 +9129,7 @@ mod tests {
     /// session.history 可回读（前端同一事实源）。
     #[test]
     fn serve_closure_prompt_routes_to_fully_assembled_loop() {
-        use std::cell::RefCell;
         use std::collections::VecDeque;
-        use std::rc::Rc;
         let session_host = SessionHost::in_memory();
         let _ = session_host.session("default");
         let root = std::env::temp_dir().join(format!("dsh-m6-closure-{}", std::process::id()));
@@ -9123,7 +9139,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
 
         // Mock LLM：一段文本回答（完整装配路径下走真实 loop 驱动）。
-        let script = Rc::new(RefCell::new(VecDeque::from_iter([vec![
+        let script = Arc::new(Mutex::new(VecDeque::from_iter([vec![
             dsh_llm::StreamChunk::BlockStart {
                 index: 0,
                 block_type: "text".parse().unwrap(),
@@ -9139,19 +9155,19 @@ mod tests {
             },
         ]])));
         struct Adapter {
-            script: Rc<RefCell<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
+            script: Arc<Mutex<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
         }
         impl dsh_llm::LlmAdapter for Adapter {
             fn stream(
                 &self,
                 _options: dsh_llm::GenerateOptions,
             ) -> Box<dyn Iterator<Item = dsh_llm::StreamChunk>> {
-                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                let next = self.script.lock().unwrap().pop_front().unwrap_or_default();
                 Box::new(next.into_iter())
             }
         }
-        let llm = Rc::new(dsh_llm::LlmRuntime::new());
-        llm.register_adapter(&["mock"], Rc::new(Adapter { script })).unwrap();
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Arc::new(Adapter { script })).unwrap();
 
         let bundle = match crate::web::assemble_server_runtime_with_llm(
             &session_host,
@@ -9308,7 +9324,7 @@ mod tests {
     #[test]
     fn skill_prompt_section_registers_generic() {
         use dsh_system_prompt::{Config as PromptConfig, SystemPrompt};
-        let prompt = SystemPrompt::new(&PromptConfig::default(), Rc::new(|| {})).expect("prompt");
+        let prompt = SystemPrompt::new(&PromptConfig::default(), Arc::new(|| {})).expect("prompt");
         // skill 段（order 120：工具指引带内；复用 step4 同一的 section 缝）。
         web_m5::register_prompt_section(
             &prompt,
@@ -9341,7 +9357,6 @@ mod tests {
     #[test]
     fn m6_loop_turn_host_pre_execute_veto_denies_bash() {
         use dsh_llm::{CallId, ContentBlock, FinishReason, StreamChunk, ToolCallBlock};
-        use std::cell::RefCell;
         use std::collections::VecDeque;
 
         fn bash_chunks(id: &str) -> Vec<StreamChunk> {
@@ -9390,23 +9405,23 @@ mod tests {
         }
 
         struct Adapter {
-            script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>,
+            script: Arc<Mutex<VecDeque<Vec<StreamChunk>>>>,
         }
         impl dsh_llm::LlmAdapter for Adapter {
             fn stream(
                 &self,
                 _options: dsh_llm::GenerateOptions,
             ) -> Box<dyn Iterator<Item = StreamChunk>> {
-                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                let next = self.script.lock().unwrap().pop_front().unwrap_or_default();
                 Box::new(next.into_iter())
             }
         }
-        let script = Rc::new(RefCell::new(VecDeque::from_iter([
+        let script = Arc::new(Mutex::new(VecDeque::from_iter([
             bash_chunks("b1"),
             text_chunks("bash was denied"),
         ])));
-        let llm = Rc::new(dsh_llm::LlmRuntime::new());
-        llm.register_adapter(&["mock"], Rc::new(Adapter { script }))
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Arc::new(Adapter { script }))
             .unwrap();
 
         let session_host = SessionHost::in_memory();
@@ -9444,7 +9459,7 @@ mod tests {
             web_m5::register_pre_execute_hook(
                 &loop_host.tools,
                 session,
-                Rc::new(|name| {
+                Arc::new(|name| {
                     if name == "bash" {
                         Some("bash disabled by host hook".to_string())
                     } else {
@@ -9942,11 +9957,11 @@ mod tests {
         use dsh_llm::{FinishReason, GenerateOptions, LlmAdapter, LlmRuntime, StreamChunk};
 
         struct Capture {
-            tool_names: std::rc::Rc<std::cell::RefCell<Option<Vec<String>>>>,
+            tool_names: std::sync::Arc<std::sync::Mutex<Option<Vec<String>>>>,
         }
         impl LlmAdapter for Capture {
             fn stream(&self, options: GenerateOptions) -> Box<dyn Iterator<Item = StreamChunk>> {
-                *self.tool_names.borrow_mut() = options.tools.map(|ts| {
+                *self.tool_names.lock().unwrap() = options.tools.map(|ts| {
                     ts.into_iter().map(|t| t.name).collect::<Vec<String>>()
                 });
                 let end = vec![StreamChunk::Finish {
@@ -9965,9 +9980,9 @@ mod tests {
         }
         std::fs::create_dir_all(&root).unwrap();
 
-        let captured = std::rc::Rc::new(std::cell::RefCell::new(None::<Vec<String>>));
-        let llm = std::rc::Rc::new(LlmRuntime::new());
-        llm.register_adapter(&["deepseek"], std::rc::Rc::new(Capture { tool_names: captured.clone() }))
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<String>>));
+        let llm = std::sync::Arc::new(LlmRuntime::new());
+        llm.register_adapter(&["deepseek"], std::sync::Arc::new(Capture { tool_names: captured.clone() }))
             .unwrap();
         let bundle = crate::web::assemble_server_runtime_with_llm(
             &host,
@@ -9981,7 +9996,7 @@ mod tests {
         boot.agent_loop = Some(bundle.host.clone());
         crate::run_rust_loop(&boot, "default", "hi").expect("turn runs");
 
-        let seen = captured.borrow().clone();
+        let seen = captured.lock().unwrap().clone();
         let names = seen.expect("loop request captured by LLM adapter (GenerateOptions seen)");
         assert!(
             names.iter().any(|n| n == "todo_write"),
@@ -10000,15 +10015,13 @@ mod tests {
     #[test]
     fn agent_loop_tool_schemas_registered_once_and_idempotent() {
         use dsh_llm::{FinishReason, GenerateOptions, LlmAdapter, LlmRuntime, StreamChunk};
-        use std::cell::RefCell;
-        use std::rc::Rc;
 
         struct Capture {
-            all: Rc<RefCell<Vec<Vec<String>>>>,
+            all: Arc<Mutex<Vec<Vec<String>>>>,
         }
         impl LlmAdapter for Capture {
             fn stream(&self, options: GenerateOptions) -> Box<dyn Iterator<Item = StreamChunk>> {
-                self.all.borrow_mut().push(
+                self.all.lock().unwrap().push(
                     options.tools.map(|ts| ts.into_iter().map(|t| t.name).collect()).unwrap_or_default(),
                 );
                 let end = vec![StreamChunk::Finish {
@@ -10024,16 +10037,16 @@ mod tests {
         let root = std::env::temp_dir().join(format!("dsh-m6w-tools2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let all = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
-        let llm = Rc::new(LlmRuntime::new());
-        llm.register_adapter(&["deepseek"], Rc::new(Capture { all: all.clone() })).unwrap();
+        let all = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let llm = Arc::new(LlmRuntime::new());
+        llm.register_adapter(&["deepseek"], Arc::new(Capture { all: all.clone() })).unwrap();
         let bundle = crate::web::assemble_server_runtime_with_llm(&h, root.clone(), llm, "deepseek", "m")
             .expect("assemble");
         let mut boot = boot_with_sessions();
         boot.agent_loop = Some(bundle.host.clone());
         crate::run_rust_loop(&boot, "default", "one").unwrap();
         crate::run_rust_loop(&boot, "default", "two").unwrap();
-        let batches = all.borrow();
+        let batches = all.lock().unwrap();
         assert_eq!(batches.len(), 2, "two turns produced two requests");
         for names in batches.iter() {
             let mut sorted = names.clone();
