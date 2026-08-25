@@ -5101,8 +5101,9 @@ bad-response/永不恢复）；`events.host` 不再收 `session/event`（ZodErro
 真 loop：s2 会话 plan 激活 → bash 挂起 pending（不执行）→ respond allowed-once →
 `accepted:true` → kick 后 bash 真执行、tool/result 无错、tool/call 不重复；修复前
 此测试红 = `bad-response`，精确复现用户抓包）。dsh-cli lib 210/210 绿；dsh-agent-loop
-lib 绿；clippy（--all-targets）零。live 60880 脚本化 wire 全链 + 浏览器手动复测待
-D-114 收口。
+lib 绿；clippy（--all-targets）零。live 60880 脚本化 wire 全链 PASS（session.create →
+/plan → plan 投影实时帧 → prompt 门控挂起 → respond `accepted:true` → resolved 广播 →
+bash 真执行写 marker → events.host 零泄漏，9 项全绿）；浏览器手动复测待 D-114 收口。
 
 
 
