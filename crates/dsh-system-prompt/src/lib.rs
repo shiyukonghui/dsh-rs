@@ -61,6 +61,10 @@ pub(crate) fn quoted(s: &str) -> String {
 pub struct AssembleContext {
     /// 参与者 scope：缺省 = 仅全局 provider 与无主题 listener。
     pub scope: Option<ScopeKey>,
+    /// S3（D-107）：组装者的会话身份（`dsh_agent::assemble_context_for` 填充）；供
+    /// standing 等宿主注入的 Fn 段**按组装者自身会话**折叠（如 plan-mode 段），
+    /// 而非全局「最后一次 select」的会话。None = 无身份组装（回退全局源）。
+    pub session_id: Option<String>,
 }
 
 /// section 文本：静态或按组装求值的 provider。
@@ -695,6 +699,7 @@ fn dispatch_slice(
     }
     let owned = AssembleContext {
         scope: context.scope.clone(),
+        session_id: context.session_id.clone(),
     };
     let tail: Vec<AssembleListener> = list[i + 1..].iter().cloned().collect();
     let next: AssembleNext = Rc::new(move |a| dispatch_slice(&tail, 0, a, &owned));

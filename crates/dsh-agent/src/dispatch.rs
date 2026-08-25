@@ -65,5 +65,7 @@ pub fn emit_agent_event(
 pub fn assemble_context_for(agent: &Agent) -> dsh_system_prompt::AssembleContext {
     dsh_system_prompt::AssembleContext {
         scope: Some(agent.scope.clone()),
+        // S3（D-107）：携带组装者会话身份，供宿主注入的 Fn 段按自身会话折叠。
+        session_id: Some(agent.id.to_string()),
     }
 }

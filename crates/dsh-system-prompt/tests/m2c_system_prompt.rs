@@ -218,8 +218,9 @@ fn scoped_duplicate_uses_scope_message_and_global_shadowing() {
         "prompt section \"s\" is already registered (for a per-agent override, register through that agent's `agent.ctx` instead)"
     );
     let a = sp
-        .assemble(&AssembleContext {
+        .assemble(&AssembleContext{
             scope: Some(key.clone()),
+            session_id: None,
         })
         .unwrap();
     let s = a.sections.iter().find(|s| s.name == "s").unwrap();
@@ -612,8 +613,9 @@ fn scoped_assemble_listener_only_affects_own_scope() {
     let g = sp.assemble(&AssembleContext::default()).unwrap();
     assert!(!g.sections.iter().any(|s| s.name == "scopedOnly"));
     let sc = sp
-        .assemble(&AssembleContext {
+        .assemble(&AssembleContext{
             scope: Some(s2),
+            session_id: None,
         })
         .unwrap();
     assert!(sc.sections.iter().any(|s| s.name == "scopedOnly"));
@@ -871,8 +873,9 @@ fn scoped_persona_shadows_global_within_scope_only() {
     assert!(render_prompt(&g).unwrap().contains("You are DeepSeek Harness."));
     assert!(!render_prompt(&g).unwrap().contains("You run tests."));
     let sc = sp
-        .assemble(&AssembleContext {
+        .assemble(&AssembleContext{
             scope: Some(scope_key.clone()),
+            session_id: None,
         })
         .unwrap();
     let sc_render = render_prompt(&sc).unwrap();
@@ -894,15 +897,17 @@ fn scoped_section_goes_away_after_dispose_and_global_returns() {
         )
         .unwrap();
     let sc = sp
-        .assemble(&AssembleContext {
+        .assemble(&AssembleContext{
             scope: Some(scope_key.clone()),
+            session_id: None,
         })
         .unwrap();
     assert!(render_prompt(&sc).unwrap().contains("You run tests."));
     d();
     let sc2 = sp
-        .assemble(&AssembleContext {
+        .assemble(&AssembleContext{
             scope: Some(scope_key.clone()),
+            session_id: None,
         })
         .unwrap();
     assert!(render_prompt(&sc2).unwrap().contains("You are DeepSeek Harness."));
@@ -931,8 +936,9 @@ fn scoped_shadowing_wins_before_evaluation() {
         .unwrap();
     let _ = sp.section(Some(&scope_key), &sec("shadowme", 0.0, "scoped")).unwrap();
     let sc = sp
-        .assemble(&AssembleContext {
+        .assemble(&AssembleContext{
             scope: Some(scope_key.clone()),
+            session_id: None,
         })
         .unwrap();
     assert_eq!(
@@ -957,8 +963,9 @@ fn scoped_variable_shadows_global_and_dispose_restores() {
         .variable(Some(&scope_key), "mode", Rc::new(|_| Some("strict".to_string())))
         .unwrap();
     let a = sp
-        .assemble(&AssembleContext {
+        .assemble(&AssembleContext{
             scope: Some(scope_key.clone()),
+            session_id: None,
         })
         .unwrap();
     let out = render_prompt(&PromptAssembly {
@@ -974,8 +981,9 @@ fn scoped_variable_shadows_global_and_dispose_restores() {
     assert_eq!(out, "Mode: strict.");
     d();
     let a2 = sp
-        .assemble(&AssembleContext {
+        .assemble(&AssembleContext{
             scope: Some(scope_key.clone()),
+            session_id: None,
         })
         .unwrap();
     let out2 = render_prompt(&PromptAssembly {
@@ -998,15 +1006,17 @@ fn scoped_context_shadows_global_and_falls_back() {
     sp.context(None, &ctx("topic", 1.0, "global topic")).unwrap();
     let d = sp.context(Some(&scope_key), &ctx("topic", 2.0, "scoped topic")).unwrap();
     let sc = sp
-        .assemble(&AssembleContext {
+        .assemble(&AssembleContext{
             scope: Some(scope_key.clone()),
+            session_id: None,
         })
         .unwrap();
     assert_eq!(sc.contexts[0].text, "scoped topic");
     d();
     let sc2 = sp
-        .assemble(&AssembleContext {
+        .assemble(&AssembleContext{
             scope: Some(scope_key.clone()),
+            session_id: None,
         })
         .unwrap();
     assert_eq!(sc2.contexts[0].text, "global topic");
@@ -1020,8 +1030,9 @@ fn suppress_runtime_context_is_scope_local() {
     sp.context(Some(&scope_key), &ctx("local", 1.0, "l")).unwrap();
     let suppress = sp.suppress_runtime_context(Some(&scope_key));
     let sc = sp
-        .assemble(&AssembleContext {
+        .assemble(&AssembleContext{
             scope: Some(scope_key.clone()),
+            session_id: None,
         })
         .unwrap();
     assert!(sc.contexts.is_empty(), "scope contexts suppressed");
@@ -1029,8 +1040,9 @@ fn suppress_runtime_context_is_scope_local() {
     assert_eq!(g.contexts[0].text, "g", "global unaffected");
     suppress();
     let sc2 = sp
-        .assemble(&AssembleContext {
+        .assemble(&AssembleContext{
             scope: Some(scope_key.clone()),
+            session_id: None,
         })
         .unwrap();
     // 恢复后 scoped 组装 = 全局 g + scoped l（合并视图）
@@ -1050,16 +1062,18 @@ fn scope_chain_nearest_wins_and_ancestor_visible() {
     bind_scope_parent(child.clone(), parent.clone()).unwrap();
     let _ = sp.variable(Some(&parent), "mode", Rc::new(|_| Some("ancestor".to_string())));
     let a_child = sp
-        .assemble(&AssembleContext {
+        .assemble(&AssembleContext{
             scope: Some(child.clone()),
+            session_id: None,
         })
         .unwrap();
     let names: Vec<&str> = a_child.variables.iter().map(|(k, _)| k.as_str()).collect();
     assert!(names.contains(&"mode"), "ancestor variable visible to child");
     let _ = sp.variable(Some(&child), "mode", Rc::new(|_| Some("nearest".to_string())));
     let a_child2 = sp
-        .assemble(&AssembleContext {
+        .assemble(&AssembleContext{
             scope: Some(child),
+            session_id: None,
         })
         .unwrap();
     let val = a_child2.variables.iter().find(|(k, _)| k == "mode").unwrap().1.clone();
@@ -1074,9 +1088,9 @@ fn scoped_context_shadowing_through_parent_chain() {
     bind_scope_parent(child.clone(), root.clone()).unwrap();
     sp.context(Some(&root), &ctx("topic", 1.0, "root")).unwrap();
     sp.context(Some(&child), &ctx("topic", 2.0, "child")).unwrap();
-    let a_child = sp.assemble(&AssembleContext { scope: Some(child) }).unwrap();
+    let a_child = sp.assemble(&AssembleContext{ scope: Some(child) , session_id: None }).unwrap();
     assert_eq!(a_child.contexts.iter().find(|c| c.name == "topic").unwrap().text, "child");
-    let a_root = sp.assemble(&AssembleContext { scope: Some(root) }).unwrap();
+    let a_root = sp.assemble(&AssembleContext{ scope: Some(root) , session_id: None }).unwrap();
     assert_eq!(a_root.contexts.iter().find(|c| c.name == "topic").unwrap().text, "root");
 }
 

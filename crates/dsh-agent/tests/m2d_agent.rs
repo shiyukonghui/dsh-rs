@@ -593,6 +593,9 @@ fn assemble_context_for_sets_scope_to_agent() {
     let a = w.agent("asm");
     let ctx = assemble_context_for(&a);
     assert_eq!(ctx.scope, Some(a.scope.clone()));
+    // S3（D-107）：组装上下文携带组装者会话身份 —— 供 standing 等的 Fn 段按
+    // 自身会话折叠（None = 无身份组装 → 回退全局源）。
+    assert_eq!(ctx.session_id.as_deref(), Some(a.session.id().raw()));
 }
 
 // ---------------------------------------------------------------------------
@@ -654,8 +657,9 @@ fn model_selection_overrides_assembly_variables_and_assemble_request() {
     install_model_selection(&sp, &bus, &agent.scope, sel.clone());
 
     // 1) 组装侧：variables 被覆盖，assembled 捕获 current
-    let ctx = AssembleContext {
+    let ctx = AssembleContext{
         scope: Some(agent.scope.clone()),
+        session_id: None,
     };
     let assembly = sp.assemble(&ctx).unwrap();
     let vars: std::collections::HashMap<&str, String> = assembly
@@ -721,8 +725,9 @@ fn model_selection_no_reasoning_effort_strips_inherited() {
     let agent = w.agent("ms3");
     install_model_selection(&sp, &bus, &agent.scope, sel.clone());
     // 先组装一次以设置 assembled
-    sp.assemble(&AssembleContext {
+    sp.assemble(&AssembleContext{
         scope: Some(agent.scope.clone()),
+        session_id: None,
     })
     .unwrap();
     let payload = json!({ "provider": "x", "model": "y", "reasoningEffort": "medium" });

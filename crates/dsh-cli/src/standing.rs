@@ -868,8 +868,9 @@ mod tests {
     }
 
     fn sect_texts(sp: &SystemPrompt, scope: &ScopeKey) -> Vec<String> {
-        sp.assemble(&AssembleContext {
+        sp.assemble(&AssembleContext{
             scope: Some(scope.clone()),
+            session_id: None,
         })
         .unwrap()
         .sections

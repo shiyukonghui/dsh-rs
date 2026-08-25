@@ -5185,7 +5185,7 @@ mod tests {
             let scope = loop_host.agent("a-main").unwrap().agent.scope.clone();
             let a = loop_host
                 .prompt
-                .assemble(&dsh_system_prompt::AssembleContext { scope: Some(scope) })
+                .assemble(&dsh_system_prompt::AssembleContext{ scope: Some(scope) , session_id: None })
                 .unwrap();
             a.sections.into_iter().map(|s| s.text).collect::<Vec<_>>()
         };
@@ -7707,8 +7707,9 @@ mod tests {
         let asm = bundle
             .host
             .prompt
-            .assemble(&AssembleContext {
+            .assemble(&AssembleContext{
                 scope: Some(scope),
+                session_id: None,
             })
             .unwrap();
         // 修复前：render_prompt 报 `unknown prompt variable "{{model}}"`（live 已现）。
