@@ -4468,6 +4468,24 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
   瀑布流关闸工件：交付范围/验收证据/644 全回归/live 复验/诚实边界/遗留决策），并呈
   「shipped preset 未桥行 → disabled:true vs 保持 guard 降级」给用户定夺。live term-33。
 
+### D-105（round 25 末，用户拍板）：未桥行策略 + loop 级状态桥档位
+
+- 触发：用户问「shipped preset 未桥行 → disabled:true vs 保持 guard 降级，有哪些决策点」；
+  我列出 7 个决策点 + 倾向，用户逐条拍板（见四答）。
+- 决策：
+  1. **未桥面但宿主全局基已满足类**（tool-fs / fs-search / jobs / goal / todo / subagent /
+     workflow / tool-skill 等）与 **plan-mode / compaction（即将桥）类** → **安排规划
+     实现其桥接**，不纠结标注措辞（不 bulk 改 disabled）；「准备实现他们的桥接」。
+  2. **其余（broken-D-103：web / tool-cordis / command-compact）→ 报错降级**：保持 guard
+     （原因可见、fail-loud、不拒绝）——现状已符合，不改。
+  3. **plan-mode → C 档**：完整 harness 语义——状态驱动段（组合行 config.section 随会话
+     plan 模式注入）+ `exit_plan_mode` 真实执行器 + **approval 联动**。
+  4. **compaction → 档位 3**：仅守卫段 + 接口预留（本轮不做真实压缩/摘要行为；
+     tool-result-pruner 的 thresholdChars/headChars/tailChars 语义留接口）。
+- 影响：`PLAN-loop-state-bridge.md` 定稿（新增「未桥面桥接」计划段）；broken-D-103 保持。
+- 下一：按瀑布流逐段执行（U 桥接段 → L1 plan-mode C 档 → L3 compaction 守卫+接口），
+  每段 TDD 红→绿、全回归、clippy 零、live 复验、DECISIONS 补记、独立提交=回滚点。
+
 ### D-104 实施补记预留
 
 
