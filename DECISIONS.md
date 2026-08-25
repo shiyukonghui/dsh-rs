@@ -4486,6 +4486,30 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
 - 下一：按瀑布流逐段执行（U 桥接段 → L1 plan-mode C 档 → L3 compaction 守卫+接口），
   每段 TDD 红→绿、全回归、clippy 零、live 复验、DECISIONS 补记、独立提交=回滚点。
 
+### D-105 实施补记（U1：未桥面首批桥接 — fs/family / jobs / todo，round 26；TDD 红→绿）
+
+- 触发：D-105 决策 1（host 全局基已满足类 → 规划并实现桥接）；U1 = 首批发。
+- 自下而上核对（宿主实际注册工具名，web.rs register_m4/m5_tools_with_host）：
+  todo_write、job_output/job_list/job_kill、schedule_*/exit_plan_mode/workflow（M4）；
+  bash/pwsh/fs 六件套/terminal 六件套/str_replace_editor（M5）。
+  **没有 goal 模型工具**（goal = web RPC `goal_dispatch` + dsh-session-query
+  `goal_projection`，非 agent 工具）→ goal 行**不桥**；
+  **无独立 search 工具** → 搜索面 = glob（路径）+ grep（内容）。
+- 桥接结果：
+  - `dsh-tool-fs` → 组解析确认宿主 fs 六件套（compound fs == 宿主 fs 面，同 fs-local）；
+  - `dsh-tool-fs-search` → 组解析确认 glob/grep（宿主搜索面）；
+  - `dsh-tool-jobs` → 组解析确认 job_output/job_list/job_kill；
+  - `dsh-tool-todo` → 单工具重呈现 todo_write（行 config description/timeoutMs 生效）；
+  - `dsh-tool-goal` → 诚实 guard（专用原因，与预设注释「model-facing tool，service 在
+    host 面」一致）。
+  - 桥后「宿主工具缺」语义：组行缺宿主工具 = stuck（同 fs-local），符合映射行桥依赖
+    必须满足；shipped preset 在生产宿主下不受影响（web 恒注册 M4/M5）。
+- 验收：+2 测（synthetic 五行桥接/守卫 + 真实 standard/code/cordis 呈现断言）；
+  standing 21/21、dsh-cli lib 182/182、八 crate 全回归 **646/646**、clippy `-D warnings`
+  零、live 60165 四真实预设 select 全 OK（零回归）。回滚：`git revert` U1 提交。
+- 下一：U2（subagent 家 / workflow / ralph / ask-user）→ U3（tool-skill 等保持 guard
+  原因收口 + 安全网）→ L1（plan-mode C 档）。
+
 ### D-104 实施补记预留
 
 

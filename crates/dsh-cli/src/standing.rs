@@ -615,8 +615,8 @@ impl StandingRegistry {
 // 组合自身的 `disabled_expr` 决定（win32 上 bash 系 `=== 'win32'` 判禁、pwsh 系
 // 活化）。求值走注入引擎（K4/F-05 WASM 面 + native 兜底；见 mount_at 的 `gate`）。
 
-/// 单工具行 → 宿主工具名（P3-a 桥表；P3-e 加 pwsh）。多工具行（fs-local/
-/// terminal/…）见 `host_tool_group_for_row`。
+/// 单工具行 → 宿主工具名（P3-a 桥表；P3-e 加 pwsh；U1/D-105 加 todo）。多工具行
+/// （fs-local/terminal/…）见 `host_tool_group_for_row`。
 fn host_tool_for_row(row: &CompositionRow) -> Option<&'static str> {
     match row.name.as_str() {
         "@deepseek-ai/dsh-tool-bash" => Some("bash"),
@@ -624,6 +624,7 @@ fn host_tool_for_row(row: &CompositionRow) -> Option<&'static str> {
         "@deepseek-ai/dsh-tool-pwsh" => Some("pwsh"),
         "@deepseek-ai/dsh-tool-pwsh-persistent" => Some("pwsh"),
         "@deepseek-ai/dsh-tool-str-replace-editor" => Some("str_replace_editor"),
+        "@deepseek-ai/dsh-tool-todo" => Some("todo_write"),
         _ => None,
     }
 }
@@ -639,11 +640,19 @@ const TERMINAL_TOOLS: &[&str] = &[
 ];
 
 /// 多工具组行 → 宿主工具集（P3-b 解析确认；单工作区宿主 = standing 链继承全局基）。
+/// U1（D-105）加：dsh-tool-fs（compound fs）→ 宿主 fs 六件套（同 fs-local 语义）；
+/// dsh-tool-fs-search → 宿主搜索面（glob 路径 + grep 内容）；dsh-tool-jobs → 宿主
+/// job_* 工具集（M4 宿主 bind）。
 fn host_tool_group_for_row(row: &CompositionRow) -> Option<&'static [&'static str]> {
     match row.name.as_str() {
         "@deepseek-ai/dsh-fs-local" => {
             Some(&["read", "write", "edit", "read_image", "glob", "grep"])
         }
+        "@deepseek-ai/dsh-tool-fs" => {
+            Some(&["read", "write", "edit", "read_image", "glob", "grep"])
+        }
+        "@deepseek-ai/dsh-tool-fs-search" => Some(&["glob", "grep"]),
+        "@deepseek-ai/dsh-tool-jobs" => Some(&["job_output", "job_list", "job_kill"]),
         "@deepseek-ai/dsh-terminal" => Some(TERMINAL_TOOLS),
         _ => None,
     }
@@ -662,6 +671,12 @@ fn tool_guard_reason(row: &CompositionRow) -> String {
             .to_string()
     } else if n.contains("tool-cordis") || n.contains("command-compact") || n.contains("web") {
         "broken per D-103 (unbridged surface)".to_string()
+    } else if n == "@deepseek-ai/dsh-tool-goal" {
+        // U1/D-105 自下而上核对：本 build 的 goal 是 RPC/会话投影面（web goal_dispatch +
+        // dsh-session-query goal_projection），**没有**注册为 agent 可调用工具；预设注释
+        // 亦声明「model-facing tool，service 在 host 面」——故不桥，诚实 guard。
+        "host goal is an RPC/session-projection surface, not an agent tool in this build (U1)"
+            .to_string()
     } else {
         "no Rust bridge yet (P3/P5)".to_string()
     }
@@ -1169,6 +1184,11 @@ mod tests {
             "bash",
             "pwsh",
             "str_replace_editor",
+            // U1（D-105）：生产等同工具集补齐 M4 宿主面（web.rs 恒注册）。
+            "todo_write",
+            "job_output",
+            "job_list",
+            "job_kill",
         ] {
             tools.register_global(tool_def(name, name, 1000.0)).unwrap();
         }
@@ -1203,6 +1223,117 @@ mod tests {
                 u.is_empty(),
                 "{id}: shipped preset must be usable on production host: {u:?}"
             );
+        }
+    }
+
+    /// —— U1（D-105）—— fs/搜索/jobs 组行 + todo 单工具行在宿主工具在场时真桥接
+    /// （组解析确认 = 宿主工具集 / 单工具重呈现）；goal 行无宿主 goal 模型工具 →
+    /// 诚实 guard（专用原因，与预设法定义「service 在 host 面、此工具为 model-facing」
+    /// 的意图一致）。TDD 红→绿。
+    #[test]
+    fn tool_family_fs_search_jobs_todo_bridge_when_host_tools_present() {
+        let sp = new_sp();
+        // realistic_tools 含 fs-six + terminal-six + bash/pwsh/edit + job_* + todo_write。
+        let mut reg = StandingRegistry::new(sp.clone(), Some(realistic_tools()));
+        let comp = "
+- id: fs
+  name: '@deepseek-ai/dsh-tool-fs'
+- id: fss
+  name: '@deepseek-ai/dsh-tool-fs-search'
+- id: jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+- id: todo
+  name: '@deepseek-ai/dsh-tool-todo'
+- id: goal
+  name: '@deepseek-ai/dsh-tool-goal'
+";
+        let rows = dsh_agent_presets::parse::parse_composition(comp).unwrap();
+        reg.mount("u1", &rows, &win32_facade()).unwrap();
+        let r = reg.report("u1").unwrap();
+        let bridged_of = |n: &str| {
+            r.bridged
+                .iter()
+                .find(|s| s.starts_with(n))
+                .map(|s| s.as_str())
+                .unwrap_or("<not bridged>")
+        };
+        let guarded_of = |n: &str| {
+            r.guarded
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, w)| w.as_str())
+                .unwrap_or("<not guarded>")
+        };
+        assert!(
+            bridged_of("@deepseek-ai/dsh-tool-fs").contains("read/write/edit/read_image/glob/grep"),
+            "fs row bridged to host fs toolset: {}",
+            bridged_of("@deepseek-ai/dsh-tool-fs")
+        );
+        assert!(
+            bridged_of("@deepseek-ai/dsh-tool-fs-search").contains("glob/grep"),
+            "fs-search bridged to host search surface: {}",
+            bridged_of("@deepseek-ai/dsh-tool-fs-search")
+        );
+        assert!(
+            bridged_of("@deepseek-ai/dsh-tool-jobs").contains("job_output/job_list/job_kill"),
+            "jobs bridged to host jobs toolset: {}",
+            bridged_of("@deepseek-ai/dsh-tool-jobs")
+        );
+        assert!(
+            bridged_of("@deepseek-ai/dsh-tool-todo").contains("(tool todo_write)"),
+            "todo bridged to host todo_write: {}",
+            bridged_of("@deepseek-ai/dsh-tool-todo")
+        );
+        assert!(
+            guarded_of("@deepseek-ai/dsh-tool-goal").contains("not an agent tool"),
+            "goal stays honest guard with specific reason: {}",
+            guarded_of("@deepseek-ai/dsh-tool-goal")
+        );
+        assert!(
+            r.unusable_rows().is_empty(),
+            "all bridged/guarded rows usable: {:?}",
+            r.unusable_rows()
+        );
+    }
+
+    /// U1 在真实 shipped 预设上的呈现：standard/code/cordis 的 fs/family、jobs、todo
+    /// 行 → bridged；goal/skill/web 行 → 诚实 guard（不为终点能力而误桥）。
+    #[test]
+    fn real_presets_bridge_fs_jobs_todo_and_guard_goal_skill_web() {
+        let sp = new_sp();
+        let root = repo_root().join("resources").join("agent-presets");
+        for id in ["standard", "code", "cordis"] {
+            let mut reg = StandingRegistry::new(sp.clone(), Some(realistic_tools()));
+            reg.mount_at(id, &preset_rows(id), Some(&root.join(id)), &win32_facade())
+                .unwrap_or_else(|e| panic!("{id}: mount failed: {e}"));
+            let r = reg.report(id).unwrap();
+            for want in [
+                "@deepseek-ai/dsh-tool-fs",
+                "@deepseek-ai/dsh-tool-fs-search",
+                "@deepseek-ai/dsh-tool-jobs",
+                "@deepseek-ai/dsh-tool-todo",
+            ] {
+                assert!(
+                    r.bridged.iter().any(|s| s.starts_with(want)),
+                    "{id}: {want} bridged: {:?}",
+                    r.bridged
+                );
+                assert!(
+                    !r.guarded.iter().any(|(n, _)| n == want),
+                    "{id}: {want} must not stay guarded"
+                );
+            }
+            for want in [
+                "@deepseek-ai/dsh-tool-goal",
+                "@deepseek-ai/dsh-tool-skill",
+                "@deepseek-ai/dsh-tool-web",
+            ] {
+                assert!(
+                    r.guarded.iter().any(|(n, _)| n == want),
+                    "{id}: {want} honestly guarded: {:?}",
+                    r.guarded
+                );
+            }
         }
     }
 
