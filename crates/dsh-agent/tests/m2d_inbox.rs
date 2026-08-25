@@ -1,6 +1,5 @@
 //! Inbox 行为测试（移植 agent.spec.ts 的 Inbox 部分，消息/事件/形状逐字）。
 
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use dsh_agent::{
@@ -48,7 +47,7 @@ fn session_with(
 fn inbox_with_log(s: Arc<Session>) -> (Inbox, Arc<Mutex<Vec<InboxNotification>>>) {
     let log = Arc::new(Mutex::new(Vec::new()));
     let log2 = log.clone();
-    let inbox = Inbox::with_notify(s, Rc::new(move |n| log2.lock().unwrap().push(n.clone()))).unwrap();
+    let inbox = Inbox::with_notify(s, Arc::new(move |n| log2.lock().unwrap().push(n.clone()))).unwrap();
     (inbox, log)
 }
 

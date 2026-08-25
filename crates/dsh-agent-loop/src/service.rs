@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_agent::{Agent, AgentRegistry};
 use dsh_llm::{
@@ -39,7 +40,7 @@ fn invariant_error(message: String) -> LlmError {
 /// - `tool_exec` → `execute_tool_calls`（绑定 session/tools/scope/agent）。
 #[allow(clippy::too_many_arguments)]
 pub fn build_loop_deps(
-    agent: &Rc<Agent>,
+    agent: &Arc<Agent>,
     prompt: Rc<SystemPrompt>,
     llm: Rc<LlmRuntime>,
     tools: Rc<ToolRegistry>,
@@ -135,8 +136,8 @@ pub fn build_loop_deps(
 
 /// 便捷：装配真实 deps 并把 agent 交给驱动。
 pub fn create_loop_agent(
-    agent: Rc<Agent>,
-    registry: Rc<AgentRegistry>,
+    agent: Arc<Agent>,
+    registry: Arc<AgentRegistry>,
     prompt: Rc<SystemPrompt>,
     llm: Rc<LlmRuntime>,
     tools: Rc<ToolRegistry>,
@@ -150,8 +151,8 @@ pub fn create_loop_agent(
 /// 包装等）。宿主工厂（`AgentLoopHost::set_tool_exec_factory`）按 driver 事实产出的
 /// tool_exec 经此落位；其余 deps 与 `create_loop_agent` 一致。
 pub fn create_loop_agent_with_tool_exec(
-    agent: Rc<Agent>,
-    registry: Rc<AgentRegistry>,
+    agent: Arc<Agent>,
+    registry: Arc<AgentRegistry>,
     prompt: Rc<SystemPrompt>,
     llm: Rc<LlmRuntime>,
     tools: Rc<ToolRegistry>,

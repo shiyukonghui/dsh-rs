@@ -12,7 +12,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use dsh_agent::{
     agent_carrier, Agent, AgentEventDispatch, AgentRegistry, AgentStatus, CancelOptions,
@@ -185,26 +185,32 @@ impl PreStepDecision {
 // ---------------------------------------------------------------------------
 
 pub struct ReactLoopAgent {
-    pub agent: Rc<Agent>,
-    pub registry: Rc<AgentRegistry>,
+    pub agent: Arc<Agent>,
+    pub registry: Arc<AgentRegistry>,
     pub deps: LoopDeps,
     dispatch: AgentEventDispatch,
     propose: Rc<dyn Fn(CallConfig, u64, u64) -> Result<CallConfig, String>>,
     phase: RefCell<Phase>,
     request_header_logged: Cell<bool>,
+    /// D-115（请求面并发化）：**共享取消令牌**——Send+Sync 上下文（bus 监听器 / 未来
+    /// worker 的 accept 线程）经 `cancel_token()` 写入取消请求，driver 在 turn/step
+    /// 边界 `abort_reason()` 轮询消费。与既有 `cancel()`（直改 phase，宿主单线程
+    /// 路径）并存；二者互斥只见其一（先到先得）。这是 Phase 4 worker 化的最小
+    /// 前置缝（accept 线程写、worker 读），Phase 2 即落位以便 bus 监听器 Send+Sync。
+    cancel_token: Arc<Mutex<Option<AgentCancelCause>>>,
     /// 审批暂停中的待决调用（D-106）。**agent 级（非 Phase 字段）**：越过
     /// pause→Idle 停驻存活；恢复 turn 由 step() 顶部消费并清空。
     approval_pending: RefCell<Vec<PendingCall>>,
 }
 
 impl ReactLoopAgent {
-    pub fn new(agent: Rc<Agent>, registry: Rc<AgentRegistry>, deps: LoopDeps) -> Rc<Self> {
+    pub fn new(agent: Arc<Agent>, registry: Arc<AgentRegistry>, deps: LoopDeps) -> Rc<Self> {
         let dispatch = AgentEventDispatch::new(agent.ctx.bus().clone(), agent_carrier(&agent));
         let propose: Rc<dyn Fn(CallConfig, u64, u64) -> Result<CallConfig, String>> = {            let dispatch = dispatch.clone();
             let agent = agent.clone();
             Rc::new(move |seed: CallConfig, turn: u64, step: u64| -> Result<CallConfig, String> {
                 let seed_json = serde_json::to_value(&seed).map_err(|e| e.to_string())?;
-                let innermost: NextFn = Rc::new(move |_p| seed_json.clone());
+                let innermost: NextFn = Arc::new(move |_p| seed_json.clone());
                 let d = dispatch.clone();
                 let a = agent.clone();
                 let name = "agent/request";
@@ -223,7 +229,7 @@ impl ReactLoopAgent {
         {
             let d = dispatch.clone();
             let notify_agent = agent.clone();
-            let notify = Rc::new(move |n: &dsh_agent::InboxNotification| {
+            let notify = Arc::new(move |n: &dsh_agent::InboxNotification| {
                 let (name, payload) = match n {
                     dsh_agent::InboxNotification::Inserted { message } => {
                         ("agent/inbox/inserted", json!({ "message": message }))
@@ -249,6 +255,7 @@ impl ReactLoopAgent {
             propose,
             phase: RefCell::new(Phase::Idle { last_turn }),
             request_header_logged: Cell::new(false),
+            cancel_token: Arc::new(Mutex::new(None)),
             approval_pending: RefCell::new(Vec::new()),
         })
     }
@@ -279,7 +286,7 @@ impl ReactLoopAgent {
             Phase::Running { .. } => AgentStatus::Running,
         };
         *self.phase.borrow_mut() = next;
-        self.agent.status.set(now);
+        self.agent.set_status(now);
         if now != prev {
             let mut warns = Vec::new();
             self.dispatch
@@ -365,11 +372,23 @@ impl ReactLoopAgent {
             match &mut *ph {
                 Phase::Running { abort_reason, .. }
                 | Phase::Maintenance { abort_reason, .. } => {
-                    *abort_reason = Some(cause);
+                    *abort_reason = Some(cause.clone());
                 }
                 _ => {}
             }
+            // D-115：共享令牌旁路（Send+Sync 上下文经 `cancel_token` 注入同一取消）。
+            // 幂等：直接改 phase 与令牌路径互斥先到先得；`abort_reason` 先令牌后 phase。
+            // **只在运行/维护相位写入**——idle 取消不得污染下一个 turn（对齐旧语义：
+            // idle 上 cancel 仅清 inbox，不设 abort）。
+            *self.cancel_token.lock().unwrap() = Some(cause);
         }
+    }
+
+    /// D-115：共享取消令牌句柄——Send+Sync 上下文（bus 监听器 / 未来 worker 的
+    /// accept 线程）写入取消请求，driver 在 turn/step 边界消费。Phase 4 worker 化
+    /// 的最小前置缝。
+    pub fn cancel_token(&self) -> Arc<Mutex<Option<AgentCancelCause>>> {
+        self.cancel_token.clone()
     }
 
     /// sync：send/kick 返回前整个 driver 已排空（D-032；无并发等待）。
@@ -461,6 +480,10 @@ impl ReactLoopAgent {
     }
 
     fn abort_reason(&self) -> Option<AgentCancelCause> {
+        // D-115：先消费共享取消令牌（Send+Sync 旁路），再回退 phase 内的合作式取消。
+        if let Some(c) = self.cancel_token.lock().unwrap().take() {
+            return Some(c);
+        }
         self.phase.borrow().abort_reason()
     }
 
@@ -730,7 +753,7 @@ impl ReactLoopAgent {
                 v
             }
         };
-        let innermost: NextFn = Rc::new(move |_p| json!({ "kind": "enter", "messages": default_messages.clone() }));
+        let innermost: NextFn = Arc::new(move |_p| json!({ "kind": "enter", "messages": default_messages.clone() }));
         let payload = json!({ "messages": claimed_json, "turn": turn, "step": step });
         let decision_v = self.waterfall_safe("agent/pre-step", payload, innermost)?;
         if let Some(c) = self.abort_reason() {
@@ -740,7 +763,7 @@ impl ReactLoopAgent {
     }
 
     fn dispatch_turn_stopping(&self, turn: u64) -> Result<(), Halt> {
-        let innermost: NextFn = Rc::new(|p| p);
+        let innermost: NextFn = Arc::new(|p| p);
         let _ = self.serial_safe("agent/turn-stopping", json!({ "turn": turn }), innermost)?;
         Ok(())
     }
@@ -755,7 +778,7 @@ impl ReactLoopAgent {
     ) -> Result<bool, Halt> {
         // retryPolicy：M2e-2 未序列化（D-032 声明；M2e-3 接 prepared.retryPolicy）
         let payload = json!({ "turn": turn, "step": step, "provider": provider, "failure": failure });
-        let innermost: NextFn = Rc::new(|_p| Value::Null);
+        let innermost: NextFn = Arc::new(|_p| Value::Null);
         let v = self.waterfall_safe("agent/request-error", payload, innermost)?;
         if let Some(c) = self.abort_reason() {
             return Err(Halt::Aborted(c));

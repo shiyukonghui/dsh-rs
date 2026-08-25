@@ -6,6 +6,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use dsh_scope::*;
 use serde_json::{json, Value};
@@ -127,16 +128,16 @@ fn scope_target_preserves_a_base_filter_and_runs_it_before_scope_predicate() {
     scope.ctx.on("ping", false, Box::new(move |_, _| h.borrow_mut().push("yes".to_string())));
 
     // base filter 返回 false（含 receiver 断言：调用一次）
-    let receiver_matches = Rc::new(RefCell::new(false));
+    let receiver_matches = Arc::new(Mutex::new(false));
     let rm = receiver_matches.clone();
-    let base_filter: BaseFilter = Rc::new(move || {
-        *rm.borrow_mut() = true;
+    let base_filter: BaseFilter = Arc::new(move || {
+        *rm.lock().unwrap() = true;
         false
     });
     let carrier = scope_target(Some(key), Some(base_filter));
     root.emit_scoped(&carrier, "ping", vec![json!("vetoed")]);
     assert_eq!(*heard.borrow(), Vec::<String>::new(), "base filter vetoed all");
-    assert!(*receiver_matches.borrow(), "base filter was called");
+    assert!(*receiver_matches.lock().unwrap(), "base filter was called");
 }
 
 #[test]

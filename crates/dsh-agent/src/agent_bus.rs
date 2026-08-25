@@ -4,21 +4,24 @@
 //! 模式支持：emit（通知，逐 listener 包含、不可 veto）、emit_veto（首抛传播——
 //! 用于 `agent/created` 的发布否决）、serial（有序链）、waterfall（next 短路链）。
 //! 派发**收集-再执行**：先把命中监听器克隆出借用再逐个运行，监听器内可重入注册。
+//!
+//! D-115（请求面并发化）：监听器族 `Rc<dyn Fn>` → `Arc<dyn Fn + Send + Sync>`、
+//! `items: Rc<RefCell<Vec>>` → `Mutex<Vec<Arc<BusItem>>>`，使 bus 成为 Send+Sync
+//! （serve worker 化前置）。
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use dsh_scope::{ScopeCarrier, ScopeKey};
 use serde_json::Value;
 
 /// 监听器签名：`(name, payload)`。
-pub type AgentListener = Rc<dyn Fn(&str, &Value)>;
+pub type AgentListener = Arc<dyn Fn(&str, &Value) + Send + Sync>;
 
 /// waterfall/serial 的 next 回调：接收（可能被替换的）载荷，返回链的最终值。
-pub type NextFn = Rc<dyn Fn(Value) -> Value>;
+pub type NextFn = Arc<dyn Fn(Value) -> Value + Send + Sync>;
 
 /// waterfall/serial 监听器签名：接收 `(payload, next)`，返回链的结果。
-pub type ChainListener = Rc<dyn Fn(Value, NextFn) -> Value>;
+pub type ChainListener = Arc<dyn Fn(Value, NextFn) -> Value + Send + Sync>;
 
 struct BusItem {
     name: String,
@@ -31,7 +34,7 @@ struct BusItem {
 /// 作用域事件总线（与 dsh-scope `ScopedContext` 同构但带逐 listener 包含 + 链模式）。
 #[derive(Default, Clone)]
 pub struct AgentBus {
-    items: Rc<RefCell<Vec<BusItem>>>,
+    items: Arc<Mutex<Vec<Arc<BusItem>>>>,
 }
 
 impl AgentBus {
@@ -41,41 +44,35 @@ impl AgentBus {
 
     /// 注册监听器。`global=true` → 恒可见；`global=false` 需 `tag`（或 None → 无标签）。
     pub fn on(&self, name: &str, global: bool, tag: Option<ScopeKey>, cb: AgentListener) {
-        self.items.borrow_mut().push(BusItem {
+        self.items.lock().unwrap().push(Arc::new(BusItem {
             name: name.to_string(),
             global: global || tag.is_none(),
             tag,
             cb,
             chain: None,
-        });
+        }));
     }
 
     /// 注册链路监听器（serial/waterfall 模式）。
     pub fn on_chain(&self, name: &str, global: bool, tag: Option<ScopeKey>, cb: ChainListener) {
-        self.items.borrow_mut().push(BusItem {
+        self.items.lock().unwrap().push(Arc::new(BusItem {
             name: name.to_string(),
             global: global || tag.is_none(),
             tag,
-            cb: Rc::new(|_, _| {}),
+            cb: Arc::new(|_, _| {}),
             chain: Some(cb),
-        });
+        }));
     }
 
-    fn select(&self, carrier: &ScopeCarrier, name: &str) -> Vec<Rc<BusItem>> {
-        let borrowed = self.items.borrow();
-        let mut out: Vec<Rc<BusItem>> = Vec::new();
+    fn select(&self, carrier: &ScopeCarrier, name: &str) -> Vec<Arc<BusItem>> {
+        let borrowed = self.items.lock().unwrap();
+        let mut out: Vec<Arc<BusItem>> = Vec::new();
         for item in borrowed.iter() {
             if item.name != name {
                 continue;
             }
             if item.global || carrier.adopts(item.tag.as_ref()) {
-                out.push(Rc::new(BusItem {
-                    name: item.name.clone(),
-                    global: item.global,
-                    tag: item.tag.clone(),
-                    cb: item.cb.clone(),
-                    chain: item.chain.clone(),
-                }));
+                out.push(item.clone());
             }
         }
         out
@@ -125,7 +122,7 @@ impl AgentBus {
 
     /// **serial**：有序链，每个同步监听器 `(payload, next)`；不调 next 即短路。
     pub fn serial(&self, carrier: &ScopeCarrier, name: &str, payload: Value, innermost: NextFn) -> Value {
-        let items = Rc::new(self.select(carrier, name));
+        let items = Arc::new(self.select(carrier, name));
         run_chain(items, 0, payload, innermost)
     }
 
@@ -135,11 +132,11 @@ impl AgentBus {
     }
 
     pub fn listener_count(&self) -> usize {
-        self.items.borrow().len()
+        self.items.lock().unwrap().len()
     }
 }
 
-fn run_chain(items: Rc<Vec<Rc<BusItem>>>, idx: usize, payload: Value, innermost: NextFn) -> Value {
+fn run_chain(items: Arc<Vec<Arc<BusItem>>>, idx: usize, payload: Value, innermost: NextFn) -> Value {
     if idx >= items.len() {
         return innermost(payload);
     }
@@ -149,7 +146,7 @@ fn run_chain(items: Rc<Vec<Rc<BusItem>>>, idx: usize, payload: Value, innermost:
         return run_chain(items, idx + 1, payload, innermost);
     };
     let items2 = items.clone();
-    let next: NextFn = Rc::new(move |p: Value| run_chain(items2.clone(), idx + 1, p, innermost.clone()));
+    let next: NextFn = Arc::new(move |p: Value| run_chain(items2.clone(), idx + 1, p, innermost.clone()));
     chain(payload, next)
 }
 

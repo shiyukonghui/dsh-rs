@@ -7,10 +7,8 @@
 //!   NaN→0/负坐标/上界截断）。
 //! - 构造时重放 `header.seedLength` 之后的持久 splice（错误包装逐字）。
 
-use std::cell::RefCell;
 use std::collections::HashSet;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use dsh_llm::{Message, MessageId};
 use dsh_session::{EventKind, Session};
@@ -62,7 +60,8 @@ pub enum InboxNotification {
 }
 
 /// 通知接收器（M2d-2 将在此发射 agent/inbox/inserted 等 live 事件）。
-pub type InboxNotify = Rc<dyn Fn(&InboxNotification)>;
+/// D-115：`Rc<dyn Fn>` → `Arc<dyn Fn + Send + Sync>`（worker 化前置）。
+pub type InboxNotify = Arc<dyn Fn(&InboxNotification) + Send + Sync>;
 
 /// 一次 mutate 的投影结果（被移除的消息）。
 #[derive(Debug, Default, Clone)]
@@ -98,13 +97,13 @@ struct InboxInner {
 }
 
 pub struct Inbox {
-    inner: Rc<RefCell<InboxInner>>,
+    inner: Arc<Mutex<InboxInner>>,
 }
 
 impl Inbox {
     /// 用会话日志重建投影。仅重放 `seed_length` 之后的持久 splice。
     pub fn new(session: Arc<Session>) -> Result<Self, String> {
-        Self::with_notify(session, Rc::new(|_| {}))
+        Self::with_notify(session, Arc::new(|_| {}))
     }
 
     pub fn with_notify(session: Arc<Session>, notify: InboxNotify) -> Result<Self, String> {
@@ -128,27 +127,27 @@ impl Inbox {
             })?;
         }
         Ok(Inbox {
-            inner: Rc::new(RefCell::new(inner)),
+            inner: Arc::new(Mutex::new(inner)),
         })
     }
 
     /// 运行时替换通知接收器（M2e loop 构造时挂 live `agent/inbox/*` 事件发射）。
     pub fn set_notify(&self, notify: InboxNotify) {
-        self.inner.borrow_mut().notify = notify;
+        self.inner.lock().unwrap().notify = notify;
     }
 
     // ---- getters ----
 
     pub fn next_turn(&self) -> Vec<Message> {
-        self.inner.borrow().next_turn.clone()
+        self.inner.lock().unwrap().next_turn.clone()
     }
 
     pub fn next_step(&self) -> Vec<Message> {
-        self.inner.borrow().next_step.clone()
+        self.inner.lock().unwrap().next_step.clone()
     }
 
     pub fn has_pending(&self) -> bool {
-        let b = self.inner.borrow();
+        let b = self.inner.lock().unwrap();
         !b.next_turn.is_empty() || !b.next_step.is_empty()
     }
 
@@ -156,16 +155,16 @@ impl Inbox {
 
     /// `clear()`：先 next-step 后 next-turn（各为 canceled 删除）。
     pub fn clear(&self) -> Result<(), String> {
-        let step_len = self.inner.borrow().next_step.len() as f64;
+        let step_len = self.inner.lock().unwrap().next_step.len() as f64;
         self.mutate(InboxTarget::NextStep, 0.0, step_len, Vec::new(), true)?;
-        let turn_len = self.inner.borrow().next_turn.len() as f64;
+        let turn_len = self.inner.lock().unwrap().next_turn.len() as f64;
         self.mutate(InboxTarget::NextTurn, 0.0, turn_len, Vec::new(), true)?;
         Ok(())
     }
 
     /// `claim(target, turn)`：取走全部 next-step；按需再取队首 1 条 turn。
     pub fn claim(&self, target: InboxTarget, turn: u64) -> Result<ClaimResult, String> {
-        let step_len = self.inner.borrow().next_step.len() as f64;
+        let step_len = self.inner.lock().unwrap().next_step.len() as f64;
         let next_steps = self
             .mutate(InboxTarget::NextStep, 0.0, step_len, Vec::new(), false)?
             .removed;
@@ -178,7 +177,7 @@ impl Inbox {
                 .next();
         }
         // claimed 通知：next-step 批次先、队首 turn 后（逐条）
-        let notify = self.inner.borrow().notify.clone();
+        let notify = self.inner.lock().unwrap().notify.clone();
         for m in &next_steps {
             notify(&InboxNotification::Claimed {
                 message: m.clone(),
@@ -210,7 +209,7 @@ impl Inbox {
 
     /// `append`：追加到队尾。
     pub fn append_msg(&self, target: InboxTarget, message: Message) -> Result<(), String> {
-        let len = queue_length(&self.inner.borrow(), target) as f64;
+        let len = queue_length(&self.inner.lock().unwrap(), target) as f64;
         self.mutate(target, len, 0.0, vec![message], true)?;
         Ok(())
     }
@@ -223,7 +222,7 @@ impl Inbox {
 
     /// `replace(messageId, newMessage)`：跨双队列按身份替换；找不到返回 false。
     pub fn replace(&self, message_id: &MessageId, new_message: Message) -> Result<bool, String> {
-        let found = find_id(&self.inner.borrow(), message_id);
+        let found = find_id(&self.inner.lock().unwrap(), message_id);
         let Some((target, idx)) = found else {
             return Ok(false);
         };
@@ -233,7 +232,7 @@ impl Inbox {
 
     /// `remove(messageId)`：跨双队列按身份删除；找不到返回 false。
     pub fn remove(&self, message_id: &MessageId) -> Result<bool, String> {
-        let found = find_id(&self.inner.borrow(), message_id);
+        let found = find_id(&self.inner.lock().unwrap(), message_id);
         let Some((target, idx)) = found else {
             return Ok(false);
         };
@@ -253,7 +252,7 @@ impl Inbox {
         inserted: Vec<Message>,
         discard_removed: bool,
     ) -> Result<Mutation, String> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().unwrap();
         let len = queue_length(&inner, target);        let actual_start = normalize_start(start, len);
         let actual_delete = normalize_delete(delete_count, len - actual_start);
 

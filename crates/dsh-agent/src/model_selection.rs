@@ -11,9 +11,13 @@
 //! 差异声明：TS 的安装发生在 agent scope 内由 scope teardown 拆除；Rust 侧
 //! M2d-2 只安装（拆除由 M2e loop 的生命周期负责——即「作用域拆除替代 disposer」，
 //! D-030 记）。无 fallback/并发合并（loop 层职责，报告 A.3 model-selection 明示）。
+//!
+//! D-115：`sel: Rc<RefCell>` → `Arc<Mutex>`、bus 监听器 `Rc<dyn Fn>` → `Arc<dyn Fn +
+//! Send + Sync>`（worker 化前置）。dsh-system-prompt 一侧仍 `Rc<dyn Fn>`（不在 D-115
+//! 库存，Phase 3 预算外）——`register_assemble_listener` 保持 Rc，闭包内捕获 Arc 即可。
 
-use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use dsh_scope::ScopeKey;
 use dsh_system_prompt::SystemPrompt;
@@ -37,17 +41,18 @@ pub fn install_model_selection(
     sp: &Rc<SystemPrompt>,
     bus: &AgentBus,
     scope: &ScopeKey,
-    sel: Rc<RefCell<ModelSelectionRef>>,
+    sel: Arc<Mutex<ModelSelectionRef>>,
 ) {
     // 1) prompt 组装侧（system-prompt assemble 水岭，scoped 到 agent）
+    //    注：dsh-system-prompt 的 listener 仍是 Rc<dyn Fn>（D-115 库存外）。
     let sel1 = sel.clone();
     let scope1 = scope.clone();
     sp.register_assemble_listener(Some(scope1), false, Rc::new(
         move |assembly, _ctx, next| {
             // 进入时捕获 current（不理会链中变化）
-            let selected = sel1.borrow().current.clone();
+            let selected = sel1.lock().unwrap().current.clone();
             let mut result = next(assembly)?;
-            sel1.borrow_mut().assembled = selected.clone();
+            sel1.lock().unwrap().assembled = selected.clone();
             if let Some(s) = selected {
                 upsert_variable(&mut result.variables, "provider", s.provider);
                 upsert_variable(&mut result.variables, "model", s.model);
@@ -58,10 +63,13 @@ pub fn install_model_selection(
 
     // 2) 请求路由侧（agent/request 水岭，scoped 到 agent）
     let scope2 = scope.clone();
-    bus.on_chain("agent/request", false, Some(scope2), Rc::new(
-        move |payload: serde_json::Value, next: NextFn| {
+    bus.on_chain(
+        "agent/request",
+        false,
+        Some(scope2),
+        Arc::new(move |payload: serde_json::Value, next: NextFn| {
             let resolved = next(payload);
-            let selected = sel.borrow().assembled.clone();
+            let selected = sel.lock().unwrap().assembled.clone();
             let Some(s) = selected else {
                 return resolved;
             };
@@ -79,6 +87,6 @@ pub fn install_model_selection(
                 }
             }
             out
-        },
-    ));
+        }),
+    );
 }

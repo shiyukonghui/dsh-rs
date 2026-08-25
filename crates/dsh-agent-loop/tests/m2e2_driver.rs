@@ -7,9 +7,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use dsh_agent::{Agent, AgentBus, AgentRegistry, AgentStatus, CancelOptions, NextFn};
+use dsh_agent::{Agent, AgentBus, AgentRegistry, AgentStatus, InboxTarget, NextFn};
 use dsh_agent_loop::{
     LoopDeps, PendingCall, ReactLoopAgent, ToolExecCtx, ToolExecOutcome,
 };
@@ -50,19 +50,19 @@ fn session(store: &Arc<SessionStore>, id: &str) -> Arc<Session> {
 }
 
 struct TestWorld {
-    reg: Rc<AgentRegistry>,
+    reg: Arc<AgentRegistry>,
     bus: AgentBus,
 }
 
 impl TestWorld {
     fn new() -> Self {
         let bus = AgentBus::new();
-        let reg = Rc::new(AgentRegistry::new(bus.clone()));
+        let reg = Arc::new(AgentRegistry::new(bus.clone()));
         TestWorld { reg, bus }
     }
-    fn agent(&self, id: &str) -> Rc<Agent> {
+    fn agent(&self, id: &str) -> Arc<Agent> {
         let s = session(&store(), id);
-        Rc::new(
+        Arc::new(
             Agent::new(
                 SessionId(id.to_string()),
                 s,
@@ -79,20 +79,20 @@ impl TestWorld {
     }
 }
 
-fn listen_status(bus: &AgentBus) -> Rc<RefCell<Vec<String>>> {
-    let log = Rc::new(RefCell::new(Vec::new()));
+fn listen_status(bus: &AgentBus) -> Arc<Mutex<Vec<String>>> {
+    let log = Arc::new(Mutex::new(Vec::new()));
     let l = log.clone();
     bus.on(
         "agent/status",
         true,
         None,
-        Rc::new(move |_n, p| {
+        Arc::new(move |_n, p| {
             let s = p
                 .get("status")
                 .and_then(Value::as_str)
                 .unwrap_or("?")
                 .to_string();
-            l.borrow_mut().push(s);
+            l.lock().unwrap().push(s);
         }),
     );
     log
@@ -302,7 +302,7 @@ fn send_runs_one_turn_completed() {
 
     driver.followup(user_msg("m1", "hi")).unwrap();
 
-    assert_eq!(status.borrow().as_slice(), &["running".to_string(), "idle".to_string()]);
+    assert_eq!(status.lock().unwrap().as_slice(), &["running".to_string(), "idle".to_string()]);
     assert_eq!(count_of(&a.session, EventKind::TurnStart), 1);
     assert_eq!(count_of(&a.session, EventKind::StepStart), 1);
     assert_eq!(count_of(&a.session, EventKind::TurnEnd), 1);
@@ -413,7 +413,7 @@ fn reject_closes_turn_blocked() {
         "agent/pre-step",
         true,
         None,
-        Rc::new(|_payload: Value, _next: NextFn| json!({ "kind": "reject" })),
+        Arc::new(|_payload: Value, _next: NextFn| json!({ "kind": "reject" })),
     );
     let script = Rc::new(RefCell::new(VecDeque::new()));
     let calls = Rc::new(Cell::new(0u32));
@@ -436,7 +436,7 @@ fn empty_prestep_completes_without_step() {
         "agent/pre-step",
         true,
         None,
-        Rc::new(|_payload: Value, _next: NextFn| json!({ "kind": "enter", "messages": [] })),
+        Arc::new(|_payload: Value, _next: NextFn| json!({ "kind": "enter", "messages": [] })),
     );
     let script = Rc::new(RefCell::new(VecDeque::new()));
     let calls = Rc::new(Cell::new(0u32));
@@ -466,18 +466,21 @@ fn max_tokens_sticky_keeps_turn_reason() {
         deps(mock_assemble("sys"), mock_stream(script, calls), mock_tool_never()),
     );
     // pre-step 监听器在第一步注入 steer → 同 turn 续到第二步
-    let driver2 = driver.clone();
-    let injected = Rc::new(Cell::new(false));
+    // （D-115：监听器须 Send+Sync → 经 Send 的 agent.inbox 直注同效应；
+    //  与 steer（splice+wake）对当前正在排空的 turn 等价——主循环按 next_step 续跑）
+    let steer_agent = a.clone();
+    let injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let inj = injected.clone();
     w.bus.on_chain(
         "agent/pre-step",
         true,
         None,
-        Rc::new(move |payload: Value, next: NextFn| {
+        Arc::new(move |payload: Value, next: NextFn| {
             let decision = next(payload);
-            if !inj.get() {
-                inj.set(true);
-                let _ = driver2.steer(user_msg("s1", "keep going"));
+            if !inj.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let _ = steer_agent
+                    .inbox
+                    .append_msg(InboxTarget::NextStep, user_msg("s1", "keep going"));
             }
             decision
         }),
@@ -504,21 +507,21 @@ fn cancel_before_turn_start_leaves_no_records() {
             mock_tool_never(),
         ),
     );
-    let d = driver.clone();
+    let cancel = driver.cancel_token();
     w.bus.on(
         "agent/status",
         true,
         None,
-        Rc::new(move |_n, p| {
+        Arc::new(move |_n, p| {
             if p.get("status").and_then(Value::as_str) == Some("running") {
-                d.cancel(AgentCancelCause::User, &CancelOptions::default());
+                *cancel.lock().unwrap() = Some(AgentCancelCause::User);
             }
         }),
     );
     driver.followup(user_msg("m1", "hi")).unwrap();
     assert_eq!(count_of(&a.session, EventKind::TurnStart), 0);
     assert_eq!(count_of(&a.session, EventKind::TurnEnd), 0);
-    assert_eq!(status.borrow().as_slice(), &["running".to_string(), "idle".to_string()]);
+    assert_eq!(status.lock().unwrap().as_slice(), &["running".to_string(), "idle".to_string()]);
     assert_eq!(driver.status(), AgentStatus::Idle);
 }
 
@@ -526,9 +529,11 @@ fn cancel_before_turn_start_leaves_no_records() {
 fn cancel_mid_turn_aborts_without_error_event() {
     let w = TestWorld::new();
     let a = w.agent("a");
-    let errors = Rc::new(RefCell::new(0usize));
+    let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let err_log = errors.clone();
-    w.bus.on("agent/error", true, None, Rc::new(move |_n, _p| *err_log.borrow_mut() += 1));
+    w.bus.on("agent/error", true, None, Arc::new(move |_n, _p| {
+        err_log.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
     let script = Rc::new(RefCell::new(VecDeque::from(vec![text_chunks(
         "partial",
         FinishReason::Stop,
@@ -542,17 +547,16 @@ fn cancel_mid_turn_aborts_without_error_event() {
             mock_tool_never(),
         ),
     );
-    let d = driver.clone();
-    let cancelled = Rc::new(Cell::new(false));
+    let cancel = driver.cancel_token();
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let c = cancelled.clone();
     w.bus.on_chain(
         "agent/pre-step",
         true,
         None,
-        Rc::new(move |payload: Value, next: NextFn| {
-            if !c.get() {
-                c.set(true);
-                d.cancel(AgentCancelCause::User, &CancelOptions::default());
+        Arc::new(move |payload: Value, next: NextFn| {
+            if !c.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                *cancel.lock().unwrap() = Some(AgentCancelCause::User);
             }
             next(payload)
         }),
@@ -564,7 +568,7 @@ fn cancel_mid_turn_aborts_without_error_event() {
     assert_eq!(reason["kind"], "aborted");
     assert_eq!(reason["reason"]["kind"], "user");
     // 无 agent/error（abort 路径静默）
-    assert_eq!(errors.borrow().clone(), 0);
+    assert_eq!(errors.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -581,15 +585,14 @@ fn request_error_retry_once_then_succeeds() {
         w.reg.clone(),
         deps(mock_assemble("sys"), mock_stream(script, calls.clone()), mock_tool_never()),
     );
-    let attempts = Rc::new(Cell::new(0usize));
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let at = attempts.clone();
     w.bus.on_chain(
         "agent/request-error",
         true,
         None,
-        Rc::new(move |_payload: Value, _next: NextFn| {
-            let i = at.get();
-            at.set(i + 1);
+        Arc::new(move |_payload: Value, _next: NextFn| {
+            let i = at.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if i == 0 {
                 json!({ "kind": "retry" })
             } else {
@@ -600,7 +603,7 @@ fn request_error_retry_once_then_succeeds() {
     driver.followup(user_msg("m1", "go")).unwrap();
 
     assert_eq!(calls.get(), 2);
-    assert_eq!(attempts.get(), 1);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(turn_end_reason(&a.session)["kind"], "completed");
     // 失败 attempt 的 chunk 已登录（无 assistant/message 关闭），成功 attempt 的消息在：
     // error_chunks 产 1 个 Finish chunk；text_chunks 产 4 个 → 共 5 个 assistant/chunk
@@ -615,14 +618,15 @@ fn request_error_retry_once_then_succeeds() {
 fn turn_stopping_serial_dispatched_on_close() {
     let w = TestWorld::new();
     let a = w.agent("a");
-    let stopped = Rc::new(RefCell::new(Vec::new()));
+    let stopped = Arc::new(Mutex::new(Vec::new()));
     let log = stopped.clone();
     w.bus.on_chain(
         "agent/turn-stopping",
         true,
         None,
-        Rc::new(move |payload: Value, next: NextFn| {
-            log.borrow_mut()
+        Arc::new(move |payload: Value, next: NextFn| {
+            log.lock()
+                .unwrap()
                 .push(payload.get("turn").and_then(Value::as_u64).unwrap_or(0));
             next(payload)
         }),
@@ -638,16 +642,16 @@ fn turn_stopping_serial_dispatched_on_close() {
         deps(mock_assemble("sys"), mock_stream(script, calls), mock_tool_never()),
     );
     driver.followup(user_msg("m1", "hi")).unwrap();
-    assert_eq!(stopped.borrow().as_slice(), &[1u64]);
+    assert_eq!(stopped.lock().unwrap().as_slice(), &[1u64]);
 }
 
 #[test]
 fn inbox_live_events_emitted() {
     let w = TestWorld::new();
     let a = w.agent("a");
-    let inserted = Rc::new(RefCell::new(0usize));
+    let inserted = Arc::new(Mutex::new(0usize));
     let log = inserted.clone();
-    w.bus.on("agent/inbox/inserted", true, None, Rc::new(move |_n, _p| *log.borrow_mut() += 1));
+    w.bus.on("agent/inbox/inserted", true, None, Arc::new(move |_n, _p| *log.lock().unwrap() += 1));
     let script = Rc::new(RefCell::new(VecDeque::new()));
     let calls = Rc::new(Cell::new(0u32));
     let driver = ReactLoopAgent::new(
@@ -660,21 +664,21 @@ fn inbox_live_events_emitted() {
         ),
     );
     driver.followup(user_msg("m1", "hi")).unwrap();
-    assert_eq!(inserted.borrow().clone(), 1);
+    assert_eq!(*inserted.lock().unwrap(), 1);
 }
 
 #[test]
 fn pre_step_payload_shows_claimed_messages_and_agent_fusion() {
     let w = TestWorld::new();
     let a = w.agent("a");
-    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let payloads = Arc::new(Mutex::new(Vec::new()));
     let log = payloads.clone();
     w.bus.on_chain(
         "agent/pre-step",
         true,
         None,
-        Rc::new(move |payload: Value, next: NextFn| {
-            log.borrow_mut().push(payload.clone());
+        Arc::new(move |payload: Value, next: NextFn| {
+            log.lock().unwrap().push(payload.clone());
             next(payload)
         }),
     );
@@ -689,7 +693,8 @@ fn pre_step_payload_shows_claimed_messages_and_agent_fusion() {
         deps(mock_assemble("sys"), mock_stream(script, calls), mock_tool_never()),
     );
     driver.followup(user_msg("m1", "hello")).unwrap();
-    let log = payloads.borrow();
+    let log = payloads.lock().unwrap();
+    let log: &Vec<Value> = &log;
     assert_eq!(log.len(), 1);
     let p = &log[0];
     assert_eq!(p["turn"], 1u64);

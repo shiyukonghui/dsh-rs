@@ -8,7 +8,8 @@
 //!   `AgentScope`/`ScopedMessage`/`Agent` 等 agent 语义——那是消费方（dsh-agent）
 //!   用本包原语组合出来的。本包不是沙箱/权限边界（README 明确）。
 //! - **无任何 JSON 序列化**：`ScopeKey` 是对象（引用相等）；`ScopeCarrier` 只做
-//!   路由。Rust 侧映射：`ScopeKey(Rc<()>)` 不透明身份句柄（`Eq`/`Hash` 按指针），
+//!   路由。Rust 侧映射：`ScopeKey(Arc<()>)` 不透明身份句柄（`Eq`/`Hash` 按指针；
+//!   D-115 自 `Rc<()>` 升级——使 dsh-agent 句柄可 Send+Sync），
 //!   永不跨进程、从不落盘。
 //! - 父子链一条关系双向驱动：**向下继承**（子作用域注册视图能看祖先 layer，
 //!   `ScopedLayers.chainLayers`/`merge`）与**向上准入**（事件只沿链上行、绝不下行，
@@ -31,6 +32,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub mod invariant;
 pub mod store;
@@ -47,17 +49,21 @@ pub use store::{AnonymousEntries, NamedEntries, ScopeLayer, ScopedLayers, Undo};
 
 /// 不透明作用域键：身份比较（指针相等）。对齐 TS `ScopeKey = object`。
 /// 不序列化、不可克隆语义；`create_scope`/`scope_target`/`ScopedLayers` 用它做键。
+///
+/// D-115（请求面并发化）：内层 `Rc<()>` → `Arc<()>`——使 `ScopeKey` 成为
+/// Send+Sync（dsh-agent 的 `Agent`/`AgentCtx`/`AgentBus` 嵌入 `ScopeKey`，
+/// 须随 D-115 Phase 2 作公开类型连锁升级）；指针身份语义不变。
 #[derive(Clone)]
-pub struct ScopeKey(Rc<()>);
+pub struct ScopeKey(Arc<()>);
 
 impl ScopeKey {
     /// 铸造一枚全新作用域键（幂等身份）：任何时候都不与其它键相等。
     pub fn new() -> Self {
-        ScopeKey(Rc::new(()))
+        ScopeKey(Arc::new(()))
     }
 
     fn ptr(&self) -> *const () {
-        Rc::as_ptr(&self.0)
+        Arc::as_ptr(&self.0)
     }
 }
 
@@ -177,7 +183,9 @@ pub fn scope_chain_of(key: Option<&ScopeKey>) -> Vec<ScopeKey> {
 
 /// base filter（对齐 TS `base[cordis.filter]`，以 base 为 `this` 调用）：
 /// Rust 用捕获 base 的闭包表达；返回 `true` = 放行 base 层面。
-pub type BaseFilter = Rc<dyn Fn() -> bool>;
+/// D-115：`Rc<dyn Fn>` → `Arc<dyn Fn + Send + Sync>`（`ScopeCarrier` 被
+/// dsh-agent 的 `AgentEntry` 存储，须随连锁升级）。
+pub type BaseFilter = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// 铸造出现成可以过滤监听者的 carrier：
 /// `tags: Option<ScopeKey>` 为路由键；`base_filter` 缺省 = 放行（无自定义 filter）。

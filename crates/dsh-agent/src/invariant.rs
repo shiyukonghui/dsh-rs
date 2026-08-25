@@ -1,8 +1,7 @@
 //! `agent-invariant` 伴生插件等效：全局观察 `agent/status`，拒绝同态重复转移。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use dsh_session::SessionId;
 
@@ -14,14 +13,14 @@ use crate::types::AgentStatus;
 pub struct AgentInvariant;
 
 impl AgentInvariant {
-    pub fn install(bus: &AgentBus, fail: Rc<dyn Fn(String)>) {
-        let last: Rc<RefCell<HashMap<SessionId, AgentStatus>>> =
-            Rc::new(RefCell::new(HashMap::new()));
+    pub fn install(bus: &AgentBus, fail: Arc<dyn Fn(String) + Send + Sync>) {
+        let last: Arc<Mutex<HashMap<SessionId, AgentStatus>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         bus.on(
             "agent/status",
             true,
             None,
-            Rc::new(move |_name, payload| {
+            Arc::new(move |_name, payload| {
                 let Some(status) = payload
                     .get("status")
                     .and_then(|v| serde_json::from_value::<AgentStatus>(v.clone()).ok())
@@ -35,7 +34,7 @@ impl AgentInvariant {
                 else {
                     return;
                 };
-                let prev = last.borrow_mut().insert(agent_id, status);
+                let prev = last.lock().unwrap().insert(agent_id, status);
                 if prev == Some(status) {
                     fail(format!(
                         "agent/status repeated {} (no-op transition)",

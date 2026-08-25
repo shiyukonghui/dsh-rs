@@ -5310,6 +5310,88 @@ Mutex 粗锁（本机单会话为主，可忽略）。回滚 = 逆向连锁换�
 
 ---
 
+## D-115（实施·Phase 2）：dsh-agent 整体 Send 化——Agent/Registry/Bus/Inbox/监听器族
+Arc 化 + 连锁更新 dsh-scope（ScopeKey/BaseFilter）与 dsh-agent-loop 消费面
+
+**日期**：2025（本机时间）
+
+**触发问题**：D-115 方案 II 的 Phase 2「dsh-agent」落地——把 `Agent`、`AgentRegistry`、
+`Inbox`、`AgentBus`、监听器族（`InboxNotify/NextFn/ChainListener/AgentListener`）、
+`model_selection.sel`、`invariant.last` 全部迁到 Arc/Mutex/Atomic，使 dsh-agent 公开
+句柄成为 Send+Sync（serve worker 化前置；设计 §4 顺序 Phase 2 dsh-agent）。
+
+**自下而上库存修正（与 Phase 0/Phase 1 盘点核对）**：**dsh-scope 隐性入局**——`Agent`/
+`AgentCtx`/`AgentBus.items` 嵌入 `ScopeKey(Rc<()>)`、`AgentEntry.carrier` 存
+`ScopeCarrier{ base_filter: BaseFilter = Rc<dyn Fn> }`；`Rc<()>` 与 `Rc<dyn Fn>` 均为
+!Send+!Sync，直接堵死 Agent/AgentEntry 的 Send+Sync。故 dsh-scope 作为公开类型传递依赖
+随迁（设计「三 crate 公开类型 Rc→Arc 连锁更新全部消费者」的自然外延）。dsh-system-prompt
+**不在库存**：`register_assemble_listener`/`ToolProvider`/`VariableProvider`/
+`AssembleNext`/`AssembleListener` 保持 `Rc<dyn Fn>`（Phase 3 预算外）——model_selection
+的组装侧监听器保持 Rc，仅闭包内捕获 Arc（sel）即可。
+
+**决策事项**：
+1. `dsh-scope`：`ScopeKey(Rc<()>)` → `ScopeKey(Arc<()>)`（指针身份语义不变：
+   `new()` 每次铸造全新 Arc，`ptr()`/`Eq`/`Hash` 按指针）；`BaseFilter = Rc<dyn Fn()>
+   → `Arc<dyn Fn() -> bool + Send + Sync>`。`Scope`/`ScopedContext`/`ScopeDisposer`
+   内部仍 Rc/RefCell 保留（不被 dsh-agent Send+Sync 面捕获；Phase 3/4 如有 worker 跨
+   线程作用域父链再议——模块级 SCOPE_STATE 仍是 thread_local）。
+2. `dsh-agent/agent_bus.rs`：监听器族 → `Arc<dyn Fn(..) + Send + Sync>`；
+   `items: Rc<RefCell<Vec<BusItem>>>` → `Mutex<Vec<Arc<BusItem>>>`；`select` 克隆
+   Arc 在外层收集后逐个执行（收集-再执行语义保留）。
+3. `dsh-agent/inbox.rs`：`Inbox{ inner: Arc<Mutex<InboxInner>> }`；
+   `InboxNotify = Arc<dyn Fn(&InboxNotification)+Send+Sync>`；所有 borrow → lock。
+4. `dsh-agent/registry.rs`：`Agent.status: Cell<AgentStatus>` → `AtomicU8`
+   （0=Idle,1=Running，`status()`/`set_status()` 原子读写）；`AgentEntry` 的
+   `announced/announcing/detach_requested: Cell<bool>` → `AtomicBool`；
+   registry `store/order/factory/initiator: RefCell` → `Mutex`；句柄 `Rc<Agent>`/`
+   Rc<AgentEntry>` → `Arc`；`factory: Rc<dyn AgentFactory>` → `Arc<dyn AgentFactory +
+   Send + Sync>`；register/enter_agent/set_factory 的 disposer `Rc<dyn Fn()>` →
+   `Arc<dyn Fn() + Send + Sync>`。`AgentFactory::create_agent/resume_agent` 返回
+   `Arc<Agent>`。锁序审计：`list/roots` 先克隆 order 再查 store（Mutex 短持）；
+   detach_entered「store 检查 → store 删除 → order retain」顺序取锁不嵌套，无环。
+5. `dsh-agent/invariant.rs`：`fail: Rc<dyn Fn(String)>` →
+   `Arc<dyn Fn(String)+Send+Sync>`；`last: Rc<RefCell<HashMap>>` → `Arc<Mutex<..>>`。
+6. `dsh-agent/model_selection.rs`：`sel: Rc<RefCell<ModelSelectionRef>>` →
+   `Arc<Mutex<..>>`；请求侧 `agent/request` 监听器 Arc；组装侧
+   `register_assemble_listener` 保持 Rc（dsh-system-prompt 库存外）但捕获 Arc sel。
+7. `dsh-agent-loop` 消费面连锁：`ReactLoopAgent.agent/registry: Rc<..>` →
+   `Arc<Agent>/Arc<AgentRegistry>`；`new()/build_loop_deps/create_loop_agent(_with_
+   tool_exec)` 签名 Rc→Arc；`AgentLoopHost.registry: Arc<AgentRegistry>`。
+   **新增共享取消令牌（Phase 4 前置缝）**：`ReactLoopAgent.cancel_token:
+   Arc<Mutex<Option<AgentCancelCause>>>` + `cancel_token()` 句柄 + `abort_reason()`
+   先消费令牌再回退 phase——因为 bus 监听器现在须 Send+Sync，测试里无法在监听器闭包
+   捕获 `Rc<ReactLoopAgent>` 直调 `cancel()`；令牌让 Send+Sync 上下文（bus 监听器 /
+   未来 worker 的 accept 线程）注入取消，driver 在 turn/step 边界轮询消费。`cancel()`
+   仅在**运行/维护相位**写令牌（idle 取消不得污染下一个 turn——对齐 dsh-cli web 回归
+   `session_cancel_accepted_idempotent_and_keeps_turns_driving`，仅清 inbox 不设 abort）。
+8. 测试连锁：m2d_agent/m2d_inbox/m2e2_driver/m2e3_service/m2f_interaction/m2_scope
+   的 `Rc<Agent>`/`Rc<AgentRegistry>` → Arc；bus 监听器闭包全 Arc+Send+Sync；日志
+   `Rc<RefCell<Vec/..>>` → `Arc<Mutex<..>>`/Atomic；`Agent.status.get()` → `status()`；
+   cancel 类测试经 `cancel_token()` 注入而非捕获 driver；steer 类测试经 Send 的
+   `agent.inbox.append_msg(NextStep)` 直注（对正在排空的 turn 与 steer 等价——
+   主循环按 next_step 续跑）。
+
+**最终选择**：上述 1-8。原子化 status/标志 + 整表 Mutex（粗锁，与 Phase 1 一致）；
+D-115 库存外的 dsh-scope 最小随迁（ScopeKey/BaseFilter Arc 化，Scope 内部不变）；
+dsh-agent-loop 仅消费面连锁 + 共享取消令牌（其自身 RefCell/LoopDeps/AgentLoopHost
+内部 Send 化仍属 Phase 3）。
+**被否决**：把 `ScopeKey` 内部换成 `Mutex<()>`/裸指针靠 unsafe 假性 Send（语义劣化、
+伤害代码卫生）；把 dsh-agent 各 Communicating 容器拆细锁/读写锁（与 Phase 1 粗锁决定
+一致——worker 化只要求 Send+Sync，不给并发热度加复杂度）；让 bus 监听器保持非 Send
+而仅把数据 Arc 化（worker 无法持有含监听器的 bus——自下而上不可行）。
+
+**预期影响与回滚点**：dsh-agent 全部公开句柄/监听器类型由 Rc→Arc（破坏性换型，
+编译期联动 dsh-scope/dsh-agent-loop/dsh-cli 消费者）；bus/registry/inbox 操作从借用
+变加锁（热路径粗锁，本机单会话可忽略）。回滚 = 逆向连锁（git revert 本提交）。
+**验证（Phase 2 关闸）**：`cargo test --workspace` 全绿 EXIT=0（191 套 ok，含
+dsh-agent 21+12+11 / dsh-agent-loop 各套 / dsh-scope 24 / dsh-cli 212+18；
+dsh-cli web `session_cancel_accepted_idempotent_and_keeps_turns_driving` 经取消令牌
+修正后回归通过）；`cargo clippy --workspace --all-targets` EXIT=0 零告警。
+60880 演示服务以 Phase 1 原命令行（`--workspace-root target/web-workspace
+--sqlite-store target/web/sessions.sqlite`）重启验证 HTTP 200（PID 变化）。
+
+---
+
 
 
 

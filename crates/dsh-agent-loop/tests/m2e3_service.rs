@@ -126,7 +126,7 @@ fn store() -> Arc<SessionStore> {
     Arc::new(SessionStore::new())
 }
 
-fn agent(store: &Arc<SessionStore>, id: &str, bus: &AgentBus) -> Rc<Agent> {
+fn agent(store: &Arc<SessionStore>, id: &str, bus: &AgentBus) -> Arc<Agent> {
     let s = store
         .create(
             Some(SessionId(id.to_string())),
@@ -139,7 +139,7 @@ fn agent(store: &Arc<SessionStore>, id: &str, bus: &AgentBus) -> Rc<Agent> {
             },
         )
         .unwrap();
-    Rc::new(
+    Arc::new(
         Agent::new(
             SessionId(id.to_string()),
             s,
@@ -193,7 +193,7 @@ fn real_loop_tool_call_then_answer_closes_turn() {
     let prompt = Rc::new(SystemPrompt::new(&Config::default(), Rc::new(|| {})).unwrap());
 
     let bus = AgentBus::new();
-    let reg = Rc::new(AgentRegistry::new(bus.clone()));
+    let reg = Arc::new(AgentRegistry::new(bus.clone()));
     let a = agent(&store(), "a", &bus);
     let driver = create_loop_agent(a.clone(), reg, prompt, llm, tools, 8);
 
@@ -290,7 +290,7 @@ fn real_loop_direct_answer_without_tools() {
     let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
     let prompt = Rc::new(SystemPrompt::new(&Config::default(), Rc::new(|| {})).unwrap());
     let bus = AgentBus::new();
-    let reg = Rc::new(AgentRegistry::new(bus.clone()));
+    let reg = Arc::new(AgentRegistry::new(bus.clone()));
     let a = agent(&store(), "b", &bus);
     let driver = create_loop_agent(a.clone(), reg, prompt, llm, tools, 8);
 
@@ -311,7 +311,7 @@ fn real_loop_exhausted_script_emits_turn_error() {
     let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
     let prompt = Rc::new(SystemPrompt::new(&Config::default(), Rc::new(|| {})).unwrap());
     let bus = AgentBus::new();
-    let reg = Rc::new(AgentRegistry::new(bus.clone()));
+    let reg = Arc::new(AgentRegistry::new(bus.clone()));
     let a = agent(&store(), "c", &bus);
     let driver = create_loop_agent(a.clone(), reg, prompt, llm, tools, 8);
 

@@ -152,7 +152,7 @@ pub struct AgentLoopHost {
     /// 共享 session store（`with_store` 注入；否则宿主自建）。
     pub store: Arc<SessionStore>,
     pub bus: AgentBus,
-    pub registry: Rc<AgentRegistry>,
+    pub registry: Arc<AgentRegistry>,
     pub llm: Rc<LlmRuntime>,
     pub tools: Rc<ToolRegistry>,
     pub prompt: Rc<SystemPrompt>,
@@ -208,7 +208,7 @@ impl AgentLoopHost {
             prompt.tools(None, provider);
         }
         let bus = AgentBus::new();
-        let registry = Rc::new(AgentRegistry::new(bus.clone()));
+        let registry = Arc::new(AgentRegistry::new(bus.clone()));
         Ok(Rc::new(AgentLoopHost {
             config,
             store,
@@ -314,7 +314,7 @@ impl AgentLoopHost {
                 })?,
         };
         let scope = ScopeKey::new();
-        let agent = Rc::new(
+        let agent = Arc::new(
             Agent::new(
                 SessionId::from_raw(session_id_str.clone()),
                 session,

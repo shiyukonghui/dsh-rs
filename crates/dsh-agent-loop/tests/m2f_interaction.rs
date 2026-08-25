@@ -111,7 +111,7 @@ fn stream(script: &[Vec<StreamChunk>]) -> (Rc<RefCell<VecDeque<Vec<StreamChunk>>
 }
 
 struct World {
-    a: Rc<Agent>,
+    a: Arc<Agent>,
     driver: Rc<dsh_agent_loop::ReactLoopAgent>,
     ran: Rc<Cell<bool>>,
 }
@@ -160,7 +160,7 @@ fn build(
 
     let prompt = Rc::new(SystemPrompt::new(&Config::default(), Rc::new(|| {})).unwrap());
     let bus = AgentBus::new();
-    let reg = Rc::new(AgentRegistry::new(bus.clone()));
+    let reg = Arc::new(AgentRegistry::new(bus.clone()));
     let store = Arc::new(SessionStore::new());
     let s = store
         .create(
@@ -171,7 +171,7 @@ fn build(
             },
         )
         .unwrap();
-    let a = Rc::new(
+    let a = Arc::new(
         Agent::new(
             SessionId("a".into()),
             s,

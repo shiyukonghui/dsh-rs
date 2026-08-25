@@ -2,9 +2,7 @@
 //! agent-invariant（移植 agent.spec.ts 的 registry、agent-initiator.spec.ts（sync 版）、
 //! dispatch、invariant.spec.ts 相关场景；错误消息逐字）。
 
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use dsh_agent::{
     agent_carrier, agent_value, assemble_context_for, emit_agent_event, fuse_agent, Agent,
@@ -40,19 +38,19 @@ fn session(store: &Arc<SessionStore>, id: &str) -> Arc<Session> {
 }
 
 struct TestWorld {
-    reg: Rc<AgentRegistry>,
+    reg: Arc<AgentRegistry>,
 }
 
 impl TestWorld {
     fn new() -> Self {
         TestWorld {
-            reg: Rc::new(AgentRegistry::new(AgentBus::new())),
+            reg: Arc::new(AgentRegistry::new(AgentBus::new())),
         }
     }
     /// 便捷：构造与 session id 一致的 agent（inbox 从空 session 重建）。
-    fn agent(&self, id: &str) -> Rc<Agent> {
+    fn agent(&self, id: &str) -> Arc<Agent> {
         let s = session(&store(), id);
-        Rc::new(
+        Arc::new(
             Agent::new(
                 SessionId(id.to_string()),
                 s,
@@ -64,27 +62,27 @@ impl TestWorld {
         )
     }
     /// 注册并返回 disposer（borrow 到 self 生命周期）。
-    fn register<'a>(&'a self, a: Rc<Agent>) -> Rc<dyn Fn() + 'a> {
+    fn register<'a>(&'a self, a: Arc<Agent>) -> Arc<dyn Fn() + 'a + Send + Sync> {
         self.reg.register(a, None).expect("register should succeed")
     }
 }
 
-fn global_log(_bus: &AgentBus) -> Rc<RefCell<Vec<String>>> {
-    Rc::new(RefCell::new(Vec::new()))
+fn global_log(_bus: &AgentBus) -> Arc<Mutex<Vec<String>>> {
+    Arc::new(Mutex::new(Vec::new()))
 }
 
 /// 全局监听某事件并把名字/载荷写入 log。
-fn listen(bus: &AgentBus, name: &'static str, log: Rc<RefCell<Vec<String>>>) {
+fn listen(bus: &AgentBus, name: &'static str, log: Arc<Mutex<Vec<String>>>) {
     bus.on(
         name,
         true,
         None,
-        Rc::new(move |got, _payload| log.borrow_mut().push(got.to_string())),
+        Arc::new(move |got, _payload| log.lock().unwrap().push(got.to_string())),
     );
 }
 
 // ---------------------------------------------------------------------------
-// registry：登记 / 生命周�序列
+// registry：登记 / 生命周期序列
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -117,18 +115,18 @@ fn register_lists_roots_and_disposes() {
     // dispose a → 只发一次 disposed
     w.reg.dispose(&a);
     w.reg.dispose(&a);
-    assert_eq!(disposed.borrow().iter().filter(|s| *s == "agent/disposed").count(), 1);
+    assert_eq!(disposed.lock().unwrap().iter().filter(|s| *s == "agent/disposed").count(), 1);
     w.reg.dispose(&child);
     assert!(w.reg.list().is_empty());
     // created 仍两次（enter 各自一次）
-    assert_eq!(created.borrow().len(), 2);
+    assert_eq!(created.lock().unwrap().len(), 2);
 }
 
 #[test]
 fn enter_identity_mismatch_rejects() {
     let w = TestWorld::new();
     let s = session(&store(), "session-a");
-    let stray = Rc::new(
+    let stray = Arc::new(
         Agent::new(
             SessionId("other".into()),
             s,
@@ -166,17 +164,17 @@ fn enter_announce_separation_and_repeat_announce() {
     let a = w.agent("sep");
     // enter 不发布
     let detach = w.reg.enter_agent(a.clone(), None).unwrap();
-    assert!(created.borrow().is_empty(), "enter must not emit created");
+    assert!(created.lock().unwrap().is_empty(), "enter must not emit created");
     // announce → created
     w.reg.announce_by_id(&SessionId("sep".into())).unwrap();
-    assert_eq!(created.borrow().len(), 1);
+    assert_eq!(created.lock().unwrap().len(), 1);
     // 重复 announce → 拒
     let err = w.reg.announce_by_id(&SessionId("sep".into())).err().unwrap();
     assert_eq!(err, "agent \"sep\" was already announced");
     // detach → disposed；再 detach no-op（幂等）
     detach();
     detach();
-    assert_eq!(disposed.borrow().len(), 1);
+    assert_eq!(disposed.lock().unwrap().len(), 1);
     assert!(w.reg.get(&SessionId("sep".into())).is_none());
 }
 
@@ -189,7 +187,7 @@ fn created_veto_rolls_back_to_disposed() {
         "agent/created",
         true,
         None,
-        Rc::new(|_, _| panic!("boom from created")),
+        Arc::new(|_, _| panic!("boom from created")),
     );
     let disposed = global_log(&bus);
     listen(&bus, "agent/disposed", disposed.clone());
@@ -198,7 +196,7 @@ fn created_veto_rolls_back_to_disposed() {
     assert_eq!(err, "boom from created");
     // 回滚：disposed 发出一次，且 entry 已拆
     assert_eq!(
-        disposed.borrow().iter().filter(|s| *s == "agent/disposed").count(),
+        disposed.lock().unwrap().iter().filter(|s| *s == "agent/disposed").count(),
         1
     );
     assert!(w.reg.get(&SessionId("veto".into())).is_none());
@@ -208,7 +206,7 @@ fn created_veto_rolls_back_to_disposed() {
 fn created_listener_detach_defers_to_unwind() {
     let w = TestWorld::new();
     let bus = w.reg.bus().clone();
-    let log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let a = w.agent("def");
 
     // 第一个 created listener：记 'first' → detach（延后）→ 记 'after-detach'
@@ -219,10 +217,10 @@ fn created_listener_detach_defers_to_unwind() {
         "agent/created",
         true,
         None,
-        Rc::new(move |_, _| {
-            log1.borrow_mut().push("first".into());
+        Arc::new(move |_, _| {
+            log1.lock().unwrap().push("first".into());
             reg.dispose(&a1);
-            log1.borrow_mut().push("after-detach".into());
+            log1.lock().unwrap().push("after-detach".into());
         }),
     );
     // 第二个 created listener：仍收到 created（detach 延后），且 entry 仍 live
@@ -231,9 +229,9 @@ fn created_listener_detach_defers_to_unwind() {
         "agent/created",
         true,
         None,
-        Rc::new(move |_, p| {
+        Arc::new(move |_, p| {
             assert_eq!(p["agent"]["id"], "def");
-            log2.borrow_mut().push("second".into());
+            log2.lock().unwrap().push("second".into());
         }),
     );
     // disposed listener
@@ -242,11 +240,11 @@ fn created_listener_detach_defers_to_unwind() {
         "agent/disposed",
         true,
         None,
-        Rc::new(move |_, _| log3.borrow_mut().push("disposed".into())),
+        Arc::new(move |_, _| log3.lock().unwrap().push("disposed".into())),
     );
 
     w.register(a.clone());
-    let after = log.borrow().clone();
+    let after = log.lock().unwrap().clone();
     assert_eq!(after, vec!["first", "after-detach", "second", "disposed"]);
     assert!(w.reg.get(&SessionId("def".into())).is_none());
 }
@@ -298,7 +296,7 @@ fn announce_on_non_live_entry_rejects() {
 
 #[allow(clippy::type_complexity)]
 struct FakeFactory {
-    calls: Rc<RefCell<Vec<(Option<SessionId>, SessionId)>>>,
+    calls: Arc<Mutex<Vec<(Option<SessionId>, SessionId)>>>,
     bus: AgentBus,
 }
 
@@ -307,13 +305,14 @@ impl AgentFactory for FakeFactory {
         &self,
         owner: Option<SessionId>,
         options: &CreateAgentOptions,
-    ) -> Result<Rc<Agent>, String> {
+    ) -> Result<Arc<Agent>, String> {
         self.calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push((owner, options.session_id.clone()));
         let id = options.session_id.raw();
         let s = session(&store(), id);
-        Ok(Rc::new(
+        Ok(Arc::new(
             Agent::new(
                 options.session_id.clone(),
                 s,
@@ -328,12 +327,13 @@ impl AgentFactory for FakeFactory {
         &self,
         owner: Option<SessionId>,
         options: &ResumeAgentOptions,
-    ) -> Result<Rc<Agent>, String> {
+    ) -> Result<Arc<Agent>, String> {
         self.calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push((owner, options.resume_session_id.clone()));
         let s = session(&store(), options.resume_session_id.raw());
-        Ok(Rc::new(
+        Ok(Arc::new(
             Agent::new(
                 options.resume_session_id.clone(),
                 s,
@@ -357,8 +357,8 @@ fn factory_seam_rejects_without_factory_and_single_registration() {
     let err = w.reg.create(&opts).err().unwrap();
     assert_eq!(err, "no agent factory registered (load an agent-loop plugin)");
 
-    let calls = Rc::new(RefCell::new(Vec::new()));
-    let factory = Rc::new(FakeFactory {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(FakeFactory {
         calls: calls.clone(),
         bus: w.reg.bus().clone(),
     });
@@ -366,8 +366,8 @@ fn factory_seam_rejects_without_factory_and_single_registration() {
     // 第二个 factory → 拒
     let err2 = w
         .reg
-        .set_factory(Rc::new(FakeFactory {
-            calls: Rc::new(RefCell::new(Vec::new())),
+        .set_factory(Arc::new(FakeFactory {
+            calls: Arc::new(Mutex::new(Vec::new())),
             bus: w.reg.bus().clone(),
         }))
         .err()
@@ -377,8 +377,8 @@ fn factory_seam_rejects_without_factory_and_single_registration() {
     // create 委托（owner = 当前 initiator，栈外为 None）
     let created = w.reg.create(&opts).unwrap();
     assert_eq!(created.id, SessionId("f".into()));
-    assert_eq!(calls.borrow().len(), 1);
-    assert_eq!(calls.borrow()[0].0, None);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(calls.lock().unwrap()[0].0, None);
 
     // disposer 清空 slot → create 再拒
     disposer();
@@ -467,13 +467,13 @@ fn initiator_scope_restores_after_panic() {
 fn emit_fuses_agent_and_injects_subject_over_conflict() {
     let w = TestWorld::new();
     let bus = w.reg.bus().clone();
-    let got: Rc<RefCell<Option<Value>>> = Rc::new(RefCell::new(None));
+    let got: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
     let got2 = got.clone();
     bus.on(
         "agent/inbox/inserted",
         true,
         None,
-        Rc::new(move |_, p| *got2.borrow_mut() = Some(p.clone())),
+        Arc::new(move |_, p| *got2.lock().unwrap() = Some(p.clone())),
     );
     let a = w.agent("fus");
     let carrier = agent_carrier(&a);
@@ -484,7 +484,7 @@ fn emit_fuses_agent_and_injects_subject_over_conflict() {
         json!({ "agent": "WRONG", "message": { "id": "m1" } }),
         &mut Vec::new(),
     );
-    let payload = got.borrow().clone().unwrap();
+    let payload = got.lock().unwrap().clone().unwrap();
     // 冲突的 agent 字段被注入 subject 覆盖
     assert_eq!(payload["agent"]["id"], "fus");
     assert_eq!(payload["message"]["id"], "m1");
@@ -494,15 +494,15 @@ fn emit_fuses_agent_and_injects_subject_over_conflict() {
 fn emit_containment_not_veto_and_no_starvation() {
     let w = TestWorld::new();
     let bus = w.reg.bus().clone();
-    let log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     // 第一个监听器抛
     let log1 = log.clone();
     bus.on(
         "agent/boom",
         true,
         None,
-        Rc::new(move |_, _| {
-            log1.borrow_mut().push("first".into());
+        Arc::new(move |_, _| {
+            log1.lock().unwrap().push("first".into());
             panic!("listener boom");
         }),
     );
@@ -512,13 +512,13 @@ fn emit_containment_not_veto_and_no_starvation() {
         "agent/boom",
         true,
         None,
-        Rc::new(move |_, _| log2.borrow_mut().push("second".into())),
+        Arc::new(move |_, _| log2.lock().unwrap().push("second".into())),
     );
     let a = w.agent("boom");
     let mut warns = Vec::new();
     emit_agent_event(&bus, &a, "agent/boom", json!({}), &mut warns);
     // 通知不可 veto：第二个监听器未饿死
-    assert_eq!(log.borrow()[..], vec!["first", "second"]);
+    assert_eq!(log.lock().unwrap()[..], vec!["first", "second"]);
     // warn 逐字
     assert_eq!(warns.len(), 1);
     assert_eq!(warns[0], "agent event \"agent/boom\" listener threw: listener boom");
@@ -528,16 +528,16 @@ fn emit_containment_not_veto_and_no_starvation() {
 fn serial_fuses_subject_and_respects_next() {
     let w = TestWorld::new();
     let bus = w.reg.bus().clone();
-    let order: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     // 串行监听器：改载荷 + 继续
     let o1 = order.clone();
     bus.on_chain(
         "agent/turn-stopping",
         true,
         None,
-        Rc::new(move |mut p: Value, next: NextFn| {
+        Arc::new(move |mut p: Value, next: NextFn| {
             let agent_id = p["agent"]["id"].as_str().unwrap().to_string();
-            o1.borrow_mut().push(format!("ln1:{agent_id}"));
+            o1.lock().unwrap().push(format!("ln1:{agent_id}"));
             p["turn"] = json!(4); // 替换参数
             next(p)
         }),
@@ -547,27 +547,28 @@ fn serial_fuses_subject_and_respects_next() {
         "agent/turn-stopping",
         true,
         None,
-        Rc::new(move |p: Value, next: NextFn| {
-            o2.borrow_mut().push(format!("ln2:{}", p["turn"]));
+        Arc::new(move |p: Value, next: NextFn| {
+            o2.lock().unwrap().push(format!("ln2:{}", p["turn"]));
             next(p)
         }),
     );
     let a = w.agent("ser");
     let carrier = agent_carrier(&a);
     let d = AgentEventDispatch::new(bus.clone(), carrier);
-    let innermost_called = Rc::new(Cell::new(false));
-    let ic = innermost_called.clone();
+    let innermost_called = std::sync::atomic::AtomicBool::new(false);
+    let ic = std::sync::Arc::new(innermost_called);
+    let ic2 = ic.clone();
     let result = d.serial(
         &a,
         "agent/turn-stopping",
         json!({ "turn": 3, "signal": "cancel" }),
-        Rc::new(move |p| {
-            ic.set(true);
+        Arc::new(move |p| {
+            ic2.store(true, std::sync::atomic::Ordering::SeqCst);
             p
         }),
     );
-    assert!(innermost_called.get());
-    assert_eq!(order.borrow()[..], vec!["ln1:ser", "ln2:4"]);
+    assert!(ic.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(order.lock().unwrap()[..], vec!["ln1:ser", "ln2:4"]);
     assert_eq!(result["turn"], 4);
 }
 
@@ -575,17 +576,17 @@ fn serial_fuses_subject_and_respects_next() {
 fn emit_agent_event_oneshot_and_fuse_conflict() {
     let w = TestWorld::new();
     let bus = w.reg.bus().clone();
-    let got: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let got: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let got2 = got.clone();
     bus.on(
         "agent/x",
         true,
         None,
-        Rc::new(move |_, p| *got2.borrow_mut() = Some(p["agent"]["id"].as_str().unwrap().to_string())),
+        Arc::new(move |_, p| *got2.lock().unwrap() = Some(p["agent"]["id"].as_str().unwrap().to_string())),
     );
     let a = w.agent("one");
     emit_agent_event(&bus, &a, "agent/x", json!({}), &mut Vec::new());
-    assert_eq!(got.borrow().as_deref(), Some("one"));
+    assert_eq!(got.lock().unwrap().as_deref(), Some("one"));
 }
 
 #[test]
@@ -607,9 +608,9 @@ fn assemble_context_for_sets_scope_to_agent() {
 fn invariant_rejects_noop_status_transition() {
     let w = TestWorld::new();
     let bus = w.reg.bus().clone();
-    let fails: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let fails: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let f = fails.clone();
-    AgentInvariant::install(&bus, Rc::new(move |m| f.borrow_mut().push(m)));
+    AgentInvariant::install(&bus, Arc::new(move |m| f.lock().unwrap().push(m)));
     let a = w.agent("inv");
 
     let mut warns = Vec::new();
@@ -619,7 +620,7 @@ fn invariant_rejects_noop_status_transition() {
     emit_agent_event(&bus, &a, "agent/status", json!({ "status": "idle" }), &mut warns);
 
     assert_eq!(
-        fails.borrow()[..],
+        fails.lock().unwrap()[..],
         vec![
             "agent/status repeated running (no-op transition)",
             "agent/status repeated idle (no-op transition)"
@@ -634,11 +635,10 @@ fn invariant_rejects_noop_status_transition() {
 use dsh_agent::{install_model_selection, ModelSelection, ModelSelectionRef};
 use dsh_brand::ReasoningEffortId;
 use dsh_system_prompt::{AssembleContext, Config, SystemPrompt};
-use std::cell::RefCell as StdRefCell;
-use std::rc::Rc as StdRc;
+use std::rc::Rc;
 
 fn sp() -> Rc<SystemPrompt> {
-    Rc::new(SystemPrompt::new(&Config::default(), StdRc::new(|| {})).unwrap())
+    Rc::new(SystemPrompt::new(&Config::default(), Rc::new(|| {})).unwrap())
 }
 
 #[test]
@@ -646,7 +646,7 @@ fn model_selection_overrides_assembly_variables_and_assemble_request() {
     let w = TestWorld::new();
     let bus = w.reg.bus().clone();
     let sp = sp();
-    let sel: StdRc<StdRefCell<ModelSelectionRef>> = StdRc::new(StdRefCell::new(ModelSelectionRef {
+    let sel: Arc<Mutex<ModelSelectionRef>> = Arc::new(Mutex::new(ModelSelectionRef {
         current: Some(ModelSelection {
             provider: "litellm".into(),
             model: "deepseek-r1".into(),
@@ -672,7 +672,7 @@ fn model_selection_overrides_assembly_variables_and_assemble_request() {
     assert_eq!(vars.get("model").map(String::as_str), Some("deepseek-r1"));
     // assembled 快照 == 进入时的 current
     assert_eq!(
-        sel.borrow().assembled.as_ref().map(|s| s.model.as_str()),
+        sel.lock().unwrap().assembled.as_ref().map(|s| s.model.as_str()),
         Some("deepseek-r1")
     );
 
@@ -685,7 +685,7 @@ fn model_selection_overrides_assembly_variables_and_assemble_request() {
     });
     let carrier = agent_carrier(&agent);
     let result = bus
-        .waterfall(&carrier, "agent/request", payload, StdRc::new(|p| p));
+        .waterfall(&carrier, "agent/request", payload, std::sync::Arc::new(|p| p));
     assert_eq!(result["provider"], "litellm");
     assert_eq!(result["model"], "deepseek-r1");
     assert_eq!(result["maxTokens"], 1024);
@@ -697,15 +697,15 @@ fn model_selection_assembled_unset_passes_request_through() {
     let w = TestWorld::new();
     let bus = w.reg.bus().clone();
     let sp = sp();
-    let sel: StdRc<StdRefCell<ModelSelectionRef>> =
-        StdRc::new(StdRefCell::new(ModelSelectionRef::default()));
+    let sel: Arc<Mutex<ModelSelectionRef>> =
+        Arc::new(Mutex::new(ModelSelectionRef::default()));
     let agent = w.agent("ms2");
     install_model_selection(&sp, &bus, &agent.scope, sel.clone());
 
     // 未组装（assembled None）→ 请求原样透传
     let payload = json!({ "provider": "x", "model": "y", "reasoningEffort": "low" });
     let carrier = agent_carrier(&agent);
-    let result = bus.waterfall(&carrier, "agent/request", payload, StdRc::new(|p| p));
+    let result = bus.waterfall(&carrier, "agent/request", payload, std::sync::Arc::new(|p| p));
     assert_eq!(result["provider"], "x");
     assert_eq!(result["reasoningEffort"], "low");
 }
@@ -715,7 +715,7 @@ fn model_selection_no_reasoning_effort_strips_inherited() {
     let w = TestWorld::new();
     let bus = w.reg.bus().clone();
     let sp = sp();
-    let sel: StdRc<StdRefCell<ModelSelectionRef>> = StdRc::new(StdRefCell::new(ModelSelectionRef {
+    let sel: Arc<Mutex<ModelSelectionRef>> = Arc::new(Mutex::new(ModelSelectionRef {
         current: Some(ModelSelection {
             provider: "p".into(),
             model: "m".into(),
@@ -733,7 +733,7 @@ fn model_selection_no_reasoning_effort_strips_inherited() {
     .unwrap();
     let payload = json!({ "provider": "x", "model": "y", "reasoningEffort": "medium" });
     let carrier = agent_carrier(&agent);
-    let result = bus.waterfall(&carrier, "agent/request", payload, StdRc::new(|p| p));
+    let result = bus.waterfall(&carrier, "agent/request", payload, std::sync::Arc::new(|p| p));
     // selected.reasoningEffort 缺省 → 继承的 reasoningEffort 无条件剥离（不恢复）
     assert!(result.get("reasoningEffort").is_none());
     assert_eq!(result["provider"], "p");
@@ -750,5 +750,5 @@ fn _fuse(agent: &Agent) -> Value {
 }
 #[allow(dead_code)]
 fn _status(a: &Agent) -> AgentStatus {
-    a.status.get()
+    a.status()
 }
