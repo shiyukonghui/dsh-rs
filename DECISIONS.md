@@ -4675,6 +4675,29 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
 - 验收关闸见 PLAN §2；本条目是需求阶段工件，回滚 = 无代码变更、删/改本规划即可。
 - 下一：**系统设计阶段（当前）**——S1 wire/RPC 面 + S2 loop 异步工具门设计决策 → TDD。
 
+### D-106 设计决策（approval RPC 里程碑，round 1；无实现）
+
+- 触发：需求关闸通过（D-a 异步 / D-b 清单 / D-c 留后续）；进入设计。
+- 自下而上补核（设计关键）：loop 驱动为同步 inline drain（send/kick 前整个 driver
+  排空，D-032）；`turn()` 主循环 step→tool_exec→续步，tool_exec 是可注入缝
+  `Rc<dyn Fn(&ToolExecCtx)->ToolExecOutcome>`；pre_step 空 inbox 仍给 Enter+assembly
+  （step0+空消息短路在 turn() line~523-527）；phase 有 Running/Idle 停驻（kick 循环后
+  set Idle，恢复需重踢新 turn）；invariant 只查 step 闭 + open_turn（turn/end 不要求
+  pending_calls 空）且 tool/result 跨 turn 删 call 成立（line 197 只查属主）；web 经
+  `AgentLoopHost::with_store` + followup 驱动，`run_rust_loop` 返回 `{"accepted":true}`。
+- 设计定稿（PLAN §4）：**loop 只加通用 pending 机制**（ToolExecOutcome.pending +
+  ToolExecCtx.resume + 恢复只追加 result 防重复 tool/call + `TurnEndReason::Approval
+  Pending` + agent 级 approval_pending（非 Phase，越过 Idle 存活）+ turn 短路条件 +
+  AgentLoopHost.kick（bare-wake））；**策略全在宿主**（ApprovalGate：D-b mutation 集/
+  plan_active 经 agent→session fold/fold_decided/emit_asked/合成拒绝；tool_exec 包装；
+  `session.approval.decide` RPC → approval/decided + kick 恢复；run_rust_loop 返回
+  approvalPending 面）。S1 = `session.plan.mode{active, message?}`，宿主 leave 无
+  heading 前置（模型 exit_plan_mode 保持三重前置不变）；approval/policy 首条诚实宣告
+  作用域。
+- 事件契约 / 不变量相容论证 / 分拆提交（A loop 机制 / B 宿主策略 / C S1 RPC，各独立
+  回滚点）/ 风险（A 状态机最险→先独立全量回归）见 PLAN §4.2-4.5。
+- 回滚：未实现，改 PLAN/DECISIONS 即可；实现后 `git revert` 各段。
+
 ### D-104 实施补记预留
 
 
