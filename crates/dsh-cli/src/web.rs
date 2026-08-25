@@ -3345,6 +3345,22 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
         "subagent.list" | "subagent.history" | "subagent.prompt" | "subagent.interrupt" => {
             subagent_dispatch(boot, method, payload, host)
         }
+        // D-106/S1：宿主 plan-mode 入口/出口（用户侧动作，进入/离开无前置；standing
+        // 折叠段随 `plan/mode` 事件注入/撤下；`approval/policy` 诚实宣告同落）。
+        "session.plan.mode" => {
+            let active = payload.get("active").and_then(Value::as_bool).unwrap_or(false);
+            let message = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            match crate::web::approval::set_plan_mode(boot, active, message.as_deref()) {
+                Ok(a) => serde_json::json!({"ok": true, "value": {"active": a}}),
+                Err(e) => serde_json::json!({"ok": false, "error": {
+                    "code": "internal",
+                    "message": e,
+                }}),
+            }
+        }
         // D-106：执行层审批决定——写 `approval/decided` + 裸踢恢复（GUI 弹窗回执）。
         "session.approval.decide" => {
             let call_id = payload
@@ -3428,6 +3444,7 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use dsh_session::EventKind;
 
     /// 测试用闭包插件（提供 sessions 服务）。
     type PluginBody = Box<dyn Fn(&Cordis, Value) -> Result<EffectOutcome, CordisError>>;
@@ -3507,6 +3524,65 @@ mod tests {
             )),
             plan_session: None,
         }
+    }
+
+    /// D-106/S1：`session.plan.mode` 宿主入口/出口——落 `plan/mode`（含 message）+
+    /// `approval/policy` 诚实宣告；离开无 heading 前置；折叠源即时可见。
+    #[test]
+    fn session_plan_mode_sets_mode_and_declares_policy() {
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let m4 = M4HostServices {
+            jobs: None,
+            schedule: None,
+            todo: None,
+            plan_mode: None,
+        };
+        let root = std::env::temp_dir().join(format!("dsh-m6-planmode-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        let loop_host = assemble_server_loop(
+            session_host.store.clone(),
+            root.clone(),
+            llm,
+            "mock",
+            "mock-model",
+            m4,
+            m5,
+        )
+        .expect("assemble ok");
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(loop_host.clone());
+        boot.plan_session = Some(std::rc::Rc::new(std::cell::RefCell::new("default".to_string())));
+
+        // 进入（宿主动作，无前置）。
+        assert!(crate::web::approval::set_plan_mode(&boot, true, Some("investigate")).unwrap());
+        let sid = dsh_session::types::SessionId::from_raw("default".to_string());
+        let s = loop_host.store.get(&sid).unwrap();
+        let evs = s.events();
+        assert!(dsh_plan::fold_plan_mode(&evs), "折叠源即时可见 true");
+        let mode = evs.iter().rfind(|e| e.kind == EventKind::PlanMode).unwrap();
+        assert_eq!(mode.data["active"], json!(true));
+        assert_eq!(mode.data["message"], json!("investigate"));
+        let pol = evs.iter().rfind(|e| e.kind == EventKind::ApprovalPolicy).unwrap();
+        assert_eq!(pol.data["active"], json!(true));
+        assert_eq!(pol.data["scope"], json!("mutation"));
+        assert_eq!(
+            pol.data["tools"].as_array().map(|a| a.len()),
+            Some(crate::web::approval::mutation_tool_set().len())
+        );
+
+        // 离开（宿主动作，**无 heading 前置**）。
+        assert!(!crate::web::approval::set_plan_mode(&boot, false, None).unwrap());
+        let s = loop_host.store.get(&sid).unwrap();
+        assert!(!dsh_plan::fold_plan_mode(&s.events()), "离开后折叠 false（无 heading 前置）");
+        let evs = s.events();
+        let pol = evs.iter().rfind(|e| e.kind == EventKind::ApprovalPolicy).unwrap();
+        assert_eq!(pol.data["active"], json!(false));
     }
 
     fn echo_component_bytes() -> Vec<u8> {

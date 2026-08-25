@@ -4757,6 +4757,27 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
   （segB-regression.txt）；live 复验推迟到 D 段。
 - 回滚：`git revert` 段 B 提交（loop 缝 + approval.rs + RPC + 返回面 + tests）。
 
+### D-106 段 C 实施（S1：宿主 plan-mode 入口/出口 + approval/policy 宣告，round 2；TDD 红→绿）
+
+- 触发：段 B（执行层审批策略）提交 `53e5863`；S1 是用户侧入口面。
+- 自下而上核证：`PlanModeHost`（M4 exit_plan_mode 工具绑定 + 三重前置）已在 D-105；
+  standing 折叠源（`boot.plan_session` + `dsh_plan::fold_plan_mode`）已在 web 装配；
+  `EventKind::PlanMode/ApprovalPolicy` 词已在 dsh-session。缺口 = 用户侧「进入/离开」
+  RPC（宿主动作，不经过模型工具前置）。
+- 实现（dsh-cli web）：
+  - `approval::set_plan_mode(boot, active, message?)`：落 `plan/mode`
+    （`{active, message?}`）+ `approval/policy`（`{active, scope:"mutation",
+    tools:[D-b清单]}` 诚实宣告）到 `boot.plan_session` 目标会话；standing 折叠段随事件
+    注入/撤下。
+  - RPC `session.plan.mode {active, message?}`。**进入与离开都无前置**：宿主 leave 是
+    GUI 用户显式动作，不要求 plan heading；模型 `exit_plan_mode` 保持 dsh_plan
+    三重前置不变（两者分面）。
+- 测试（TDD）：进入 → 折叠可见 true + `plan/mode{active,message}` + `approval/policy
+  {active,scope,tools=D-b}`；离开 → 折叠 false（无 heading 前置）+ policy active:false。
+- 验证：dsh-cli clippy `-D warnings` 零；全 workspace 回归（segC-regression.txt）；
+  live 复验推迟到 D 段。
+- 回滚：`git revert` 段 C 提交（approval.rs + web.rs 分支 + 测试）。
+
 ### D-104 实施补记预留
 
 

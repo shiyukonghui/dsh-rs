@@ -233,6 +233,53 @@ pub fn decide(boot: &crate::Boot, call_id: &str, decision: &str) -> Result<usize
     Ok(host.pending_calls(AGENT)?.len())
 }
 
+/// D-106/S1：宿主 plan-mode 入口/出口（`session.plan.mode` RPC 后端）。
+/// 用户侧动作：进入与离开都**无前置**——宿主 leave 是 GUI 用户显式动作，不要求
+/// plan heading；模型 `exit_plan_mode` 保持 dsh_plan 三重前置不变。落 `plan/mode`
+/// 事件（standing 折叠段随事件注入/撤下）+ `approval/policy` 诚实宣告
+/// （作用域 `mutation`，工具集即 D-b 清单）。返回当前 plan-active 值。
+pub fn set_plan_mode(
+    boot: &crate::Boot,
+    active: bool,
+    message: Option<&str>,
+) -> Result<bool, String> {
+    let sid = boot
+        .plan_session
+        .as_ref()
+        .map(|ps| ps.borrow().clone())
+        .unwrap_or_else(|| "default".to_string());
+    let host = boot
+        .agent_loop
+        .as_ref()
+        .ok_or_else(|| "no Rust AgentLoopHost assembled in this boot".to_string())?;
+    let session = host
+        .store
+        .get(&dsh_session::types::SessionId::from_raw(sid.clone()))
+        .ok_or_else(|| format!("session \"{sid}\" missing"))?;
+    let mut mode = serde_json::Map::new();
+    mode.insert("active".to_string(), json!(active));
+    if active {
+        if let Some(m) = message {
+            mode.insert("message".to_string(), json!(m));
+        }
+    }
+    session
+        .append(EventKind::PlanMode, Value::Object(mode), None)
+        .map_err(|e| e.0)?;
+    session
+        .append(
+            EventKind::ApprovalPolicy,
+            json!({
+                "active": active,
+                "scope": "mutation",
+                "tools": mutation_tool_set(),
+            }),
+            None,
+        )
+        .map_err(|e| e.0)?;
+    Ok(active)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
