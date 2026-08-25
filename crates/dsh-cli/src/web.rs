@@ -313,6 +313,11 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
     let host_events: Arc<std::sync::Mutex<Vec<Value>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     boot.host_events = Some(host_events.clone());
+    // D-114：运行位投影——agent-loop 下把 turn/start、turn/end 同步镜像为
+    // `host/session-status` 帧（前端发送按钮→停止按钮的唯一驱动源）。
+    if boot.agent_loop.is_some() {
+        install_session_running_frames(&host.store, Some(host_events.clone()));
+    }
     loop {
         let request = match server.recv_timeout(std::time::Duration::from_millis(M6_SERVE_TICK_INTERVAL_MS)) {
             Ok(Some(request)) => Some(request),
@@ -1364,6 +1369,35 @@ pub fn push_host_frame(boot: &Boot, payload: serde_json::Value) {
             log.push(payload);
         }
     }
+}
+
+/// D-114：会话运行位投影——逐 turn 推送 `host/session-status {running}` 帧，驱动前端
+/// 发送按钮 ↔ 停止按钮切换（客户端 `Session.handleRunning` 只消费 host 帧，不看
+/// session/event）。机理：`SessionStore::enter` 已给每个会话装 append 转发钩子，store 级
+/// `on_event` 在 turn/start、turn/end 落地**当下**（append 提交）同步触发——单线程 serve 里
+/// 阻塞 turn 期间无法另起 tick，故必须由落盘瞬间回调推送。非 agent-loop（boot.host_events
+/// None）→ 无宿主日志，no-op。
+pub fn install_session_running_frames(
+    store: &std::rc::Rc<dsh_session::store::SessionStore>,
+    host_events: Option<std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
+) {
+    store.on_event(Box::new(move |session, event| {
+        let running = match event.kind {
+            dsh_session::types::EventKind::TurnStart => Some(true),
+            dsh_session::types::EventKind::TurnEnd => Some(false),
+            _ => None,
+        };
+        let Some(running) = running else { return };
+        if let Some(log) = &host_events {
+            if let Ok(mut log) = log.lock() {
+                log.push(serde_json::json!({
+                    "type": "host/session-status",
+                    "sessionId": session.id().to_string(),
+                    "running": running,
+                }));
+            }
+        }
+    }));
 }
 
 /// RPC 分派是 handle_rpc_host 的纯函数核心：把方法 + payload → `{ok,value|error}`。
@@ -3127,6 +3161,28 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             serde_json::json!({"ok": true, "value": {"accepted": true}})
         }
         "session.cancel" => {
+            // D-114：真取消——按会话定位其 driver，向运行中的 turn 注入 User abort
+            // （driver 在 step 边界检查 abort_reason → turn/end reason=aborted）。
+            // 幂等：无对应 agent / 已 idle → 同样 accepted（driver.cancel 对 idle 为
+            // no-op）。边界见 DECISIONS D-114：单线程 serve 目录下取消请求需在 turn
+            // 间隙到达（turn 内并发送达属后续架构项）。
+            let sid = payload
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("default")
+                .to_string();
+            if let Some(loop_host) = &boot.agent_loop {
+                if let Some(configured) = loop_host.configured_for_session(&sid) {
+                    if let Some(driver) = loop_host.agent(&configured.id) {
+                        driver.cancel(
+                            dsh_agent::AgentCancelCause::User,
+                            &dsh_agent::CancelOptions {
+                                keep_inbox: Some(false),
+                            },
+                        );
+                    }
+                }
+            }
             serde_json::json!({"ok": true, "value": {"accepted": true}})
         }
         "session.attachment" => {
@@ -8426,6 +8482,221 @@ mod tests {
         assert!(
             evs.iter().any(|e| e.kind.as_str() == "assistant/message"),
             "assistant resume message in shared store"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// D-114：发送按钮 ↔ 停止按钮由客户端 `session.running` 位驱动，而该位只写入
+    /// `host/session-status` 帧（`handleRunning`）。服务器必须逐 turn 推送
+    /// `{type:"host/session-status", sessionId, running}`：TurnStart→true、TurnEnd→false。
+    /// 红：`install_session_running_frames` 尚不存在 → 编译失败（TDD 红）。
+    #[test]
+    fn session_running_frames_follow_turn_boundaries_per_turn() {
+        use dsh_llm::{ContentBlock, FinishReason, StreamChunk};
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+
+        fn text_chunks(text: &str) -> Vec<StreamChunk> {
+            vec![
+                StreamChunk::BlockStart {
+                    index: 0,
+                    block_type: "text".parse().unwrap(),
+                },
+                StreamChunk::TextDelta {
+                    index: 0,
+                    text: text.into(),
+                },
+                StreamChunk::BlockEnd {
+                    index: 0,
+                    block: ContentBlock::text(text),
+                },
+                StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay_state: None,
+                },
+            ]
+        }
+
+        struct Adapter {
+            script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>,
+        }
+        impl dsh_llm::LlmAdapter for Adapter {
+            fn stream(
+                &self,
+                _options: dsh_llm::GenerateOptions,
+            ) -> Box<dyn Iterator<Item = StreamChunk>> {
+                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                Box::new(next.into_iter())
+            }
+        }
+        let script = Rc::new(RefCell::new(VecDeque::from_iter([
+            text_chunks("first"),
+            text_chunks("second"),
+        ])));
+        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Rc::new(Adapter { script }))
+            .unwrap();
+
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let m4 = M4HostServices {
+            jobs: None,
+            schedule: None,
+            todo: None,
+            plan_mode: None,
+        };
+        let root = std::env::temp_dir().join(format!("dsh-running-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let loop_host = assemble_server_loop(
+            session_host.store.clone(),
+            root.clone(),
+            llm,
+            "mock",
+            "mock-model",
+            m4,
+            m5,
+        )
+        .expect("assemble_server_loop ok");
+
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(loop_host.clone());
+        let host_events: std::sync::Arc<std::sync::Mutex<Vec<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        boot.host_events = Some(host_events.clone());
+        crate::web::install_session_running_frames(&session_host.store, Some(host_events.clone()));
+
+        crate::run_rust_loop(&boot, "default", "first turn").expect("turn 1 runs");
+        crate::run_rust_loop(&boot, "default", "second turn").expect("turn 2 runs");
+
+        let log = host_events.lock().unwrap();
+        let running: Vec<(String, bool)> = log
+            .iter()
+            .filter(|f| f["type"] == "host/session-status")
+            .map(|f| (
+                f["sessionId"].as_str().unwrap_or_default().to_string(),
+                f["running"].as_bool().unwrap_or(false),
+            ))
+            .collect();
+        assert_eq!(
+            running,
+            vec![
+                ("default".to_string(), true),
+                ("default".to_string(), false),
+                ("default".to_string(), true),
+                ("default".to_string(), false),
+            ],
+            "per-turn running flip drives the send/stop toggle: {running:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// D-114：`session.cancel` 走真实 driver 取消接线——按会话定位其驱动，幂等 accepted，
+    /// 未知会话 no-op 不报错，且不破坏后续 turn（中止注入在 step 边界生效；idle 时为 no-op）。
+    #[test]
+    fn session_cancel_accepted_idempotent_and_keeps_turns_driving() {
+        use dsh_llm::{ContentBlock, FinishReason, StreamChunk};
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+
+        fn text_chunks(text: &str) -> Vec<StreamChunk> {
+            vec![
+                StreamChunk::BlockStart {
+                    index: 0,
+                    block_type: "text".parse().unwrap(),
+                },
+                StreamChunk::TextDelta {
+                    index: 0,
+                    text: text.into(),
+                },
+                StreamChunk::BlockEnd {
+                    index: 0,
+                    block: ContentBlock::text(text),
+                },
+                StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay_state: None,
+                },
+            ]
+        }
+
+        struct Adapter {
+            script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>,
+        }
+        impl dsh_llm::LlmAdapter for Adapter {
+            fn stream(
+                &self,
+                _options: dsh_llm::GenerateOptions,
+            ) -> Box<dyn Iterator<Item = StreamChunk>> {
+                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                Box::new(next.into_iter())
+            }
+        }
+        let script = Rc::new(RefCell::new(VecDeque::from_iter([
+            text_chunks("ok"),
+            text_chunks("ok2"),
+        ])));
+        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Rc::new(Adapter { script }))
+            .unwrap();
+
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let m4 = M4HostServices {
+            jobs: None,
+            schedule: None,
+            todo: None,
+            plan_mode: None,
+        };
+        let root = std::env::temp_dir().join(format!("dsh-cancel-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let loop_host = assemble_server_loop(
+            session_host.store.clone(),
+            root.clone(),
+            llm,
+            "mock",
+            "mock-model",
+            m4,
+            m5,
+        )
+        .expect("assemble_server_loop ok");
+
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(loop_host.clone());
+        crate::ensure_session_agent(&boot, "s2", None).expect("agent for s2");
+
+        let cancel = |sid: &str| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request",
+                "rpcId": "cancel-1",
+                "method": "session.cancel",
+                "payload": {"sessionId": sid},
+            }))
+            .unwrap();
+            handle_rpc_host(&boot, "session.cancel", &body, &session_host).1
+        };
+        let r1 = cancel("s2");
+        assert_eq!(r1["result"]["value"]["accepted"], true, "known session: {r1}");
+        let r2 = cancel("s2");
+        assert_eq!(r2["result"]["value"]["accepted"], true, "idempotent on idle: {r2}");
+        let r3 = cancel("ghost");
+        assert_eq!(r3["result"]["value"]["accepted"], true, "unknown session no-op: {r3}");
+
+        // 取消不破坏后续 turn（driver 仍可驱动）。
+        crate::run_rust_loop(&boot, "s2", "still works").expect("turn after cancel");
+        let evs = session_host.events("s2");
+        assert!(
+            evs.iter().any(|e| e.kind.as_str() == "assistant/message"),
+            "turn after cancel still drives"
         );
 
         let _ = std::fs::remove_dir_all(&root);

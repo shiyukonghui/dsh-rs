@@ -5105,6 +5105,69 @@ lib 绿；clippy（--all-targets）零。live 60880 脚本化 wire 全链 PASS�
 /plan → plan 投影实时帧 → prompt 门控挂起 → respond `accepted:true` → resolved 广播 →
 bash 真执行写 marker → events.host 零泄漏，9 项全绿）；浏览器手动复测待 D-114 收口。
 
+---
+
+## D-114：发送按钮↔停止按钮——host/session-status 运行位帧 + 真取消接线（真实中断待架构决策）
+
+**日期**：2025（本机时间）
+
+**触发的问题**：用户报告「消息发送后，发送按钮应变为停止按钮，现在没有这个过程，
+导致无法停止模型工作」。剥到第一性原理后拆成两层：
+1. **按钮不切换**：fork 前端 `InputBar.tsx` 的
+   `primaryStops = running && subagent===null` —— 发送/停止由会话的 `running` 位
+   驱动，而客户端 `Session.handleRunning` 的**唯一**写入源是 `host/session-status`
+   帧（`SessionManager` 只消费该帧 + `session.list` 摘要，不看 `session/event`）。
+   我们后端从未推过该帧 → `running` 恒 false → 按钮永不变。
+2. **即使变了也停不下来**：serve 主循环单线程（D-004/D-006 Rc/RefCell 纪律），
+   `session.prompt` 经 `run_rust_loop` 同步排空整轮 turn（`kick()` 到 idle 才返回），
+   turn 期间 accept 循环被占用 → 点停止发出的 `session.cancel` RPC 根本送不进循环，
+   等 turn 自然结束后送达时 driver 已 idle → no-op。
+
+**自下而上验证**：`session.ts` `derivePhase`/`handleRunning` 与 `manager.ts`
+`case 'host/session-status'`（`handleRunning(frame.running)`）逐行确认按钮驱动源；
+`SessionStore::enter` 已给每个会话装 append 转发钩子（`store.on_event` 在
+append 提交同步触发，`session_host.rs:105` 已有同模式消费者）→ turn/start、
+turn/end 落盘瞬间可推帧，无需等 tick（单线程 turn 期间无 tick 可达）。
+
+**最终选择**（范围：先解决「有这个过程」+ 诚实接线）：
+1. `install_session_running_frames(store, host_events)`：store 级 `on_event`
+   投影——`turn/start`→`{type:"host/session-status", sessionId, running:true}`、
+   `turn/end`→`false`（含 approval-pending 的 turn/end，回退后按钮恢复「发送」，
+   审批态由 approval 条承载）。serve 装配在 `boot.host_events` 就绪后接线，
+   agent-loop 门控。单点覆盖所有 turn 驱动（prompt/steer/kick/子代理）。
+2. `session.cancel` 从纯 stub 改为**真取消接线**：按 `configured_for_session(sid)`
+   定位 driver → `driver.cancel(AgentCancelCause::User, keep_inbox:false)` →
+   driver 在 step 边界检查 `abort_reason` → `turn/end reason=aborted`；幂等
+   （idle/未知会话 no-op，一律 `accepted:true`）。
+
+**被否决**：只做按钮切换不做取消接线——会出现一个「点了没用的停止按钮」
+（比没有更糟）；同步驱动的取消注入口已就位，属必要的下一步资产。
+
+**已知边界（显式报告，未在本批越级改架构）**：单线程 serve 下 `session.cancel`
+需在 turn 间隙送达才有意义；turn 内并发送达目前送不进。真实「生成中即停」需要
+架构决策——两个候选：
+- **方案 I（协作式泵）**：driver 在 step 边界让出给请求泵（单线程内重入处理
+  `session.cancel` 一类只读/取消请求，其余暂存 turn 后派发）。保持 Rc 单线程纪律，
+  改动集中在 dsh-agent-loop 热循环 + serve 派发。
+- **方案 II（Send 化 + worker 线程）**：dsh-session/dsh-agent/dsh-agent-loop 全栈
+  Rc→Arc+Mutex 送长 RPC 上 worker 线程。根治但也推翻 D-004/D-006 单线程纪律，
+  跨 crate、影响面大。
+待用户拍板（横向纪律：不默默选方案、不因「快」降级）。
+
+**预期影响与回滚点**：按钮在模型生成时变为「停止」（running:true 先于 false 到达），
+events.host 新增 `host/session-status`（zod 联合本就含该型，无新拒绝）；取消 RPC
+语义从谎报变为真中止（可送达时）。回滚：①/②各自独立可回。
+
+**验证**：新增单测 `session_running_frames_follow_turn_boundaries_per_turn`
+（两轮文本 turn → host_events 收到 `[true,false,true,false]`，修复前编译失败=红）
+与 `session_cancel_accepted_idempotent_and_keeps_turns_driving`（已知会话/幂等/
+未知会话 no-op/取消不破坏后续 turn）。dsh-cli lib 212/212 绿；clippy（--lib --tests）
+零。live 60880 脚本化 wire PASS（5/5）：逐 turn `[true,false]`、`running:true`
+在 turn 仍在生成时已到达（按钮可停）、events.host 全帧为已知 host/* 类型
+（零 zod 拒绝）。浏览器手动复测 + 真实中断架构决策待用户。
+
+---
+
 
 
 
