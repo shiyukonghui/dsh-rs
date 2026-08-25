@@ -205,4 +205,47 @@
   决策日志/git 互查；fail-loud（无决策拒绝/停留、live 环境阻塞如实呈报）；key 纪律
   （密钥仅 live 进程 env 注入，从未落盘/入 git/DECISIONS/.env）。
 
+# 追加章：S3（D-107）per-agent plan-mode 保真 + G（D-108）approval GUI 里程碑（round 3–4）
+
+## 14. S3 · per-agent plan-mode 折叠（完成）
+
+- **交付**（`5ae0aa9` S3-a、`c43aa2a` S3-b/c）：`AssembleContext.session_id` 身份
+  管道；standing 折叠源改 `Fn(Option<&str>) -> bool`（`PlanModeProbe`）；plan-mode 段
+  按组装会话身份折叠（多会话共享 standing 各看各的、None 回退 `plan_session`）；
+  `web::plan_mode_resolver` 接线。
+- **测试**：m2d 身份断言（`assemble_context_for_sets_scope_to_agent` 增
+  `session_id`）、standing per-session 折叠（alice/bob/None/flip）、web resolver
+  per-session（alice active/bob inactive/None 回退/flip）。全 workspace 回归绿
+  （dsh-cli lib 196→现 204）；clippy `-D warnings` 零。
+
+## 15. G · approval GUI 里程碑（D-108，round 4；Rust serve 侧完成并真机闭环）
+
+- **交付**（`222f2a5` + `35996fb`）：`web/approval_wire.rs` 注册表（append-only 帧
+  日志 + pending 表；stable rpcId；approvalId=审计 id `ap-<call_id>` 配对
+  asked/decided）；`events.mux` SSE/WS 下推 requested（**pending 重放逐字同
+  rpcId**）+ resolved；`POST /api/respond`（client-response echo rpcId 路由、审计
+  校验、accepted/not-pending/bad-response）；`approval_tool_exec` 挂起即推 requested、
+  `decide()` 结算 wire；`build_boot_manifest` 跟随 junction/symlink。
+- **单测**：approval_wire 8 项全绿；dsh-cli lib **204/204**；clippy `-D warnings` 零。
+- **真机 wire 闭环（自部署网关 + fork 前端 dist :60165）**：
+  - ALLOW：plan enter → 真模型 bash 调用 → `approval/requested` → `respond`
+    allowed-once → `{accepted:true}` → `approval/resolved(allowed-once)` → **bash
+    真执行（marker 落盘）** → 迟到 respond `not-pending`。
+  - REJECT：新 rpcId requested → respond rejected → resolved(rejected) → **工具未
+    执行**（marker 不存在）。
+  - 浏览器级目视（点「允许/拒绝」按钮）留给用户：`http://127.0.0.1:60165`。
+- **fork 前端**（零改动）：`feature/approval-gui` 分支 + `pnpm install` + 基线
+  `pnpm build`（全部通过）；web-root = `apps/web/dist`；`DSH_PLUGIN_ROOT` =
+  junction 聚合 42 个 web 客户端包。凭据仅 live env 注入，node_modules/安装包
+  （npx）零接触。
+
+## 16. 里程碑总览（round 4 收口）
+
+- 提交链：`5ae0aa9`（S3-a）→ `c43aa2a`（S3-b/c）→ `4ae16e6`（D-106 live 复验补）
+  → `222f2a5`（D-108 G）→ `35996fb`（junction fix）。各自独立回滚点，DECISIONS
+  记互查。
+- 方法学：S3/G 均按瀑布流需求→设计→编码（TDD）→测试→部署/验证推进；越级问题
+  （junction 漏扫）显式回退实现段修 `build_boot_manifest` 并补 DECISIONS；key 纪律
+  全程守。
+
 
