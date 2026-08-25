@@ -4554,6 +4554,33 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
   select OK。回滚：`git revert` U3。
 - 下一：**L1（plan-mode C 档）**——先自下而上核对 harness 语义 + 宿主 approval 现状。
 
+### D-105 实施补记（L1 核心片：plan-mode 状态驱动段，round 28；TDD 红→绿）
+
+- 触发：D-105 L1（plan-mode C 档）；本轮交付**第一片（状态驱动段）**，执行器/approval
+  联动留轮（见诚实边界）。
+- 自下而上核对：`dsh_system_prompt::PromptSectionText::Fn(Rc<dyn Fn(&AssembleContext)
+  -> String>)` **已存在**（动态段不是缺口——早前「设计缺口」判断是误判，纠正）；
+  `sandbox/mode → resolve_sandbox_mode → sandbox_policy_segment` 是宿主「会话模式 →
+  提示段」的既有模式；`exit_plan_mode`（m4.rs：521）定义意图 = 宿主注入「离开 plan
+  mode + 写 command 事件」，未注入 → NOT_BOUND。预设注释：「Plan state is per-agent by
+  nature…entry-local realm is the correct lifetime」——状态**随 standing（agent 作用域）**。
+- 实现：
+  - standing 挂载 `dsh-plan-mode` 叶行 → config.section 经 `PromptSectionText::Fn`
+    注册 scoped 段（order 55 < 工具指引带，满足预设文本「override 更晚工具指引」；
+    与 skills 30 区隔）；Fn 组装期读 standing 的 plan_mode cell（`Rc<RefCell<bool>>`，
+    **per-agent 本性**）——active → 注入 section 原文，否则空串。
+  - `StandingRegistry::set_plan_mode(id, bool)` / `plan_mode(id)`（host 翻转；未知 id
+    fail-loud；无 plan-mode 行 → 翻转无害 cell）。
+  - report：plan-mode 行 → **bridged**（section bridge）；config.section 缺失 → 诚实
+    guard（非泛化）。移除 tool_guard_reason 的 L1-pending 分支（行已由桥循环接管）。
+- 诚实边界（下轮需求结论后再定，不臆造）：`exit_plan_mode` 真实执行器（web 会话宿主
+  接线：离开 plan mode + 写 `plan/mode` 与 command 事件）；approval 联动——预设文本本身
+  即「规则 override 更晚工具指引」的**指令层**语义，approval 联动是否再加执行层
+  （ApprovalProvider 联动）待定。
+- 验收：standing 25/25（+1）、八 crate **651/651**、clippy 零、live 60165 四真实预设
+  select 全 OK（plan-mode 行转入 bridged 不回归）。回滚：`git revert` L1-slice。
+- 下一：exit_plan_mode 真实执行器（web 会话宿主接线）+ approval 联动需求结论。
+
 ### D-104 实施补记预留
 
 

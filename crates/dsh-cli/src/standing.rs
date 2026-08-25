@@ -19,6 +19,7 @@
 //! str_replace_editor）；多工具行（fs-local/terminal）与 pwsh 执行器留 P3-b/A。
 //! standing 是注册面里的一个作用域子树；真实 isolate 服务隔离是 C 段收敛目标。
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -26,7 +27,7 @@ use std::sync::Arc;
 use dsh_agent_presets::parse::{row_disabled_with, CompositionRow};
 use dsh_core::{Cordis, CordisError, EffectOutcome, FiberHandle, Plugin, ScopeId};
 use dsh_scope::{bind_scope_parent, store::Undo, ScopeKey, ScopeParentBinding};
-use dsh_system_prompt::{PromptSection, PromptSectionText, SystemPrompt};
+use dsh_system_prompt::{AssembleContext, PromptSection, PromptSectionText, SystemPrompt};
 use dsh_tools::ToolRegistry;
 use dsh_wasmrt::{ComboEvaluator, FallbackEval, NativeComboEvaluator, WasmComboEvaluator};
 use serde_json::Value;
@@ -126,6 +127,11 @@ pub struct Standing {
     /// （leakedServices 守卫）的审计目标。
     pub core_scope: ScopeId,
     pub record_fiber: FiberHandle,
+    /// L1/D-105：plan-mode 状态（per-agent 本性，随 standing；Fn 段组装期读取——
+    /// active → 注入 config.section 文本，否则空串不贡献）。
+    pub plan_mode: Rc<RefCell<bool>>,
+    /// L1：plan-mode 行 config.section 文本（预设无该行/无 section → None → 不注册段）。
+    pub plan_mode_section: Option<String>,
     undos: Vec<Undo>,
 }
 
@@ -238,6 +244,11 @@ impl StandingRegistry {
             ..Default::default()
         };
         let mut undos: Vec<Undo> = Vec::new();
+        // L1/D-105：plan-mode 状态 cell（per-agent 本性，随 standing；host 经
+        // `set_plan_mode` 翻转，Fn 段组装期读取）。section 文本在行桥循环内若有
+        // config.section 即填充并注册 Fn 段。
+        let plan_mode = Rc::new(RefCell::new(false));
+        let mut plan_mode_section: Option<String> = None;
 
         // 行审计：走 tree（组递归；组容器自身不列），叶子 → disabled/活化。
         // 禁用判定 = `row_disabled_with`（fail-closed + truthy 权威在 dsh-agent-presets），
@@ -420,6 +431,51 @@ impl StandingRegistry {
             .iter()
             .filter(|r| r.name != PERSONA_ROW && r.name != INSTRUCTIONS_ROW && r.name != SKILLS_ROW)
         {
+            // L1/D-105：plan-mode 状态驱动段桥（组合 `dsh-plan-mode` 行）——不依赖工具
+            // 注册面；config.section 经 Fn 段随 standing 的 plan-mode 状态注入
+            // （active → 文本、否则空串）。per-agent 本性（预设注释：entry-local realm
+            // 是正确生存期）。section 缺失 → 诚实 guard（非泛化）。
+            if row.name == "@deepseek-ai/dsh-plan-mode" {
+                let section = row
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.get("section"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                match section {
+                    Some(text) => {
+                        plan_mode_section = Some(text.clone());
+                        let cell = plan_mode.clone();
+                        let ftext = text.clone();
+                        let pc = PromptSection {
+                            name: format!("preset:{id}:plan-mode"),
+                            order: PLAN_MODE_ORDER,
+                            text: PromptSectionText::Fn(Rc::new(move |_ctx: &AssembleContext| {
+                                if *cell.borrow() {
+                                    ftext.clone()
+                                } else {
+                                    String::new()
+                                }
+                            })),
+                            complete: false,
+                        };
+                        let undo = self
+                            .system_prompt
+                            .section(Some(&scope), &pc)
+                            .map_err(|e| format!("preset {id}: plan-mode section: {e}"))?;
+                        undos.push(undo);
+                        report.bridged.push(
+                            "@deepseek-ai/dsh-plan-mode (plan-mode section bridge; state-driven)"
+                                .to_string(),
+                        );
+                    }
+                    None => report.guarded.push((
+                        "@deepseek-ai/dsh-plan-mode".to_string(),
+                        "plan-mode row without config.section (L1, deliberate)".to_string(),
+                    )),
+                }
+                continue;
+            }
             let Some(home) = self.tools.as_ref() else {
                 report.guarded.push((
                     row.name.clone(),
@@ -528,6 +584,8 @@ impl StandingRegistry {
                 report,
                 core_scope,
                 record_fiber,
+                plan_mode,
+                plan_mode_section,
                 undos,
             },
         );
@@ -551,6 +609,23 @@ impl StandingRegistry {
     /// standing 的 scope key（join/rebind 用）。
     pub fn scope_of(&self, preset_id: &str) -> Option<&ScopeKey> {
         self.standings.get(preset_id).map(|s| &s.scope)
+    }
+
+    /// L1：plan-mode 状态读写（per-agent 本性；host/loop 进入/退出 plan mode 时经此
+    /// 翻转，Fn 段组装期读取）。未知 id → Err（fail-loud）；无 plan-mode 行 → 翻转
+    /// 无害的 cell（无段可注入）。
+    pub fn set_plan_mode(&self, id: &str, active: bool) -> Result<(), String> {
+        let standing = self
+            .standings
+            .get(id)
+            .ok_or_else(|| format!("dsh-cli standing: no preset {id} mounted"))?;
+        *standing.plan_mode.borrow_mut() = active;
+        Ok(())
+    }
+
+    /// 当前 plan-mode 状态（None = 未挂载该 preset）。
+    pub fn plan_mode(&self, id: &str) -> Option<bool> {
+        self.standings.get(id).map(|s| *s.plan_mode.borrow())
     }
 
     pub fn report(&self, preset_id: &str) -> Option<&StandingReport> {
@@ -615,8 +690,8 @@ impl StandingRegistry {
 // 组合自身的 `disabled_expr` 决定（win32 上 bash 系 `=== 'win32'` 判禁、pwsh 系
 // 活化）。求值走注入引擎（K4/F-05 WASM 面 + native 兜底；见 mount_at 的 `gate`）。
 
-/// 单工具行 → 宿主工具名（P3-a 桥表；P3-e 加 pwsh；U1/D-105 加 todo）。多工具行
-/// （fs-local/terminal/…）见 `host_tool_group_for_row`。
+/// 单工具行 → 宿主工具名（P3-a 桥表；P3-e 加 pwsh；U1/D-105 加 todo；U2 加 workflow）。
+/// 多工具行（fs-local/terminal/…）见 `host_tool_group_for_row`。
 fn host_tool_for_row(row: &CompositionRow) -> Option<&'static str> {
     match row.name.as_str() {
         "@deepseek-ai/dsh-tool-bash" => Some("bash"),
@@ -642,6 +717,11 @@ const TERMINAL_TOOLS: &[&str] = &[
     "terminal_close",
     "terminal_list",
 ];
+
+/// L1/D-105：plan-mode 段 order——预设文本要求「plan-mode rules override 任何更晚的
+/// 工具指引」，故置于工具指引带（100–199）之前、persona（0）之后；与 skills（30）
+/// 区分以免同阶排序模糊。
+pub const PLAN_MODE_ORDER: f64 = 55.0;
 
 /// 多工具组行 → 宿主工具集（P3-b 解析确认；单工作区宿主 = standing 链继承全局基）。
 /// U1（D-105）加：dsh-tool-fs（compound fs）→ 宿主 fs 六件套（同 fs-local 语义）；
@@ -700,11 +780,6 @@ fn tool_guard_reason(row: &CompositionRow) -> String {
         "no host ralph loop tool in this build (U2)".to_string()
     } else if n.contains("ask-user") {
         "host ask-user is a UI/approval RPC, not an agent-callable tool in this build (U2)"
-            .to_string()
-    } else if n == "@deepseek-ai/dsh-plan-mode" {
-        // L1（D-105 C 档，待桥）：dsh-plan-mode 行的 config.section 将随会话 plan 模式
-        // 注入 SystemPrompt；exit_plan_mode 从 NOT_BOUND 升真实执行器。U3 显式标注 pending。
-        "L1 (D-105 plan-mode C-tier): state-driven section bridge pending (config.section injection + exit_plan_mode real executor + approval linkage)"
             .to_string()
     } else if n == "@deepseek-ai/dsh-compaction-basic"
         || n == "@deepseek-ai/dsh-compaction-tool-result-pruner"
@@ -1535,6 +1610,49 @@ mod tests {
                 r.unusable_rows()
             );
         }
+    }
+
+    /// —— L1（D-105）—— plan-mode 状态驱动段：组合 `dsh-plan-mode` 行的
+    /// config.section 随 standing 的 plan-mode 状态注入 SystemPrompt（per-agent 本性，
+    /// 预设注释：「Plan state is per-agent by nature…entry-local realm is the correct
+    ///  lifetime」）。状态开 → 段出现；关 → 消失；该行从守卫转 bridged（section bridge）。
+    /// TDD 红→绿（先红：行仍在守卫、无段）。
+    #[test]
+    fn plan_mode_section_injected_when_active_else_absent() {
+        let sp = new_sp();
+        let mut reg = StandingRegistry::new(sp.clone(), Some(realistic_tools()));
+        let comp = "
+- id: plan-mode
+  name: '@deepseek-ai/dsh-plan-mode'
+  config:
+    section: |
+      YOU-ARE-IN-PLAN-MODE-MARKER-{tag}
+";
+        let rows = dsh_agent_presets::parse::parse_composition(comp).unwrap();
+        reg.mount("l1", &rows, &win32_facade()).unwrap();
+        let r = reg.report("l1").unwrap();
+        assert!(
+            r.bridged.iter().any(|s| s.starts_with("@deepseek-ai/dsh-plan-mode")),
+            "plan-mode row bridged (section bridge): {:?}",
+            r.bridged
+        );
+        let scope = ScopeKey::new();
+        reg.join("l1", &scope).unwrap();
+        let has_marker = |sp: &Rc<SystemPrompt>, sc: &ScopeKey| {
+            sect_texts(sp, sc)
+                .iter()
+                .any(|t| t.contains("YOU-ARE-IN-PLAN-MODE-MARKER"))
+        };
+        assert!(!has_marker(&sp, &scope), "inactive: no plan-mode section");
+        reg.set_plan_mode("l1", true).expect("enter plan mode");
+        assert!(has_marker(&sp, &scope), "active: plan-mode section injected");
+        reg.set_plan_mode("l1", false).expect("leave plan mode");
+        assert!(!has_marker(&sp, &scope), "left: section removed again");
+        assert_eq!(reg.plan_mode("l1"), Some(false), "state cell readable");
+        assert!(
+            reg.set_plan_mode("no-such", true).is_err(),
+            "unknown id errors loudly"
+        );
     }
 
     /// 映射行缺宿主工具（桥依赖不可满足）→ stuck → 挂载否决。
