@@ -8,6 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_agent::{Agent, AgentBus, AgentRegistry, AgentOptions, AgentStatus};
 use dsh_agent_loop::create_loop_agent;
@@ -30,7 +31,7 @@ fn user_msg(id: &str, text: &str) -> dsh_llm::Message {
     dsh_llm::Message::user(MessageId::from_raw(id), vec![ContentBlock::text(text)])
 }
 
-fn turn_end_reason(s: &Rc<Session>) -> serde_json::Value {
+fn turn_end_reason(s: &Arc<Session>) -> serde_json::Value {
     s.events()
         .into_iter()
         .find(|e| e.kind == EventKind::TurnEnd)
@@ -38,7 +39,7 @@ fn turn_end_reason(s: &Rc<Session>) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
-fn count_of(s: &Rc<Session>, kind: EventKind) -> usize {
+fn count_of(s: &Arc<Session>, kind: EventKind) -> usize {
     s.events().into_iter().filter(|e| e.kind == kind).count()
 }
 
@@ -121,11 +122,11 @@ fn stream(script: &[Vec<StreamChunk>]) -> (Rc<RefCell<VecDeque<Vec<StreamChunk>>
 // world
 // ---------------------------------------------------------------------------
 
-fn store() -> Rc<SessionStore> {
-    Rc::new(SessionStore::new())
+fn store() -> Arc<SessionStore> {
+    Arc::new(SessionStore::new())
 }
 
-fn agent(store: &Rc<SessionStore>, id: &str, bus: &AgentBus) -> Rc<Agent> {
+fn agent(store: &Arc<SessionStore>, id: &str, bus: &AgentBus) -> Rc<Agent> {
     let s = store
         .create(
             Some(SessionId(id.to_string())),

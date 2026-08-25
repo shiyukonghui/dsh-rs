@@ -10,8 +10,8 @@
 //!   后端仍按契约返回 `torn: false` + `truncate_offset: None`）；
 //! - revision = 该会话已持久化写入计数器（`sqlite:<file>:<rev>`，变更即可被观察）。
 
-// rusqlite Connection 具备内部可变性（RefCell），后端可达 `&self` 方法——匹配本
-// build 的单线程纪律（D-006）；SQLite 连接非 Send/Sync，按 coordinator 设计单线程持有。
+// rusqlite Connection 具备内部可变性（Mutex），后端可达 `&self` 方法；D-115 后
+// 后端需 `Send + Sync`（coordinator 被 store 观察者跨线程共享）——Mutex 提供 Sync。
 #![allow(clippy::arc_with_non_send_sync)]
 
 use std::path::{Path, PathBuf};
@@ -36,7 +36,7 @@ pub struct SqliteConfig {
 /// （D-006）下用 `RefCell` 提供内部可变性（`PersistenceBackend` 仅 `&self`）。
 pub struct SqliteBackend {
     path: PathBuf,
-    conn: std::cell::RefCell<rusqlite::Connection>,
+    conn: std::sync::Mutex<rusqlite::Connection>,
 }
 
 const SCHEMA: &str = "
@@ -63,7 +63,7 @@ impl SqliteBackend {
             .map_err(|e| PersistenceError::Other(format!("sqlite schema {}: {e}", path.display())))?;
         Ok(SqliteBackend {
             path: path.to_path_buf(),
-            conn: std::cell::RefCell::new(conn),
+            conn: std::sync::Mutex::new(conn),
         })
     }
 
@@ -73,7 +73,7 @@ impl SqliteBackend {
 
     /// 会话 revision（`sqlite:<path>:<write-count>`；变更即可被观察）。
     fn revision_for(&self, id: &SessionId) -> Result<Option<SessionPersistenceRevision>, PersistenceError> {
-        let conn = self.conn.borrow();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT revision FROM sessions WHERE id = ?1")
             .map_err(|e| PersistenceError::Other(format!("sqlite rev prepare: {e}")))?;
@@ -91,7 +91,7 @@ impl SqliteBackend {
     }
 
     fn read_header(&self, id: &SessionId) -> Result<Option<SessionHeader>, PersistenceError> {
-        let conn = self.conn.borrow();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT header FROM sessions WHERE id = ?1")
             .map_err(|e| PersistenceError::Other(format!("sqlite header prepare: {e}")))?;
@@ -113,7 +113,7 @@ impl SqliteBackend {
     /// 读取会话事件（按 seq 有序；校验 0..n 连续——事务库保证物理完整，缺口仅可能
     /// 人为删除 → 视为 corruption）。
     fn read_events(&self, id: &SessionId) -> Result<Vec<SessionEvent>, PersistenceError> {
-        let conn = self.conn.borrow();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT seq, json FROM events WHERE id = ?1 ORDER BY seq ASC")
             .map_err(|e| PersistenceError::Other(format!("sqlite events prepare: {e}")))?;
@@ -232,7 +232,7 @@ impl PersistenceBackend for SqliteBackend {
         meta: &SessionHeader,
         events: &[SessionEvent],
     ) -> Result<(), PersistenceError> {
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| PersistenceError::Other(format!("sqlite txn: {e}")))?;
@@ -267,7 +267,7 @@ impl PersistenceBackend for SqliteBackend {
         meta: &SessionHeader,
         events: &[SessionEvent],
     ) -> Result<(), PersistenceError> {
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| PersistenceError::Other(format!("sqlite txn: {e}")))?;
@@ -304,7 +304,7 @@ impl PersistenceBackend for SqliteBackend {
         torn_offset: Option<u64>,
         closers: &[SessionEvent],
     ) -> Result<(), PersistenceError> {
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| PersistenceError::Other(format!("sqlite txn: {e}")))?;
@@ -343,7 +343,7 @@ impl PersistenceBackend for SqliteBackend {
     }
 
     fn list_snapshots(&self) -> Result<Vec<SessionPersistenceSnapshot>, PersistenceError> {
-        let conn = self.conn.borrow();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT header, revision FROM sessions ORDER BY id ASC")
             .map_err(|e| PersistenceError::Other(format!("sqlite snaps prepare: {e}")))?;

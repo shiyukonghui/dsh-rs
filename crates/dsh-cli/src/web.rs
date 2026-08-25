@@ -145,7 +145,7 @@ pub struct WebServer {
 fn session_host_for(
     sqlite_store: &Option<PathBuf>,
     session_dir: &Option<PathBuf>,
-) -> Result<std::rc::Rc<crate::session_host::SessionHost>, String> {
+) -> Result<std::sync::Arc<crate::session_host::SessionHost>, String> {
     match (sqlite_store, session_dir) {
         (Some(file), Some(dir)) => {
             eprintln!(
@@ -378,7 +378,7 @@ fn hmr_events_plan(path: &str, method: &Method) -> Option<HmrEventsPlan> {
 /// 折叠权威恒为会话事件（`dsh_plan::fold_plan_mode` 纯重放，无第二状态源）。
 fn plan_mode_resolver(
     plan_session: std::rc::Rc<std::cell::RefCell<String>>,
-    store: std::rc::Rc<dsh_session::store::SessionStore>,
+    store: std::sync::Arc<dsh_session::store::SessionStore>,
 ) -> impl Fn(Option<&str>) -> bool {
     move |sid: Option<&str>| {
         let target = sid
@@ -412,7 +412,7 @@ fn plan_state_active_on(boot: &crate::Boot, sid: Option<&str>) -> bool {
 
 /// 目标会话的句柄（None = 未装配）。`sid` Some 优先（`commands/execute` 的
 /// `agentId`），否则回退 `plan_session`。
-fn plan_session_ref_on(boot: &crate::Boot, sid: Option<&str>) -> Option<std::rc::Rc<dsh_session::Session>> {
+fn plan_session_ref_on(boot: &crate::Boot, sid: Option<&str>) -> Option<Arc<dsh_session::Session>> {
     let sid = sid.map(str::to_string).unwrap_or_else(|| {
         boot.plan_session
             .as_ref()
@@ -522,7 +522,7 @@ fn dispatch_request(
     manifest: &BootManifest,
     hmr: &Arc<crate::hmr_events::HmrChannel>,
     boot: &Boot,
-    host: &Rc<SessionHost>,
+    host: &Arc<SessionHost>,
     sink: &crate::session_host::EventSink,
 ) {
     // 路径去 query
@@ -1378,10 +1378,10 @@ pub fn push_host_frame(boot: &Boot, payload: serde_json::Value) {
 /// 阻塞 turn 期间无法另起 tick，故必须由落盘瞬间回调推送。非 agent-loop（boot.host_events
 /// None）→ 无宿主日志，no-op。
 pub fn install_session_running_frames(
-    store: &std::rc::Rc<dsh_session::store::SessionStore>,
+    store: &std::sync::Arc<dsh_session::store::SessionStore>,
     host_events: Option<std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
 ) {
-    store.on_event(Box::new(move |session, event| {
+    store.on_event(Arc::new(move |session, event| {
         let running = match event.kind {
             dsh_session::types::EventKind::TurnStart => Some(true),
             dsh_session::types::EventKind::TurnEnd => Some(false),
@@ -1405,7 +1405,7 @@ pub fn handle_rpc_host(
     boot: &Boot,
     method: &str,
     body: &[u8],
-    host: &Rc<SessionHost>,
+    host: &Arc<SessionHost>,
 ) -> (u16, Value) {
     let rpc_id = rpc_id_of(body);
     if !rpc_envelope_ok(body, method) {
@@ -1701,7 +1701,7 @@ fn goal_max_rounds(payload: &Value) -> Option<u64> {
 ///
 /// 每次成功 mutation 后把服务的最近一次 `goal/change` 变更 meta 落进目标会话
 /// （验收 #2「goal/change 事件落会话」）——事件由 GoalService 产，caller 落会话。
-fn goal_dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) -> Value {
+fn goal_dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>) -> Value {
     // 全部 goal.* 请求带 sessionId（catch-all：缺失 → bad-request）。
     let session_id = payload.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
     if session_id.is_empty() {
@@ -1819,7 +1819,7 @@ fn subagent_dispatch(
     boot: &Boot,
     method: &str,
     payload: &Value,
-    host: &Rc<SessionHost>,
+    host: &Arc<SessionHost>,
 ) -> Value {
     use crate::subagent_runtime as sa;
     match method {
@@ -1976,7 +1976,7 @@ pub struct M4HostServices {
 pub mod dsh_cli_host {
     use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use dsh_session::types::EventKind;
     use dsh_session::runtime::Session;
@@ -1986,13 +1986,13 @@ pub mod dsh_cli_host {
     /// （对齐 `packages/todo/tool-todo`：写入既产出模型可见输出，也落事件到属主会话，
     /// `todos` 投影据此折叠）。
     pub struct TodoWriteHost {
-        host: Rc<crate::session_host::SessionHost>,
+        host: Arc<crate::session_host::SessionHost>,
         agent_to_session: RefCell<HashMap<String, String>>,
         default_session: String,
     }
 
     impl TodoWriteHost {
-        pub fn new(host: Rc<crate::session_host::SessionHost>, default_session: String) -> Self {
+        pub fn new(host: Arc<crate::session_host::SessionHost>, default_session: String) -> Self {
             Self {
                 host,
                 agent_to_session: RefCell::new(HashMap::new()),
@@ -2033,11 +2033,11 @@ pub mod dsh_cli_host {
     /// ScheduleHost：以某会话（通常为发起调度提醒的 agent 会话）的事件日志为权威。
     pub struct ScheduleHost {
         /// 事件追加目标会话（`Rc`，web 集成时 SessionHost 持有）。
-        session: Rc<Session>,
+        session: Arc<Session>,
     }
 
     impl ScheduleHost {
-        pub fn new(session: Rc<Session>) -> Self {
+        pub fn new(session: Arc<Session>) -> Self {
             Self { session }
         }
 
@@ -2200,7 +2200,7 @@ pub mod dsh_cli_host {
     /// `exit_plan_mode` 执行器的前置校验（`dsh_plan::exit_plan_mode_check`：in-plan-mode
     /// / plan 以 `# 标题` 开头 / 评审通道可用）与落事件都走这里。
     pub struct PlanModeHost {
-        host: Rc<crate::session_host::SessionHost>,
+        host: Arc<crate::session_host::SessionHost>,
         agent_to_session: RefCell<HashMap<String, String>>,
         default_session: String,
         /// 宿主是否装配 user-questions 评审通道（`exit_plan_mode_check` 第三前置）。
@@ -2209,7 +2209,7 @@ pub mod dsh_cli_host {
 
     impl PlanModeHost {
         pub fn new(
-            host: Rc<crate::session_host::SessionHost>,
+            host: Arc<crate::session_host::SessionHost>,
             default_session: String,
             review_channel: bool,
         ) -> Self {
@@ -2237,7 +2237,7 @@ pub mod dsh_cli_host {
                 .unwrap_or_else(|| self.default_session.clone())
         }
 
-        fn session(&self, agent: Option<&str>) -> Result<Rc<Session>, String> {
+        fn session(&self, agent: Option<&str>) -> Result<Arc<Session>, String> {
             self.host
                 .session(&self.session_id_for(agent))
                 .map_err(|e| format!("plan-mode: session lookup: {e}"))
@@ -2711,7 +2711,7 @@ pub fn register_m4_tools(registry: &dsh_tools::ToolRegistry) {
 /// 单一默认 agent（provider/model 由装配方指定；session_id "default" 与前端会话入口一致）。
 /// 宿主生命周期清理（`M5Host::shutdown` 等）由装配方挂 disposer（step2 补实）。
 pub fn assemble_server_loop(
-    session_store: Rc<dsh_session::store::SessionStore>,
+    session_store: Arc<dsh_session::store::SessionStore>,
     workspace_root: std::path::PathBuf,
     llm: Rc<dsh_llm::LlmRuntime>,
     provider: &str,
@@ -2797,7 +2797,7 @@ pub struct ServerLoopBundle {
 /// 首回合 fail-loud，装配照常。`assemble_server_runtime_with_llm` 暴露 LLM/品牌注入缝
 /// （完整装配路径的可测前端闭环；mock 驱动 / 显式 no-key / 真实 key 均可）。
 pub fn assemble_server_runtime(
-    host: &Rc<crate::session_host::SessionHost>,
+    host: &Arc<crate::session_host::SessionHost>,
     workspace_root: std::path::PathBuf,
     base_url: &str,
     model: &str,
@@ -2808,7 +2808,7 @@ pub fn assemble_server_runtime(
 
 /// 完整装配路径（LLM/品牌可注入）——serve 装配 + 测试共用同一代码路径。
 pub fn assemble_server_runtime_with_llm(
-    host: &Rc<crate::session_host::SessionHost>,
+    host: &Arc<crate::session_host::SessionHost>,
     workspace_root: std::path::PathBuf,
     llm: Rc<dsh_llm::LlmRuntime>,
     provider: &str,
@@ -2870,7 +2870,7 @@ pub fn assemble_server_runtime_with_llm(
 }
 
 
-fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) -> Value {
+fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>) -> Value {
     match method {
         "version" => serde_json::json!({"ok": true, "value": {"version": env!("CARGO_PKG_VERSION")}}),
         "host.describe" => {
@@ -4183,7 +4183,7 @@ mod tests {
     #[test]
     fn plan_mode_resolver_folds_per_assembled_session() {
         use dsh_session::types::{CreateSessionOptions, SessionId};
-        let store = Rc::new(dsh_session::store::SessionStore::new());
+        let store = Arc::new(dsh_session::store::SessionStore::new());
         let alice = store
             .create(Some(SessionId::from_raw("alice")), &CreateSessionOptions { seed: None, meta: None })
             .unwrap();
@@ -4384,7 +4384,7 @@ mod tests {
     }
 
     /// 构造一个 seed `default` 的 SessionHost（测试用；M1e 会话由 store 承载）。
-    fn seeded_host() -> Rc<SessionHost> {
+    fn seeded_host() -> Arc<SessionHost> {
         let host = SessionHost::in_memory();
         let _ = host.session("default");
         host
@@ -4545,7 +4545,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.to_string_lossy().to_string();
 
-        let call = |boot: &crate::Boot, method: &str, payload: Value, host: &Rc<SessionHost>| {
+        let call = |boot: &crate::Boot, method: &str, payload: Value, host: &Arc<SessionHost>| {
             let body = serde_json::to_vec(&serde_json::json!({
                 "type": "client-request", "rpcId": "r", "method": method, "payload": payload,
             })).unwrap();
@@ -4613,7 +4613,7 @@ mod tests {
         boot.host_events = Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
         let host = seeded_host();
 
-        let call = |boot: &crate::Boot, method: &str, payload: Value, host: &Rc<SessionHost>| {
+        let call = |boot: &crate::Boot, method: &str, payload: Value, host: &Arc<SessionHost>| {
             let body = serde_json::to_vec(&serde_json::json!({
                 "type": "client-request", "rpcId": "r", "method": method, "payload": payload,
             })).unwrap();
@@ -4753,7 +4753,7 @@ mod tests {
         let mut boot = boot_with_sessions();
         boot.host_events = Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
 
-        let call = |boot: &crate::Boot, method: &str, payload: Value, host: &Rc<SessionHost>| {
+        let call = |boot: &crate::Boot, method: &str, payload: Value, host: &Arc<SessionHost>| {
             let body = serde_json::to_vec(&serde_json::json!({
                 "type": "client-request", "rpcId": "r", "method": method, "payload": payload,
             })).unwrap();
@@ -8725,7 +8725,7 @@ mod tests {
             Ok(bundle) => {
                 let loop_host = bundle.host;
                 assert!(
-                    Rc::ptr_eq(&host.store, &loop_host.store),
+                    Arc::ptr_eq(&host.store, &loop_host.store),
                     "loop host shares the SessionHost store (frontend read model)"
                 );
                 let names = loop_host.tools.known_names(None);
@@ -9048,7 +9048,7 @@ mod tests {
         use dsh_session::store::SessionStore;
         use dsh_session::types::{EventKind, SessionId};
         let prompt = SystemPrompt::new(&PromptConfig::default(), Rc::new(|| {})).expect("prompt");
-        let store = Rc::new(SessionStore::new());
+        let store = Arc::new(SessionStore::new());
         let session = store
             .create(
                 Some(SessionId::from_raw("default".to_string())),

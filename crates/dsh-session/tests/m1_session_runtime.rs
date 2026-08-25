@@ -1,8 +1,7 @@
 //! M1a：dsh-session 运行时端到端测试（Session append/surface/deriveMessages +
 //! SessionStore create/fork/event 发布 + repair 崩溃关闭器）。
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use dsh_brand::SessionId;
 use serde_json::json;
@@ -226,31 +225,31 @@ fn session_request_header_fold_and_context() {
 
 #[test]
 fn store_create_lists_and_gets() {
-    let store = Rc::new(SessionStore::new());
-    let created_events = Rc::new(RefCell::new(Vec::new()));
+    let store = Arc::new(SessionStore::new());
+    let created_events = Arc::new(Mutex::new(Vec::new()));
     {
         let created_events = created_events.clone();
-        store.on_created(Box::new(move |s| {
-            created_events.borrow_mut().push(s.id().clone());
+        store.on_created(Arc::new(move |s| {
+            created_events.lock().unwrap().push(s.id().clone());
         }));
     }
     let s1 = store.create(None, &CreateSessionOptions { seed: None, meta: None }).unwrap();
     let s2 = store.create(None, &CreateSessionOptions { seed: None, meta: None }).unwrap();
     assert_ne!(s1.id(), s2.id());
     assert_eq!(store.list().len(), 2);
-    assert_eq!(created_events.borrow().len(), 2);
+    assert_eq!(created_events.lock().unwrap().len(), 2);
     let got = store.get(s1.id()).unwrap();
-    assert!(Rc::ptr_eq(&got, &s1));
+    assert!(Arc::ptr_eq(&got, &s1));
 }
 
 #[test]
 fn store_event_observer_fires_on_append() {
-    let store = Rc::new(SessionStore::new());
-    let seen = Rc::new(RefCell::new(Vec::new()));
+    let store = Arc::new(SessionStore::new());
+    let seen = Arc::new(Mutex::new(Vec::new()));
     {
         let seen = seen.clone();
-        store.on_event(Box::new(move |_, event| {
-            seen.borrow_mut().push(event.kind.as_str().to_string());
+        store.on_event(Arc::new(move |_, event| {
+            seen.lock().unwrap().push(event.kind.as_str().to_string());
         }));
     }
     let session = store.create(None, &CreateSessionOptions { seed: None, meta: None }).unwrap();
@@ -265,13 +264,13 @@ fn store_event_observer_fires_on_append() {
             }),
         )
         .unwrap();
-    assert_eq!(seen.borrow().as_slice(), &["user/message"]);
+    assert_eq!(seen.lock().unwrap().as_slice(), &["user/message"]);
     store.flush(&session);
 }
 
 #[test]
 fn store_fork_creates_child_with_parent_lineage() {
-    let store = Rc::new(SessionStore::new());
+    let store = Arc::new(SessionStore::new());
     let parent = store.create(None, &CreateSessionOptions { seed: None, meta: None }).unwrap();
     let u = user_msg("u0", "hello", 0);
     parent
@@ -313,7 +312,7 @@ fn store_fork_creates_child_with_parent_lineage() {
 
 #[test]
 fn store_fork_open_turn_rejected() {
-    let store = Rc::new(SessionStore::new());
+    let store = Arc::new(SessionStore::new());
     let parent = store.create(None, &CreateSessionOptions { seed: None, meta: None }).unwrap();
     parent.append(EventKind::TurnStart, json!({"turn": 1}), None).unwrap();
     // 前缀内最后 turn 边界是 turn/start（seq 0）→ open turn fork = 拒绝（boundary=0）
@@ -325,7 +324,7 @@ fn store_fork_open_turn_rejected() {
 
 #[test]
 fn store_fork_boundary_not_found_rejected() {
-    let store = Rc::new(SessionStore::new());
+    let store = Arc::new(SessionStore::new());
     let parent = store.create(None, &CreateSessionOptions { seed: None, meta: None }).unwrap();
     parent.append(EventKind::TurnStart, json!({"turn": 1}), None).unwrap();
     parent.append(EventKind::TurnEnd, json!({"turn": 1, "reason": {"kind": "complete"}}), None).unwrap();
@@ -338,26 +337,26 @@ fn store_fork_boundary_not_found_rejected() {
 
 #[test]
 fn store_dispose_announces_paired_notification() {
-    let store = Rc::new(SessionStore::new());
-    let disposed = Rc::new(RefCell::new(Vec::new()));
+    let store = Arc::new(SessionStore::new());
+    let disposed = Arc::new(Mutex::new(Vec::new()));
     {
         let disposed = disposed.clone();
-        store.on_disposed(Box::new(move |s| {
-            disposed.borrow_mut().push(s.id().clone());
+        store.on_disposed(Arc::new(move |s| {
+            disposed.lock().unwrap().push(s.id().clone());
         }));
     }
     let s = store.create(None, &CreateSessionOptions { seed: None, meta: None }).unwrap();
     let id = s.id().clone();
     store.dispose(&id);
     assert!(!store.is_live(&id));
-    assert_eq!(disposed.borrow().len(), 1);
+    assert_eq!(disposed.lock().unwrap().len(), 1);
 }
 
 // ---- fork seed pure function（对齐 store.cpp 的 fork seed 计算）----
 
 #[test]
 fn fork_seed_default_to_last_event() {
-    let store = Rc::new(SessionStore::new());
+    let store = Arc::new(SessionStore::new());
     let parent = store.create(None, &CreateSessionOptions { seed: None, meta: None }).unwrap();
     parent.append(EventKind::TurnStart, json!({"turn": 1}), None).unwrap();
     parent.append(EventKind::TurnEnd, json!({"turn": 1, "reason": {"kind": "complete"}}), None).unwrap();

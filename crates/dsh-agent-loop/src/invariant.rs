@@ -6,7 +6,7 @@
 //! （D-031 声明）。`isAgentLoopRequest` 的运行时门在 Rust 变成 `AgentLoopRequest`
 //! 包装类型（loop 唯一生产者；D-031 声明）。
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_llm::GenerateOptions;
 use dsh_session::{fold_request_header, EventKind, Session};
@@ -32,7 +32,7 @@ impl AgentLoopRequest {
 /// - 消息文本逐字对齐 `invariant.ts`。
 pub fn check_loop_request(
     request: &AgentLoopRequest,
-    session: Option<&Rc<Session>>,
+    session: Option<&Arc<Session>>,
 ) -> Result<(), String> {
     let options = &request.0;
 

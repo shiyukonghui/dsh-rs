@@ -1,7 +1,7 @@
 //! Inbox 行为测试（移植 agent.spec.ts 的 Inbox 部分，消息/事件/形状逐字）。
 
-use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use dsh_agent::{
     inbox_splice, Inbox, InboxNotification, InboxSpliceOutcome, InboxSpliceRecord, InboxTarget,
@@ -13,24 +13,24 @@ use dsh_session::{
 };
 use serde_json::json;
 
-fn store() -> Rc<SessionStore> {
-    Rc::new(SessionStore::new())
+fn store() -> Arc<SessionStore> {
+    Arc::new(SessionStore::new())
 }
 
 fn msg(id: &str) -> Message {
     Message::user(MessageId(id.to_string()), vec![])
 }
 
-fn session(store: &Rc<SessionStore>, id: &str) -> Rc<Session> {
+fn session(store: &Arc<SessionStore>, id: &str) -> Arc<Session> {
     session_with(store, id, None, None)
 }
 
 fn session_with(
-    store: &Rc<SessionStore>,
+    store: &Arc<SessionStore>,
     id: &str,
     seed: Option<Vec<SessionEvent>>,
     seed_length: Option<u64>,
-) -> Rc<Session> {
+) -> Arc<Session> {
     store
         .create(
             Some(SessionId(id.to_string())),
@@ -45,10 +45,10 @@ fn session_with(
         .unwrap()
 }
 
-fn inbox_with_log(s: Rc<Session>) -> (Inbox, Rc<RefCell<Vec<InboxNotification>>>) {
-    let log = Rc::new(RefCell::new(Vec::new()));
+fn inbox_with_log(s: Arc<Session>) -> (Inbox, Arc<Mutex<Vec<InboxNotification>>>) {
+    let log = Arc::new(Mutex::new(Vec::new()));
     let log2 = log.clone();
-    let inbox = Inbox::with_notify(s, Rc::new(move |n| log2.borrow_mut().push(n.clone()))).unwrap();
+    let inbox = Inbox::with_notify(s, Rc::new(move |n| log2.lock().unwrap().push(n.clone()))).unwrap();
     (inbox, log)
 }
 
@@ -83,9 +83,9 @@ enum NKind {
     Inserted,
 }
 
-/// 从通知日志提取某一类的消息 id（返回 owned String，避免借用临时 Ref）。
-fn notif_ids(log: &RefCell<Vec<InboxNotification>>, kind: NKind) -> Vec<String> {
-    let guard = log.borrow();
+/// 从通知日志提取某一类的消息 id（返回 owned String，避免借用临时锁）。
+fn notif_ids(log: &Mutex<Vec<InboxNotification>>, kind: NKind) -> Vec<String> {
+    let guard = log.lock().unwrap();
     guard
         .iter()
         .filter_map(|n| match (kind, n) {
@@ -195,7 +195,7 @@ fn replace_by_identity_across_queues() {
     // missing → false
     assert!(!inbox.replace(&MessageId("nope".into()), new_b.clone()).unwrap());
     // 找到并替换：discarded=[a]（next-step），inserted=[b]
-    log.borrow_mut().clear();
+    log.lock().unwrap().clear();
     assert!(inbox.replace(&MessageId("a".into()), new_b.clone()).unwrap());
     assert_eq!(ids(&inbox.next_step()), vec!["b"]);
     assert_eq!(notif_ids(&log, NKind::Discarded), vec!["a"]);
@@ -212,7 +212,7 @@ fn remove_by_identity() {
     let (inbox, log) = inbox_with_log(s.clone());
     inbox.append_msg(InboxTarget::NextTurn, msg("a")).unwrap();
     assert!(!inbox.remove(&MessageId("missing".into())).unwrap());
-    log.borrow_mut().clear();
+    log.lock().unwrap().clear();
     assert!(inbox.remove(&MessageId("a".into())).unwrap());
     assert!(inbox.next_turn().is_empty());
     assert_eq!(notif_ids(&log, NKind::Discarded), vec!["a"]);
@@ -229,7 +229,7 @@ fn clear_discards_next_step_then_next_turn_and_writes_canceled_events() {
     inbox.prepend_msg(InboxTarget::NextStep, msg("s1")).unwrap();
     inbox.append_msg(InboxTarget::NextTurn, msg("t1")).unwrap();
     inbox.append_msg(InboxTarget::NextTurn, msg("t2")).unwrap();
-    log.borrow_mut().clear();
+    log.lock().unwrap().clear();
     let before = s.seq();
     inbox.clear().unwrap();
     assert!(!inbox.has_pending());
@@ -265,7 +265,7 @@ fn claim_takes_all_next_step_then_front_turn() {
     inbox.append_msg(InboxTarget::NextStep, msg("s2")).unwrap();
     inbox.append_msg(InboxTarget::NextTurn, msg("t1")).unwrap();
     inbox.append_msg(InboxTarget::NextTurn, msg("t2")).unwrap();
-    log.borrow_mut().clear();
+    log.lock().unwrap().clear();
     let result = inbox.claim(InboxTarget::NextTurn, 7).unwrap();
     // 返回：next-step 全取 + 队首 1 条 turn
     assert_eq!(ids(result.next_steps()), vec!["s1", "s2"]);

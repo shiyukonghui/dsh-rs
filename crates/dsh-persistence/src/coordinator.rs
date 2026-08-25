@@ -14,9 +14,8 @@
 //! 推进；本 coordinator 的公开 `append` 承诺**耐用**（立即 drain），后台 batch 窗口
 //! 属于 future live-session 层。
 
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use dsh_brand::SessionId;
 use dsh_session::repair::interrupted_turn_closers;
@@ -58,25 +57,27 @@ struct SessionState {
     materialized: bool,
     /// live turn 是否打开（owner 语义：关闭前不允许 load/prepare）。
     live_turn_open: bool,
-    /// 写批控制器（后台窗口推进由服务层驱动）。
-    write_behind: Rc<RefCell<SessionWriteBehind>>,
+    /// 写批控制器（后台窗口推进由服务层驱动）。D-115：`Arc<Mutex>`（Send+Sync）。
+    write_behind: Arc<Mutex<SessionWriteBehind>>,
 }
 
 /// 持久化协调器：在 `PersistenceBackend` 之上实现公开 `SessionPersistence`。
+/// D-115：`states`/`prepared` 单 Mutex（并发面交集），backend `+ Send + Sync`
+/// （coordinator 需整体 `Send + Sync`——store 观察者闭包已 `Send + Sync`）。
 pub struct PersistenceCoordinator {
-    backend: Box<dyn PersistenceBackend>,
-    states: RefCell<HashMap<SessionId, SessionState>>,
+    backend: Box<dyn PersistenceBackend + Send + Sync>,
+    states: Mutex<HashMap<SessionId, SessionState>>,
     /// LRU 预备缓存（TS 缺省 5）。
-    prepared: RefCell<VecDeque<SessionId>>,
+    prepared: Mutex<VecDeque<SessionId>>,
     prepared_cache_size: usize,
 }
 
 impl PersistenceCoordinator {
-    pub fn new(backend: Box<dyn PersistenceBackend>) -> Self {
+    pub fn new(backend: Box<dyn PersistenceBackend + Send + Sync>) -> Self {
         PersistenceCoordinator {
             backend,
-            states: RefCell::new(HashMap::new()),
-            prepared: RefCell::new(VecDeque::new()),
+            states: Mutex::new(HashMap::new()),
+            prepared: Mutex::new(VecDeque::new()),
             prepared_cache_size: DEFAULT_PREPARED_SESSION_CACHE_SIZE,
         }
     }
@@ -84,7 +85,8 @@ impl PersistenceCoordinator {
     /// 会话是否已有物化日志（协调器内存视图）。
     pub fn is_materialized(&self, id: &SessionId) -> bool {
         self.states
-            .borrow()
+            .lock()
+            .unwrap()
             .get(id)
             .map(|s| s.materialized)
             .unwrap_or(false)
@@ -92,16 +94,16 @@ impl PersistenceCoordinator {
 
     /// 会话事件 cursor（协调器内存视图；未登记会话 None）。
     pub fn cursor_of(&self, id: &SessionId) -> Option<u64> {
-        self.states.borrow().get(id).map(|s| s.cursor)
+        self.states.lock().unwrap().get(id).map(|s| s.cursor)
     }
 
-    pub fn backend(&self) -> &dyn PersistenceBackend {
+    pub fn backend(&self) -> &(dyn PersistenceBackend + Send + Sync) {
         &*self.backend
     }
 
     /// 会话 live turn 状态（owner 语义控制）。
     pub fn set_live_turn(&self, id: &SessionId, open: bool) {
-        if let Some(s) = self.states.borrow_mut().get_mut(id) {
+        if let Some(s) = self.states.lock().unwrap().get_mut(id) {
             s.live_turn_open = open;
         }
     }
@@ -109,7 +111,7 @@ impl PersistenceCoordinator {
     /// 推进 write-behind 的 automatic 窗口（服务层调用）。返回是否触发后台写入。
     pub fn tick(&self, id: &SessionId, now_ms: u64) -> bool {
         let wb = {
-            let states = self.states.borrow();
+            let states = self.states.lock().unwrap();
             let Some(state) = states.get(id) else {
                 return false;
             };
@@ -119,14 +121,14 @@ impl PersistenceCoordinator {
             state.write_behind.clone()
         };
         let mut sink = CoordinatorSink { backend: &*self.backend, id: id.clone() };
-        let mut guard = wb.borrow_mut();
+        let mut guard = wb.lock().unwrap();
         guard.tick(&mut sink, now_ms)
     }
 
     /// 显式 quiescence flush（服务层在批次窗口到期 / 会话关闭时调用）。
     pub fn flush(&self, id: &SessionId) -> Result<(), PersistenceError> {
         let wb = {
-            let states = self.states.borrow();
+            let states = self.states.lock().unwrap();
             let Some(state) = states.get(id) else {
                 return Err(PersistenceError::NotFound(id.clone()));
             };
@@ -136,7 +138,7 @@ impl PersistenceCoordinator {
             state.write_behind.clone()
         };
         let mut sink = CoordinatorSink { backend: &*self.backend, id: id.clone() };
-        let mut guard = wb.borrow_mut();
+        let mut guard = wb.lock().unwrap();
         guard.flush(&mut sink).map_err(PersistenceError::Other)?;
         Ok(())
     }
@@ -157,7 +159,7 @@ impl SessionPersistence for PersistenceCoordinator {
 
     fn create(&self, meta: &SessionHeader) -> Result<(), PersistenceError> {
         let id = meta.id.clone();
-        let mut states = self.states.borrow_mut();
+        let mut states = self.states.lock().unwrap();
         if states.contains_key(&id) {
             return Ok(()); // 已登记：幂等
         }
@@ -169,7 +171,7 @@ impl SessionPersistence for PersistenceCoordinator {
                 cursor: 0,
                 materialized: false,
                 live_turn_open: false,
-                write_behind: Rc::new(RefCell::new(SessionWriteBehind::new(
+                write_behind: Arc::new(Mutex::new(SessionWriteBehind::new(
                     crate::seam::DEFAULT_WRITE_BATCH_MAX_DELAY_MS,
                 ))),
             },
@@ -181,7 +183,7 @@ impl SessionPersistence for PersistenceCoordinator {
         if events.is_empty() {
             return Ok(());
         }
-        let mut states = self.states.borrow_mut();
+        let mut states = self.states.lock().unwrap();
         let state = states
             .get_mut(id)
             .ok_or_else(|| PersistenceError::NotFound(id.clone()))?;
@@ -206,7 +208,7 @@ impl SessionPersistence for PersistenceCoordinator {
         // 后续 append 经 write-behind 耐用写入
         let mut sink = CoordinatorSink { backend: &*self.backend, id: id.clone() };
         {
-            let mut wb = state.write_behind.borrow_mut();
+            let mut wb = state.write_behind.lock().unwrap();
             for e in events {
                 wb.enqueue(e.clone(), 0);
             }
@@ -223,7 +225,7 @@ impl SessionPersistence for PersistenceCoordinator {
             return Err(PersistenceError::NotFound(id.clone()));
         };
         // live turn 打开 → 拒绝
-        let states = self.states.borrow();
+        let states = self.states.lock().unwrap();
         if let Some(s) = states.get(id) {
             if s.live_turn_open {
                 return Err(PersistenceError::Invalid(format!(
@@ -248,7 +250,7 @@ impl SessionPersistence for PersistenceCoordinator {
     fn load(&self, id: &SessionId) -> Result<SessionInspection, PersistenceError> {
         // live turn 打开 → 拒绝（用 live Session）
         {
-            let states = self.states.borrow();
+            let states = self.states.lock().unwrap();
             if let Some(s) = states.get(id) {
                 if s.live_turn_open {
                     return Err(PersistenceError::Invalid(format!(
@@ -332,7 +334,7 @@ impl PersistenceCoordinator {
     }
 
     fn cache_prepared(&self, id: &SessionId) {
-        let mut cache = self.prepared.borrow_mut();
+        let mut cache = self.prepared.lock().unwrap();
         cache.retain(|cached| cached != id);
         cache.push_back(id.clone());
         while cache.len() > self.prepared_cache_size {
@@ -342,11 +344,11 @@ impl PersistenceCoordinator {
 
     /// 是否命中预备缓存（测试/诊断）。
     pub fn is_prepared_cached(&self, id: &SessionId) -> bool {
-        self.prepared.borrow().iter().any(|cached| cached == id)
+        self.prepared.lock().unwrap().iter().any(|cached| cached == id)
     }
 
     /// 访问预备缓存当前条目（测试/诊断）。
     pub fn prepared_len(&self) -> usize {
-        self.prepared.borrow().len()
+        self.prepared.lock().unwrap().len()
     }
 }

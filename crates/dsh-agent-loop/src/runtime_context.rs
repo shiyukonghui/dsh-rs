@@ -6,7 +6,7 @@
 //! 权威重派生（日志即权威，见 THEOREM），等价 TS 构造扫描 + 事件跟随的最终状态。
 
 use std::cell::Cell;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_llm::{
     ContentBlock, ContextForm, ContextSnapshotSection, Message, MessageId, MessageSource,
@@ -58,7 +58,7 @@ impl RuntimeContextProjection {
 
     /// 从 session 日志权威重派生 retained（后向找最后一个 owned 且仍在 surface 的
     /// user/message；owned 存在但不在 surface → 无 retained）。
-    pub fn reconcile(&mut self, session: &Rc<Session>) {
+    pub fn reconcile(&mut self, session: &Arc<Session>) {
         let surface: Vec<u64> = session.surface_nodes().unwrap_or_default();
         let mut found_owned = false;
         for event in session.events().into_iter().rev() {
@@ -85,7 +85,7 @@ impl RuntimeContextProjection {
     /// `current` 为完整渲染的动态 context（含前缀）；`sections` 为构成该快照的具名贡献。
     pub fn project(
         &mut self,
-        session: &Rc<Session>,
+        session: &Arc<Session>,
         current: &str,
         sections: &[ContextSnapshotSection],
     ) -> Option<Message> {

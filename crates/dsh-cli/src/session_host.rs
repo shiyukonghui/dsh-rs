@@ -8,11 +8,10 @@
 //! `session/event` 观察者 → 持久化（coordinator create/append）+ 事件下链
 //! （`EventSink`，Send+Sync 供 SSE/WS 线程 drain）。
 //!
-//! 单线程纪律（D-004/D-006）：所有 store/coordinator 操作发生在调用线程（web 的
-//! RPC thread 单线程顺序分派）；跨线程只走 `EventSink`（`Arc<Mutex<..>>`）。
+//! 请求面并发化（D-115）：SessionStore/Session/PersistenceCoordinator 已整体
+//! Arc + Mutex 化（Send+Sync）；SessionHost 自身亦 Send+Sync，可由 worker 线程握有。
 
 use std::path::Path;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use dsh_brand::SessionId;
@@ -34,10 +33,10 @@ pub type EventSink = Arc<Mutex<Vec<(String, SessionEvent)>>>;
 
 /// SessionHost：dsh-session store + 可选持久化挂载。
 pub struct SessionHost {
-    /// 权威 session store（Rc/RefCell，单线程）。
-    pub store: Rc<SessionStore>,
+    /// 权威 session store（Arc 共享，Send+Sync）。
+    pub store: Arc<SessionStore>,
     /// 持久化协调器（可选：root 缺省时纯内存）。
-    pub coord: Option<Rc<PersistenceCoordinator>>,
+    pub coord: Option<Arc<PersistenceCoordinator>>,
     /// 事件下链日志（Send+Sync）。
     pub sink: EventSink,
     /// 持久化后端种类诊断（"mem"/"jsonl"/"sqlite"）。
@@ -46,13 +45,13 @@ pub struct SessionHost {
 
 impl SessionHost {
     /// 纯内存 SessionHost（无持久化根；测试 / 未配置 session 根时使用）。
-    pub fn in_memory() -> Rc<Self> {
+    pub fn in_memory() -> Arc<Self> {
         Self::new_from_backend("mem", None)
     }
 
     /// 从持久化根构造：JSONL 后端 + coordinator 挂载 + 恢复既有快照。
     /// 快照恢复失败不阻断构造（返回的 host 仍可用；错误在调用方诊断）。
-    pub fn with_root(root: &Path) -> Rc<Self> {
+    pub fn with_root(root: &Path) -> Arc<Self> {
         let backend = JsonlBackend::new(JsonlConfig {
             root: root.to_path_buf(),
             ..Default::default()
@@ -66,7 +65,7 @@ impl SessionHost {
     /// restore_all。父目录不存在则 create_dir_all（镜像 JSONL 惰性建根）。
     /// 打开/建 schema 失败 → `Err`（fail-loud，调用方负责 boot 时终止——绝不静默
     /// 降级到内存）。
-    pub fn with_sqlite(path: &Path) -> Result<Rc<Self>, String> {
+    pub fn with_sqlite(path: &Path) -> Result<Arc<Self>, String> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
@@ -89,20 +88,20 @@ impl SessionHost {
     /// create/append/flush 持久化副作用 + 下链。
     fn new_from_backend(
         kind: &'static str,
-        backend: Option<Box<dyn PersistenceBackend>>,
-    ) -> Rc<Self> {
-        let coord = backend.map(|b| Rc::new(PersistenceCoordinator::new(b)));
-        let host = Rc::new(SessionHost {
-            store: Rc::new(SessionStore::new()),
+        backend: Option<Box<dyn PersistenceBackend + Send + Sync>>,
+    ) -> Arc<Self> {
+        let coord = backend.map(|b| Arc::new(PersistenceCoordinator::new(b)));
+        let host = Arc::new(SessionHost {
+            store: Arc::new(SessionStore::new()),
             coord,
             sink: Arc::new(Mutex::new(Vec::new())),
             kind,
         });
         // 挂载观察者：append 提交后 → 持久化 + 下链。
-        // 注意：闭包不捕获 `host.store`（否则 store→观察者→store 引用环泄漏）。
+        // 注意：闭包不捕获 `host.store`（否则 store→观察者→store 强引用环泄漏）。
         let coord_weak = host.coord.clone();
         let sink = host.sink.clone();
-        host.store.on_event(Box::new(move |session, event| {
+        host.store.on_event(Arc::new(move |session, event| {
             if let Some(coord) = &coord_weak {
                 let _ = coord.create(session.header());
                 let _ = coord.append(session.id(), std::slice::from_ref(event));
@@ -110,7 +109,7 @@ impl SessionHost {
             sink.lock().unwrap().push((session.id().to_string(), event.clone()));
         }));
         let coord_flush = host.coord.clone();
-        host.store.on_flush(Box::new(move |session| {
+        host.store.on_flush(Arc::new(move |session| {
             if let Some(coord) = &coord_flush {
                 let _ = coord.flush(session.id());
             }
@@ -167,7 +166,7 @@ impl SessionHost {
         }
         let session =
             Session::from_restore(id.clone(), &events, &header).map_err(|e| e.to_string())?;
-        let rc = Rc::new(session);
+        let rc = Arc::new(session);
         self.store.enter(&rc).map_err(|e| e.to_string())?;
         let _ = self.store.announce(&rc);
         // coordinator cursor 对齐：以 live 会话的完整事件表（含 seed 边界标记
@@ -200,7 +199,7 @@ impl SessionHost {
     }
 
     /// 取或建目标会话（adopt 时惰性创建；id 即前端 sessionId）。
-    pub fn session(&self, id: &str) -> Result<Rc<Session>, String> {
+    pub fn session(&self, id: &str) -> Result<Arc<Session>, String> {
         let sid = SessionId::from_raw(id.to_string());
         if let Some(s) = self.store.get(&sid) {
             return Ok(s);
@@ -259,7 +258,7 @@ impl SessionHost {
     }
 
     /// 全部 live 会话（创建顺序）。
-    pub fn list(&self) -> Vec<Rc<Session>> {
+    pub fn list(&self) -> Vec<Arc<Session>> {
         self.store.list()
     }
 

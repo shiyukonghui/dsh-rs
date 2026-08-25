@@ -7,7 +7,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_agent::AgentOptions;
 use dsh_agent_loop::{
@@ -30,11 +30,11 @@ use serde_json::Value;
 // helpers
 // ---------------------------------------------------------------------------
 
-fn store() -> Rc<SessionStore> {
-    Rc::new(SessionStore::new())
+fn store() -> Arc<SessionStore> {
+    Arc::new(SessionStore::new())
 }
 
-fn session_new(store: &Rc<SessionStore>, id: &str) -> Rc<Session> {
+fn session_new(store: &Arc<SessionStore>, id: &str) -> Arc<Session> {
     store
         .create(
             Some(SessionId(id.to_string())),
@@ -49,7 +49,7 @@ fn session_new(store: &Rc<SessionStore>, id: &str) -> Rc<Session> {
         .unwrap()
 }
 
-fn step_start(s: &Rc<Session>, turn: u64, step: u64) {
+fn step_start(s: &Arc<Session>, turn: u64, step: u64) {
     s.append(
         EventKind::StepStart,
         serde_json::json!({ "turn": turn, "step": step }),
@@ -58,7 +58,7 @@ fn step_start(s: &Rc<Session>, turn: u64, step: u64) {
     .unwrap();
 }
 
-fn append_user(s: &Rc<Session>, id: &str, text: &str) {
+fn append_user(s: &Arc<Session>, id: &str, text: &str) {
     let msg = Message::user(MessageId(id.to_string()), vec![ContentBlock::text(text)]);
     // user/message 事件 data = Message 本体（derive_event_message 直接 from_value(data)）
     s.append(
@@ -147,7 +147,7 @@ fn base_prepared(provider: &str, model: &str) -> impl Fn(CallConfig) -> Result<P
 }
 
 fn default_build(
-    s: &Rc<Session>,
+    s: &Arc<Session>,
     opts: &AgentOptions,
     logged: bool,
     tools: &[ToolSchema],
@@ -161,7 +161,7 @@ fn default_build(
     )
 }
 
-fn request_headers(s: &Rc<Session>) -> Vec<(Value, String)> {
+fn request_headers(s: &Arc<Session>) -> Vec<(Value, String)> {
     s.events()
         .iter()
         .filter(|e| e.kind == EventKind::RequestHeader)
@@ -658,7 +658,7 @@ fn build_request_context_logged_only_on_change() {
 // invariant
 // ---------------------------------------------------------------------------
 
-fn reconstructed_request() -> (Rc<Session>, AgentLoopRequest) {
+fn reconstructed_request() -> (Arc<Session>, AgentLoopRequest) {
     let st = store();
     let s = session_new(&st, "inv");
     step_start(&s, 1, 1);

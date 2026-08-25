@@ -7,6 +7,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_llm::{
     CallId, ContentBlock, Message, MessageSource, Role, ToolCallBlock,
@@ -21,8 +22,8 @@ use serde_json::{json, Value};
 // helpers
 // ---------------------------------------------------------------------------
 
-fn session() -> Rc<Session> {
-    Rc::new(Session::create(SessionId::from_raw("s0"), None, None).unwrap())
+fn session() -> Arc<Session> {
+    Arc::new(Session::create(SessionId::from_raw("s0"), None, None).unwrap())
 }
 
 fn echo_def(name: &str) -> dsh_tools::ToolDefinition {
@@ -92,12 +93,12 @@ fn registry(defs: Vec<Rc<dsh_tools::ToolDefinition>>) -> ToolRegistry {
     r
 }
 
-fn event(s: &Rc<Session>, kind: EventKind) -> Vec<dsh_session::SessionEvent> {
+fn event(s: &Arc<Session>, kind: EventKind) -> Vec<dsh_session::SessionEvent> {
     s.events().into_iter().filter(|e| e.kind == kind).collect()
 }
 
 fn run(
-    s: &Rc<Session>,
+    s: &Arc<Session>,
     tools: &ToolRegistry,
     turn: u64,
     step: u64,
@@ -107,7 +108,7 @@ fn run(
 }
 
 fn run_resume(
-    s: &Rc<Session>,
+    s: &Arc<Session>,
     tools: &ToolRegistry,
     turn: u64,
     step: u64,

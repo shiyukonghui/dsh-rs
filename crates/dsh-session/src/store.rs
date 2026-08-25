@@ -6,10 +6,14 @@
 //! - `session/created` / `session/disposed` 同步广播；
 //! - `session/event` 在 append 提交后同步通知（per-listener containment）；
 //! - `session/flush` 同步 drain 回调（M1 无 async；后续桥到服务层线程）。
+//!
+//! D-115（请求面并发化）：句柄 `Rc` → `Arc`、`RefCell` → `Mutex`，使 store/session
+//! 成为 Send+Sync，可跨线程共享（serve worker 化前置）。锁粒度：map+counter 单 Mutex、
+//! 回调表各一 Mutex。死锁审计：观察者只取叶子锁且不反向取 session/store 锁
+//! （锁序 `session.data → 叶子锁` 无环）。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use dsh_brand::SessionId;
 
@@ -42,25 +46,34 @@ pub enum SessionForkSource<'a> {
 
 /// 一个 store 条目的最小状态。
 struct StoreEntry {
-    session: Rc<Session>,
+    session: Arc<Session>,
     /// 已发布（announce 过）——dispose 时发配对通知。
     announced: bool,
 }
 
-type EventCallback = Box<dyn Fn(&Session, &SessionEvent)>;
-type SessionCallback = Box<dyn Fn(&Session)>;
+/// 观察者回调：D-115 后须 `Send + Sync`（跨线程共享）。
+type EventCallback = Arc<dyn Fn(&Session, &SessionEvent) + Send + Sync>;
+/// 观察者回调：D-115 后须 `Send + Sync`（跨线程共享）。
+type SessionCallback = Arc<dyn Fn(&Session) + Send + Sync>;
 
 /// 内存 session store（`ctx.sessions` 的 Rust 形态）。
 ///
-/// 观察者回调通过 `Rc` 共享持久化插件状态；`append` 后同步触发 `session/event`。
+/// 观察者回调通过 `Arc` 共享持久化插件状态；`append` 后同步触发 `session/event`。
 #[derive(Default)]
 pub struct SessionStore {
-    store: RefCell<HashMap<SessionId, StoreEntry>>,
-    counter: RefCell<u64>,
-    on_created: RefCell<Vec<SessionCallback>>,
-    on_disposed: RefCell<Vec<SessionCallback>>,
-    on_event: RefCell<Vec<EventCallback>>,
-    on_flush: RefCell<Vec<SessionCallback>>,
+    /// map + counter 单 Mutex（D-115 锁粒度；热路径不经过此锁——append 只在回调表上）。
+    state: Mutex<StoreState>,
+    on_created: Mutex<Vec<SessionCallback>>,
+    on_disposed: Mutex<Vec<SessionCallback>>,
+    on_event: Mutex<Vec<EventCallback>>,
+    on_flush: Mutex<Vec<SessionCallback>>,
+}
+
+/// store 内部可变核心（map + counter 同锁）。
+#[derive(Default)]
+struct StoreState {
+    store: HashMap<SessionId, StoreEntry>,
+    counter: u64,
 }
 
 impl SessionStore {
@@ -71,22 +84,22 @@ impl SessionStore {
     /// 订阅 `session/created`（同步广播；抛错按订阅序传播——M1 无 Cordis 的 rollback 语义，
     /// 由调用方（agent-loop 归壳）在 create 事务里处理回滚）。
     pub fn on_created(&self, cb: SessionCallback) {
-        self.on_created.borrow_mut().push(cb);
+        self.on_created.lock().unwrap().push(cb);
     }
 
     /// 订阅 `session/disposed`。
     pub fn on_disposed(&self, cb: SessionCallback) {
-        self.on_disposed.borrow_mut().push(cb);
+        self.on_disposed.lock().unwrap().push(cb);
     }
 
     /// 订阅 `session/event`（append 提交后同步触发；per-listener containment）。
     pub fn on_event(&self, cb: EventCallback) {
-        self.on_event.borrow_mut().push(cb);
+        self.on_event.lock().unwrap().push(cb);
     }
 
     /// 订阅 `session/flush`（同步 drain）。
     pub fn on_flush(&self, cb: SessionCallback) {
-        self.on_flush.borrow_mut().push(cb);
+        self.on_flush.lock().unwrap().push(cb);
     }
 
     /// 构造 Session（不进入 store）——普通创建（seed/meta）。
@@ -114,9 +127,9 @@ impl SessionStore {
     }
 
     /// 创建并进入 + 发布一个会话。
-    pub fn create(self: &Rc<Self>, id: Option<SessionId>, options: &CreateSessionOptions) -> Result<Rc<Session>, SessionError> {
+    pub fn create(self: &Arc<Self>, id: Option<SessionId>, options: &CreateSessionOptions) -> Result<Arc<Session>, SessionError> {
         let session = self.prepare(id, options)?;
-        let rc = Rc::new(session);
+        let rc = Arc::new(session);
         self.enter(&rc)?;
         self.announce(&rc)?;
         Ok(rc)
@@ -124,23 +137,25 @@ impl SessionStore {
 
     /// 进入一个 prepare 过的会话：安装 append 发布钩子 + 加入 store。
     /// 不发布 `session/created`——调用方先 detach 再 announce（rollback 安全）。
-    pub fn enter(self: &Rc<Self>, session: &Rc<Session>) -> Result<(), SessionError> {
+    pub fn enter(self: &Arc<Self>, session: &Arc<Session>) -> Result<(), SessionError> {
         let id = session.id().clone();
         if self.is_live(&id) {
             return Err(SessionError(format!("session \"{id}\" already exists")));
         }
         // 安装 append 发布钩子：把事件转发给 store 的 `session/event` 观察者。
         // 用 Weak 避免 store→session→store 引用环；剪枝在闭包内完成。
-        let store_weak = Rc::downgrade(self);
-        let session_weak = Rc::downgrade(session);
-        session.set_event_observer(Some(Box::new(move |event: &SessionEvent| {
+        // D-115：闭包只取 `on_event` 回调表锁（叶子序），绝不反向取 session/store 锁。
+        let store_weak = Arc::downgrade(self);
+        let session_weak = Arc::downgrade(session);
+        session.set_event_observer(Some(Arc::new(move |event: &SessionEvent| {
             let Some(store) = store_weak.upgrade() else { return };
             let Some(s) = session_weak.upgrade() else { return };
-            for cb in store.on_event.borrow().iter() {
+            let callbacks = store.on_event.lock().unwrap();
+            for cb in callbacks.iter() {
                 cb(&s, event);
             }
         })));
-        self.store.borrow_mut().insert(
+        self.state.lock().unwrap().store.insert(
             id,
             StoreEntry {
                 session: session.clone(),
@@ -151,18 +166,18 @@ impl SessionStore {
     }
 
     /// 发布 `session/created`（一次；同步广播）。
-    pub fn announce(&self, session: &Rc<Session>) -> Result<(), SessionError> {
+    pub fn announce(&self, session: &Arc<Session>) -> Result<(), SessionError> {
         let id = session.id().clone();
-        let mut store = self.store.borrow_mut();
-        let entry = store.get_mut(&id).ok_or_else(|| {
+        let mut state = self.state.lock().unwrap();
+        let entry = state.store.get_mut(&id).ok_or_else(|| {
             SessionError(format!("session \"{id}\" is not live in this store"))
         })?;
         if entry.announced {
             return Err(SessionError(format!("session \"{id}\" was already announced")));
         }
         entry.announced = true;
-        drop(store);
-        for cb in self.on_created.borrow().iter() {
+        drop(state);
+        for cb in self.on_created.lock().unwrap().iter() {
             cb(session);
         }
         Ok(())
@@ -170,11 +185,11 @@ impl SessionStore {
 
     /// 移除一个会话并发布配对 dispose（若已 announce）。
     /// 返回被移除的会话引用。
-    pub fn dispose(&self, id: &SessionId) -> Option<Rc<Session>> {
-        let removed = self.store.borrow_mut().remove(id);
+    pub fn dispose(&self, id: &SessionId) -> Option<Arc<Session>> {
+        let removed = self.state.lock().unwrap().store.remove(id);
         if let Some(entry) = &removed {
             if entry.announced {
-                for cb in self.on_disposed.borrow().iter() {
+                for cb in self.on_disposed.lock().unwrap().iter() {
                     cb(&entry.session);
                 }
             }
@@ -183,8 +198,8 @@ impl SessionStore {
     }
 
     /// `session/flush` 同步 drain。
-    pub fn flush(&self, session: &Rc<Session>) -> usize {
-        let callbacks = self.on_flush.borrow();
+    pub fn flush(&self, session: &Arc<Session>) -> usize {
+        let callbacks = self.on_flush.lock().unwrap();
         let count = callbacks.len();
         for cb in callbacks.iter() {
             cb(session);
@@ -193,27 +208,27 @@ impl SessionStore {
     }
 
     /// 查找 live 会话。
-    pub fn get(&self, id: &SessionId) -> Option<Rc<Session>> {
-        self.store.borrow().get(id).map(|e| e.session.clone())
+    pub fn get(&self, id: &SessionId) -> Option<Arc<Session>> {
+        self.state.lock().unwrap().store.get(id).map(|e| e.session.clone())
     }
 
     /// 全部 live 会话（创建顺序）。
-    pub fn list(&self) -> Vec<Rc<Session>> {
-        self.store.borrow().values().map(|e| e.session.clone()).collect()
+    pub fn list(&self) -> Vec<Arc<Session>> {
+        self.state.lock().unwrap().store.values().map(|e| e.session.clone()).collect()
     }
 
     /// 会话是否 live。
     pub fn is_live(&self, id: &SessionId) -> bool {
-        self.store.borrow().contains_key(id)
+        self.state.lock().unwrap().store.contains_key(id)
     }
 
     /// mint 唯一 session id（`session-<n>`）。
     fn mint_id(&self) -> SessionId {
-        let mut counter = self.counter.borrow_mut();
+        let mut state = self.state.lock().unwrap();
         loop {
-            *counter += 1;
-            let id = SessionId::from_raw(format!("session-{counter}"));
-            if !self.store.borrow().contains_key(&id) {
+            state.counter += 1;
+            let id = SessionId::from_raw(format!("session-{}", state.counter));
+            if !state.store.contains_key(&id) {
                 return id;
             }
         }
@@ -221,11 +236,11 @@ impl SessionStore {
 
     /// 从 live 源会话创建 live 子会话（fork）。
     pub fn fork(
-        self: &Rc<Self>,
+        self: &Arc<Self>,
         source: &SessionForkSource<'_>,
         boundary: Option<u64>,
         child_session_id: Option<SessionId>,
-    ) -> Result<Rc<Session>, SessionForkError> {
+    ) -> Result<Arc<Session>, SessionForkError> {
         if let Some(child_id) = &child_session_id {
             if self.is_live(child_id) {
                 return Err(SessionForkError {
@@ -260,7 +275,7 @@ impl SessionStore {
     fn resolve_fork_source<'a>(
         &self,
         source: &'a SessionForkSource<'a>,
-    ) -> Result<Rc<Session>, SessionForkError> {
+    ) -> Result<Arc<Session>, SessionForkError> {
         let id = match source {
             SessionForkSource::Id(id) => id.clone(),
             SessionForkSource::Object(s) => s.id().clone(),
@@ -275,7 +290,7 @@ impl SessionStore {
             SessionForkSource::Id(_) => Ok(live),
             // 对象源必须与 live store 条目是同一个 Session（按指针 identity）。
             SessionForkSource::Object(s) => {
-                if std::ptr::eq(Rc::as_ptr(&live), *s) {
+                if std::ptr::eq(Arc::as_ptr(&live), *s) {
                     Ok(live)
                 } else {
                     Err(SessionForkError {
@@ -350,8 +365,8 @@ fn now_ms() -> u64 {
 /// 便捷：构造以 `session/created` 广播的 store（DI 形态）。
 impl SessionStore {
     /// 创建一个 store + 一条默认会话（对齐 web.rs boot 的 seed default）。
-    pub fn with_default_session(self) -> (Rc<Self>, Rc<Session>) {
-        let rc = Rc::new(self);
+    pub fn with_default_session(self) -> (Arc<Self>, Arc<Session>) {
+        let rc = Arc::new(self);
         let session = rc
             .create(None, &CreateSessionOptions { seed: None, meta: None })
             .expect("default session creation");

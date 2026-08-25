@@ -4,6 +4,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_agent::{
     agent_carrier, agent_value, assemble_context_for, emit_agent_event, fuse_agent, Agent,
@@ -19,11 +20,11 @@ use serde_json::{json, Value};
 // helpers
 // ---------------------------------------------------------------------------
 
-fn store() -> Rc<SessionStore> {
-    Rc::new(SessionStore::new())
+fn store() -> Arc<SessionStore> {
+    Arc::new(SessionStore::new())
 }
 
-fn session(store: &Rc<SessionStore>, id: &str) -> Rc<Session> {
+fn session(store: &Arc<SessionStore>, id: &str) -> Arc<Session> {
     store
         .create(
             Some(SessionId(id.to_string())),

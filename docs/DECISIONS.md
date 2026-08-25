@@ -5238,6 +5238,78 @@ live 60880 wire 全链（含生成中 cancel 即停）。
 
 ---
 
+## D-115（实施·Phase 1）：dsh-session/dsh-persistence 整体 Send 化——粗锁迁移 +
+Rc→Arc 连锁更新全部消费者（dsh-agent/dsh-agent-loop/dsh-diff/dsh-cli）
+
+**日期**：2025（本机时间）
+
+**触发问题**：D-115 方案 II 的 Phase 1「dsh-session」落地——把 `Session/SessionStore`
+单线程 Rc/RefCell 纪律迁到 Arc/Mutex，并连锁更新全部消费者（设计 §4 顺序 Phase 1
+dsh-session）。dsh-persistence（coordinator/sqlite/write_behind）因 SessionHost 闭包
+要 Send+Sync 而随迁。
+
+**自下而上库存修正（与 Phase 0 盘点核对）**：phase 0 预期 `dsh-session` 61 测试；实际
+本轮 gate 以 dsh-session 69 / dsh-persistence 77 / dsh-agent 44 / dsh-agent-loop 全量
+/ dsh-diff 22 / dsh-cli 212+18 计。dsh-llm/dtah-tools（`Rc<dyn LlmAdapter>`/
+`Rc<dyn Fn>` 族）**未动**（Phase 3 预算），故 agent/add 面仍 Rc 单线程语义——Session
+升级后两端类型由 `Arc<Session>` 接缝兼容，已由编译期验证。
+
+**决策事项**：
+1. `dsh-session/runtime.rs`：`Session.data: RefCell<SessionData>` → `Mutex<SessionData>`；
+   观察者类型 `Rc<dyn Fn(&SessionEvent)>` → `Arc<dyn Fn(&SessionEvent)+Send+Sync>`；
+   所有 `.borrow()/.borrow_mut()` → `.lock().unwrap()`（粗边界单锁，热路径唯一）。
+2. `dsh-session/store.rs`：`SessionStore` 拆为 `Arc<Self>` 形态——`StoreEntry{ session:
+   Arc<Session>, announced }`；`SessionStore{ state: Mutex<StoreState>, on_created/
+   on_disposed/on_event/on_flush: Mutex<Vec<..>> }`；`create/enter/fork` 收 `&Arc<Self>`
+   且返回 `Arc<Session>`；`Arc::downgrade` 避免回调克隆引用环。观察者回调
+   `Arc<dyn Fn(&Session,&SessionEvent)+Send+Sync>`。
+3. **死锁审计执行（设计门槛）**：`append` 持 `Session.data` 锁 → 调 store 观察者；
+   观察者（session_host 持久化→sink `Arc<Mutex<Vec>>`、running-frames→host_events
+   `Arc<Mutex<Vec>>`）只取叶子锁，绝不反向取 session/store 锁——锁序 `session.data →
+   叶子锁` 无环；`session_host.on_event` 闭包捕获 `coord`（Arc）+ `sink`（Arc），
+   `session.id()` 在锁内经头字段读取（append 锁内取值后同步回调，语义不变）。
+4. `dsh-persistence`：`coordinator` 的 `states: RefCell<HashMap>` → `Mutex`、
+   `prepared: RefCell<VecDeque>` → `Mutex`；backend `Box<dyn PersistenceBackend>` →
+   `Box<dyn PersistenceBackend + Send + Sync>`；`SqliteBackend.conn: RefCell<Connection>`
+   → `Mutex<Connection>`（rusqlite Connection 本身 Send，Mutex 补 Sync）；
+   `write_behind.FailureReporter = Rc<dyn Fn>` → `Arc<dyn Fn+Send+Sync>`。
+   `SessionPersistence` trait 未动（`&self` 方法，不加 Send 界——dsh-session-query
+   的 `&dyn SessionPersistence` 传参不受影响）。
+5. **消费者连锁（机械但大量）**：`Rc<Session>`/`Rc<SessionStore>`/`Rc<SessionHost>`/
+   `Rc<PersistenceCoordinator>` 全部 → `Arc<…>`；`on_event/on_flush/on_created`
+   `Box::new` → `Arc::new`。dsh-agent（inbox/registry 的 `session: Arc<Session>`，
+   `AgentRegistry`/`Inbox` 自身 Rc/RefCell 保留至 Phase 2）；dsh-agent-loop
+   （host/service/build_request/runtime_context/invariant/tool_calls/agent 的
+   `&Arc<Session>`；`AgentLoopHost.store: Arc<SessionStore>`；`AgentLoopHost` 自身仍
+   Rc<dyn> 闭包笔至 Phase 3）；dsh-diff（session_store/sessions → Arc）；dsh-cli
+   （`SessionHost{store: Arc, coord: Option<Arc<PersistenceCoordinator>>}`，
+   `new_from_backend` 收 `Box<dyn PersistenceBackend+Send+Sync>`，m5/approval/
+   subagent_runtime/web 连锁）。`AgentLoopHost`（Rc）与 `SessionHost`（Arc）共存——
+   web.rs `assemble_server_loop` 仍返回 `Rc<AgentLoopHost>`（Phase 3 再 Send 化），
+   与 `Arc<SessionHost>` 无类型冲突（共享 `Arc<SessionStore>`）。
+6. **环境问题（按 D 纪律记档）**：Phase 1 gate「cargo test -p dsh-cli」被运行中的
+   dsh.exe web（60880 演示服务）占用 `target\debug\dsh.exe` 锁住 → 无法重链二进制。
+   已与用户确认后 Stop-Process 该进程 → 测试/clippy 跑完 → 以原命令行重启（PID
+   变化，端口 60880 HTTP 200 验证通过）。决策不受影响，仅临时阻碍。
+
+**最终选择**：上述 1-5。粗锁（单一整表锁）+ `Arc<dyn Fn+Send+Sync>` 回调 + 全消费者
+Rc→Arc 连锁；`SessionPersistence`/`LlmRuntime`/`ToolRegistry` 保持 Phase 3/未动。
+**被否决**：细粒度锁/读优先锁（阶段目的不达——worker 化只需 Send+Sync，不为并发热度
+优化增加锁复杂度与死锁面）；让 callback 仍是 `Rc<dyn Fn>` 而只把数据 Arc 化（回调在
+闭包捕获 `Arc<SessionStore>` 时须 Send，否则 worker 无法握整个状态——自下而上不可行）。
+
+**预期影响与回滚点**：dsh-session/dsh-persistence/dsh-agent/dsh-agent-loop/dsh-diff/
+dsh-cli 全部公开「会话句柄」类型由 `Rc` 改为 `Arc`（破坏性换型，编译期联动）；所有
+会话操作从借用到加锁（`Session` 方法 body 内 `.lock().unwrap()`）；内存/性能成本为
+Mutex 粗锁（本机单会话为主，可忽略）。回滚 = 逆向连锁换型（git revert 本提交）。
+**验证（Phase 1 关闸）**：`cargo test -p dsh-session -p dsh-persistence -p dsh-agent
+-p dsh-agent-loop -p dsh-diff -p dsh-cli --tests` 全绿（dsh-session 69 / dsh-persistence
+77 / dsh-agent 44 / dsh-agent-loop 各套 / dsh-diff 22 / dsh-cli 212+18，EXIT=0）；
+`cargo clippy` 上述五 crate `--lib --tests` 零告警；`cargo check --workspace` 绿。
+60880 演示服务重启验证 HTTP 200。
+
+---
+
 
 
 

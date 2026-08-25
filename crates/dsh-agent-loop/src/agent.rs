@@ -12,6 +12,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_agent::{
     agent_carrier, Agent, AgentEventDispatch, AgentRegistry, AgentStatus, CancelOptions,
@@ -256,7 +257,7 @@ impl ReactLoopAgent {
         &self.agent.id
     }
 
-    pub fn session(&self) -> &Rc<dsh_session::Session> {
+    pub fn session(&self) -> &Arc<dsh_session::Session> {
         &self.agent.session
     }
 
@@ -994,7 +995,7 @@ impl ReactLoopAgent {
 // helpers
 // ---------------------------------------------------------------------------
 
-fn last_turn_of(session: &Rc<dsh_session::Session>) -> u64 {
+fn last_turn_of(session: &Arc<dsh_session::Session>) -> u64 {
     session
         .events()
         .into_iter()

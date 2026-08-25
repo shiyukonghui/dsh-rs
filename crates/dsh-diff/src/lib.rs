@@ -150,9 +150,9 @@ pub struct Runner {
     /// loader 场景专用（懒初始化；Loader 插件挂载在 ctx 上）。
     loader: Option<dsh_loader::Loader>,
     /// session 场景专用（懒初始化；真实 dsh-session store——会话事件模型的权威侧）。
-    session_store: Option<Rc<dsh_session::store::SessionStore>>,
+    session_store: Option<Arc<dsh_session::store::SessionStore>>,
     /// session 场景已创建会话（id → store 会话）。
-    sessions: HashMap<String, Rc<dsh_session::Session>>,
+    sessions: HashMap<String, Arc<dsh_session::Session>>,
 }
 
 impl Runner {
@@ -332,9 +332,9 @@ impl Runner {
     }
 
     /// 懒初始化 session store（session 场景专用）。
-    fn ensure_session_store(&mut self) -> Result<Rc<dsh_session::store::SessionStore>, CordisError> {
+    fn ensure_session_store(&mut self) -> Result<Arc<dsh_session::store::SessionStore>, CordisError> {
         if self.session_store.is_none() {
-            self.session_store = Some(Rc::new(dsh_session::store::SessionStore::new()));
+            self.session_store = Some(Arc::new(dsh_session::store::SessionStore::new()));
         }
         Ok(self.session_store.clone().expect("just set"))
     }
@@ -343,7 +343,7 @@ impl Runner {
     fn session_of(
         &self,
         id: &str,
-    ) -> Result<Rc<dsh_session::Session>, CordisError> {
+    ) -> Result<Arc<dsh_session::Session>, CordisError> {
         self.sessions
             .get(id)
             .cloned()

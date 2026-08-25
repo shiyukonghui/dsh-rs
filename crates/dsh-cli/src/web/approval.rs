@@ -11,6 +11,7 @@
 //! plan 非激活时的全部工具 → 直通（与既有行为逐位一致）。
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_agent_loop::{
     append_pending_rejection, emit_pending_calls, execute_tool_calls, PendingCall, ToolExecCtx,
@@ -75,7 +76,7 @@ pub fn approval_tool_exec_factory(wire: Option<ApprovalWireRef>) -> Rc<ToolExecF
 }
 
 fn approval_tool_exec(
-    session: &Rc<Session>,
+    session: &Arc<Session>,
     tools: &Rc<ToolRegistry>,
     scope: Option<&ScopeKey>,
     agent: Option<&str>,
@@ -132,7 +133,7 @@ fn approval_tool_exec(
 /// 恢复路径：按 `fold_decided` 分派——allowedOnce 执行（只追 result）、rejected 合成
 /// 拒绝、未决（防御，decide 是先决）保持 pending 并重发 asked。
 fn resume_path(
-    session: &Rc<Session>,
+    session: &Arc<Session>,
     tools: &Rc<ToolRegistry>,
     scope: Option<&ScopeKey>,
     agent: Option<&str>,
@@ -186,7 +187,7 @@ fn resume_path(
 /// 调用 `execute_tool_calls` 并包装 outcome（pending 由调用方给定）。
 #[allow(clippy::too_many_arguments)]
 fn run_calls(
-    session: &Rc<Session>,
+    session: &Arc<Session>,
     tools: &Rc<ToolRegistry>,
     scope: Option<&ScopeKey>,
     agent: Option<&str>,
@@ -209,7 +210,7 @@ fn run_calls(
 }
 
 /// 该 call 最近的 `approval/decided` 决策（无/未知 → None）。
-fn fold_decided(session: &Rc<Session>, call_id: &str) -> Option<String> {
+fn fold_decided(session: &Arc<Session>, call_id: &str) -> Option<String> {
     session
         .events()
         .into_iter()
@@ -327,8 +328,8 @@ mod tests {
     use dsh_llm::{CallId, ContentBlock};
     use dsh_tools::{define_tool, DefineToolOptions, ToolExecutionMode};
 
-    fn session() -> Rc<Session> {
-        Rc::new(dsh_session::Session::create(
+    fn session() -> Arc<Session> {
+        Arc::new(dsh_session::Session::create(
             dsh_session::types::SessionId::from_raw("s0"),
             None,
             None,
@@ -362,7 +363,7 @@ mod tests {
         }
     }
 
-    fn enter_plan(s: &Rc<Session>) {
+    fn enter_plan(s: &Arc<Session>) {
         s.append(
             EventKind::PlanMode,
             json!({ "active": true }),
@@ -371,12 +372,12 @@ mod tests {
         .unwrap();
     }
 
-    fn ask(s: &Rc<Session>, call_id: &str) {
+    fn ask(s: &Arc<Session>, call_id: &str) {
         s.append(EventKind::ApprovalAsked, json!({ "toolCallId": call_id }), None)
             .unwrap();
     }
 
-    fn decide(s: &Rc<Session>, call_id: &str, decision: &str) {
+    fn decide(s: &Arc<Session>, call_id: &str, decision: &str) {
         s.append(
             EventKind::ApprovalDecided,
             json!({ "toolCallId": call_id, "decision": decision }),
@@ -394,7 +395,7 @@ mod tests {
         }
     }
 
-    fn asked_call_ids(s: &Rc<Session>) -> Vec<String> {
+    fn asked_call_ids(s: &Arc<Session>) -> Vec<String> {
         s.events()
             .into_iter()
             .filter(|e| e.kind == EventKind::ApprovalAsked)

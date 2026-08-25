@@ -4,7 +4,7 @@
 //! (initial/resume/change)、request/context 增量去重、适配器填充暗省的重解析剥离、
 //! 空 system/tools 不写、loop 标记。信号（AbortSignal）不入 Rust 面（sync 纪律）。
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_agent::AgentOptions;
 use dsh_llm::types::{Message, ToolSchema};
@@ -55,7 +55,7 @@ pub struct BuiltRequest {
 /// - `boundary_messages`：派生消息（`session.deriveMessages()`），请求的唯一消息源。
 #[allow(clippy::too_many_arguments)] // 1:1 对齐 buildRequest 输入面（10 参数，拒绝包壳失真）
 pub fn build_request(
-    session: &Rc<Session>,
+    session: &Arc<Session>,
     options: &AgentOptions,
     request_header_logged: bool,
     tools: &[ToolSchema],
@@ -192,7 +192,7 @@ pub fn build_request(
 }
 
 fn append_header(
-    session: &Rc<Session>,
+    session: &Arc<Session>,
     header: &dsh_session::EpochHeader,
     reason: RequestHeaderReason,
 ) -> Result<dsh_session::SessionEvent, String> {

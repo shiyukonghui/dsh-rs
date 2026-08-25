@@ -1,7 +1,7 @@
 //! M2e-3：RuntimeContextProjection 测试——retained 三态、CLEARED、快照去重、
 //! surface-replacement 后无 retained、form Snapshot 携带。
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_agent_loop::{RuntimeContextProjection, RUNTIME_CONTEXT_CLEARED};
 use dsh_llm::{
@@ -14,8 +14,8 @@ use serde_json::json;
 
 pub const SOURCE: &str = "@deepseek-ai/dsh-system-prompt";
 
-fn session() -> Rc<Session> {
-    Rc::new(Session::create(SessionId::from_raw("s0"), None, None).unwrap())
+fn session() -> Arc<Session> {
+    Arc::new(Session::create(SessionId::from_raw("s0"), None, None).unwrap())
 }
 
 fn section(name: &str, text: &str) -> dsh_llm::ContextSnapshotSection {
@@ -42,7 +42,7 @@ fn owned_message(id: &str, text: &str, sections: &[dsh_llm::ContextSnapshotSecti
     }
 }
 
-fn append_user(s: &Rc<Session>, msg: Message, replace: Option<(u64, u64)>) -> u64 {
+fn append_user(s: &Arc<Session>, msg: Message, replace: Option<(u64, u64)>) -> u64 {
     let surface = match replace {
         Some((start, end)) => SurfaceIntent {
             surface_op: SurfaceOp::Replace { start, end },

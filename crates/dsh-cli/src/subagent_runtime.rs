@@ -26,6 +26,7 @@ use dsh_subagent::{
 };
 use serde_json::{json, Value};
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// 子代理运行时错误（web 侧转 wire：bad-request / internal 两档）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +68,7 @@ pub enum SpawnMode {
 }
 
 /// mint 唯一 child 会话 id（`sa-<n>`；与 `s{n}` 命名空间分开）。
-fn mint_child_id(host: &Rc<SessionHost>) -> String {
+fn mint_child_id(host: &Arc<SessionHost>) -> String {
     let mut n = 1u64;
     loop {
         let candidate = format!("sa-{n}");
@@ -79,7 +80,7 @@ fn mint_child_id(host: &Rc<SessionHost>) -> String {
 }
 
 /// 解析父会话 delegationDepth（无会话 → 0）。
-fn parent_depth(host: &Rc<SessionHost>, parent: &str) -> u64 {
+fn parent_depth(host: &Arc<SessionHost>, parent: &str) -> u64 {
     host.session(parent)
         .ok()
         .map(|s| s.header().delegation_depth.unwrap_or(0))
@@ -98,7 +99,7 @@ fn child_meta(parent: &str, depth: u64) -> CreateSessionMeta {
 
 /// 把 child 会话 id 与描述符写进 store（spawn/fork 共用；描述符事件落日志）。
 fn persist_child(
-    host: &Rc<SessionHost>,
+    host: &Arc<SessionHost>,
     parent: &str,
     opts: &SpawnOptions,
     child_id: &str,
@@ -158,7 +159,7 @@ fn persist_child(
 /// in-process spawn：mint child 会话 + 描述符；返回 child id。
 /// 对齐 `spawn-in-process`（fresh session；不继承父上下文）。
 pub fn spawn_child(
-    host: &Rc<SessionHost>,
+    host: &Arc<SessionHost>,
     parent: &str,
     opts: &SpawnOptions,
 ) -> SpawnResult {
@@ -181,7 +182,7 @@ pub fn spawn_child(
 /// in-process fork：从源会话 seed 派生 child（继承父上下文），再落描述符。
 /// 对齐 `fork-in-process`（`inheritsParentContext=true`）。
 pub fn fork_child(
-    host: &Rc<SessionHost>,
+    host: &Arc<SessionHost>,
     parent: &str,
     source: &str,
     opts: &SpawnOptions,
@@ -241,7 +242,7 @@ pub fn fork_child(
 /// - 有身份但 mode 异常 → diagnostic「corrupt」；
 /// - parent 存在 → parentAvailable=true。
 pub fn list_children(
-    host: &Rc<SessionHost>,
+    host: &Arc<SessionHost>,
     parent: &str,
 ) -> (Vec<ChildEntry>, bool) {
     let parent_available = host.is_live(parent);
@@ -290,7 +291,7 @@ pub fn list_children(
 /// 读 child 会话事件（分页 read；不激活 Agent）。
 /// 返回 `(events, has_more)`；事件是 strict-envelope 形式的 wire 行。
 pub fn history(
-    host: &Rc<SessionHost>,
+    host: &Arc<SessionHost>,
     child: &str,
     before_seq: Option<u64>,
     max: Option<usize>,
@@ -314,7 +315,7 @@ pub fn history(
 /// 成功）。同步单线程：followup 即时驱动到本轮结束（fake-loop 即 mock adapter 驱动
 /// 真实 Rust loop 的测试模板）。
 pub fn prompt(
-    host: &Rc<SessionHost>,
+    host: &Arc<SessionHost>,
     agent_loop: &Option<Rc<AgentLoopHost>>,
     parent: &str,
     child: &str,
@@ -406,7 +407,7 @@ pub fn interrupt(parent: &str, child: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn host_with_default() -> Rc<SessionHost> {
+    fn host_with_default() -> Arc<SessionHost> {
         let host = SessionHost::in_memory();
         let _ = host.session("default");
         host

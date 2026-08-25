@@ -10,6 +10,7 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_llm::{Message, MessageId};
 use dsh_session::{EventKind, Session};
@@ -90,7 +91,7 @@ impl ClaimResult {
 // ---------------------------------------------------------------------------
 
 struct InboxInner {
-    session: Rc<Session>,
+    session: Arc<Session>,
     next_turn: Vec<Message>,
     next_step: Vec<Message>,
     notify: InboxNotify,
@@ -102,11 +103,11 @@ pub struct Inbox {
 
 impl Inbox {
     /// 用会话日志重建投影。仅重放 `seed_length` 之后的持久 splice。
-    pub fn new(session: Rc<Session>) -> Result<Self, String> {
+    pub fn new(session: Arc<Session>) -> Result<Self, String> {
         Self::with_notify(session, Rc::new(|_| {}))
     }
 
-    pub fn with_notify(session: Rc<Session>, notify: InboxNotify) -> Result<Self, String> {
+    pub fn with_notify(session: Arc<Session>, notify: InboxNotify) -> Result<Self, String> {
         let seed_length = session.header().seed_length.unwrap_or(0) as usize;
         let mut inner = InboxInner {
             session,

@@ -4,7 +4,7 @@
 //! append-only 日志 + surface 折叠 + 派生模型历史缓存。纯语义（无线程/IO）；
 //! 持久化是观察者关心的事（`session/event` 订阅、`session/flush` drain）。
 
-use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 
 use dsh_llm::types::Message;
 use dsh_llm::types::StreamChunk;
@@ -18,7 +18,8 @@ use crate::types::{
 };
 
 /// append 后同步通知的观察者（store 挂载；M1 内为最小回调表）。
-type EventObserver = Box<dyn Fn(&SessionEvent)>;
+/// D-115：`Send + Sync` 使 `Session` 可跨线程共享（serve worker 化前置）。
+type EventObserver = Arc<dyn Fn(&SessionEvent) + Send + Sync>;
 
 /// 会话运行时数据（可变部分；`header`/`first_live_seq` 是不可变元数据在外面）。
 struct SessionData {
@@ -50,7 +51,9 @@ pub struct Session {
     header: SessionHeader,
     /// 本进程内首次 append 的 seq：构造 seed 的长度（无 seed = 0）。
     first_live_seq: u64,
-    data: RefCell<SessionData>,
+    /// D-115：`Mutex` 使 `Session` 成为 Send+Sync（跨线程共享），锁粒度=单 data 锁。
+    /// 死锁审计：锁序 `session.data → 叶子锁`（观察者只取叶子锁且不反向取 session/store 锁）。
+    data: Mutex<SessionData>,
 }
 
 /// 会话校验错误（TS 用 throw Error；Rust 用带消息的错误）。
@@ -138,7 +141,7 @@ impl Session {
         let this = Session {
             header,
             first_live_seq,
-            data: RefCell::new(SessionData {
+            data: Mutex::new(SessionData {
                 log,
                 surface,
                 events_snapshot: None,
@@ -155,7 +158,8 @@ impl Session {
         // 标记 seed 边界：seed 未以 `session/end-seed` 结尾则追加（已结尾不重复标记）
         let ends_with_seed_marker = this
             .data
-            .borrow()
+            .lock()
+            .unwrap()
             .log
             .last()
             .map(|e| e.is_end_seed())
@@ -187,12 +191,12 @@ impl Session {
 
     /// 下一个事件的 seq（恒为 log 长度）。
     pub fn seq(&self) -> u64 {
-        self.data.borrow().log.len() as u64
+        self.data.lock().unwrap().log.len() as u64
     }
 
     /// 不可变日志快照（缓存；append 后失效）。
     pub fn events(&self) -> Vec<SessionEvent> {
-        let mut data = self.data.borrow_mut();
+        let mut data = self.data.lock().unwrap();
         if data.events_snapshot.is_none() {
             data.events_snapshot = Some(data.log.clone());
         }
@@ -201,7 +205,7 @@ impl Session {
 
     /// append 后同步通知的观察者（store 挂载）。
     pub fn set_event_observer(&self, observer: Option<EventObserver>) {
-        self.data.borrow_mut().on_event = observer;
+        self.data.lock().unwrap().on_event = observer;
     }
 
     /// 追加一条事件到日志并同步通知观察者。热点路径不阻塞 IO——
@@ -228,7 +232,7 @@ impl Session {
         }
         // validate-then-commit：候选先校验再入 log
         {
-            let mut guard = self.data.borrow_mut();
+            let mut guard = self.data.lock().unwrap();
             let SessionData {
                 log,
                 surface,
@@ -249,7 +253,7 @@ impl Session {
 
     /// 最后一次 `request/header` 之后的 `EpochHeader`（或无）。增量折叠。
     pub fn request_header(&self) -> Option<EpochHeader> {
-        let mut guard = self.data.borrow_mut();
+        let mut guard = self.data.lock().unwrap();
         let SessionData {
             log,
             header_fold,
@@ -268,7 +272,7 @@ impl Session {
 
     /// 最新解析的路由元数据（或无）。每个 `request/context` 事件折一次。
     pub fn request_context(&self) -> Option<RequestContext> {
-        let mut guard = self.data.borrow_mut();
+        let mut guard = self.data.lock().unwrap();
         let SessionData {
             log,
             context_fold,
@@ -294,7 +298,7 @@ impl Session {
     /// 缓存：每个 surface 节点首次出现时投影一次；surface 重写（replace）重建。
     /// 返回新数组快照（后续 append 不增长调用方已持有的数组）；`Message` 共享且不可变。
     pub fn derive_messages(&self) -> Result<Vec<Message>, SessionError> {
-        let mut guard = self.data.borrow_mut();
+        let mut guard = self.data.lock().unwrap();
         let SessionData {
             log,
             surface,
@@ -325,7 +329,7 @@ impl Session {
 
     /// 当前 surface 节点 seq（模型可见顺序）。
     pub fn surface_nodes(&self) -> Result<Vec<u64>, SessionError> {
-        let mut guard = self.data.borrow_mut();
+        let mut guard = self.data.lock().unwrap();
         let SessionData { log, surface, .. } = &mut *guard;
         surface.commit_next(log.as_slice())?;
         Ok(surface.state().nodes.clone())
@@ -333,7 +337,7 @@ impl Session {
 
     /// 当前 surface replace 计数。
     pub fn surface_replace_generation(&self) -> Result<u64, SessionError> {
-        let mut guard = self.data.borrow_mut();
+        let mut guard = self.data.lock().unwrap();
         let SessionData { log, surface, .. } = &mut *guard;
         surface.commit_next(log.as_slice())?;
         Ok(surface.state().replace_generation)

@@ -4,6 +4,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_llm::Message;
 use dsh_scope::{scope_target, ScopeCarrier, ScopeKey};
@@ -43,7 +44,7 @@ impl AgentCtx {
 pub struct Agent {
     pub id: dsh_session::SessionId,
     pub options: AgentOptions,
-    pub session: Rc<Session>,
+    pub session: Arc<Session>,
     pub inbox: Inbox,
     pub status: Cell<AgentStatus>,
     pub ctx: AgentCtx,
@@ -54,7 +55,7 @@ impl Agent {
     /// 构造（未注册）。inbox 从 session 重建。
     pub fn new(
         id: dsh_session::SessionId,
-        session: Rc<Session>,
+        session: Arc<Session>,
         options: AgentOptions,
         bus: AgentBus,
         scope: ScopeKey,
@@ -197,7 +198,7 @@ impl AgentRegistry {
     pub fn new_agent(
         &self,
         id: dsh_session::SessionId,
-        session: Rc<Session>,
+        session: Arc<Session>,
         options: AgentOptions,
     ) -> Rc<Agent> {
         Rc::new(

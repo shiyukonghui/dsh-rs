@@ -568,7 +568,7 @@ pub type HostVeto = dyn Fn(&str) -> Option<String>;
 /// 装配方可注册多个；首个非 None 即最终决策（dsh-tools 语义）。
 pub fn register_pre_execute_hook(
     registry: &dsh_tools::ToolRegistry,
-    session: Rc<dsh_session::Session>,
+    session: Arc<dsh_session::Session>,
     veto: Rc<HostVeto>,
 ) -> Result<(), String> {
     use dsh_session::types::EventKind;
@@ -598,7 +598,7 @@ pub fn register_pre_execute_hook(
 /// （`assemble_server_loop` 调用；记录供宿主钩子面可见，放行保持既有语义）。
 pub fn wire_recording_pre_execute_hook(
     registry: &dsh_tools::ToolRegistry,
-    session: Rc<dsh_session::Session>,
+    session: Arc<dsh_session::Session>,
 ) -> Result<(), String> {
     register_pre_execute_hook(registry, session, Rc::new(|_name| None))
 }
@@ -611,7 +611,7 @@ pub fn wire_recording_pre_execute_hook(
 /// 不伪造批准来源）。
 pub fn register_sandbox_policy_section(
     prompt: &dsh_system_prompt::SystemPrompt,
-    session_store: Rc<dsh_session::store::SessionStore>,
+    session_store: Arc<dsh_session::store::SessionStore>,
     default_session: &str,
     workspace_root: std::path::PathBuf,
 ) -> Result<(), String> {

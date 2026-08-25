@@ -7,6 +7,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_agent::{Agent, AgentBus, AgentRegistry, AgentStatus, CancelOptions, NextFn};
 use dsh_agent_loop::{
@@ -29,11 +30,11 @@ use serde_json::{json, Value};
 // helpers
 // ---------------------------------------------------------------------------
 
-fn store() -> Rc<SessionStore> {
-    Rc::new(SessionStore::new())
+fn store() -> Arc<SessionStore> {
+    Arc::new(SessionStore::new())
 }
 
-fn session(store: &Rc<SessionStore>, id: &str) -> Rc<Session> {
+fn session(store: &Arc<SessionStore>, id: &str) -> Arc<Session> {
     store
         .create(
             Some(SessionId(id.to_string())),
@@ -97,11 +98,11 @@ fn listen_status(bus: &AgentBus) -> Rc<RefCell<Vec<String>>> {
     log
 }
 
-fn count_of(s: &Rc<Session>, kind: EventKind) -> usize {
+fn count_of(s: &Arc<Session>, kind: EventKind) -> usize {
     s.events().into_iter().filter(|e| e.kind == kind).count()
 }
 
-fn turn_end_reason(s: &Rc<Session>) -> Value {
+fn turn_end_reason(s: &Arc<Session>) -> Value {
     s.events()
         .into_iter()
         .find(|e| e.kind == EventKind::TurnEnd)

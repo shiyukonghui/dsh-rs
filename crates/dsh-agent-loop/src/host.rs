@@ -17,6 +17,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_agent::{Agent, AgentBus, AgentOptions, AgentRegistry};
 use dsh_llm::{LlmRuntime, Message};
@@ -39,7 +40,7 @@ use crate::ReactLoopAgent;
 /// max_parallel）产出一个 `tool_exec` 实现。缺省 `None` → `service` 直通路径
 /// （永不暂停审批）。宿主（web）注入 approval 策略包装即经此缝。
 pub type ToolExecFactory = dyn Fn(
-    Rc<Session>,
+    Arc<Session>,
     Rc<ToolRegistry>,
     Option<ScopeKey>,
     Option<String>,
@@ -149,7 +150,7 @@ pub fn validate_configured_agents(agents: &[ConfiguredAgent]) -> Result<(), Stri
 pub struct AgentLoopHost {
     pub config: AgentLoopConfig,
     /// 共享 session store（`with_store` 注入；否则宿主自建）。
-    pub store: Rc<SessionStore>,
+    pub store: Arc<SessionStore>,
     pub bus: AgentBus,
     pub registry: Rc<AgentRegistry>,
     pub llm: Rc<LlmRuntime>,
@@ -172,7 +173,7 @@ pub struct AgentLoopHost {
 impl AgentLoopHost {
     /// 自建 store 的宿主（用于独立测试/命令行路径）。
     pub fn new(config: AgentLoopConfig, llm: Rc<LlmRuntime>, tools: Rc<ToolRegistry>) -> Result<Rc<Self>, String> {
-        Self::with_store(config, llm, tools, Rc::new(SessionStore::new()))
+        Self::with_store(config, llm, tools, Arc::new(SessionStore::new()))
     }
 
     /// 登记一个宿主 disposer（teardown 时按序执行；如工具注册/守卫的 disposer）。
@@ -185,7 +186,7 @@ impl AgentLoopHost {
         config: AgentLoopConfig,
         llm: Rc<LlmRuntime>,
         tools: Rc<ToolRegistry>,
-        store: Rc<SessionStore>,
+        store: Arc<SessionStore>,
     ) -> Result<Rc<Self>, String> {
         config.validate()?;
         let prompt = Rc::new(
@@ -398,7 +399,7 @@ impl AgentLoopHost {
     pub fn pending_by_call_id(
         &self,
         call_id: &str,
-    ) -> Option<(String, Rc<Session>)> {
+    ) -> Option<(String, Arc<Session>)> {
         for id in self.agents.borrow().keys().cloned().collect::<Vec<_>>() {
             if let Some(driver) = self.agent(&id) {
                 if driver.pending_calls().iter().any(|p| p.block.id.raw() == call_id) {
@@ -482,7 +483,7 @@ mod tests {
             config,
             Rc::new(dsh_llm::LlmRuntime::new()),
             Rc::new(dsh_tools::ToolRegistry::new(dsh_tools::ToolExecutionMode::Native)),
-            Rc::new(SessionStore::new()),
+            Arc::new(SessionStore::new()),
         )
         .unwrap()
     }

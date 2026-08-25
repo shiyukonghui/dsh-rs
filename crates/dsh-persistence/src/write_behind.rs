@@ -12,7 +12,7 @@
 //!   队非空时由调用方继续 automatic；
 //! - barrier：`flush` 期间再次调用 flush 加入同一 drain（M1d 同步下表现为幂等）。
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_session::types::SessionEvent;
 
@@ -26,8 +26,8 @@ pub trait BatchSink {
     fn write(&mut self, batch: &[SessionEvent]) -> Result<(), String>;
 }
 
-/// 背景失败报告回调（写失败时的通知钩子）。
-type FailureReporter = Rc<dyn Fn(&str)>;
+/// 背景失败报告回调（写失败时的通知钩子）。D-115：Send+Sync（跨线程共享）。
+type FailureReporter = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// 每会话写批控制器（对应 TS `SessionWriteBehind`）。
 pub struct SessionWriteBehind {

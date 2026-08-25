@@ -11,7 +11,7 @@
 #![allow(clippy::result_large_err)]
 #![allow(clippy::too_many_arguments)]
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dsh_llm::{ContentBlock, Message, MessageId, ToolCallBlock, ToolResultBlock};
 use dsh_scope::ScopeKey;
@@ -60,7 +60,7 @@ fn parse_arguments(raw: &str) -> Value {
 /// 恢复路径只 `execute + append_tool_result`（复用存储的 call seq，绝不重复
 /// `tool/call`）；其余调用走正常调度。正常执行恒传空切片。
 pub fn execute_tool_calls(
-    session: &Rc<Session>,
+    session: &Arc<Session>,
     tools: &ToolRegistry,
     scope: Option<&ScopeKey>,
     agent: Option<&str>,
@@ -129,7 +129,7 @@ pub fn execute_tool_calls(
 
 /// 运行一个独占屏障或并行池。结果与上下文按**模型顺序**提交；同步顺序执行即天然有序。
 fn run_group(
-    session: &Rc<Session>,
+    session: &Arc<Session>,
     tools: &ToolRegistry,
     scope: Option<&ScopeKey>,
     turn: u64,
@@ -184,7 +184,7 @@ fn is_aborted_before_dispatch(result: &ToolExecutionResult) -> bool {
 }
 
 /// 解析取消后跳过的模型调用：写 call + 合成的错误结果（对偶于 TS `appendSkippedToolCall`）。
-fn append_skipped_tool_call(session: &Rc<Session>, turn: u64, step: u64, block: &ToolCallBlock) {
+fn append_skipped_tool_call(session: &Arc<Session>, turn: u64, step: u64, block: &ToolCallBlock) {
     let call_seq = append_tool_call(session, turn, step, block);
     let payload = ToolResultPayload {
         turn,
@@ -218,7 +218,7 @@ fn append_skipped_tool_call(session: &Rc<Session>, turn: u64, step: u64, block: 
 /// 返回带 `call_seq` 的 `PendingCall`（恢复期 result 必须链接回该 seq）。
 /// 与 `execute_tool_calls` 分离：宿主先在此落 pending 的 call，再只把非 pending 传入调度。
 pub fn emit_pending_calls(
-    session: &Rc<Session>,
+    session: &Arc<Session>,
     turn: u64,
     step: u64,
     blocks: &[ToolCallBlock],
@@ -235,7 +235,7 @@ pub fn emit_pending_calls(
 /// D-106：宿主把 pending 调用判为「拒绝」——不在 registry 执行，直接落一个**合成
 /// 拒绝 result**（`tool/result` 错误，链接回其 call seq）。恢复 turn 使用。
 pub fn append_pending_rejection(
-    session: &Rc<Session>,
+    session: &Arc<Session>,
     turn: u64,
     step: u64,
     pending: &PendingCall,
@@ -273,7 +273,7 @@ pub fn append_pending_rejection(
 }
 
 /// 追加已启动 call，返回其结果必须引用的事件 seq。
-fn append_tool_call(session: &Rc<Session>, turn: u64, step: u64, block: &ToolCallBlock) -> u64 {    let payload = ToolCallPayload {
+fn append_tool_call(session: &Arc<Session>, turn: u64, step: u64, block: &ToolCallBlock) -> u64 {    let payload = ToolCallPayload {
         turn,
         step,
         call_id: block.id.clone(),
@@ -292,7 +292,7 @@ fn append_tool_call(session: &Rc<Session>, turn: u64, step: u64, block: &ToolCal
 
 /// 追加模型顺序结果并链接到其 call 事件。
 fn append_tool_result(
-    session: &Rc<Session>,
+    session: &Arc<Session>,
     turn: u64,
     step: u64,
     block: &ToolCallBlock,
