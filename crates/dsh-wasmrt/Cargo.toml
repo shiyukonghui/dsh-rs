@@ -7,11 +7,14 @@ license.workspace = true
 description = "wasmtime backend for dsh: load WASM plugins (core-module C ABI + component model) as dsh-core Plugin."
 
 [dependencies]
+# dsh-eval = 组合求值的 **native 面**（WASM 面的同源备份/兜底；K4/F-05）。
 dsh-core = { path = "../dsh-core" }
+dsh-eval = { path = "../dsh-eval" }
 serde_json = "1"
 wasmtime = { version = "34", features = ["component-model"] }
 wasmtime-wasi = { version = "34", features = ["preview1"] }
 
 [dev-dependencies]
+dsh-agent-presets = { path = "../dsh-agent-presets" }
 dsh-loader = { path = "../dsh-loader" }
 tokio = { version = "1", features = ["rt", "macros"] }

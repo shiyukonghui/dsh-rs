@@ -4432,6 +4432,41 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
 - **已知未接/下一**：K4/F-05（WASM 组合引擎 spike：结果一致性 vs dsh-eval、native 兜底）。
   live 进程 term-32。
 
+### D-104 实施补记（K4/F-05：WASM 组合求值引擎落地，round 24-25；TDD 红→绿）
+
+- 触发：D-104 F-05（用户看「harness 原生 JS 求值、dsh-wasmrt 是插件后端非组合引擎」
+  的源证据后**重申仍要 WASM 组合引擎**，记录在案勿默改）——组合/`disabled_expr`
+  求值走 WASM 面、native 兜底，以结果一致性测试与 dsh-eval 锚定。
+- 关键自下而上事实：
+  - dsh-wasmrt 已是 dsh-core **插件**后端（wasmtime 34，C ABI 导出
+    alloc/dealloc/plugin_apply/plugin_handle_event/plugin_dispose + host_provide）；
+    `dsh-cli` **已依赖 dsh-wasmrt**（wasmtime 已在 web 二进制）→ F-05 落地**零新增
+    依赖权重**。
+  - dsh-eval 纯 std + serde_json，`wasm32-unknown-unknown` 可直接编。
+- 实现（spike 成型 → 正式落地）：
+  - **WASM 面** = `wasm-plugins/combo-eval/`：dsh-eval **同源编译进 wasm**（同一
+    源码，非第二套求值器——一致性测试锚定的是 **WASM 执行路径本身忠实**：C ABI
+    编组 / JSON 往返 / 数值 / 错误传播）；`plugin_apply({scope,expr})` 把
+    `{ok,value,truthy}` / `{ok:false,error}` 经 host_provide 回传。
+  - `dsh-wasmrt::combo`：`ComboEvaluator` trait + `NativeComboEvaluator` +
+    `WasmComboEvaluator` + **`FallbackEval`（WASM 主面、native 兜底）**；dsh-wasmrt
+    增依赖 dsh-eval（native 兜底面即其用途，非测试包袱）。
+  - `dsh-agent-presets`：`row_disabled` 保持 native 权威；新增
+    `row_disabled_with(row, process, eval)`——fail-closed + truthy **权威留在本
+    crate**，只有「用什么引擎求值」可注入（签名与 ComboEvaluator 同构）。
+  - `standing` 组合门控：`StandingRegistry` 默认 = WASM 主面 + native 兜底
+    （blob 缺失自动回落 native-only），挂载行审计经 `row_disabled_with` 注入求值。
+- 被否决：整 loop 搬 wasm（出作用域，K3 已述）；用第二套求值语义（拒绝语义分叉——
+  wasm 面与 native 面同源，正是「一致性锚定」的正手）。
+- 验收：m20 ×3（真实 preset 表达式×win32/linux 两面全等 + 门控翻转 + 全语法面语料
+  值/错误串逐字节全等 + 4 真实 preset 逐行真实 facade 门控全等）；standing +2
+  （注入引擎被行审计真实消费 + 默认 wasm 面）；dsh-agent-presets 18/18、dsh-wasmrt
+  全绿、dsh-cli lib 180/180、八 crate 全回归 **644/644** 绿；clippy `-D warnings`
+  零；live 60165 **四真实预设 select 全 OK**（WASM 面门控 = native 门控，零回归）。
+  回滚：`git revert` K4 提交。
+- **已接/下一**：K1..K4 全齐 → 整理 **C 段测试报告**（瀑布流阶段关闸工件），并呈
+  「shipped preset 未桥行 → disabled:true vs 保持 guard 降级」给用户定夺。live term-33。
+
 ### D-104 实施补记预留
 
 

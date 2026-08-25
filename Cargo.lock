@@ -928,7 +928,9 @@ dependencies = [
 name = "dsh-wasmrt"
 version = "0.1.0"
 dependencies = [
+ "dsh-agent-presets",
  "dsh-core",
+ "dsh-eval",
  "dsh-loader",
  "serde_json",
  "tokio",

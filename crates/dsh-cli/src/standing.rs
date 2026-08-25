@@ -23,11 +23,12 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use dsh_agent_presets::parse::{row_disabled, CompositionRow};
+use dsh_agent_presets::parse::{row_disabled_with, CompositionRow};
 use dsh_core::{Cordis, CordisError, EffectOutcome, FiberHandle, Plugin, ScopeId};
 use dsh_scope::{bind_scope_parent, store::Undo, ScopeKey, ScopeParentBinding};
 use dsh_system_prompt::{PromptSection, PromptSectionText, SystemPrompt};
 use dsh_tools::ToolRegistry;
+use dsh_wasmrt::{ComboEvaluator, FallbackEval, NativeComboEvaluator, WasmComboEvaluator};
 use serde_json::Value;
 
 /// persona 行名（P2-b 桥）。
@@ -143,6 +144,11 @@ pub struct StandingRegistry {
     /// K3/C 故障注入（root-realm 泄漏）：生产恒 false；仅测试
     /// （`set_fault_root_leak`，cf(g test)-only）置真以推泄漏拒绝路径。
     fault_root_leak: bool,
+    /// K4/F-05：组合求值引擎（`disabled_expr` 门控）。生产默认 = **WASM 面为主、
+    /// native 兜底**（`FallbackEval`）；测试/宿主可注入替身（`with_combo`）。
+    combo: Rc<dyn ComboEvaluator>,
+    /// combo 是否为 WASM 主面（`from_default_build` 成功即 wasm；否则 native-only）。
+    combo_wasm: bool,
 }
 
 impl Default for StandingRegistry {
@@ -160,13 +166,48 @@ impl Default for StandingRegistry {
 
 impl StandingRegistry {
     pub fn new(system_prompt: Rc<SystemPrompt>, tools: Option<Rc<ToolRegistry>>) -> Self {
+        let (combo, combo_wasm) = match WasmComboEvaluator::from_default_build() {
+            Ok(w) => (
+                Rc::new(FallbackEval::new(
+                    Rc::new(w),
+                    Rc::new(NativeComboEvaluator),
+                )) as Rc<dyn ComboEvaluator>,
+                true,
+            ),
+            Err(_) => (Rc::new(NativeComboEvaluator) as Rc<dyn ComboEvaluator>, false),
+        };
         StandingRegistry {
             system_prompt,
             tools,
             standings: HashMap::new(),
             core: Cordis::new(),
             fault_root_leak: false,
+            combo,
+            combo_wasm,
         }
+    }
+
+    /// 注入组合求值引擎（测试替身 / 宿主自选）。
+    pub fn with_combo(
+        system_prompt: Rc<SystemPrompt>,
+        tools: Option<Rc<ToolRegistry>>,
+        combo: Rc<dyn ComboEvaluator>,
+        combo_wasm: bool,
+    ) -> Self {
+        StandingRegistry {
+            system_prompt,
+            tools,
+            standings: HashMap::new(),
+            core: Cordis::new(),
+            fault_root_leak: false,
+            combo,
+            combo_wasm,
+        }
+    }
+
+    /// 组合求值引擎是否 WASM 主面（诊断/测试）。
+    pub fn combo_is_wasm(&self) -> bool {
+        self.combo_wasm
     }
     /// 挂载 preset：行审计 + 铸 standing scope + 桥贡献（persona / instructions /
     /// 单工具行重呈现 / skill 目录清单）。无 base_dir（占位/测试口）。
@@ -199,20 +240,26 @@ impl StandingRegistry {
         let mut undos: Vec<Undo> = Vec::new();
 
         // 行审计：走 tree（组递归；组容器自身不列），叶子 → disabled/活化。
-        // P3-e（A 并行收口）：禁用判定 = 忠实 `row_disabled`——pwsh 执行器已在册
-        // （P3-d），win32-B 覆盖已撤，平台取舍完全交给组合自身 `disabled_expr`。
+        // 禁用判定 = `row_disabled_with`（fail-closed + truthy 权威在 dsh-agent-presets），
+        // 求值引擎 = 注入的 `self.combo`（K4/F-05：WASM 面为主、native 兜底；
+        // wasm 缺失自动回落 native-only）。
+        let combo = self.combo.clone();
+        let gate = move |row: &CompositionRow, process: &Value| {
+            row_disabled_with(row, process, &|scope: &Value, expr: &str| combo.eval(scope, expr))
+        };
         fn walk<'a>(
             rows: &'a [CompositionRow],
             process: &Value,
             report: &mut StandingReport,
+            gate: &dyn Fn(&CompositionRow, &Value) -> bool,
         ) -> Vec<&'a CompositionRow> {
             let mut leaves = Vec::new();
             for row in rows {
                 if row.group {
-                    leaves.extend(walk(&row.children, process, report));
+                    leaves.extend(walk(&row.children, process, report, gate));
                     continue;
                 }
-                if row_disabled_for_platform(row, process) {
+                if gate(row, process) {
                     report.disabled.push(row.name.clone());
                     continue;
                 }
@@ -220,7 +267,7 @@ impl StandingRegistry {
             }
             leaves
         }
-        let leaves = walk(rows, process, &mut report);
+        let leaves = walk(rows, process, &mut report, &gate);
 
         // —— 内容桥：persona 行 → standing scope section + runtime-context 抑制。
         for (i, row) in leaves.iter().filter(|r| r.name == PERSONA_ROW).enumerate() {
@@ -563,15 +610,10 @@ impl StandingRegistry {
     }
 }
 
-/// D-103 win32-B 平台策略：bash 系行在 win32 **强制可用**（Rust 经 Git Bash 可跑
-/// bash），pwsh 系行在 win32 **判禁**（无 pwsh 执行器，A 并行落地后移除此覆盖）。
-/// 非 win32 回落忠实 `disabled_expr` 求值。
-/// 禁用判定走**忠实门控**（P3-e 起，A 并行收口）：pwsh 执行器已在册（P3-d）且有
-/// pwsh 工具/终端后端可桥（P3-e），win32 不再需要 win32-B 强制覆盖——各平台一律由组合
-/// 自身的 `disabled_expr` 决定（win32 上 bash 系 `=== 'win32'` 判禁、pwsh 系活化）。
-fn row_disabled_for_platform(row: &CompositionRow, process: &Value) -> bool {
-    row_disabled(row, process)
-}
+// 禁用判定走**忠实门控**（P3-e 起，A 并行收口）：pwsh 执行器已在册（P3-d）且有
+// pwsh 工具/终端后端可桥（P3-e），win32 不再需要 win32-B 强制覆盖——各平台一律由
+// 组合自身的 `disabled_expr` 决定（win32 上 bash 系 `=== 'win32'` 判禁、pwsh 系
+// 活化）。求值走注入引擎（K4/F-05 WASM 面 + native 兜底；见 mount_at 的 `gate`）。
 
 /// 单工具行 → 宿主工具名（P3-a 桥表；P3-e 加 pwsh）。多工具行（fs-local/
 /// terminal/…）见 `host_tool_group_for_row`。
@@ -630,6 +672,7 @@ mod tests {
     use super::*;
     use dsh_scope::scope_chain_of;
     use dsh_system_prompt::{AssembleContext, Config};
+    use std::cell::RefCell;
     use std::path::{Path, PathBuf};
 
     fn repo_root() -> PathBuf {
@@ -1288,6 +1331,78 @@ mod tests {
                 Some(FiberState::Disposed),
                 "{id}: fiber disposed"
             );
+        }
+    }
+
+    /// —— K4/F-05 —— 组合 `disabled_expr` 门控走注入求值引擎（生产 = WASM 面 +
+    /// native 兜底）；组合权威（fail-closed + truthy）仍在 dsh-agent-presets。
+    /// 记录每次求值调用：证明 standing 行审计真的消费了注入引擎。
+    struct RecordingCombo(Rc<RefCell<Vec<String>>>);
+
+    impl dsh_wasmrt::ComboEvaluator for RecordingCombo {
+        fn eval(&self, scope: &Value, expr: &str) -> Result<Value, String> {
+            self.0.borrow_mut().push(expr.to_string());
+            let win = scope
+                .get("process")
+                .and_then(|p| p.get("platform"))
+                .and_then(Value::as_str)
+                == Some("win32");
+            Ok(Value::Bool(win))
+        }
+    }
+
+    #[test]
+    fn standing_disabled_gate_consumes_injected_combo_evaluator() {
+        let sp = new_sp();
+        let calls: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let combos = calls.clone();
+        let stub = RecordingCombo(calls);
+        let mut reg = StandingRegistry::with_combo(
+            sp.clone(),
+            Some(realistic_tools()),
+            Rc::new(stub),
+            false,
+        );
+        let comp = "
+- id: a
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled_expr: \"process.platform === 'x'\"
+- id: b
+  name: '@deepseek-ai/dsh-tool-pwsh'
+";
+        let rows = dsh_agent_presets::parse::parse_composition(comp).unwrap();
+        reg.mount("t", &rows, &win32_facade()).unwrap();
+        let r = reg.report("t").unwrap();
+        assert!(
+            combos.borrow().iter().any(|e| e == "process.platform === 'x'"),
+            "enabled-with-expr row went through the injected evaluator: {:?}",
+            combos.borrow()
+        );
+        assert!(
+            r.disabled.iter().any(|s| s == "@deepseek-ai/dsh-tool-bash"),
+            "stub verdict (win32 == true) disabled bash row: {:?}",
+            r.disabled
+        );
+        assert!(
+            r.bridged.iter().any(|s| s.starts_with("@deepseek-ai/dsh-tool-pwsh")),
+            "no-expr row stays active: {:?}",
+            r.bridged
+        );
+    }
+
+    /// 默认构造：combo_eval.wasm 已构建 → 组合求值 = WASM 主面 + native 兜底
+    /// （F-05 语义；blob 缺失回落 native-only，仍正确——本次构建后应命中 wasm 面）。
+    #[test]
+    fn default_combo_is_wasm_faced_when_blob_present() {
+        let sp = new_sp();
+        if WasmComboEvaluator::from_default_build().is_ok() {
+            let reg = StandingRegistry::new(sp.clone(), None);
+            assert!(
+                reg.combo_is_wasm(),
+                "default combo is wasm-faced (native fallback underneath)"
+            );
+        } else {
+            eprintln!("combo_eval.wasm not built — skipping wasm-default assertion");
         }
     }
 

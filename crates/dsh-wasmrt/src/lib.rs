@@ -21,6 +21,7 @@ use std::sync::Arc;
 use dsh_core::*;
 
 mod abi;
+mod combo;
 mod component;
 mod host;
 mod plugin;
@@ -31,6 +32,7 @@ pub mod r#loop;
 pub use abi::{
     CAPS_EMIT, CAPS_GET, CAPS_PROVIDE, CAPS_WASI_ENV, CAPS_WASI_FS, CAPS_WASI_NET, Capabilities,
 };
+pub use combo::{ComboEvaluator, FallbackEval, NativeComboEvaluator, WasmComboEvaluator};
 pub use component::WasmComponentPlugin;
 pub use host::{NativeHost, PluginHost, PluginKind, PluginManifest};
 pub use plugin::WasmPlugin;

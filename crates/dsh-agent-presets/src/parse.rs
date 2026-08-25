@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 
+use serde_json::json;
 use serde_json::Value;
 
 /// 一行组合（组行带 children，叶行带 config）。
@@ -84,20 +85,42 @@ pub enum RowState {
 }
 
 /// 计算一行是否禁用（fail-closed：求值失败 = 禁用）。组行自身不被禁用（其子行
-/// 各自判断）。
+/// 各自判断）。native 路径（dsh-eval 直连）；引擎可注入的等价物见
+/// [`row_disabled_with`]（K4/F-05：组合求值 WASM 面 / native 兜底）。
 pub fn row_disabled(row: &CompositionRow, process: &Value) -> bool {
+    row_disabled_with(row, process, &native_combo)
+}
+
+/// 组合求值的 **native 求值器**（flat JSON scope → `dsh_eval::Scope`）：
+/// `Err(原始错误串)` 与 `dsh_eval::EvalError.0` 同构，供两面一致性互验。
+pub fn native_combo(scope: &Value, expr: &str) -> Result<Value, String> {
+    let mut map = HashMap::new();
+    if let Some(obj) = scope.as_object() {
+        for (k, v) in obj {
+            map.insert(k.clone(), v.clone());
+        }
+    }
+    dsh_eval::evaluate(&map, expr).map_err(|e| e.0.to_string())
+}
+
+/// 用注入的求值引擎计算一行是否禁用（fail-closed + truthy 语义固定在**本 crate**
+/// ——组合门控的唯一权威；只有「用什么引擎求值」可注入）。`eval` 签名与
+/// `dsh_wasmrt::ComboEvaluator::eval` 同构：`(scope, expr) -> Result<Value, String>`，
+/// 引擎可 WASM 面 / native 兜底 / 测试替身。scope 为 `{process, config}` flat 对象
+/// （与 [`row_disabled`] 喂给 `dsh_eval::Scope` 的内容一致）。
+pub fn row_disabled_with(
+    row: &CompositionRow,
+    process: &Value,
+    eval: &dyn Fn(&Value, &str) -> Result<Value, String>,
+) -> bool {
     let Some(expr) = &row.disabled_expr else {
         return false;
     };
-    let mut scope = HashMap::new();
-    scope.insert("process".to_string(), process.clone());
-    scope.insert(
-        "config".to_string(),
-        row.config.clone().unwrap_or(Value::Null),
-    );
-    dsh_eval::evaluate(&scope, expr)
-        .map(|v| dsh_eval::truthy(&v))
-        .unwrap_or(true)
+    let scope = json!({
+        "process": process.clone(),
+        "config": row.config.clone().unwrap_or(Value::Null),
+    });
+    eval(&scope, expr).map(|v| dsh_eval::truthy(&v)).unwrap_or(true)
 }
 
 /// 行分类。
