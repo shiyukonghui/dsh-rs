@@ -104,16 +104,34 @@ enum Halt {
 }
 
 /// 工具执行上下文（M2e-2 由注入钩子消费；M2e-3 接真实 scheduler）。
+///
+/// `resume`：**审批恢复**携带上一步暂停的 pending 调用（D-106）；正常执行恒空。
+/// 恢复语义：这些调用的 `tool/call` 事件已在暂停步落盘，恢复执行**只追加
+/// `tool/result`**（用存储的 call seq，绝不重复 tool/call；见 `execute_tool_calls`）。
 pub struct ToolExecCtx<'a> {
     pub turn: u64,
     pub step: u64,
     pub tool_calls: &'a [ToolCallBlock],
+    pub resume: Vec<PendingCall>,
+}
+
+/// 一个等待宿主审批的工具调用（暂停步已落 `tool/call`）。
+#[derive(Debug, Clone)]
+pub struct PendingCall {
+    pub block: ToolCallBlock,
+    /// 该调用的 `tool/call` 事件 seq（恢复期 result 必须链接回它）。
+    pub call_seq: u64,
 }
 
 /// 工具执行结果（模型顺序结果 + 延后到全部 result 之后的 context）。
+///
+/// `pending`：本轮被宿主判为「待审批」而未执行的调用（已落 `tool/call`、未落
+/// `tool/result`）。非空 → driver 暂停（`TurnEndReason::ApprovalPending`）；恢复 turn
+/// 由 `kick_resume` 经 `resume` 语义重跑。
 pub struct ToolExecOutcome {
     pub concluded: bool,
     pub context: Vec<Message>,
+    pub pending: Vec<PendingCall>,
 }
 
 /// driver 依赖哑合（全部 Rc，构造即注入；M2e-3 由 AgentLoop 服务装配真实实现）。
@@ -173,13 +191,15 @@ pub struct ReactLoopAgent {
     propose: Rc<dyn Fn(CallConfig, u64, u64) -> Result<CallConfig, String>>,
     phase: RefCell<Phase>,
     request_header_logged: Cell<bool>,
+    /// 审批暂停中的待决调用（D-106）。**agent 级（非 Phase 字段）**：越过
+    /// pause→Idle 停驻存活；恢复 turn 由 step() 顶部消费并清空。
+    approval_pending: RefCell<Vec<PendingCall>>,
 }
 
 impl ReactLoopAgent {
     pub fn new(agent: Rc<Agent>, registry: Rc<AgentRegistry>, deps: LoopDeps) -> Rc<Self> {
         let dispatch = AgentEventDispatch::new(agent.ctx.bus().clone(), agent_carrier(&agent));
-        let propose: Rc<dyn Fn(CallConfig, u64, u64) -> Result<CallConfig, String>> = {
-            let dispatch = dispatch.clone();
+        let propose: Rc<dyn Fn(CallConfig, u64, u64) -> Result<CallConfig, String>> = {            let dispatch = dispatch.clone();
             let agent = agent.clone();
             Rc::new(move |seed: CallConfig, turn: u64, step: u64| -> Result<CallConfig, String> {
                 let seed_json = serde_json::to_value(&seed).map_err(|e| e.to_string())?;
@@ -228,6 +248,7 @@ impl ReactLoopAgent {
             propose,
             phase: RefCell::new(Phase::Idle { last_turn }),
             request_header_logged: Cell::new(false),
+            approval_pending: RefCell::new(Vec::new()),
         })
     }
 
@@ -289,6 +310,31 @@ impl ReactLoopAgent {
 
     pub fn followup(&self, input: Message) -> Result<(), String> {
         self.send(input, InboxTarget::NextTurn, true)
+    }
+
+    /// D-106：**审批恢复裸踢**——不追加任何消息，直接唤醒 driver 重跑暂停的
+    /// pending 调用（`approval_pending` 非空才有效；同步排空到 idle）。fail-loud：
+    /// 无待决审批或 driver 非 Idle 均拒绝（不臆造恢复入口）。
+    pub fn kick_resume(&self) -> Result<(), String> {
+        if self.approval_pending.borrow().is_empty() {
+            return Err(format!(
+                "agent \"{}\": no pending approval to resume",
+                self.agent.id
+            ));
+        }
+        if !matches!(*self.phase.borrow(), Phase::Idle { .. }) {
+            return Err(format!(
+                "agent \"{}\": cannot resume while not idle",
+                self.agent.id
+            ));
+        }
+        self.wake_driver(false);
+        Ok(())
+    }
+
+    /// D-106：待决审批调用（只读，宿主 decide RPC 感知）。
+    pub fn pending_calls(&self) -> Vec<PendingCall> {
+        self.approval_pending.borrow().clone()
     }
 
     pub fn steer(&self, input: Message) -> Result<(), String> {
@@ -522,7 +568,10 @@ impl ReactLoopAgent {
                         if turn_ends.is_some() && messages.is_empty() {
                             break;
                         }
-                        if self.phase.borrow().step() == 0 && messages.is_empty() {
+                        if self.phase.borrow().step() == 0
+                            && messages.is_empty()
+                            && self.approval_pending.borrow().is_empty()
+                        {
                             turn_ends = Some(TurnEndReason::Completed);
                             return Ok(false);
                         }
@@ -726,6 +775,37 @@ impl ReactLoopAgent {
             return Err(Halt::Aborted(c));
         }
         let system = render_prompt(assembly).map_err(|e| Halt::Failed(unknown_failure(e)))?;
+        // D-106：审批恢复——先重跑暂停的 pending 调用（结果落会话后再走 LLM）。
+        // 消费 `approval_pending`（挂在 resume 语义上）；宿主仍判未决（防御分支）→
+        // 再次暂停。恢复结果若 concludesTurn → 本 step 关闭。
+        if !self.approval_pending.borrow().is_empty() {
+            let pending = std::mem::take(&mut *self.approval_pending.borrow_mut());
+            let blocks: Vec<ToolCallBlock> = pending.iter().map(|p| p.block.clone()).collect();
+            let resume_outcome = (self.deps.tool_exec)(&ToolExecCtx {
+                turn,
+                step,
+                tool_calls: &blocks,
+                resume: pending,
+            });
+            for context_msg in resume_outcome.context {
+                let len = self.agent.inbox.next_step().len();
+                self.agent
+                    .inbox
+                    .splice(InboxTarget::NextStep, len as f64, 0.0, vec![context_msg])
+                    .map_err(|e| Halt::Failed(unknown_failure(e)))?;
+            }
+            if let Some(c) = self.abort_reason() {
+                return Err(Halt::Aborted(c));
+            }
+            if !resume_outcome.pending.is_empty() {
+                *self.approval_pending.borrow_mut() = resume_outcome.pending;
+                return Ok(Some(TurnEndReason::ApprovalPending));
+            }
+            if resume_outcome.concluded {
+                return Ok(Some(TurnEndReason::Completed));
+            }
+            // 结果已落会话 → 落入下方正常 loop（build_request 派生消息含其结果）。
+        }
         loop {
             let boundary = self
                 .agent
@@ -847,6 +927,7 @@ impl ReactLoopAgent {
                 turn,
                 step,
                 tool_calls: &tool_calls,
+                resume: Vec::new(),
             });
             for context_msg in outcome.context {
                 let len = self.agent.inbox.next_step().len();
@@ -857,6 +938,11 @@ impl ReactLoopAgent {
             }
             if let Some(c) = self.abort_reason() {
                 return Err(Halt::Aborted(c));
+            }
+            // D-106：宿主判为待审批 → 存 pending + 暂停（turn/end reason=approval-pending）。
+            if !outcome.pending.is_empty() {
+                *self.approval_pending.borrow_mut() = outcome.pending;
+                return Ok(Some(TurnEndReason::ApprovalPending));
             }
             return Ok(if outcome.concluded {
                 Some(TurnEndReason::Completed)

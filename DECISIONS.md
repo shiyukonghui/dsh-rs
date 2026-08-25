@@ -4698,6 +4698,36 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
   回滚点）/ 风险（A 状态机最险→先独立全量回归）见 PLAN §4.2-4.5。
 - 回滚：未实现，改 PLAN/DECISIONS 即可；实现后 `git revert` 各段。
 
+### D-106 段 A 实施（loop pending 工具调用机制，round 2；TDD 红→绿）
+
+- 触发：设计关闸通过（PLAN §4）；段 A 是 loop 通用机制（策略在宿主层）。
+- 自下而上核证（实现期）：turn() 主循环 step0+空 inbox 空消息短路在 line~525-527；
+  `pre_step` 空 inbox 仍给 Enter+assembly（恢复 turn 可行）；Phase 为
+  Idle/Maintenance/Running 枚举 → `approval_pending` 存 agent 级
+  `RefCell<Vec<PendingCall>>`（越过 Idle 停驻存活；abort/dispose 不主动清——由 decide
+  决定归属）；invariant 对 turn/end 只查 step 闭 + open_turn 匹配，pending_calls 跨
+  turn 删除成立（tool/result 新 turn 删 pause 步 call）。
+- 实现（dsh-session + dsh-agent-loop）：
+  - `TurnEndReason::ApprovalPending`（serde kind `approval-pending`；诚实收尾——非错、
+    非完成）。
+  - `PendingCall { block, call_seq }`；`ToolExecOutcome.pending`；`ToolExecCtx.resume`。
+  - `execute_tool_calls` + `resume: &[PendingCall]`：resume 非空 → 只 execute +
+    `append_tool_result`（复用 call seq，绝不重复 tool/call）。
+  - 新公共助手：`emit_pending_calls`（落 tool/call、返 PendingCall）、
+    `append_pending_rejection`（合成拒绝 result，code `TOOL_REJECTED`）。
+  - driver：step() 顶部消费 `approval_pending`（resume 语义重跑，结果落会话后走 LLM；
+    仍未决 → 再次暂停；concluded → Completion）；tool_exec 后 pending 非空 → 存 +
+    `ApprovalPending`；turn() 空消息短路门控 `approval_pending.is_empty()`；
+    `kick_resume()`（bare-wake，仅 Idle∧pending 非空，fail-loud）；AgentLoopHost.kick。
+  - 服务直通路径 `pending: Vec::new()`（永不停审；宿主包装注入）。
+- 分家论证：策略（mutation/plan/决策）在 web 宿主段 B 接入；loop 不改 approval 语义。
+- 测试（TDD）：暂停 reason + 无继续 + Idle 停车 + pending 留驻；kick_resume 重跑
+  pending → 模型续发 → 双 TurnEnd（approval-pending→completed）；无 pending fail-loud；
+  resume 只追 result 不重 call；合成拒绝 seq/码/error 语义。（红先绿后全绿。）
+- 验证：dsh-agent-loop + dsh-session clippy `-D warnings` 零；全 workspace 回归（段 A
+  独立全量，见 segA-regression.txt）；live 复验推迟到 D 段（live 需 host 接线后才改观）。
+- 回滚：`git revert` 段 A 提交（含 types/ToolExecCtx/Outcome/driver/helpers/tests）。
+
 ### D-104 实施补记预留
 
 

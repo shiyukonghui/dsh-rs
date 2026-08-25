@@ -25,6 +25,11 @@ use dsh_tools::{
 };
 use serde_json::{json, Value};
 
+use crate::agent::PendingCall;
+
+/// 审批拒绝（宿主合成 result）的结构化错误代码（D-106；工具未被实际执行）。
+pub const CODE_TOOL_REJECTED: &str = "TOOL_REJECTED";
+
 /// 一次已解析好参数的、待调度的模型调用。
 struct PlannedCall {
     block: ToolCallBlock,
@@ -50,6 +55,10 @@ fn parse_arguments(raw: &str) -> Value {
 ///
 /// 返回 `concluded`（任一提交 result 携带 `concludesTurn`）。`accept_context` 接受
 /// 已提交结果延后到全部调用提交之后的 next-step 上下文（模型顺序）。
+///
+/// `resume`（D-106）：**审批恢复**调用集——这些调用的 `tool/call` 已在暂停步落盘，
+/// 恢复路径只 `execute + append_tool_result`（复用存储的 call seq，绝不重复
+/// `tool/call`）；其余调用走正常调度。正常执行恒传空切片。
 pub fn execute_tool_calls(
     session: &Rc<Session>,
     tools: &ToolRegistry,
@@ -59,8 +68,30 @@ pub fn execute_tool_calls(
     turn: u64,
     step: u64,
     tool_calls: &[ToolCallBlock],
+    resume: &[PendingCall],
     accept_context: &mut dyn FnMut(Message),
 ) -> Result<bool, String> {
+    // 恢复路径：只执行 + 只追 result（防御检查 call_seq 合法性由调用方保证）。
+    if !resume.is_empty() {
+        let mut concluded = false;
+        for pending in resume {
+            let input = ToolExecutionInput::new(
+                pending.block.id.raw(),
+                pending.block.name.clone(),
+                parse_arguments(&pending.block.arguments),
+                agent.map(ToString::to_string),
+            );
+            let result = tools.execute(&input, scope);
+            append_tool_result(session, turn, step, &pending.block, &result, pending.call_seq)?;
+            for ctx in &result.additional_contexts {
+                let msg: Message = serde_json::from_value(ctx.clone())
+                    .map_err(|e| format!("invalid tool additional context: {e}"))?;
+                accept_context(msg);
+            }
+            concluded |= result.concludes_turn;
+        }
+        return Ok(concluded);
+    }
     let planned: Vec<PlannedCall> = tool_calls
         .iter()
         .map(|block| PlannedCall {
@@ -183,9 +214,66 @@ fn append_skipped_tool_call(session: &Rc<Session>, turn: u64, step: u64, block: 
     );
 }
 
+/// D-106：宿主把一批调用判为「待审批」——为每个 block 落 `tool/call`（用户可见），
+/// 返回带 `call_seq` 的 `PendingCall`（恢复期 result 必须链接回该 seq）。
+/// 与 `execute_tool_calls` 分离：宿主先在此落 pending 的 call，再只把非 pending 传入调度。
+pub fn emit_pending_calls(
+    session: &Rc<Session>,
+    turn: u64,
+    step: u64,
+    blocks: &[ToolCallBlock],
+) -> Vec<PendingCall> {
+    blocks
+        .iter()
+        .map(|block| PendingCall {
+            block: block.clone(),
+            call_seq: append_tool_call(session, turn, step, block),
+        })
+        .collect()
+}
+
+/// D-106：宿主把 pending 调用判为「拒绝」——不在 registry 执行，直接落一个**合成
+/// 拒绝 result**（`tool/result` 错误，链接回其 call seq）。恢复 turn 使用。
+pub fn append_pending_rejection(
+    session: &Rc<Session>,
+    turn: u64,
+    step: u64,
+    pending: &PendingCall,
+    message: &str,
+) -> Result<(), String> {
+    let payload = ToolResultPayload {
+        turn,
+        step,
+        message: Message::tool_result(
+            MessageId::from_raw(format!("tool-result-{turn}-{step}-{}", pending.block.id.raw())),
+            pending.block.id.clone(),
+            vec![ContentBlock::ToolResult(ToolResultBlock {
+                tool_call_id: pending.block.id.clone(),
+                content: vec![ContentBlock::text(message.to_string())],
+                is_error: Some(true),
+            })],
+        ),
+        error: Some(ToolCallError {
+            name: "RejectedError".into(),
+            code: CODE_TOOL_REJECTED.into(),
+        }),
+        meta: None,
+    };
+    session
+        .append(
+            EventKind::ToolResult,
+            serde_json::to_value(&payload).unwrap_or(Value::Null),
+            Some(&SurfaceIntent {
+                surface_op: SurfaceOp::Append,
+                source_event_seqs: Some(vec![pending.call_seq]),
+            }),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// 追加已启动 call，返回其结果必须引用的事件 seq。
-fn append_tool_call(session: &Rc<Session>, turn: u64, step: u64, block: &ToolCallBlock) -> u64 {
-    let payload = ToolCallPayload {
+fn append_tool_call(session: &Rc<Session>, turn: u64, step: u64, block: &ToolCallBlock) -> u64 {    let payload = ToolCallPayload {
         turn,
         step,
         call_id: block.id.clone(),

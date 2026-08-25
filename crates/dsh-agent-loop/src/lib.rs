@@ -16,7 +16,9 @@ pub mod service;
 pub mod settings;
 pub mod tool_calls;
 
-pub use agent::{LoopDeps, PreStepDecision, ReactLoopAgent, ToolExecCtx, ToolExecOutcome};
+pub use agent::{
+    LoopDeps, PendingCall, PreStepDecision, ReactLoopAgent, ToolExecCtx, ToolExecOutcome,
+};
 pub use build_request::{build_request, request_proposal, BuiltRequest};
 pub use constants::*;
 pub use host::{
@@ -27,4 +29,6 @@ pub use invariant::{check_loop_request, AgentLoopRequest};
 pub use runtime_context::{RuntimeContextProjection, CLEARED as RUNTIME_CONTEXT_CLEARED};
 pub use service::{build_loop_deps, create_loop_agent};
 pub use settings::{validate_max_parallel_tool_calls, validate_max_tokens, AgentLoopSettings};
-pub use tool_calls::execute_tool_calls;
+pub use tool_calls::{
+    append_pending_rejection, emit_pending_calls, execute_tool_calls, CODE_TOOL_REJECTED,
+};

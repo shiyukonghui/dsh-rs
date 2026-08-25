@@ -9,7 +9,9 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use dsh_agent::{Agent, AgentBus, AgentRegistry, AgentStatus, CancelOptions, NextFn};
-use dsh_agent_loop::{LoopDeps, ReactLoopAgent, ToolExecCtx, ToolExecOutcome};
+use dsh_agent_loop::{
+    LoopDeps, PendingCall, ReactLoopAgent, ToolExecCtx, ToolExecOutcome,
+};
 use dsh_llm::call_config::CallConfigAdapterDefaults;
 use dsh_llm::retry::{ResolvedAlwaysRetryPolicy, ResolvedRetryBackoff, ResolvedRetryPolicy};
 use dsh_llm::{
@@ -172,6 +174,7 @@ fn mock_tool(
         ToolExecOutcome {
             concluded: concluded_seq[i],
             context,
+            pending: Vec::new(),
         }
     })
 }
@@ -180,6 +183,7 @@ fn mock_tool_never() -> Rc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome> {
     Rc::new(|_ctx: &ToolExecCtx| ToolExecOutcome {
         concluded: true,
         context: vec![],
+        pending: Vec::new(),
     })
 }
 
@@ -694,4 +698,132 @@ fn pre_step_payload_shows_claimed_messages_and_agent_fusion() {
     let msgs = p["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0]["id"], "m1");
+}
+
+// ---------------------------------------------------------------------------
+// D-106 段 A：审批暂停 / 恢复（pending 工具调用机制）
+// ---------------------------------------------------------------------------
+
+fn demo_block(id: &str) -> ToolCallBlock {
+    ToolCallBlock {
+        id: CallId::from_raw(id),
+        name: "demo".into(),
+        arguments: "{}".into(),
+    }
+}
+
+#[test]
+fn approval_pending_pauses_turn_with_approval_pending_reason() {
+    let w = TestWorld::new();
+    let a = w.agent("a");
+    let script = Rc::new(RefCell::new(VecDeque::from(vec![tool_call_chunks("c1")])));
+    let calls = Rc::new(Cell::new(0u32));
+    let block = demo_block("c1");
+    let tool: Rc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome> =
+        Rc::new(move |_ctx: &ToolExecCtx| ToolExecOutcome {
+            concluded: false,
+            context: vec![],
+            pending: vec![PendingCall {
+                block: block.clone(),
+                call_seq: 7,
+            }],
+        });
+    let driver = ReactLoopAgent::new(
+        a.clone(),
+        w.reg.clone(),
+        deps(mock_assemble("sys"), mock_stream(script, calls.clone()), tool),
+    );
+    driver.followup(user_msg("m1", "go")).unwrap();
+
+    // 暂停：turn/end = approval-pending；不续发 LLM；Idle 停车；pending 留驻；无 result。
+    assert_eq!(turn_end_reason(&a.session)["kind"], "approval-pending");
+    assert_eq!(count_of(&a.session, EventKind::TurnEnd), 1);
+    assert_eq!(calls.get(), 1);
+    assert_eq!(driver.status(), AgentStatus::Idle);
+    assert_eq!(driver.pending_calls().len(), 1);
+    assert_eq!(driver.pending_calls()[0].block.id, CallId::from_raw("c1"));
+    assert_eq!(count_of(&a.session, EventKind::ToolResult), 0);
+}
+
+#[test]
+fn kick_resume_reruns_pending_then_continues() {
+    let w = TestWorld::new();
+    let a = w.agent("a");
+    // 第 1 次 LLM → tool call c1；恢复后第 2 次 LLM → 纯文本收尾。
+    let script = Rc::new(RefCell::new(VecDeque::from(vec![
+        tool_call_chunks("c1"),
+        text_chunks("done", FinishReason::Stop),
+    ])));
+    let calls = Rc::new(Cell::new(0u32));
+    let block = demo_block("c1");
+    let invocations = Rc::new(Cell::new(0u32));
+    let resume_seen = Rc::new(RefCell::new(Vec::<String>::new()));
+    let inv = invocations.clone();
+    let seen = resume_seen.clone();
+    let tool: Rc<dyn Fn(&ToolExecCtx) -> ToolExecOutcome> = Rc::new(move |ctx: &ToolExecCtx| {
+        let i = inv.get();
+        inv.set(i + 1);
+        if i == 0 {
+            ToolExecOutcome {
+                concluded: false,
+                context: vec![],
+                pending: vec![PendingCall {
+                    block: block.clone(),
+                    call_seq: 7,
+                }],
+            }
+        } else {
+            // 恢复：必须收到 resume 集（绝不在正常路径断言的直观信号）。
+            for p in &ctx.resume {
+                seen.borrow_mut().push(p.block.id.raw().to_string());
+            }
+            ToolExecOutcome {
+                concluded: false,
+                context: vec![],
+                pending: Vec::new(),
+            }
+        }
+    });
+    let driver = ReactLoopAgent::new(
+        a.clone(),
+        w.reg.clone(),
+        deps(mock_assemble("sys"), mock_stream(script, calls.clone()), tool),
+    );
+    driver.followup(user_msg("m1", "go")).unwrap();
+    assert_eq!(turn_end_reason(&a.session)["kind"], "approval-pending");
+    assert_eq!(calls.get(), 1);
+
+    // fail-loud：无操作触发不了恢复（空踢不臆造入口）——先断言正常恢复路径。
+    driver.kick_resume().unwrap();
+
+    assert_eq!(invocations.get(), 2, "恢复必须重跑 tool_exec");
+    assert_eq!(resume_seen.borrow().as_slice(), &["c1".to_string()]);
+    assert_eq!(calls.get(), 2, "恢复后模型续发请求");
+    let ends: Vec<String> = a
+        .session
+        .events()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::TurnEnd)
+        .map(|e| e.data["reason"]["kind"].as_str().unwrap_or("?").to_string())
+        .collect();
+    assert_eq!(ends, vec!["approval-pending".to_string(), "completed".to_string()]);
+    assert!(driver.pending_calls().is_empty(), "恢复后 pending 清空");
+    assert_eq!(count_of(&a.session, EventKind::TurnStart), 2, "恢复是新 turn");
+    assert_eq!(driver.status(), AgentStatus::Idle);
+}
+
+#[test]
+fn kick_resume_fails_loud_without_pending() {
+    let w = TestWorld::new();
+    let a = w.agent("a");
+    let driver = ReactLoopAgent::new(
+        a.clone(),
+        w.reg.clone(),
+        deps(
+            mock_assemble("sys"),
+            mock_stream(Rc::new(RefCell::new(VecDeque::new())), Rc::new(Cell::new(0u32))),
+            mock_tool_never(),
+        ),
+    );
+    assert!(driver.kick_resume().is_err(), "无待决审批 → fail loud");
 }

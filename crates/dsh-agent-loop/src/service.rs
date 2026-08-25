@@ -111,10 +111,16 @@ pub fn build_loop_deps(
                 ctx.turn,
                 ctx.step,
                 ctx.tool_calls,
+                &ctx.resume,
                 &mut accept,
             )
             .unwrap_or(false);
-            ToolExecOutcome { concluded, context }
+            // 直通路径永不暂停审批（pending 由宿主包装层注入）；保留 pending 字段供宿主复用。
+            ToolExecOutcome {
+                concluded,
+                context,
+                pending: Vec::new(),
+            }
         })
     };
 

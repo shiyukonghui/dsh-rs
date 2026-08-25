@@ -395,6 +395,9 @@ pub enum TurnEndReason {
     MaxTokens,
     /// 持久化后端在 reload 时关闭了一个 crash 孤儿 turn（loop 从不发射此标记）。
     Interrupted,
+    /// 审批暂停：turn 因工具调用等待宿主审批而收尾（工具结果在恢复 turn 落盘）。
+    /// 语义上是「未完待决」——非错误、非完成；恢复后新 turn 续跑。
+    ApprovalPending,
     Unknown {
         kind_: String,
         data: Map<String, Value>,
@@ -414,6 +417,7 @@ impl serde::Serialize for TurnEndReason {
             }
             TurnEndReason::MaxTokens => serde_json::json!({ "kind": "max-tokens" }),
             TurnEndReason::Interrupted => serde_json::json!({ "kind": "interrupted" }),
+            TurnEndReason::ApprovalPending => serde_json::json!({ "kind": "approval-pending" }),
             TurnEndReason::Unknown { data, .. } => Value::Object(data.clone()),
         };
         obj.serialize(s)
@@ -448,6 +452,7 @@ impl<'de> serde::Deserialize<'de> for TurnEndReason {
             }
             "max-tokens" => Ok(TurnEndReason::MaxTokens),
             "interrupted" => Ok(TurnEndReason::Interrupted),
+            "approval-pending" => Ok(TurnEndReason::ApprovalPending),
             other => Ok(TurnEndReason::Unknown {
                 kind_: other.to_string(),
                 data: obj.clone(),

@@ -329,6 +329,24 @@ impl AgentLoopHost {
         driver.followup(message).map_err(|e| e.to_string())
     }
 
+    /// D-106：**审批恢复裸踢**（等价 `driver.kick_resume`）——不追加消息，唤醒 driver
+    /// 重跑暂停的 pending 调用；无待决审批或非 Idle → Err（fail loud）。
+    /// 未知 id → Err。
+    pub fn kick(&self, id: &str) -> Result<(), String> {
+        let driver = self
+            .agent(id)
+            .ok_or_else(|| format!("host: no configured agent \"{id}\""))?;
+        driver.kick_resume().map_err(|e| e.to_string())
+    }
+
+    /// D-106：当前待决审批调用（只读，宿主 decide RPC 感知 / 返回面）。
+    pub fn pending_calls(&self, id: &str) -> Result<Vec<super::agent::PendingCall>, String> {
+        let driver = self
+            .agent(id)
+            .ok_or_else(|| format!("host: no configured agent \"{id}\""))?;
+        Ok(driver.pending_calls())
+    }
+
     /// P4（直通 accept）：把 agent 作用域链到 preset 的 standing scope（join）。
     /// - 首次 = `bind_scope_parent(agent.scope → standing)`，绑定存入宿主 `joins`；
     /// - 再次（换 preset）= 原绑定 `rebind`（沿用装配期 scope）；

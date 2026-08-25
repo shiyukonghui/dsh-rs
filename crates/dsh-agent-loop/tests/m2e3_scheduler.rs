@@ -103,6 +103,17 @@ fn run(
     step: u64,
     calls: &[ToolCallBlock],
 ) -> (bool, Vec<Message>) {
+    run_resume(s, tools, turn, step, calls, &[])
+}
+
+fn run_resume(
+    s: &Rc<Session>,
+    tools: &ToolRegistry,
+    turn: u64,
+    step: u64,
+    calls: &[ToolCallBlock],
+    resume: &[dsh_agent_loop::PendingCall],
+) -> (bool, Vec<Message>) {
     let mut accepted = Vec::new();
     let concluded = dsh_agent_loop::execute_tool_calls(
         s,
@@ -113,6 +124,7 @@ fn run(
         turn,
         step,
         calls,
+        resume,
         &mut |m| accepted.push(m),
     )
     .unwrap();
@@ -319,4 +331,65 @@ fn tool_call_payload_ignores_unused_agent_and_max_parallel() {
     .unwrap())]);
     let (_, _) = run(&s, &tools, 1, 1, &[call("c1", "who", "{}")]);
     assert_eq!(seen_agent.borrow().as_deref(), Some("agent-1"));
+}
+
+// ---------------------------------------------------------------------------
+// D-106 段 A：审批恢复路径（resume 只追 result、复用 call seq；合成拒绝）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn emit_pending_calls_then_resume_appends_result_without_duplicate_call() {
+    let s = session();
+    let tools = registry(vec![Rc::new(parallel_echo_def("echo"))]);
+    let block = call("c1", "echo", r#"{"text":"hi"}"#);
+
+    // 暂停步：宿主把 c1 判待审批 → 落 tool/call、拿 seq、不执行。
+    let pending = dsh_agent_loop::emit_pending_calls(&s, 1, 1, std::slice::from_ref(&block));
+    assert_eq!(pending.len(), 1);
+    assert_eq!(event(&s, EventKind::ToolCall).len(), 1);
+    assert_eq!(event(&s, EventKind::ToolResult).len(), 0);
+    let tc_seq = event(&s, EventKind::ToolCall)[0].seq;
+    assert_eq!(pending[0].call_seq, tc_seq);
+
+    // 恢复步（新 turn）：只执行 + 只追 result，链接回 call seq，绝不重复 tool/call。
+    let (concluded, accepted) = run_resume(&s, &tools, 2, 1, &[], &pending);
+    assert!(!concluded);
+    assert!(accepted.is_empty());
+    assert_eq!(event(&s, EventKind::ToolCall).len(), 1, "恢复不得重复 tool/call");
+    let results = event(&s, EventKind::ToolResult);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].source_event_seqs(), Some(&vec![tc_seq]));
+    let msg: Message = serde_json::from_value(results[0].data["message"].clone()).unwrap();
+    let ContentBlock::ToolResult(b) = &msg.content[0] else {
+        panic!("tool-result block expected");
+    };
+    assert_eq!(b.tool_call_id, CallId::from_raw("c1"));
+    assert_eq!(b.is_error, Some(false));
+}
+
+#[test]
+fn append_pending_rejection_synthesizes_error_result_on_stored_seq() {
+    let s = session();
+    let block = call("c1", "echo", r#"{"text":"hi"}"#);
+    let pending = dsh_agent_loop::emit_pending_calls(&s, 1, 1, std::slice::from_ref(&block));
+    let tc_seq = event(&s, EventKind::ToolCall)[0].seq;
+
+    // 拒绝：不进 registry 执行（echo 不应跑），直接合成拒绝 result。
+    dsh_agent_loop::append_pending_rejection(&s, 2, 1, &pending[0], "the user rejected tool \"echo\"")
+        .unwrap();
+    assert_eq!(event(&s, EventKind::ToolCall).len(), 1);
+    let results = event(&s, EventKind::ToolResult);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].source_event_seqs(), Some(&vec![tc_seq]));
+    assert_eq!(results[0].data["error"]["name"], json!("RejectedError"));
+    assert_eq!(results[0].data["error"]["code"], json!(dsh_agent_loop::CODE_TOOL_REJECTED));
+    let msg: Message = serde_json::from_value(results[0].data["message"].clone()).unwrap();
+    let ContentBlock::ToolResult(b) = &msg.content[0] else {
+        panic!("tool-result block expected");
+    };
+    assert_eq!(b.is_error, Some(true));
+    let ContentBlock::Text(t) = &b.content[0] else {
+        panic!("text block expected");
+    };
+    assert!(t.text().contains("rejected"));
 }
