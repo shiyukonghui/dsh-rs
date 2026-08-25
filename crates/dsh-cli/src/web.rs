@@ -3635,10 +3635,13 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
         // D-111：`commands/execute`——前端 `/plan` 命令路径（真浏览器测试发现缺失后补）；
         // 只实现 plan 命令，镜像 fork `plan-mode` handler + commands admission 契约；
         // `agentId` 会话路由（S3 per-agent 保真：作用到该会话而非默认）。
+        // 注意：commands RPC 的线路把参数包在 `payload.args`（用户抓包实证
+        // `payload:{args:{agentId,line,images}}`），缺省回退平铺 payload。
         "commands/execute" => {
-            let agent_id = payload.get("agentId").and_then(Value::as_str);
-            let line = payload.get("line").and_then(Value::as_str).unwrap_or("").to_string();
-            let images = payload.get("images").and_then(Value::as_array).cloned().unwrap_or_default();
+            let args = payload.get("args").unwrap_or(payload);
+            let agent_id = args.get("agentId").and_then(Value::as_str);
+            let line = args.get("line").and_then(Value::as_str).unwrap_or("").to_string();
+            let images = args.get("images").and_then(Value::as_array).cloned().unwrap_or_default();
             commands_execute(boot, agent_id, &line, &images)
         }
         "commands/list" => {
@@ -3964,6 +3967,47 @@ mod tests {
         assert_eq!(r["ok"], json!(true));
         assert!(dsh_plan::fold_plan_mode(&loop_host.store.get(&sid_default).unwrap().events()),
             "None 回退 plan_session");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D-111：`commands/execute` 的线路形状——前端把参数包在 `payload.args`
+    /// （用户抓包实证），`dispatch` 解包后 `/plan <message>` 正确落 plan + message。
+    #[test]
+    fn commands_execute_unwraps_args_wrapper() {
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let _ = session_host.session("s2");
+        let m4 = M4HostServices { jobs: None, schedule: None, todo: None, plan_mode: None };
+        let root = std::env::temp_dir().join(format!("dsh-m6-cmdwrap-{}", std::process::id()));
+        if root.exists() { let _ = std::fs::remove_dir_all(&root); }
+        std::fs::create_dir_all(&root).unwrap();
+        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        let loop_host = assemble_server_loop(
+            session_host.store.clone(), root.clone(), llm, "mock", "mock-model", m4, m5,
+        )
+        .expect("assemble ok");
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(loop_host.clone());
+        boot.plan_session = Some(std::rc::Rc::new(std::cell::RefCell::new("default".to_string())));
+        let sid_s2 = dsh_session::types::SessionId::from_raw("s2".to_string());
+
+        // 真实线路形状：payload = {"args":{agentId,line,images}}。
+        let payload = serde_json::json!({
+            "args": {
+                "agentId": "s2",
+                "line": "/plan 我计划一次北京旅行",
+                "images": [],
+            }
+        });
+        let result = dispatch(&boot, "commands/execute", &payload, &session_host);
+        assert_eq!(result["ok"], json!(true), "args 包裹被解包，plan 命令被接纳");
+        assert_eq!(result["value"]["result"]["kind"], json!("success"));
+        let s = loop_host.store.get(&sid_s2).unwrap();
+        assert!(dsh_plan::fold_plan_mode(&s.events()), "agentId=s2 的 plan 落在 s2");
+        let evs = s.events();
+        let mode = evs.iter().rfind(|e| e.kind == EventKind::PlanMode).unwrap();
+        assert_eq!(mode.data["message"], json!("我计划一次北京旅行"), "message 进 plan/mode");
         std::fs::remove_dir_all(&root).ok();
     }
 
