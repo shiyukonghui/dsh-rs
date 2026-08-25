@@ -115,10 +115,15 @@ impl Plugin for PresetRecordPlugin {
     }
 }
 
-/// L1（D-105）：plan-mode 折叠源句柄——`Rc<RefCell<Option<…>>>` 便于宿主在 standings
-/// 重建后注入/替换；Fn 段组装期经 `active()` 判定（单一权威态 = 会话 `plan/mode` 事件
-/// 折叠）。`None` = 永不注入（无 loop/未接）。
-type PlanModeSource = Rc<RefCell<Option<Rc<dyn Fn() -> bool>>>>;
+/// L1（D-105）/S3（D-107）：plan-mode 折叠 Fn——组装会话身份 `Some(sid)` 按该会话
+/// 折叠（per-agent 保真），`None` 回退全局/上次 select 会话。
+type PlanModeProbe = Rc<dyn Fn(Option<&str>) -> bool>;
+
+/// L1（D-105）/S3（D-107）：plan-mode 折叠源句柄——`Rc<RefCell<Option<…>>>` 便于宿主在
+/// standings 重建后注入/替换；Fn 段组装期经 `active(session_id)` 判定（单一权威态 =
+/// 会话 `plan/mode` 事件折叠；**per-agent**：携带组装会话身份则按该会话折叠，`None`
+/// 回退全局/上次 select 会话）。`None` = 永不注入（无 loop/未接）。
+type PlanModeSource = Rc<RefCell<Option<PlanModeProbe>>>;
 
 /// 一个 standing 挂载。
 pub struct Standing {
@@ -197,9 +202,11 @@ impl StandingRegistry {
         }
     }
 
-    /// L1：注入 plan-mode 折叠源（`None` = 永不注入）。经 `Rc<RefCell<Option<_>>>`
-    /// 承载——宿主在 standings 重建后注入亦可；Fn 段组装期读取。
-    pub fn set_plan_mode_source(&self, source: Option<Rc<dyn Fn() -> bool>>) {
+    /// L1/S3（D-107）：注入 plan-mode 折叠源（`None` = 永不注入）。经
+    /// `Rc<RefCell<Option<_>>>` 承载——宿主在 standings 重建后注入亦可；Fn 段组装期
+    /// 读取。**组装者会话身份**参数：`Some(sid)` = 按该会话折叠（per-agent 保真），
+    /// `None` = 无身份组装（回退全局/上次 select 会话）。
+    pub fn set_plan_mode_source(&self, source: Option<PlanModeProbe>) {
         *self.plan_mode_source.borrow_mut() = source;
     }
 
@@ -458,11 +465,14 @@ impl StandingRegistry {
                         let pc = PromptSection {
                             name: format!("preset:{id}:plan-mode"),
                             order: PLAN_MODE_ORDER,
-                            text: PromptSectionText::Fn(Rc::new(move |_ctx: &AssembleContext| {
+                            text: PromptSectionText::Fn(Rc::new(move |ctx: &AssembleContext| {
+                                // S3（D-107）：折叠源按**组装者自身会话**判定——身份在场
+                                // 时 per-agent 保真（多会话共享 standing 各看各的
+                                // plan/mode），无身份（None）回退全局源。
                                 let active = source
                                     .borrow()
                                     .as_ref()
-                                    .is_some_and(|f| f());
+                                    .is_some_and(|f| f(ctx.session_id.as_deref()));
                                 if active {
                                     ftext.clone()
                                 } else {
@@ -868,9 +878,18 @@ mod tests {
     }
 
     fn sect_texts(sp: &SystemPrompt, scope: &ScopeKey) -> Vec<String> {
+        sect_texts_with(sp, scope, None)
+    }
+
+    /// S3（D-107）：带组装会话身份的组装视图（None = 无身份组装）。
+    fn sect_texts_with(
+        sp: &SystemPrompt,
+        scope: &ScopeKey,
+        session_id: Option<&str>,
+    ) -> Vec<String> {
         sp.assemble(&AssembleContext{
             scope: Some(scope.clone()),
-            session_id: None,
+            session_id: session_id.map(str::to_string),
         })
         .unwrap()
         .sections
@@ -1619,7 +1638,7 @@ mod tests {
         // PlanModeHost 测试覆盖）。
         let state = Rc::new(RefCell::new(false));
         let src = state.clone();
-        reg.set_plan_mode_source(Some(Rc::new(move || *src.borrow())));
+        reg.set_plan_mode_source(Some(Rc::new(move |_sid| *src.borrow())));
         let comp = "
 - id: plan-mode
   name: '@deepseek-ai/dsh-plan-mode'
@@ -1659,6 +1678,46 @@ mod tests {
                 .iter()
                 .any(|t| t.contains("YOU-ARE-IN-PLAN-MODE-MARKER")),
             "no source: never injected"
+        );
+    }
+
+    /// —— S3（D-107）—— per-agent plan-mode 保真：**同一 standing（多会话共享）**下，
+    /// 折叠源按**组装者自身会话身份**判定——A 进 plan → A 的组装含段、B 不含；翻转
+    /// 亦然；无身份组装（None）回退全局判定。这正是此前「单活跃全局源」被修的缺陷。
+    #[test]
+    fn plan_mode_section_folds_per_assembled_session() {
+        let sp = new_sp();
+        let mut reg = StandingRegistry::new(sp.clone(), Some(realistic_tools()));
+        // 折叠源 = 按会话判定（模拟宿主解析器：会话 "alice" 处于 plan，其它否）。
+        reg.set_plan_mode_source(Some(Rc::new(|sid| sid == Some("alice"))));
+        let comp = "
+- id: plan-mode
+  name: '@deepseek-ai/dsh-plan-mode'
+  config:
+    section: |
+      YOU-ARE-IN-PLAN-MODE-MARKER-{tag}
+";
+        let rows = dsh_agent_presets::parse::parse_composition(comp).unwrap();
+        reg.mount("s3", &rows, &win32_facade()).unwrap();
+        let scope = ScopeKey::new();
+        reg.join("s3", &scope).unwrap();
+        let has_marker = |t: &Vec<String>| {
+            t.iter().any(|x| x.contains("YOU-ARE-IN-PLAN-MODE-MARKER"))
+        };
+        // alice 进 plan → alice 的组装含段。
+        assert!(
+            has_marker(&sect_texts_with(&sp, &scope, Some("alice"))),
+            "per-agent: alice (plan active) sees the plan-mode section"
+        );
+        // bob 未进 plan → 同 standing、同 scope，bob 的组装不含段。
+        assert!(
+            !has_marker(&sect_texts_with(&sp, &scope, Some("bob"))),
+            "per-agent: bob (not in plan) must NOT see alice's plan-mode section"
+        );
+        // 无身份组装（None）→ 回退全局判定（源对 None 返回 false）。
+        assert!(
+            !has_marker(&sect_texts(&sp, &scope)),
+            "no identity: falls back to global source verdict"
         );
     }
 

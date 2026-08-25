@@ -275,24 +275,18 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
                 Some(bundle.host.tools.clone()),
             ),
         ));
-        // L1（D-105）：plan-mode 折叠源接线——单一权威态 = 会话 `plan/mode` 事件日志
-        // （`dsh_plan::fold_plan_mode` 纯重放，无第二状态源）。single-active GUI：
-        // 折叠「最后一次 agentPreset.select 的会话」（standings 按 preset-id 挂载且单
-        // 活跃）；进入/退出经事件驱动（exit_plan_mode 执行器 + 宿主 enter 入口）。
+        // L1/S3（D-107）：plan-mode 折叠源接线——单一权威态 = 会话 `plan/mode` 事件日志
+        // （`dsh_plan::fold_plan_mode` 纯重放，无第二状态源）。**per-agent 保真**：解析器
+        // 按组装会话身份折叠（多会话共享 standing 各看各的）；None 回退 `plan_session`
+        // （single-active GUI 的「最后一次 agentPreset.select」会话，无身份组装路径）。
+        // 进入/退出经事件驱动（exit_plan_mode 执行器 + 宿主 enter 入口）。
         let plan_session = std::rc::Rc::new(std::cell::RefCell::new("default".to_string()));
         boot.plan_session = Some(plan_session.clone());
         {
-            let store = bundle.host.store.clone();
-            let ps = plan_session.clone();
+            let resolver = plan_mode_resolver(plan_session.clone(), bundle.host.store.clone());
             boot.standings
                 .borrow()
-                .set_plan_mode_source(Some(std::rc::Rc::new(move || {
-                    let sid = dsh_session::types::SessionId::from_raw(ps.borrow().clone());
-                    store
-                        .get(&sid)
-                        .map(|s| dsh_plan::fold_plan_mode(&s.events()))
-                        .unwrap_or(false)
-                })));
+                .set_plan_mode_source(Some(std::rc::Rc::new(resolver)));
         }
         // M6 step8（D-087）：真实 provider catalog 视图注入 Boot（llm.models caps）。
         boot.agent_catalog = Some(crate::m6_llm::server_catalog_view(&base_url, &model));
@@ -360,6 +354,26 @@ fn hmr_events_plan(path: &str, method: &Method) -> Option<HmrEventsPlan> {
         Method::Head => HmrEventsPlan::HeadersOnly,
         _ => HmrEventsPlan::MethodNotAllowed,
     })
+}
+
+/// S3（D-107）：plan-mode 折叠解析器——**per-agent 保真**。
+/// `Some(sid)` = 按该组装会话的 `plan/mode` 事件重放折叠（多会话共享 standing 时各看
+/// 各的）；`None` = 回退 `plan_session`（single-active GUI 的「最后一次 select」会话）。
+/// 折叠权威恒为会话事件（`dsh_plan::fold_plan_mode` 纯重放，无第二状态源）。
+fn plan_mode_resolver(
+    plan_session: std::rc::Rc<std::cell::RefCell<String>>,
+    store: std::rc::Rc<dsh_session::store::SessionStore>,
+) -> impl Fn(Option<&str>) -> bool {
+    move |sid: Option<&str>| {
+        let target = sid
+            .map(str::to_string)
+            .unwrap_or_else(|| plan_session.borrow().clone());
+        let s = dsh_session::types::SessionId::from_raw(target);
+        store
+            .get(&s)
+            .map(|sess| dsh_plan::fold_plan_mode(&sess.events()))
+            .unwrap_or(false)
+    }
 }
 
 /// 派发一个请求：`/plugins/*` bundle、`/api/*` RPC/SSE，否则静态文件（SPA fallback）。
@@ -3583,6 +3597,35 @@ mod tests {
         let evs = s.events();
         let pol = evs.iter().rfind(|e| e.kind == EventKind::ApprovalPolicy).unwrap();
         assert_eq!(pol.data["active"], json!(false));
+    }
+
+    /// S3（D-107）：折叠解析器 per-agent 保真——`Some(sid)` 按**该组装会话**折叠，
+    /// `None` 回退 `plan_session`（single-active 的「上次 select」会话）。
+    #[test]
+    fn plan_mode_resolver_folds_per_assembled_session() {
+        use dsh_session::types::{CreateSessionOptions, SessionId};
+        let store = Rc::new(dsh_session::store::SessionStore::new());
+        let alice = store
+            .create(Some(SessionId::from_raw("alice")), &CreateSessionOptions { seed: None, meta: None })
+            .unwrap();
+        let _bob = store
+            .create(Some(SessionId::from_raw("bob")), &CreateSessionOptions { seed: None, meta: None })
+            .unwrap();
+        store
+            .create(Some(SessionId::from_raw("default")), &CreateSessionOptions { seed: None, meta: None })
+            .unwrap();
+        alice
+            .append(EventKind::PlanMode, json!({ "active": true }), None)
+            .unwrap();
+        let plan_session = Rc::new(std::cell::RefCell::new("default".to_string()));
+        let res = plan_mode_resolver(plan_session, store);
+        assert!(res(Some("alice")), "per-agent: alice (in plan) folds active");
+        assert!(!res(Some("bob")), "per-agent: bob (not in plan) folds inactive — must NOT leak alice's plan state");
+        assert!(!res(None), "no identity: falls back to plan_session (default, inactive)");
+        alice
+            .append(EventKind::PlanMode, json!({ "active": false }), None)
+            .unwrap();
+        assert!(!res(Some("alice")), "flip: alice leaves plan -> folds inactive");
     }
 
     fn echo_component_bytes() -> Vec<u8> {
