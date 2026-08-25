@@ -47,6 +47,43 @@ pub struct StandingReport {
     pub guarded: Vec<(String, String)>,
 }
 
+impl StandingReport {
+    /// K2/C：unusable-rows 挂载否决（对齐 harness `mount.ts` 的 `inactiveRows`）。
+    /// 鉴别「桥依赖不可满足」的守卫行 = 挂载失败（fail-loud）；桥未实现 / 刻意
+    /// broken 的诚实降级不计（D-103 guard 报告设计，报告而不否决）。调用方（web
+    /// `agentPreset.select`）见非空即拒绝挂载且不留残留。
+    pub fn unusable_rows(&self) -> Vec<(String, String)> {
+        self.guarded
+            .iter()
+            .filter(|(_, why)| matches!(guard_kind(why), GuardKind::Stuck))
+            .cloned()
+            .collect()
+    }
+}
+
+/// K2/C：守卫原因分类——「桥依赖不可满足」（挂载否决）vs「桥未实现 / 刻意 broken」
+/// （诚实降级）。对齐 harness `inactiveRows`：只有行在等一个组合永远不满足的依赖
+/// 才否决；未实现面（P3/P5 收窄）、D-103 broken 集、A-03 只读 skill 是刻意取舍，
+/// 不算 unusable。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardKind {
+    Stuck,
+    Honest,
+}
+
+fn guard_kind(why: &str) -> GuardKind {
+    if why.starts_with("no host tool \"")
+        || why.starts_with("host tool group missing")
+        || why == "terminal backend without a resolved terminal group (P3-b)"
+        || why == "no shared tool registry in this host"
+        || why.starts_with("no base dir")
+    {
+        GuardKind::Stuck
+    } else {
+        GuardKind::Honest
+    }
+}
+
 /// 一个 standing 挂载。
 pub struct Standing {
     pub id: String,
@@ -967,6 +1004,153 @@ mod tests {
         ] {
             assert!(names.iter().any(|n| n == t), "joined model sees {t}");
         }
+    }
+
+    // —— K2/C —— unusable-rows 挂载否决（对齐 harness `inactiveRows`）。
+    // 「桥依赖不可满足」（缺宿主工具/组/注册面/后端/base-dir）→ 挂载否决；
+    // 刻意 broken / 未实现面的诚实降级 → 仅报告、不否决（D-103 兼容）。
+    /// 生产等同宿主工具集（web_m5 注册面：fs 六件套 + terminal 六件套 + bash/pwsh
+    /// + str_replace_editor）。
+    fn realistic_tools() -> Rc<ToolRegistry> {
+        let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+        for name in [
+            "read",
+            "write",
+            "edit",
+            "read_image",
+            "glob",
+            "grep",
+            "terminal_open",
+            "terminal_send",
+            "terminal_read",
+            "terminal_signal",
+            "terminal_close",
+            "terminal_list",
+            "bash",
+            "pwsh",
+            "str_replace_editor",
+        ] {
+            tools.register_global(tool_def(name, name, 1000.0)).unwrap();
+        }
+        tools
+    }
+
+    fn linux_facade() -> Value {
+        serde_json::json!({
+            "platform": "linux",
+            "env": {},
+            "cwd": "/repo",
+        })
+    }
+
+    /// 安全网：真实 shipped 预设（minimal/standard/code/cordis）+ 生产等同工具集
+    /// → 无 unusable 行（K2 对四个真实预设零回归；unmapped 行是诚实降级不计）。
+    /// 用 `mount_at(Some(base_dir))` 复刻 web select 的真实装配（base_dir = 组合目录，
+    /// skill 目录桥可解析）。
+    #[test]
+    fn real_presets_have_no_unusable_rows_on_production_host() {
+        let sp = new_sp();
+        let root = repo_root()
+            .join("resources")
+            .join("agent-presets");
+        for id in ["minimal", "standard", "code", "cordis"] {
+            let mut reg = StandingRegistry::new(sp.clone(), Some(realistic_tools()));
+            reg.mount_at(id, &preset_rows(id), Some(&root.join(id)), &win32_facade())
+                .unwrap_or_else(|e| panic!("{id}: mount failed: {e}"));
+            let r = reg.report(id).unwrap();
+            let u = r.unusable_rows();
+            assert!(
+                u.is_empty(),
+                "{id}: shipped preset must be usable on production host: {u:?}"
+            );
+        }
+    }
+
+    /// 映射行缺宿主工具（桥依赖不可满足）→ stuck → 挂载否决。
+    #[test]
+    fn unusable_rows_flags_mapped_tool_missing_from_host() {
+        let sp = new_sp();
+        // linux 门面：bash 行不被平台判禁 → 活化 → 需宿主 "bash"（缺失）。
+        let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+        let comp = "- id: t\n  name: '@deepseek-ai/dsh-tool-bash'\n";
+        let rows = dsh_agent_presets::parse::parse_composition(comp).unwrap();
+        let mut reg = StandingRegistry::new(sp.clone(), Some(tools));
+        reg.mount("x", &rows, &linux_facade()).unwrap();
+        let u = reg.report("x").unwrap().unusable_rows();
+        assert!(
+            u.iter().any(|(n, w)| {
+                n == "@deepseek-ai/dsh-tool-bash" && w.contains("no host tool \"bash\"")
+            }),
+            "stuck mapped row detected: {u:?}"
+        );
+    }
+
+    /// 组行缺宿主工具组 / terminal 后端行无已解析组 → stuck → 挂载否决。
+    #[test]
+    fn unusable_rows_flags_group_and_backend_stuck_dependencies() {
+        let sp = new_sp();
+        // 宿主只有 bash：fs/terminal 组缺失，且 terminal-bash 后端行无解析组。
+        let tools = Rc::new(ToolRegistry::new(dsh_tools::ToolExecutionMode::Native));
+        tools.register_global(tool_def("bash", "bash", 1000.0)).unwrap();
+        let comp = "
+- id: fs
+  name: '@deepseek-ai/dsh-fs-local'
+- id: term
+  name: '@deepseek-ai/dsh-terminal'
+- id: term-bash
+  name: '@deepseek-ai/dsh-terminal-bash'
+";
+        let rows = dsh_agent_presets::parse::parse_composition(comp).unwrap();
+        let mut reg = StandingRegistry::new(sp.clone(), Some(tools.clone()));
+        reg.mount("x", &rows, &win32_facade()).unwrap();
+        let u = reg.report("x").unwrap().unusable_rows();
+        assert!(
+            u.iter().any(|(n, _)| n == "@deepseek-ai/dsh-fs-local"),
+            "fs group missing is stuck: {u:?}"
+        );
+        assert!(
+            u.iter().any(|(n, _)| n == "@deepseek-ai/dsh-terminal"),
+            "terminal group missing is stuck: {u:?}"
+        );
+        assert!(
+            u.iter().any(|(n, w)| {
+                n == "@deepseek-ai/dsh-terminal-bash"
+                    && w.contains("terminal backend without a resolved terminal group")
+            }),
+            "terminal backend without resolved group is stuck: {u:?}"
+        );
+    }
+
+    /// D-103/A-03 诚实降级（broken 集、只读 skill、未桥面）→ 不否决（仅报告）。
+    #[test]
+    fn unusable_rows_ignores_declared_broken_and_unbridged_degrade() {
+        let sp = new_sp();
+        let comp = "
+- id: a
+  name: '@deepseek-ai/dsh-tool-cordis'
+- id: b
+  name: '@deepseek-ai/dsh-command-compact'
+- id: c
+  name: '@deepseek-ai/dsh-tool-skill'
+- id: d
+  name: '@deepseek-ai/dsh-tool-web'
+- id: e
+  name: '@deepseek-ai/dsh-tool-goal'
+";
+        let rows = dsh_agent_presets::parse::parse_composition(comp).unwrap();
+        let mut reg = StandingRegistry::new(sp.clone(), Some(realistic_tools()));
+        reg.mount("y", &rows, &win32_facade()).unwrap();
+        let r = reg.report("y").unwrap();
+        assert!(
+            !r.guarded.is_empty(),
+            "all five honest-degrade rows are guarded: {:?}",
+            r.guarded
+        );
+        assert!(
+            r.unusable_rows().is_empty(),
+            "declared-broken / minimal-skill / unbridged rows must not reject: {:?}",
+            r.unusable_rows()
+        );
     }
 
     /// —— P3-a：agent-instructions 内容桥 —— `<cwd>/AGENTS.md` → joined 视图 scoped

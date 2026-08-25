@@ -4376,6 +4376,35 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
   不受影响（生产 loop 不消费 dsh-core 作用域）。回滚：`git revert` K1 提交。
 - **下一步 K2**：unusable-rows 挂载否决（D-103 显式 broken 集除外）→ K3 薄适配。
 
+### D-104 实施补记（K2：unusable-rows 挂载否决，round 22；TDD 红→绿）
+
+- 触发：D-104 计划 K2（复刻 harness `inactiveRows` → 挂载失败；D-103 显式 broken 集
+  除外）。
+- 关键自下而上事实（决定精确规则）：
+  - harness `mount.ts`：只用「等一个组合永远不提供的依赖」判 unusable → 否决；`disabled`
+    行跳过；模块失败行已在 loader 层拒绝。
+  - **真实 shipped preset 的 guard 状态**：standard/code/cordis 大量行（tool-fs/jobs/goal/
+    todo/web/subagent/compaction/plan-mode…）是「no Rust bridge yet」诚实降级——其**意图
+    已由宿主导线注册面满足**（read/write/edit、todo_write、goal_*、web_search、job_*…），
+    不是「卡住」。若对其否决会误杀已验证的四个真实预设。
+  - minimal 映射 str_replace_editor/fs-local/terminal 组，生产 M5 注册面全有（web_m5.rs
+    register 六件套+终端六件套+bash+pwsh+str_replace_editor）。
+- 裁决：**两分类规则**——`GuardKind::Stuck` 仅当「桥依赖不可满足」：`no host tool "X"`、
+  `host tool group missing`、`terminal backend without a resolved terminal group`、`no
+  shared tool registry in this host`、`no base dir`（skill 目录不可解析）；**其余**
+  （No Rust bridge yet / broken per D-103 / tool-skill A-03 / 未映射 pwsh 系）= Honest
+  降级，仅报告不否决。`StandingReport::unusable_rows()` 返回 Stuck 集。
+- select 接线：web `agentPreset.select` 在 `mount_at` 后查 `unusable_rows()`；非空 →
+  **拒绝挂载 + unmount 不留残留**（对齐 harness「rejection leaves nothing mounted」）+
+  `agent-preset-mount-rejected` fail-loud 诊断。**否决 M5HostServices 加字段**（沿用
+  ShellHost 模式）；**否决把「No Rust bridge yet」当 unusable**（误杀真实预设，见上）。
+- 验收：new 5 测（真实预设 x4 生产宿主零回归安全网 / 映射行缺宿主工具 stuck /
+  组+后端 stuck / D-103-A-03 降级不否决 / select 端到端拒绝+不留残留）；standing 15/15、
+  dsh-cli lib 175/175、六 crate 全回归 **577/577** 绿；clippy `-D warnings` 零；live 60165
+  **四个真实预设 select 全 OK**（K2 不回归）。回滚：`git revert` K2 提交。
+- **已知未接/下一**：K3（standing.rs 收成薄适配层 over 新 core runtime）；K2 的「卡住」
+  判定仍属 standing 层（组合走树处），K3 迁移时随迁 dsh-core 挂载审计。live 进程 term-31。
+
 ### D-104 实施补记预留
 
 

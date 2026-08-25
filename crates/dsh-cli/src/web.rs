@@ -2874,6 +2874,9 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
             };
             // 挂载 standing（换代幂等）+ 取 standing scope（守卫报告挂 reg.report）。
             // P3-c：base_dir = 组合所在目录（skill 目录解析用）。
+            // K2/C：unusable-rows 挂载否决（对齐 harness `mount.ts` inactiveRows）——
+            //   「桥依赖不可满足」的守卫行 = 拒绝挂载（fail-loud），拒绝后不留残留；
+            //   刻意 broken / 未实现面的诚实降级行不计（仅报告，D-103 兼容）。
             let standing_scope = {
                 let mut reg = boot.standings.borrow_mut();
                 if let Err(e) = reg.mount_at(
@@ -2883,6 +2886,25 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
                     &dsh_eval::process_facade(),
                 ) {
                     return err("agent-preset-broken", format!("preset \"{preset}\" mount: {e}"));
+                }
+                let unusable: Vec<(String, String)> = reg
+                    .report(&preset)
+                    .map(|r| r.unusable_rows())
+                    .unwrap_or_default();
+                if !unusable.is_empty() {
+                    let detail = unusable
+                        .iter()
+                        .map(|(n, w)| format!("  - {n}: {w}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    reg.unmount(&preset);
+                    return err(
+                        "agent-preset-mount-rejected",
+                        format!(
+                            "preset \"{preset}\" has {} row(s) whose bridge dependency cannot be satisfied (fix the host toolset or mark the rows disabled in the preset):\n{detail}",
+                            unusable.len()
+                        ),
+                    );
                 }
                 match reg.scope_of(&preset) {
                     Some(s) => s.clone(),
@@ -4923,6 +4945,99 @@ mod tests {
         );
         assert_eq!(res["result"]["ok"], false);
         assert_eq!(res["result"]["error"]["code"], "agent-preset-broken");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// K2/C：`agentPreset.select` 的 unusable-rows 挂载否决 —— 组合含「桥依赖不可
+    /// 满足」的行（win32 上活化、但宿主工具注册面缺 pwsh）→ 挂载拒绝，`fail-loud`
+    /// 报 `agent-preset-mount-rejected`，且拒绝后不留残留挂载（对齐 harness
+    /// mount.ts「a rejection leaves nothing mounted」）。
+    #[test]
+    fn rpc_agent_preset_select_rejects_unusable_rows_and_leaves_nothing() {
+        use dsh_agent_loop::{AgentLoopConfig, AgentLoopHost, ConfiguredAgent};
+        use dsh_agent_presets::{PresetRoot, PresetTrust};
+        let mut boot = boot_with_sessions();
+        {
+            let mut sp = boot.settings.borrow_mut();
+            crate::preset_host::register_agent_presets_settings(&mut sp);
+        }
+        let base = std::env::temp_dir().join(format!("dsh-cli-presets-reject-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sys = base.join("sys");
+        let preset_dir = sys.join("unusable");
+        std::fs::create_dir_all(&preset_dir).unwrap();
+        // win32 活化行（process.platform === 'win32' 不判禁）→ 需宿主 "pwsh"。
+        std::fs::write(
+            preset_dir.join("agent.cordis.yml"),
+            "- id: p\n  name: '@deepseek-ai/dsh-tool-pwsh'\n",
+        )
+        .unwrap();
+        std::fs::write(preset_dir.join("preset.yml"), "order: 1\n").unwrap();
+        *boot.presets.borrow_mut() = crate::preset_host::PresetHost::with_user_root(
+            vec![PresetRoot { path: sys.clone(), trust: PresetTrust::System }],
+            None,
+        );
+
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let config = AgentLoopConfig {
+            max_parallel_tool_calls: None,
+            agents: vec![ConfiguredAgent {
+                id: "a-main".into(),
+                provider: Some("mock".into()),
+                model: Some("mock-model".into()),
+                session_id: Some("default".into()),
+                max_tokens: None,
+                cwd: None,
+                resume_session_id: None,
+            }],
+        };
+        // 真实 loop + **空**工具注册面（生产 M5 注册面恒在，此处人为缺失以推 K2）。
+        let loop_host = AgentLoopHost::with_store(
+            config,
+            std::rc::Rc::new(dsh_llm::LlmRuntime::new()),
+            std::rc::Rc::new(dsh_tools::ToolRegistry::new(dsh_tools::ToolExecutionMode::Native)),
+            session_host.store.clone(),
+        )
+        .unwrap();
+        loop_host.ensure_agent(&loop_host.config.agents[0]).unwrap();
+        boot.agent_loop = Some(loop_host.clone());
+        boot.standings = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::standing::StandingRegistry::new(
+                loop_host.prompt.clone(),
+                Some(loop_host.tools.clone()),
+            ),
+        ));
+
+        let call = |method: &str, payload: serde_json::Value| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "r", "method": method, "payload": payload,
+            }))
+            .unwrap();
+            handle_rpc_host(&boot, method, &body, &session_host).1
+        };
+
+        let res = call(
+            "agentPreset.select",
+            serde_json::json!({"sessionId": "default", "agentPreset": "unusable"}),
+        );
+        assert_eq!(res["result"]["ok"], false, "select rejected: {res}");
+        assert_eq!(
+            res["result"]["error"]["code"], "agent-preset-mount-rejected",
+            "fail-loud code: {res}"
+        );
+        let msg = res["result"]["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("@deepseek-ai/dsh-tool-pwsh") && msg.contains("no host tool \"pwsh\""),
+            "stuck row named in diagnostic: {msg}"
+        );
+        // 拒绝后不留残留挂载（unmount 已撤销）。
+        assert_eq!(
+            boot.standings.borrow().len(),
+            0,
+            "rejected mount must leave nothing mounted"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
