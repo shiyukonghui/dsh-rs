@@ -4,6 +4,116 @@
 > 关键设计决策与陷阱、下一步做什么。开发过程中的完整设计依据见
 > `PLAN-rust-cordis-equivalent-migration.md`（迁移方案 + 各里程碑交付记录）。
 
+## 0. 当前工作批次（最新交付状态）：Web GUI 审批 + 发送↔停止按钮 + 请求面并发化
+
+> 面向接手的新 agent：本批次延续 **D-108/G 里程碑「approval 浏览器级验证收口」**。
+> 前端为 fork（`deepseek-harness/apps/web` + `packages/client`，**零源码改动**），
+> 后端改动全在 Rust（`crates/dsh-cli/src/web.rs` 及关联）。所有决策见
+> `DECISIONS.md`（D-112 → D-115）。本小节是**接手的第一入口**，读完再进 §1。
+
+### 0.1 一句话状态
+
+- **已完成**：审批 `bad-response` 根因修复、`events.host` ZodError 根因修复、
+  发送↔停止按钮切换（`host/session-status` 帧）、`session.cancel` 真接线。
+- **进行中**：D-115 请求面并发化（用户拍板的方案 II）——Phase 0 设计已过，Phase 1-5 待做。
+- **已知限制（重要）**：60880 当前跑 **D-114 版本，按钮会切、但「生成中立即停止」
+  不可达**——见 0.3，这是设计使然，等 D-115 开发完后逻辑变动，届时重新测试即可。
+
+### 0.2 已完成并提交（commit → DECISIONS 互查）
+
+- **D-113**（`1138efb`、`34a8589`）——
+  - `AgentLoopHost::pending_by_call_id(call_id)`：跨全装配 agent 按 call id 定位
+    真正持有 pending 的 driver（`crates/dsh-agent-loop/src/host.rs`）；
+  - `approval::decide` 不再硬编码 `"default"`（此前 per-session 审批必 `bad-response`
+    且永不恢复）；`events.host` 流（SSE+WS）不再下推 `session/event`（收进
+    `!is_host`）→ 前端 `No matching discriminator` ZodError 消失。
+- **D-114**（`71e30de`）——
+  - `install_session_running_frames(store, host_events)`：store 级 `on_event` 把
+    `turn/start`→`host/session-status {running:true}`、`turn/end`→`false` 在**落盘
+    瞬间**推送（serve 装配处接线，agent-loop 门控）；前端
+    `Session.handleRunning` 的唯一写入源，驱动发送↔停止按钮；
+  - `session.cancel` 从 stub 改为真接线：`configured_for_session(sid)` 定位 driver
+    → `driver.cancel(AgentCancelCause::User, keep_inbox:false)`，幂等 accepted。
+
+### 0.3 ⚠️ 当前限制（务必让测试者知悉）
+
+- **60880 的 D-114 版本无法「生成中一键停」**：serve 主循环单线程
+  （D-004/D-006 Rc/RefCell 纪律），`session.prompt` 经 `run_rust_loop` 同步排空整轮
+  turn，turn 期间 accept 循环被占死 → `session.cancel` 无法并发送达，只能 turn
+  间隙送达，所以点「停止」在长生成中无效。
+- **这不是 bug，是设计使然**；方案 II（D-115）完成后「请求面并发化」会从根上改变
+  这个行为（accept 线程空闲接 cancel）。**方案 II 完成后再测试「生成中停止」，当前
+  版本不必再纠结。** 现在可验收的：①按钮在生成中切为「停止」、结束后复原；②间隙
+  送达的 cancel。
+
+### 0.4 进行中：D-115 请求面并发化（方案 II，分阶段）
+
+- **Phase 0（设计）已完成并提交 `506f96d`**：锁粒度（粗边界单锁：`Session.data`/
+  store/phase/approval_pending/inbox/bus 各一 `Mutex`，`Rc<Cell<bool>>`→`AtomicBool`）、
+  死锁审计（观察者只取叶子锁且不反向取 session/store 锁，锁序 `session.data → 叶子`
+  无环）、五阶段预算——全在 `DECISIONS.md` D-115。
+- **待做**：Phase 1 `dsh-session` → Phase 2 `dsh-agent` → Phase 3 `dsh-agent-loop`
+  +`dsh-llm`+`dsh-tools` → Phase 4 serve worker 化（长 RPC 上 worker，accept 空闲
+  接 cancel）→ Phase 5 回归 + live 验证。每阶段 `cargo test` 全量关闸。
+- 最大连锁：`Rc<dyn Fn>`→`Arc<dyn Fn + Send + Sync>`（所有闭包提供方须 Send+Sync）。
+
+### 0.5 本批次验证（区别于 §4 的核心差分）
+
+```sh
+# 单测 / lint
+cargo test -p dsh-cli --lib          # 212 项绿
+cargo clippy -p dsh-cli --lib --tests # 0 警告（看 $LASTEXITCODE，管道会掩盖）
+
+# live 起服（60880；60165 在 Hyper-V 保留段勿回退）——key 只经 env 注入，绝不落盘/入 git
+$env:DEEPSEEK_API_KEY='<key>'          # 由操作者提供，不写进任何文档/脚本
+$env:DSH_PLUGIN_ROOT='F:\RustProjects\dsh-rs\target\fork-plugins'
+& 'F:\RustProjects\dsh-rs\target\debug\dsh.exe' web 'F:\RustProjects\dsh-rs\target\web\cordis.yml' `
+  --agent-loop --workspace-root 'F:\RustProjects\dsh-rs\target\web-workspace' `
+  --sqlite-store 'F:\RustProjects\dsh-rs\target\web\sessions.sqlite' `
+  --llm-base-url 'http://100.105.152.101:18080/v1' --llm-model 'deepseek-v4-flash-0731-ext' `
+  --port 60880 --web-root 'F:\RustProjects\dsh-rs\deepseek-harness\apps\web\dist'
+
+# wire 脚本化验证（对 live）——重构/改动后必须重跑
+node F:\RustProjects\dsh-rs\target\d113-verify.mjs   # 审批全链 9 项（预期全 PASS）
+node F:\RustProjects\dsh-rs\target\d114-verify.mjs   # running 帧 5 项（预期全 PASS）
+```
+
+### 0.6 关键 wire/机制事实（改了别踩）
+
+- 审批 wire 契约（权威 = fork `packages/api/*/api-proxy-approval.spec.ts`）：
+  `approval/requested`（server-request）→ 前端 `POST /api/respond`（client-response，
+  校验 requested 帧 sessionId 相关性；错配 → `bad-response`）→ `{"accepted":true}`
+  → 结算 `approval/resolved`。
+- `host/session-status` 帧：`{type:"host/session-status", sessionId, running}`，经
+  `events.host` 用 `server-request {method:"host/event"}` 信封下推；客户端 zod 联合
+  本就含该型。
+- plan 投影帧是**平铺** `{type:"session/projection", sessionId, key, value, seq}`
+  （字段在顶层，**无 payload 信封**——校验谓词别写 `f.payload.*`）。
+- `"default"` 全仓三分法：①种子/握手（纯展示）；②设计性回退链
+  `plan_session→"default"`（全局命令兜底）；③真 bug（decide 硬编码，已修）。
+  用户已选范围 A（最小必要），日后勿随意扩张。
+- `commands/execute` 返回 `{ok, value:{commandId, result:{kind,text}}}`，args 包在
+  `payload.args`；`/plan off` 走 `commands.execute(sessionId,'/plan off',[])`；
+  `/plan <msg>` 非空 → `set_plan_mode_on` 后 `run_rust_loop`。
+- `events.host` 只推 `host/*`；mux 推 `session/event` + `session/projection` +
+  `approval/*`。
+
+### 0.7 护栏（不得违反）
+
+- fork 前端（`deepseek-harness/`）**零源码改动**；npx 安装包零改；`apps/web` Vite
+  仅用于构建前端产物，不另起替代 server。
+- plan 模式必须经前端原生 `/plan` 进入（用户明确要求）。
+- approval disabled：**不得设 `sandbox_permissions`**；`DEEPSEEK_API_KEY` 永不落盘
+  /入 git/DECISIONS/.env。
+- 瀑布流：需求→设计→编码（TDD 红→绿→重构）→测试→部署，阶段关闸工件可验收；
+  git 提交信息对应 DECISIONS 条目（提交用 `-F` + `UTF8Encoding($false)` 无 BOM）。
+- 遗留未跟踪产物（`b4.txt/c4.txt/t*.txt`）是 bash 测试副作用，勿提交。
+
+### 0.8 决策索引
+
+D-112（四 serve 缺口）→ D-113（审批归位/宿主流收窄）→ D-114（运行位帧 + 真取消）
+→ D-115（请求面并发化方案 II 分阶段）。全部细节在 `DECISIONS.md`。
+
 ## 1. 项目概览
 
 把 DeepSeek Harness 所用的 **Cordis 插件框架**（`deepseek-harness/vendor/cordis` 等）**行为等效移植到 Rust**，
