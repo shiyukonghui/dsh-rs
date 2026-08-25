@@ -391,6 +391,24 @@ impl AgentLoopHost {
         Ok(driver.pending_calls())
     }
 
+    /// D-113：按 call id 跨**全部**装配 agent 定位持有该 pending 审批的 driver。
+    /// 返回 `(agent_id, session)` 供审批决策落 `approval/decided` 事件 + 恢复踢。
+    /// 会话精确：per-session agent（`session-<sid>`）与默认 agent 同表可查，不依赖
+    /// 硬编码 `"default"`（旧 decide 按 default 查找，隐性多会话全拒 + 写错会话）。
+    pub fn pending_by_call_id(
+        &self,
+        call_id: &str,
+    ) -> Option<(String, Rc<Session>)> {
+        for id in self.agents.borrow().keys().cloned().collect::<Vec<_>>() {
+            if let Some(driver) = self.agent(&id) {
+                if driver.pending_calls().iter().any(|p| p.block.id.raw() == call_id) {
+                    return Some((id, driver.agent.session.clone()));
+                }
+            }
+        }
+        None
+    }
+
     /// P4（直通 accept）：把 agent 作用域链到 preset 的 standing scope（join）。
     /// - 首次 = `bind_scope_parent(agent.scope → standing)`，绑定存入宿主 `joins`；
     /// - 再次（换 preset）= 原绑定 `rebind`（沿用装配期 scope）；

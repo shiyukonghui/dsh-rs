@@ -5044,5 +5044,66 @@ steer 落 s2）、`commands_execute_routes_by_agent_id`（per-agent 路由 + ste
 
 ---
 
+## D-113：审批决策归位真实归属（消灭「硬编码 default」缺陷）+ events.host 的 session/event 泄漏
+
+**日期**：2025（本机时间）
+
+**触发的问题**：用户手动测试 60880 时报三类现象：
+1. 控制台仍 `events.host` ZodError `dropping malformed WebSocket frame ... No matching
+   discriminator`——D-112 只把 approval 帧收窄到 `!is_host`，但流循环里
+   `mux_session_event_frame`（`session/event` 帧）仍在 host 流**无条件**下推，而
+   HostFrame 联合不含它 → 前端 zod 丢弃。
+2. `/api/respond` 对形状正确的应答（`sessionId:"s2"`、`approvalId:"ap-..."`、
+   `outcome:"allowed-once"` 逐字回显）返回 `{"accepted":false,"reason":"bad-response"}`。
+3. 用户质疑「为什么有硬编码 default 目录，是否导致不该有的逻辑」——盘点全仓
+   `"default"` 硬编码后确认三类角色：①启动种子/握手（GUI 初始空白会话，纯展示，
+   无逻辑）；②设计性回退链 `plan_session → "default"`（全局命令无会话身份时的
+   兜底）；③**真正的缺陷**：`approval::decide` 硬编码 `AGENT="default"` + store
+   `"default"`（D-106 单会话时代遗留，per-session agent 普及后未跟上）。
+
+**自下而上验证**：
+- wire 的事实：approval requested 由 `approval_tool_exec` 以 `session.id().raw()`
+  （="s2"）mint，pending 挂在 driver agent `session-s2`；`decide` 却
+  `pending_calls("default")` → 该 driver 不存在 → Err → `bad-response`；即便存在，
+  `approval/decided` 也会写进 "default" 会话，resume 在 "s2" 会话 `fold_decided`
+  不到 → 永远「仍未决定」（坏得更隐蔽）。
+- fork `api-proxy-approval.spec.ts`：respond 校验 `sessionId`（=requested 帧的
+  driver 会话）+ `approvalId` 相关性；审计错配 → `bad-response`；success =
+  `accepted:true`。真实 flow 里 sessionId 逐字一致，故本批挂点只在 decide 路由。
+- `AgentLoopHost`（host.rs）已有 `configured_for_session` 精确映射；
+  `ReactLoopAgent.agent.session` 公字段可拿 driver 会话 → 跨 agent 按 call id 定位
+  无信息缺口。
+
+**最终选择**（用户确认范围 A：最小必要）：
+1. `AgentLoopHost::pending_by_call_id(call_id) -> Option<(agent_id, Rc<Session>)>`：
+   跨全装配 agent 按 call id 定位持有该 pending 的 driver（per-session
+   `session-<sid>` 与默认 agent 同表可查），不依赖硬编码 "default"。
+2. `approval::decide` 改用 `pending_by_call_id`：`approval/decided` 写到**真实归属
+   会话** + 按真实 agent 裸踢恢复；公开签名不变 `(boot, call_id, decision)`，
+   `/api/respond` 与 `session.approval.decide` 两个调用点同时受益。
+3. `events.host` 流（SSE + WS）不再下推 `mux_session_event_frame`（与 plan 投影
+   一并收进 `!is_host`）——host 通道只推 `host/*`（握手 + 宿主事件日志），帧联合
+   自洽。
+4. `agent.run`/`agent-loop` 旧路径：带 `sessionId` 则按会话路由（与
+   `session.prompt` 一致），无则回退 "default"（顺手接会话，消除无条件写死）。
+
+**被否决**：
+- 收拢全部 "default" 种子/回退链为单一常量 + Boot 单一事实源（范围 B）——改动面
+  大、会动握手帧/GUI 基线/大量测试 fixture，留单独一轮设计评审，不混入本批。
+- `approval_respond` 放松 `value.sessionId` 校验——fork 契约硬性校验审计相关性，
+  且真实 flow 里 sessionId 本就一致，不放松。
+
+**预期影响与回滚点**：per-session 审批 `accepted:true` 且恢复后**真执行**（不再
+bad-response/永不恢复）；`events.host` 不再收 `session/event`（ZodError 消失）。
+回滚：①-④ 各自独立可回；`pending_by_call_id` 是纯增量方法。
+
+**验证**：新增单测 `plan_approval_respond_routes_to_per_session_agent`（mock LLM
+真 loop：s2 会话 plan 激活 → bash 挂起 pending（不执行）→ respond allowed-once →
+`accepted:true` → kick 后 bash 真执行、tool/result 无错、tool/call 不重复；修复前
+此测试红 = `bad-response`，精确复现用户抓包）。dsh-cli lib 210/210 绿；dsh-agent-loop
+lib 绿；clippy（--all-targets）零。live 60880 脚本化 wire 全链 + 浏览器手动复测待
+D-114 收口。
+
+
 
 

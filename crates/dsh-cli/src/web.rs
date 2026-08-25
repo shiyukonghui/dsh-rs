@@ -1012,8 +1012,11 @@ fn stream_sse_events(
             let log = sink.lock().unwrap();
             let mut frames = Vec::new();
             for (session_id, ev) in log.iter().skip(cursor) {
-                frames.push(mux_session_event_frame(session_id, ev));
+                // D-113：`session/event` mux 帧只走 `events.mux`；`events.host` 的
+                // HostFrame 联合不含它，下推即被前端 zod 判 malformed 丢弃（真浏览器
+                // 抓包复现：`events.host` 控制台 ZodError）。host 通道只推 `host/*`。
                 if !is_host {
+                    frames.push(mux_session_event_frame(session_id, ev));
                     if let Some(proj) = plan_projection_frame(&mut plan_states, session_id, ev) {
                         frames.push(proj);
                     }
@@ -1145,8 +1148,11 @@ fn stream_ws_events(
             let log = sink.lock().unwrap();
             let mut frames = Vec::new();
             for (session_id, ev) in log.iter().skip(cursor) {
-                frames.push(mux_session_event_frame(session_id, ev));
+                // D-113：`session/event` mux 帧只走 `events.mux`；`events.host` 的
+                // HostFrame 联合不含它，下推即被前端 zod 判 malformed 丢弃（真浏览器
+                // 抓包复现：`events.host` 控制台 ZodError）。host 通道只推 `host/*`。
                 if !is_host {
+                    frames.push(mux_session_event_frame(session_id, ev));
                     if let Some(proj) = plan_projection_frame(&mut plan_states, session_id, ev) {
                         frames.push(proj);
                     }
@@ -3751,7 +3757,14 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Rc<SessionHost>) 
                     .and_then(|c| c.as_str())
                     .unwrap_or("")
                     .to_string();
-                return match crate::run_rust_loop(boot, "default", &text) {
+                // D-113：带 sessionId 则按会话路由（与 `session.prompt` 一致），
+                // 缺省回退 "default"——不再无条件写死 default。
+                let sid = payload
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default")
+                    .to_string();
+                return match crate::run_rust_loop(boot, &sid, &text) {
                     Ok(approval_pending) => serde_json::json!({"ok": true, "value": {"accepted": true, "approvalPending": approval_pending}}),
                     Err(e) => serde_json::json!({"ok": false, "error": {
                         "code": "internal",
@@ -3998,7 +4011,7 @@ mod tests {
         assert_eq!(done.data["kind"], json!("success"));
 
         // /plan off + images：error 结果，plan 保持 active（handler 未 set）。
-        let r = commands_execute(&boot, None, "/plan off", &img.as_array().unwrap());
+        let r = commands_execute(&boot, None, "/plan off", img.as_array().unwrap());
         assert_eq!(r["value"]["result"]["kind"], json!("error"));
         assert!(dsh_plan::fold_plan_mode(&loop_host.store.get(&sid).unwrap().events()));
 
@@ -8244,6 +8257,175 @@ mod tests {
         assert!(
             evs.iter().any(|e| e.kind.as_str() == "assistant/message"),
             "final assistant message in store"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// D-113 回归：**per-session 审批闭环**——模态会话 `s2` 的 mutation 在 plan 激活下
+    /// 挂起后，`POST /api/respond` 按 wire 真实归属路由。修复前 `decide` 写死
+    /// agent/会话 `"default"`（D-106 单会话假设）：pending 挂在 `session-s2` 上却去
+    /// `pending_calls("default")` 找 → Err → respond `bad-response` 且永不恢复
+    /// （真浏览器抓包复现）。修复后按 call id 跨 agent 定位真实 driver → accepted，
+    /// kick 后 `allowedOnce` 真执行（只追 result，不重复 tool/call）。
+    #[test]
+    fn plan_approval_respond_routes_to_per_session_agent() {
+        use dsh_llm::{CallId, ContentBlock, FinishReason, StreamChunk, ToolCallBlock};
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+
+        fn bash_call(id: &str) -> Vec<StreamChunk> {
+            let args = r#"{"command":"echo approved-s2","description":"d113 echo"}"#;
+            vec![
+                StreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: CallId::from_raw(id),
+                    name: Some("bash".into()),
+                    arguments_delta: args.into(),
+                },
+                StreamChunk::BlockEnd {
+                    index: 0,
+                    block: ContentBlock::ToolCall(ToolCallBlock {
+                        id: CallId::from_raw(id),
+                        name: "bash".into(),
+                        arguments: args.into(),
+                    }),
+                },
+                StreamChunk::Finish {
+                    reason: FinishReason::ToolCalls,
+                    replay_state: None,
+                },
+            ]
+        }
+
+        fn text_chunks(text: &str) -> Vec<StreamChunk> {
+            vec![
+                StreamChunk::BlockStart {
+                    index: 0,
+                    block_type: "text".parse().unwrap(),
+                },
+                StreamChunk::TextDelta {
+                    index: 0,
+                    text: text.into(),
+                },
+                StreamChunk::BlockEnd {
+                    index: 0,
+                    block: ContentBlock::text(text),
+                },
+                StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay_state: None,
+                },
+            ]
+        }
+
+        struct Adapter {
+            script: Rc<RefCell<VecDeque<Vec<StreamChunk>>>>,
+        }
+        impl dsh_llm::LlmAdapter for Adapter {
+            fn stream(
+                &self,
+                _options: dsh_llm::GenerateOptions,
+            ) -> Box<dyn Iterator<Item = StreamChunk>> {
+                let next = self.script.borrow_mut().pop_front().unwrap_or_default();
+                Box::new(next.into_iter())
+            }
+        }
+        let script = Rc::new(RefCell::new(VecDeque::from_iter([
+            bash_call("c1"),
+            text_chunks("approved-s2 done"),
+        ])));
+        let llm = Rc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Rc::new(Adapter { script }))
+            .unwrap();
+
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let m4 = M4HostServices {
+            jobs: None,
+            schedule: None,
+            todo: None,
+            plan_mode: None,
+        };
+        let root = std::env::temp_dir().join(format!("dsh-d113-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let loop_host = assemble_server_loop(
+            session_host.store.clone(),
+            root.clone(),
+            llm,
+            "mock",
+            "mock-model",
+            m4,
+            m5,
+        )
+        .expect("assemble_server_loop ok");
+
+        // 镜像 serve 装配：wire + 带 wire 的工厂（须在 ensure_agent 之前）。
+        let wire = std::sync::Arc::new(crate::web::approval_wire::ApprovalWire::new());
+        loop_host.set_tool_exec_factory(Some(crate::web::approval::approval_tool_exec_factory(
+            Some(wire.clone()),
+        )));
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(loop_host.clone());
+        boot.approval_wire = Some(wire.clone());
+
+        // 模态会话 s2：注册 agent（session-s2）+ plan 激活。
+        crate::ensure_session_agent(&boot, "s2", None).expect("agent for s2");
+        crate::web::approval::set_plan_mode_on(&boot, Some("s2"), true, None).expect("plan on s2");
+
+        // 驱动一轮 → plan 激活 mutation 门 → bash 挂起（不执行）。
+        let pending = crate::run_rust_loop(&boot, "s2", "do the work").expect("turn runs");
+        assert_eq!(pending, vec!["c1".to_string()], "bash pending under s2");
+
+        // wire 已 mint requested 帧（会话 s2 / approvalId ap-c1 / stable rpcId）。
+        let (len, frames) = wire.frames_since(0);
+        assert_eq!(len, 1, "one asked frame");
+        let req = &frames[0];
+        assert_eq!(req["method"], "approval/requested");
+        assert_eq!(req["payload"]["sessionId"], "s2");
+        assert_eq!(req["payload"]["approvalId"], "ap-c1");
+        let rpc_id = req["rpcId"].as_str().unwrap().to_string();
+
+        // 用户点「允许」（allowed-once）——修复前这里返回 bad-response。
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-response",
+            "rpcId": rpc_id,
+            "result": {"ok": true, "value": {
+                "sessionId": "s2", "approvalId": "ap-c1", "outcome": "allowed-once",
+            }},
+        }))
+        .unwrap();
+        let rec = crate::web::approval_wire::approval_respond(
+            Some(&wire),
+            &body,
+            |call_id, decision| crate::web::approval::decide(&boot, call_id, decision),
+        );
+        assert_eq!(rec, serde_json::json!({"accepted": true}));
+
+        // 恢复：bash 真执行（tool/result 无错）+ 收尾 assistant；tool/call 不重复。
+        let evs = session_host.events("s2");
+        let calls = evs
+            .iter()
+            .filter(|e| e.kind.as_str() == "tool/call")
+            .count();
+        assert_eq!(calls, 1, "resume must not re-append tool/call");
+        let results: Vec<_> = evs
+            .iter()
+            .filter(|e| e.kind.as_str() == "tool/result")
+            .collect();
+        assert_eq!(results.len(), 1, "bash executed after allow: {evs:?}");
+        assert_eq!(
+            results[0].data["error"],
+            Value::Null,
+            "bash executed, not rejected"
+        );
+        assert!(
+            evs.iter().any(|e| e.kind.as_str() == "assistant/message"),
+            "assistant resume message in shared store"
         );
 
         let _ = std::fs::remove_dir_all(&root);

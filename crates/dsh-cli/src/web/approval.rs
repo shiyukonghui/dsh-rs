@@ -222,24 +222,20 @@ fn fold_decided(session: &Rc<Session>, call_id: &str) -> Option<String> {
         .filter(|d| d.as_str() == DECISION_ALLOWED_ONCE || d.as_str() == DECISION_REJECTED)
 }
 
-/// 宿主审批决定（`session.approval.decide` RPC 后端）：写 `approval/decided` 到
-/// default 会话 → 裸踢恢复。返回「仍待决」调用数（None → 已全清）。
+/// 宿主审批决定（`session.approval.decide` RPC / `/api/respond` 后端）：写
+/// `approval/decided` 到**真实归属会话** → 裸踢恢复。返回「仍待决」调用数。
+///
+/// D-113：按 call id 跨全 agent 定位 pending 的 driver（`pending_by_call_id`），
+/// 不再假设单一 `"default"` agent/会话——per-session 审批（多会话 GUI）在此
+/// 修复前恒被拒（pending 挂在 `session-<sid>` 上却查 `pending_calls("default")`）。
 pub fn decide(boot: &crate::Boot, call_id: &str, decision: &str) -> Result<usize, String> {
-    const AGENT: &str = "default";
     let host = boot
         .agent_loop
         .as_ref()
         .ok_or_else(|| "no Rust AgentLoopHost assembled in this boot".to_string())?;
-    let pending = host.pending_calls(AGENT)?;
-    let _tool = pending
-        .iter()
-        .find(|p| p.block.id.raw() == call_id)
-        .map(|p| p.block.name.clone())
+    let (agent_id, session) = host
+        .pending_by_call_id(call_id)
         .ok_or_else(|| format!("no pending approval for toolCallId \"{call_id}\""))?;
-    let session = host
-        .store
-        .get(&dsh_session::types::SessionId::from_raw("default".to_string()))
-        .ok_or_else(|| "default session missing".to_string())?;
     session
         .append(
             EventKind::ApprovalDecided,
@@ -260,8 +256,8 @@ pub fn decide(boot: &crate::Boot, call_id: &str, decision: &str) -> Result<usize
         };
         let _ = w.resolve_by_call_id(call_id, outcome);
     }
-    host.kick(AGENT)?;
-    Ok(host.pending_calls(AGENT)?.len())
+    host.kick(&agent_id)?;
+    Ok(host.pending_calls(&agent_id)?.len())
 }
 
 /// D-106/S1：宿主 plan-mode 入口/出口（`session.plan.mode` RPC 后端）。
