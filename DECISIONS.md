@@ -4778,6 +4778,23 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
   live 复验推迟到 D 段。
 - 回滚：`git revert` 段 C 提交（approval.rs + web.rs 分支 + 测试）。
 
+### D-106 段 D 收口（approval RPC 里程碑完成，round 2）
+
+- 触发：段 C 提交 `2bbaa68`；里程碑门闸（回归/clippy/live/TEST_REPORT）。
+- 全 workspace 回归：段 A/B/C 各独立全量 **191/191 套件、0 真失败**
+  （segA/segB/segC-regression.txt；逐段含新增测试；segB/segC 已并回库）。
+- clippy `-D warnings` 零（三个受影响 crate + workspace 全量）。
+- live :60165 复验（新二进制）：serve 起服 + `host.describe`；`session.plan.mode`
+  进入 → `plan/mode` + `approval/policy` 落会话 + fold 投影 active:true 即时可见；
+  `session.approval.decide` 未决 → fail-loud 结构化错误。
+- **环境阻塞呈报（非代码缺陷）**：live 真机模型回合被 `api.deepseek.com` HTTP_418
+  拦截（`deepseek-v4-flash-0731-ext` 与 `deepseek-chat` 均 418），各换模型名自修无效 →
+  判定网关/凭据环境问题；真实模型驱动「mutation→弹窗→decide→续跑」GUI 目视待用户端
+  修复后复验（确定性路径已由 approve 5/5 + S1 1/1 + 段 A driver 恢复系列覆盖，均走真实
+  装配）。处理过程已记入 TEST_REPORT §12；未因环境问题妥协架构或功能。
+- TEST_REPORT-BC-segments.md 追加 D-106 章（§11-13）。
+- milestone 目标：①② 完成；③（S3 per-agent 保真）与 D-c 一致留后续。
+
 ### D-104 实施补记预留
 
 

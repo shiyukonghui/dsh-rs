@@ -154,3 +154,47 @@
   对应模型工具）；tool-skill 保持 A-03 只读 guard；broken-D-103（web/tool-cordis/
   command-compact）全程保持报错降级未改——与用户拍板一致。
 
+---
+
+# 追加章：D-106 approval RPC 里程碑（round 1–2；需求关闸 → 设计关闸 → 段 A/B/C）
+
+段目标与交付：需求结论/设计决策见 `PLAN-approval-rpc.md` + `DECISIONS.md` D-106 各补记；
+用户裁决 D-a=异步 UI 往返（本轮）、D-b=mutation 清单、D-c=S3 per-agent 保真留后续。
+
+## 11. 段 A/B/C 交付（完成）
+
+| 段 | 交付 | git | 验收 |
+|---|---|---|---|
+| A | loop **pending 工具调用机制**（纯机制，无 approval 语义）：`TurnEndReason::ApprovalPending`；`PendingCall`/`ToolExecCtx.resume`/`ToolExecOutcome.pending`；agent 级 `approval_pending`（越过 Idle 停车）；step 恢复/暂停；`kick_resume`；`execute_tool_calls(+resume)` 只追 result、复用 call seq；`emit_pending_calls`/`append_pending_rejection(TOOL_REJECTED)` | `5b22bd6` | dsh-agent-loop +2 集成测试（m2e2/m2e3）+ dsh-session 变体；全 workspace 回归 191/191 |
+| B | 宿主审批策略：loop 注入缝 `ToolExecFactory` + `create_loop_agent_with_tool_exec`；`web/approval.rs`（plan 非激活直通 / plan∧mutation→pending+asked / resume allowedOnce→执行 / rejected→合成拒绝 / 未决→拒绝停留，不伪造批准）；`session.approval.decide` RPC（写 decided + kick）；`run_rust_loop` 返回面含 `approvalPending` | `53e5863` | approval 单测 5/5（mutation 清单/直通/暂停/放行/拒绝）；dsh-agent-loop + dsh-cli clippy 零；全 workspace 回归 191/191 |
+| C | S1 用户侧入口：`session.plan.mode {active,message?}` RPC（宿主进入/离开无前置；模型 `exit_plan_mode` 保持三重前置）；`approval/policy {active,scope:"mutation",tools:[D-b]}` 随落；standing 折叠段随事件注入/撤下 | `2bbaa68` | S1 测试 1/1（进入→折叠+policy；离开→无前置折叠 false）；dsh-cli clippy 零；全 workspace 回归 191/191 |
+
+## 12. 验证与 live 复验
+
+- **全 workspace 回归**：段 A/B/C 各一次独立全量——**191/191 套件、0 真失败**
+  （segA/segB/segC-regression.txt；历史壳 191 = 段 A 基线 191，逐段含新增测试）。
+- **clippy `-D warnings` 零**：dsh-session + dsh-agent-loop + dsh-cli，及 workspace 全量。
+- **live :60165 复验（新二进制，round 2）**：serve 正常起服；`host.describe` OK；
+  `session.plan.mode{active:true}` → 会话落 `plan/mode{active:true,message}` +
+  `approval/policy{active:true,scope:"mutation",tools:[D-b 11 项]}`，fold 投影
+  `plan:{active:true}` 即时可见；`session.approval.decide` 对未决调用 fail-loud 结构化
+  错误（不伪造批准）。
+- **环境阻塞（诚实呈报，非代码缺陷）**：live 真机模型回合被端点拦截——`api.deepseek.com`
+  对 `deepseek-v4-flash-0731-ext` 与公开别名 `deepseek-chat` 均回 `HTTP_418`
+  （turn/end error；无 tool/call 触发 → approvalPending 空是正确语义）。各换模型名自修
+  均同样被拦 → 判定为网关/凭据环境问题（需要正确 `DSH_LLM_BASE_URL`/网关）。真实模型
+  驱动「mutation → approval 弹窗 → decide → 续跑」的 GUI 目视留待用户端环境修复后复验；
+  该链路的确定性路径已由单测覆盖（approval 5/5 + S1 1/1 + 段 A driver 恢复系列，均走
+  真实 `assemble_server_loop` 装配）。
+
+## 13. 段状态总览
+
+- 已交付提交：`5b22bd6`（A）、`53e5863`（B）、`2bbaa68`（C），各自独立回滚点；
+  DECISIONS 各段实施补记与提交互查。
+- 里程碑目标 ③（S3 per-agent plan-mode 保真）与 D-c 一致留后续（single-active GUI
+  caveat，§8）；D-104 实施补记另章预留。
+- 方法学循规：瀑布流三关闸（需求→设计→编码+测试）皆过；TDD 红→绿→重构逐段；
+  决策日志/git 互查；fail-loud（无决策拒绝/停留、live 环境阻塞如实呈报）；key 纪律
+  （密钥仅 live 进程 env 注入，从未落盘/入 git/DECISIONS/.env）。
+
+
