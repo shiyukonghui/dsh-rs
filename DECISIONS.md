@@ -4979,5 +4979,70 @@ composer 全要素），`/plan` 命令路径待 D-112 浏览器闭环确认。
 
 ---
 
+## D-112：手动抓包 + 用户手动测试暴露的四个 serve 缺口（approval/host 帧、args 包裹、steer、plan 投影实时帧）
+
+**日期**：2025（本机时间）
+
+**触发的问题**：用户按 D-111 清单手动测试 fork GUI 时，控制台与抓包连续暴露四个此前
+wire 层从未暴露的真实传送/语义缺口：
+1. 控制台 ZodError `dropping malformed WebSocket frame on /api/events.host`——we
+   把 **approval wire 帧（`approval/requested`/`approval/resolved`）无条件下推给
+   `events.host`**，而 host 帧联合（zod `HostFrame`）不包含 `approval/*` → 前端判
+   malformed 丢弃；approval 帧只该走 `events.mux` 母线（与 session/event 同槽）。
+2. 点击发送报 `command.execute failed ... commands/execute rejected "result"`，
+   抓包显示**真实线路把参数包在 `payload.args`**（`{type:"client-request",...,
+   payload:{args:{agentId,line,images}}}`），我们的 arm 直接读 `payload.line` 取不到
+   → 把 `/plan` 当未知命令返回 `value:null` → 前端 zod 拒绝。
+3. `/plan <message>` RPC 返回 `{ok,value:{commandId,result}}`（成功了）但「没有跳到
+   下一步页面」——fork 的 `/plan <message>` 会 `agent.steer(createUserMessage(...))`
+   （把消息投入会话并驱动下一轮）；我们只落 `plan/mode`（message 仅记录，assembly
+   不消费）不投消息不起轮 → 模型根本没开始。
+4. 同一现象的另一面：前端 plan 徽章/占位符读 `session.projections` 的 `plan` 键，
+   该键**只由 `session/history` 基线（冷启动）+ 实时 `session/projection` 帧喂**；
+   我们的 mux 流**零投影帧** → UI 永远不知道 plan 已开（D-107 的 per-agent 折叠只
+   服务了审批门，没服务 UI 投影）。
+
+**自下而上验证**：
+- `packages/client/connection/src/client/fixture.ts` 的 `projectionFramesOf`：
+  `plan/mode` 与 `command/run[name=plan,args:string]` 推进 → 下发
+  `{type:"session/projection", sessionId, key:"plan", value:{active,pending}, seq}`；
+  host 帧只在 `events.host`；approval 帧只在 mux。
+- fork `plan-mode/src/index.ts` `/plan` handler 329-331：非空 message/attachments →
+  `agent.steer(createUserMessage(...))`。
+- 抓包实证（用户提供）：`payload:{args:{...}}`；fixture `call()` 也解 `payload.args`。
+
+**最终选择**：
+1. approval wire 重放/增量下推全部收窄到 `!is_host`（SSE + WS 两处）；`events.host`
+   只下推 `host/*`（握手 `host/session-added` + 宿主事件日志），帧联合自洽。
+2. `commands/execute` arm 读 `payload.get("args").unwrap_or(payload)`（保留平铺回退），
+   `agentId`/`line`/`images` 从解包后的对象取。
+3. `commands_execute`：非空 message → 在 `set_plan_mode_on(active=true, message)` 后调用
+   `crate::run_rust_loop(boot, 目标会话, message)`（目标会话 = agentId，回退
+   plan_session）——镜像 fork 的 steer：投入 user 消息并阻塞驱动一轮（与
+   `session.prompt` 同路径同同步语义；命中审批门则暂停待批）。
+4. mux 流新增 plan 投影实时发布器 `plan_projection_frame`（per-session 惰性
+   `PlanUnitState` 增量折叠；触发=plan/mode、command/run[plan]；仅在 `!is_host` 下推），
+   `value` 用 `dsh_plan::projection::{plan_unit_apply, plan_projection_view}`（与
+   `session.history` 投影块同一折叠、同 `{active,pending}` 视图）。
+
+**被否决**：
+- 给 events.host 的帧联合打补丁或改前端（fork/安装包零接触）。
+- 在 commands/execute 里让 action 返回后由前端另行提交 prompt（命令路径已消费掉该
+  输入，会重复提交；fork 语义是 handler 内 steer）。
+- 只修 plan 投影不改 approve/args/steer（四者是同一批真机暴露的传送缺口，同批收口）。
+
+**预期影响与回滚点**：events.host 不再被 approval 帧污染（ZodError 消失）；`/plan
+<message>` 从「成功但无动作」变为「进入计划模式 + 消息投入并起一轮」；plan 徽章/占位符
+随投影帧实时更新。回滚：分别撤销 ①②③④ 处的改动即可，互不耦合，wire 契约
+（`api-proxy-approval.spec.ts`）不受影响。
+
+**验证**：新增/更新单测 `commands_execute_unwraps_args_wrapper`（args 包裹真实形状 +
+steer 落 s2）、`commands_execute_routes_by_agent_id`（per-agent 路由 + steer 落同会话）、
+`plan_projection_frame_publishes_on_plan_events`（触发/形状/独立会话）；dsh-cli lib
+209/209 绿；clippy 零。浏览器闭环（plan 徽章 + approve 条 + allow + marker）待 D-113
+用户手动复测确认。
+
+---
+
 
 

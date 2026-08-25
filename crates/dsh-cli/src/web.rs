@@ -486,9 +486,26 @@ fn commands_execute(boot: &crate::Boot, agent_id: Option<&str>, line: &str, imag
     } else {
         let msg = if message.is_empty() { None } else { Some(message) };
         match crate::web::approval::set_plan_mode_on(boot, agent_id, true, msg) {
-            Ok(_) => serde_json::json!({"kind": "success", "text": "Plan mode on. Use /plan off to leave."}),
+            Ok(_) => (),
             Err(e) => return serde_json::json!({"ok": false, "error": {"code": "internal", "message": e}}),
         }
+        // fork `/plan <message>` 语义：非空消息 `agent.steer(createUserMessage(...))`——
+        // 投入用户消息并驱动下一轮（真浏览器发现 RPC 成功但 UI 不前进的原缺口）。
+        // 目标会话 = agentId（回退 plan_session）；与已设的 plan/mode 同会话。
+        if !message.is_empty() {
+            let target_sid = match agent_id {
+                Some(a) => a.to_string(),
+                None => boot
+                    .plan_session
+                    .as_ref()
+                    .map(|ps| ps.borrow().clone())
+                    .unwrap_or_else(|| "default".to_string()),
+            };
+            if let Err(e) = crate::run_rust_loop(boot, &target_sid, message) {
+                return serde_json::json!({"ok": false, "error": {"code": "internal", "message": e.to_string()}});
+            }
+        }
+        serde_json::json!({"kind": "success", "text": "Plan mode on. Use /plan off to leave."})
     };
     finish(&session, &command_id, outcome)
 }
@@ -967,25 +984,40 @@ fn stream_sse_events(
     }
     // D-108/G：approval wire——重开时重放仍 pending 的 requested（逐字同 rpcId，
     // 刷新恢复），随后持游标增量下推 requested/resolved 帧（与 session/event 同母线）。
-    let mut approval_cursor = if let Some(wire) = &approval_wire {
-        for frame in wire.pending_requests() {
-            if write_sse(&mut writer, &frame).is_none() {
-                return;
+    // 仅 `events.mux` 通道承载 approval 帧；`events.host` 的 host 帧联合不含
+    // `approval/*`，下推会被前端 zod 判为 malformed（真浏览器抓包实证）。
+    let mut approval_cursor = if !is_host {
+        if let Some(wire) = &approval_wire {
+            for frame in wire.pending_requests() {
+                if write_sse(&mut writer, &frame).is_none() {
+                    return;
+                }
             }
+            wire.len()
+        } else {
+            0
         }
-        wire.len()
     } else {
         0
     };
     // host 帧游标（`events.host` 通道独有；每连接独立，append-only 日志安全）。
     let mut host_cursor = 0usize;
+    // plan 投影实时发布器（mux-only；per-session 惰性折叠状态）。
+    let mut plan_states: std::collections::HashMap<String, dsh_plan::projection::PlanUnitState> =
+        std::collections::HashMap::new();
     loop {
-        // 增量推送：cursor 之后的新事件逐个推成 session/event 帧（真实 time）。
+        // 增量推送：cursor 之后的新事件逐个推成 session/event 帧（真实 time）；
+        // mux 通道再逐个推成推进的 plan 投影帧（session/projection）。
         let (new_cursor, frames) = {
             let log = sink.lock().unwrap();
             let mut frames = Vec::new();
             for (session_id, ev) in log.iter().skip(cursor) {
                 frames.push(mux_session_event_frame(session_id, ev));
+                if !is_host {
+                    if let Some(proj) = plan_projection_frame(&mut plan_states, session_id, ev) {
+                        frames.push(proj);
+                    }
+                }
             }
             (log.len(), frames)
         };
@@ -995,13 +1027,15 @@ fn stream_sse_events(
             }
         }
         cursor = new_cursor;
-        // approval wire 增量帧（requested/resolved；append-only 游标安全）。
-        if let Some(wire) = &approval_wire {
-            let (new_cur, wire_frames) = wire.frames_since(approval_cursor);
-            approval_cursor = new_cur;
-            for frame in &wire_frames {
-                if write_sse(&mut writer, frame).is_none() {
-                    return;
+        // approval wire 增量帧（requested/resolved；append-only 游标安全）。仅 mux。
+        if !is_host {
+            if let Some(wire) = &approval_wire {
+                let (new_cur, wire_frames) = wire.frames_since(approval_cursor);
+                approval_cursor = new_cur;
+                for frame in &wire_frames {
+                    if write_sse(&mut writer, frame).is_none() {
+                        return;
+                    }
                 }
             }
         }
@@ -1085,24 +1119,38 @@ fn stream_ws_events(
     }
     // D-108/G：approval wire——重开时重放仍 pending 的 requested（逐字同 rpcId，
     // 刷新恢复），随后持游标增量下推 requested/resolved 帧（与 session/event 同母线）。
-    let mut approval_cursor = if let Some(wire) = &approval_wire {
-        for frame in wire.pending_requests() {
-            if ws_send(&mut ws, &frame).is_none() {
-                return;
+    // 仅 `events.mux` 通道承载 approval 帧；`events.host` 的 host 帧联合不含
+    // `approval/*`，下推会被前端 zod 判为 malformed（真浏览器抓包实证）。
+    let mut approval_cursor = if !is_host {
+        if let Some(wire) = &approval_wire {
+            for frame in wire.pending_requests() {
+                if ws_send(&mut ws, &frame).is_none() {
+                    return;
+                }
             }
+            wire.len()
+        } else {
+            0
         }
-        wire.len()
     } else {
         0
     };
     // host 帧游标（`events.host` 通道独有；每连接独立，append-only 日志安全）。
     let mut host_cursor = 0usize;
+    // plan 投影实时发布器（mux-only；per-session 惰性折叠状态）。
+    let mut plan_states: std::collections::HashMap<String, dsh_plan::projection::PlanUnitState> =
+        std::collections::HashMap::new();
     loop {
         let (new_cursor, frames) = {
             let log = sink.lock().unwrap();
             let mut frames = Vec::new();
             for (session_id, ev) in log.iter().skip(cursor) {
                 frames.push(mux_session_event_frame(session_id, ev));
+                if !is_host {
+                    if let Some(proj) = plan_projection_frame(&mut plan_states, session_id, ev) {
+                        frames.push(proj);
+                    }
+                }
             }
             (log.len(), frames)
         };
@@ -1112,13 +1160,15 @@ fn stream_ws_events(
             }
         }
         cursor = new_cursor;
-        // approval wire 增量帧（requested/resolved；append-only 游标安全）。
-        if let Some(wire) = &approval_wire {
-            let (new_cur, wire_frames) = wire.frames_since(approval_cursor);
-            approval_cursor = new_cur;
-            for frame in &wire_frames {
-                if ws_send(&mut ws, frame).is_none() {
-                    return;
+        // approval wire 增量帧（requested/resolved；append-only 游标安全）。仅 mux。
+        if !is_host {
+            if let Some(wire) = &approval_wire {
+                let (new_cur, wire_frames) = wire.frames_since(approval_cursor);
+                approval_cursor = new_cur;
+                for frame in &wire_frames {
+                    if ws_send(&mut ws, frame).is_none() {
+                        return;
+                    }
                 }
             }
         }
@@ -1207,6 +1257,39 @@ fn mux_session_event_frame(session_id: &str, e: &dsh_session::types::SessionEven
             "event": event,
         },
     })
+}
+
+/// D-111/D-112：plan 投影的**实时** `session/projection` 帧（mux 通道）。
+/// 前端 plan 徽章/占位符读 `session.projections` 的 `plan` 键——它只由
+/// `session/history` 的投影基线（冷启动）+ 本帧（实时）喂。触发规则镜像 fork
+/// fixture `projectionFramesOf`：`plan/mode` 与 `command/run[name=plan]`
+/// （args 为字符串）推进折叠。value 用 `dsh_plan::projection` 增量折叠
+/// （per-session 惰性状态；连接从 sink 末尾起，无重放旧事件，但 plan/mode 的
+/// 最后胜出语义使后继事件自洽）。
+fn plan_projection_frame(
+    states: &mut std::collections::HashMap<String, dsh_plan::projection::PlanUnitState>,
+    session_id: &str,
+    ev: &dsh_session::types::SessionEvent,
+) -> Option<Value> {
+    use dsh_plan::projection::{plan_projection_view, plan_unit_apply};
+    let advancing = ev.kind == dsh_session::types::EventKind::PlanMode
+        || (ev.kind == dsh_session::types::EventKind::CommandRun
+            && ev.data.get("name").and_then(|v| v.as_str()) == Some("plan")
+            && ev.data.get("args").and_then(|v| v.as_str()).is_some());
+    if !advancing {
+        return None;
+    }
+    let state = states
+        .entry(session_id.to_string())
+        .or_insert_with(dsh_plan::projection::PlanUnitState::init);
+    plan_unit_apply(state, ev);
+    Some(serde_json::json!({
+        "type": "session/projection",
+        "sessionId": session_id,
+        "key": "plan",
+        "value": plan_projection_view(state),
+        "seq": ev.seq,
+    }))
 }
 
 /// 处理一个 `/api/<method>` RPC：解析 client-request 信封 → 分派 → server-response。
@@ -3954,6 +4037,8 @@ mod tests {
         boot.plan_session = Some(std::rc::Rc::new(std::cell::RefCell::new("default".to_string())));
         let sid_default = dsh_session::types::SessionId::from_raw("default".to_string());
         let sid_s2 = dsh_session::types::SessionId::from_raw("s2".to_string());
+        // GUI 的 session.create 会给 s2 挂 agent；镜像之，使 /plan <message> 的 steer 可路由。
+        crate::ensure_session_agent(&boot, "s2", None).expect("agent for s2");
 
         let r = commands_execute(&boot, Some("s2"), "/plan  investigate", &[]);
         assert_eq!(r["ok"], json!(true));
@@ -3961,6 +4046,12 @@ mod tests {
             "agentId=s2 的 plan 落在 s2");
         assert!(!dsh_plan::fold_plan_mode(&loop_host.store.get(&sid_default).unwrap().events()),
             "default 不受影响");
+        // steer：非空 message 投入用户消息（镜像 fork agent.steer），落在同一会话。
+        let s2_evs = loop_host.store.get(&sid_s2).unwrap().events();
+        assert!(s2_evs.iter().any(|e| {
+            e.kind == EventKind::UserMessage
+                && e.data.pointer("/content/0/text") == Some(&json!("investigate"))
+        }), "steered user message on s2");
 
         // agentId=None → 回退 plan_session(default)。
         let r = commands_execute(&boot, None, "/plan", &[]);
@@ -3991,6 +4082,8 @@ mod tests {
         boot.agent_loop = Some(loop_host.clone());
         boot.plan_session = Some(std::rc::Rc::new(std::cell::RefCell::new("default".to_string())));
         let sid_s2 = dsh_session::types::SessionId::from_raw("s2".to_string());
+        // GUI 的 session.create 会给 s2 挂 agent；镜像之，使 /plan <message> 的 steer 可路由。
+        crate::ensure_session_agent(&boot, "s2", None).expect("agent for s2");
 
         // 真实线路形状：payload = {"args":{agentId,line,images}}。
         let payload = serde_json::json!({
@@ -4008,6 +4101,11 @@ mod tests {
         let evs = s.events();
         let mode = evs.iter().rfind(|e| e.kind == EventKind::PlanMode).unwrap();
         assert_eq!(mode.data["message"], json!("我计划一次北京旅行"), "message 进 plan/mode");
+        // steer：消息投入 s2（镜像 fork agent.steer）。
+        assert!(evs.iter().any(|e| {
+            e.kind == EventKind::UserMessage
+                && e.data.pointer("/content/0/text") == Some(&json!("我计划一次北京旅行"))
+        }), "steered user message on s2");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -4992,10 +5090,53 @@ mod tests {
         assert_eq!(keys, ["data", "seq", "time", "type"]);
     }
 
+    /// D-111/D-112：`plan_projection_frame`——`plan/mode` 与 `command/run[name=plan]`
+    /// 推进下发 `session/projection {key:"plan", value:{active,pending}, seq}`，
+    /// 非推进事件不发帧（镜像 fork fixture `projectionFramesOf` plan 规则）。
+    #[test]
+    fn plan_projection_frame_publishes_on_plan_events() {
+        use dsh_plan::projection::PlanUnitState;
+        use dsh_session::types::EventKind;
+        let mut states: std::collections::HashMap<String, PlanUnitState> =
+            std::collections::HashMap::new();
+        // 非推进事件 → 无帧。
+        let idle = dsh_session::types::SessionEvent::new(
+            0, 1_700_000_000_000, EventKind::UserMessage,
+            serde_json::json!({"content": [{"type": "text", "text": "hi"}]}),
+        );
+        assert!(plan_projection_frame(&mut states, "s2", &idle).is_none());
+        // command/run[name=plan]（args=含分隔空白的 verbatim）→ pending=true 帧。
+        let run = dsh_session::types::SessionEvent::new(
+            1, 1_700_000_000_001, EventKind::CommandRun,
+            serde_json::json!({"commandId": "cmd-1", "name": "plan", "args": "  trip", "source": {"kind": "user"}}),
+        );
+        let f = plan_projection_frame(&mut states, "s2", &run).expect("frame");
+        assert_eq!(f["type"], "session/projection");
+        assert_eq!(f["sessionId"], "s2");
+        assert_eq!(f["key"], "plan");
+        assert_eq!(f["seq"], 1);
+        assert_eq!(f["value"]["active"], false);
+        assert_eq!(f["value"]["pending"], true);
+        // plan/mode 落定 → active=true、pending=false 帧。
+        let mode = dsh_session::types::SessionEvent::new(
+            2, 1_700_000_000_002, EventKind::PlanMode,
+            serde_json::json!({"active": true}),
+        );
+        let f = plan_projection_frame(&mut states, "s2", &mode).expect("frame");
+        assert_eq!(f["seq"], 2);
+        assert_eq!(f["value"]["active"], true);
+        assert_eq!(f["value"]["pending"], false);
+        // 同会话非推进事件仍不发帧（状态已折叠，不受干扰）。
+        assert!(plan_projection_frame(&mut states, "s2", &idle).is_none());
+        // 另一会话独立折叠。
+        let f = plan_projection_frame(&mut states, "s3", &mode).expect("frame");
+        assert_eq!(f["sessionId"], "s3");
+        assert_eq!(f["value"]["active"], true);
+    }
+
     /// M71：`write_sse` 写出 `data: {json}` 帧；null → keepalive 注释行。
     #[test]
-    fn sse_write_frame_and_keepalive() {
-        let mut buf = Vec::new();
+    fn sse_write_frame_and_keepalive() {        let mut buf = Vec::new();
         let ok = write_sse(&mut buf, &serde_json::json!({"type": "server-request", "rpcId": "x"}));
         assert!(ok.is_some());
         let text = String::from_utf8(buf.clone()).unwrap();
