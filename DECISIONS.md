@@ -4795,6 +4795,29 @@ C 范围/键空间/求值引擎三问先经**源证据简报**再定稿——方
 - TEST_REPORT-BC-segments.md 追加 D-106 章（§11-13）。
 - milestone 目标：①② 完成；③（S3 per-agent 保真）与 D-c 一致留后续。
 
+### D-106 段 D live 复验补（round 2 续，真机全闭环达成）
+
+- 触发：`api.deepseek.com` 418 后用户澄清——key 属**自部署网关**，base =
+  `http://100.105.152.101:18080/v1`、model = `deepseek-v4-flash-0731-ext`、key 同前。
+- 自修/排障：按自部署 base 重启 live → 首轮模型回合报 `NETWORK malformed HTTP
+  response`。诊断（curl/裸 socket 探针）一度得 401——**查明是跨 `term` 进程取
+  `$env:DEEPSEEK_API_KEY` 为空**（探针自身伪影，非网关拒绝）。同进程带真 key 复测：
+  认证通过（401 消失）。恢复**已验证可用 live 配方**（term-2..38：
+  `target\web\cordis.yml` + `--workspace-root` + `--sqlite-store` + 自部署 base/model +
+  key 仅 env）重起。
+- **真机全闭环（live :60165，自部署网关真实模型）**：
+  - plan 激活（`session.plan.mode`）→ `plan/mode` + `approval/policy{scope:mutation,
+    tools:D-b}` + fold 投影 `active:true`；
+  - 模型调 `bash` → `approval/asked{tool:"bash"}` + `tool/call` + turn `approval-pending`
+    挂起 + **`tool/result` 0（未执行）**，`session.prompt` 返回 `approvalPending:[callId]`；
+  - `decide{allowedOnce}` → 恢复 → `tool/result{isError:false, "hi-live-approval\n"}`（真
+    执行）→ 模型续跑 completed；
+  - `decide{rejected}` → 恢复 → `tool/result{isError:true, "the user rejected tool
+    \"bash\""}`（不执行、合成拒绝）→ 模型续跑 completed。
+- 结论：执行层审批（D-b mutation 集 + 一次性 allowedOnce/Rejected）在**真实网关 + 真实
+  模型**下逐帧验证；此前「环境阻塞」判定撤销（根因是我跨进程取 key 的探针伪影 + 旧
+  配置变体瞬时抖动）。key 纪律不变（仅 live 进程 env 注入）。
+
 ### D-104 实施补记预留
 
 

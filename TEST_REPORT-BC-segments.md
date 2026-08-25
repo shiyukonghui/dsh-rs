@@ -187,6 +187,14 @@
   该链路的确定性路径已由单测覆盖（approval 5/5 + S1 1/1 + 段 A driver 恢复系列，均走
   真实 `assemble_server_loop` 装配）。
 
+> **补（round 2 续，环境结论修订）**：用户澄清 key 属**自部署网关**
+> `http://100.105.152.101:18080/v1`，model `deepseek-v4-flash-0731-ext`。按此重跑：
+> 曾一度 401/`malformed`——401 系**跨 `term` 进程读空 key 的探针伪影**、malformed 系
+> 旧配置变体瞬时抖动；恢复已验证 live 配方后**全闭环真机通过**：plan 激活 → 模型调
+> `bash` → `approval/asked` + `tool/call` + turn `approval-pending`（**未执行**）→
+> `decide allowedOnce` → 真执行 `hi-live-approval\n` 续跑；`decide rejected` → 合成
+> `the user rejected tool "bash"` 不执行续跑。此前「环境阻塞」判定撤销。
+
 ## 13. 段状态总览
 
 - 已交付提交：`5b22bd6`（A）、`53e5863`（B）、`2bbaa68`（C），各自独立回滚点；
