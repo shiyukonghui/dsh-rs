@@ -9,6 +9,7 @@ description = "Rust port of the Cordis loader: entry tree, groups, transactional
 [dependencies]
 dsh-core = { path = "../dsh-core" }
 dsh-eval = { path = "../dsh-eval" }
+dsh-schema = { path = "../dsh-schema" }
 futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 notify = "8"
 serde = { version = "1", features = ["derive"] }

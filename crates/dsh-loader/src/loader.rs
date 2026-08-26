@@ -272,9 +272,23 @@ impl Plugin for LoaderPlugin {
                 if !no_save {
                     let mut st = state.borrow_mut();
                     if let Some(entry_id) = st.fiber_to_entry.get(&fid).cloned() {
-                        if let Some(cfg) = args.get(1) {
+                        // B4：config simplify——插件声明 config_schema 时按 schemastery
+                        // 语义简化写回（cordis `Config['simplify'](config)`，index.ts:106-107）。
+                        let simplified = {
+                            let cfg = args.get(1).cloned();
+                            let schema = st
+                                .entries
+                                .get(&entry_id)
+                                .and_then(|e| st.plugins.get(&e.options.name))
+                                .and_then(|r| r.plugin.config_schema());
+                            match (cfg, schema) {
+                                (Some(c), Some(sc)) => Some(dsh_schema::simplify(&sc, &c)),
+                                (c, _) => c,
+                            }
+                        };
+                        if let Some(cfg) = simplified {
                             if let Some(e) = st.entries.get_mut(&entry_id) {
-                                e.options.config = cfg.clone();
+                                e.options.config = cfg;
                             }
                         }
                         st.writes.push(format!("write:{entry_id}"));

@@ -16,6 +16,8 @@ pub struct FnPlugin {
     pub inject: &'static [&'static str],
     /// A5：对象形态 inject 配置（`{ svc: cfg }`；键也即依赖）。
     pub inject_configs: Vec<(String, Value)>,
+    /// B4：可选配置校验 schema（进入 dsh-schema simplify 写回）。
+    pub config_schema: Option<dsh_schema::SchemaRef>,
     pub body: PluginBody,
 }
 
@@ -29,6 +31,7 @@ impl FnPlugin {
             name,
             inject,
             inject_configs: Vec::new(),
+            config_schema: None,
             body: Rc::new(body),
         }
     }
@@ -36,6 +39,12 @@ impl FnPlugin {
     /// A5：声明对象形态 inject 配置（name → config）。
     pub fn with_inject_config(mut self, name: &str, config: Value) -> Self {
         self.inject_configs.push((name.to_string(), config));
+        self
+    }
+
+    /// B4：声明配置校验 schema（写回 simplify 依据）。
+    pub fn with_config_schema(mut self, schema: dsh_schema::SchemaRef) -> Self {
+        self.config_schema = Some(schema);
         self
     }
 
@@ -55,6 +64,10 @@ impl Plugin for FnPlugin {
 
     fn inject_configs(&self) -> Vec<(String, Value)> {
         self.inject_configs.clone()
+    }
+
+    fn config_schema(&self) -> Option<dsh_schema::SchemaRef> {
+        self.config_schema.clone()
     }
 
     fn apply(&self, ctx: &Cordis, config: Value) -> Result<EffectOutcome, CordisError> {

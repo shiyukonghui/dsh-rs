@@ -6945,6 +6945,29 @@ dict 特判降级 serde_json 深等）/DIV-9-2（在写回而非序列化前简�
 **阶段结论**：需求/设计工件 `.spec/service-assembly-p9/{requirements,design}.md` 定稿 → 编码（S1→S2→S3）。
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；编码各自独立可回。
 
+## D-153（服务装配单元 Phase 9 编码落定：B4 dsh-schema simplify + m24 红→绿）
+
+**日期**：2026-08-27
+
+**触发问题**：D-152 需求+设计关闸通过 → 阶段 3（TDD 编码）。
+
+**关键实现（红→绿）**：
+- **S1（dsh-schema）**：`pub fn simplify(schema, value)`——schemastery `Schema.prototype.simplify`
+  逐字：默认深等→Null、null 透传、object 逐键（未声明键**删**、子简化 Null 删；全删→`{}`==默认`{}`
+  →**Null**；schemastery deepEqual(result, default) 收尾）、dict 保 null、array/tuple 逐项、intersect
+  合并、union try `resolve`、else 原值。（红期实证：`Schema::object()` 默认即 `{}`——全默认 object 正确
+  塌缩为 Null，初版断言 {a:{}} 是错误预期，按 schemastery 修订。）
+- **S2（loader write_back）**：入口插件 `config_schema` 存在 → `simplify` 后存回。红期实证 cordis
+  语义：`internal/update` 仅运行时 `update_with(fid,cfg,false)` 触发（`_patchContext` 的
+  `fiber.update(cfg,true)` 带 noSave=true→跳过；create 不简化）→ 修正 T1 为运行时更新断言。
+- **S3（m24）**：T1 运行时更新写回简化（`{def:5,other:2}`→`{other:2}`）/ T2 无 schema 原样 /
+  T3 十分支单测——3/3 绿。另：dsh-loader 增 `dsh-schema` 依赖（此前未直接引用）。
+
+**阶段 4 验证（编码关闸）**：`cargo test -p dsh-loader`（含 m24）；`cargo test --workspace` EXIT=0
+（**204 目标 0 失败**）；verify-diff **23/23**（无 schema 插件路径零回归）。
+
+**预期影响与回滚点**：回滚 = `git revert` 本提交。待阶段 5（clippy + serve 冒烟 + acceptance + D-154）。
+
 
 
 

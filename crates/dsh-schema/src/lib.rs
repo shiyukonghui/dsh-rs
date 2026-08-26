@@ -443,6 +443,120 @@ pub fn resolve(data: &Value, schema: &SchemaRef, options: &ResolveOptions) -> Re
     }
 }
 
+/// B4：配置简化（Cordis `Config.simplify` = schemastery `Schema.prototype.simplify`，
+/// @deepseek-ai/schemastery/src/index.ts:407-442）。
+///
+/// 语义（逐分支对齐）：
+/// - 值与 `meta.default` 深等 → `Null`（无默认 → false）。
+/// - `null` 透传（schemastery `isNullable`）。
+/// - `object`：逐键用子 schema 简化，`Null` 项**删键**；结果与 default 深等 → `Null`。
+/// - `dict`：逐键用 inner 简化（**保留** `Null` 项）；结果与 default 深等 → `Null`。
+/// - `array`/`tuple`：逐项映射（tuple 按索引对齐），无收尾 default 检查。
+/// - `intersect`：逐成员简化后 `Object.assign` 合并。
+/// - `union`：逐个 `try resolve(value, s, {})`，第一个可解析成员返回其简化。
+/// - 其余类型：原值。
+///
+/// DIV-9-1：`deepEqual` 用 serde_json 深等（JSON 值域无 `undefined`，dict 的 default
+/// 特判降级为常规深等）。DIV-9-4：`Lazy` 直接原值透传（与 schemastery 未分派 lazy 一致）。
+pub fn simplify(schema: &SchemaRef, value: &Value) -> Value {
+    if equals_default(value, &schema.meta.default) {
+        return Value::Null;
+    }
+    if value.is_null() {
+        return value.clone();
+    }
+    match &schema.kind {
+        SchemaKind::Object(fields) => {
+            let mut result = Map::new();
+            if let Value::Object(map) = value {
+                for (k, v) in map {
+                    let item = match fields.get(k) {
+                        Some(s) => simplify(s, v),
+                        // object：key 未声明 → `schema?.simplify` 为 undefined → 删键
+                        None => Value::Null,
+                    };
+                    // object：null/undefined 项删键（`!isNullable(item)`）
+                    if !item.is_null() {
+                        result.insert(k.clone(), item);
+                    }
+                }
+            }
+            let res = Value::Object(result.clone());
+            if equals_default(&res, &schema.meta.default) {
+                return Value::Null;
+            }
+            Value::Object(result)
+        }
+        SchemaKind::Dict { inner, .. } => {
+            let mut result = Map::new();
+            if let Value::Object(map) = value {
+                for (k, v) in map {
+                    result.insert(k.clone(), simplify(inner, v));
+                }
+            }
+            let res = Value::Object(result.clone());
+            if equals_default(&res, &schema.meta.default) {
+                return Value::Null;
+            }
+            Value::Object(result)
+        }
+        SchemaKind::Array(inner) => {
+            let arr = match value {
+                Value::Array(items) => items.iter().map(|v| simplify(inner, v)).collect(),
+                _ => Vec::new(),
+            };
+            Value::Array(arr)
+        }
+        SchemaKind::Tuple(items) => {
+            let arr = match value {
+                Value::Array(vs) => vs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| match items.get(i) {
+                        Some(s) => simplify(s, v),
+                        None => v.clone(),
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            Value::Array(arr)
+        }
+        SchemaKind::Intersect(list) => {
+            let mut result = Map::new();
+            for s in list {
+                if let Value::Object(m) = simplify(s, value) {
+                    for (k, v) in m {
+                        result.insert(k, v);
+                    }
+                }
+            }
+            Value::Object(result)
+        }
+        SchemaKind::Union(list) => {
+            let opts = ResolveOptions {
+                path: Vec::new(),
+                autofix: false,
+                strict: false,
+            };
+            for s in list {
+                if resolve(value, s, &opts).is_ok() {
+                    return simplify(s, value);
+                }
+            }
+            value.clone()
+        }
+        _ => value.clone(),
+    }
+}
+
+/// `value` 与 schema 默认值深等（无默认 → false）。
+fn equals_default(value: &Value, default: &Option<Value>) -> bool {
+    match default {
+        Some(d) => value == d,
+        None => false,
+    }
+}
+
 fn resolve_kind(data: &Value, schema: &SchemaRef, options: &ResolveOptions) -> Result<Value, ValidationError> {
     match &schema.kind {
         SchemaKind::Any => Ok(data.clone()),
