@@ -754,6 +754,7 @@ version = "0.1.0"
 dependencies = [
  "dsh-core",
  "dsh-eval",
+ "dsh-schema",
  "futures-util",
  "notify",
  "serde",

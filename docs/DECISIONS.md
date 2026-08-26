@@ -6968,6 +6968,30 @@ dict 特判降级 serde_json 深等）/DIV-9-2（在写回而非序列化前简�
 
 **预期影响与回滚点**：回滚 = `git revert` 本提交。待阶段 5（clippy + serve 冒烟 + acceptance + D-154）。
 
+## D-154（服务装配单元 Phase 9 验收收口：B4 阶段 4 关闸 + 阶段 5 部署冒烟 + acceptance 工件）
+
+**日期**：2026-08-27
+
+**触发问题**：D-153 编码关闸通过 → 阶段 4/5 验收收口。
+
+**阶段 4 关闸**：`cargo test --workspace` EXIT=0（204 目标 0 失败）；`cargo clippy --workspace
+--all-targets -- -D warnings` EXIT=0（红期 m24 unused import 修复后并入 D-153）；verify-diff **23/23**
+零回归（no-schema 插件路径 + goldens）。
+
+**阶段 5 部署冒烟**：`dsh web target/web/cordis.yml --port 60889` → `GET /` HTTP 200（len 13270 基线
+一致），进程干净停止。回滚 = `git revert e65546a`。
+
+**关键取舍如实收口**：① 简化触点 = 运行时 `update_with(false)`（红期实证 cordis `_patchContext`
+noSave=true 跳过、create 不简化）——修正 T1 为运行时更新断言；② object 全默认 → Null（`{}`==`{}`
+默认，schemastery deepEqual(result,default) 收尾）——初版 `{a:{}}` 预期错误，按 schemastery 修订；
+③ 未声明 object 键删（`schema?.simplify` undefined → 删）。DIV-9-1/9-2/9-4。
+
+**工件**：`.spec/service-assembly-p9/acceptance.md`（交付核对/阶段 4 证据/编码期发现/部署回滚/
+诚实边界/决策链互查）。
+
+**预期影响与回滚点**：Phase 9（B4）验收完成。回滚 = `git revert e65546a` + 撤 D-154 工件提交。
+后续按目标优先级：**A3 动态 check spike**（最后一个 HANDOFF 缺口）。
+
 
 
 
