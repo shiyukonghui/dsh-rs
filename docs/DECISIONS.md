@@ -5937,6 +5937,46 @@ package.json 扫描；用户提供真实 key 要求真实模型端到端验证�
 
 **回滚点**：设计阶段无代码改动，未 commit 业务变更；实现阶段提交后 git revert 该提交即可。
 
+---
+
+## D-115-Web（项目定位转向）：服务装配单元（Service as Assembly Unit）立项
+
+**触发问题（用户裁定，项目根本方向）**：用户明确：「把 Rust 插件变成像 cordis 服务插件
+一样的『服务装配单元』是项目创建的根本意义和基石；这个不完成，其他所有操作（模型配置
+CRUD、wasm 端点承载、前端包装……）都是在偏离核心目标。」即 Rust 重写的根本意义是**复刻
+Cordis 的配置驱动/依赖激活/可热更插件装配模型**，而不只是翻译 API。
+
+**调研（只读权威提取）**：
+- TS Cordis 装配契约已逐行提取（vendor/cordis + vendor/loader + vendor/include +
+  vendor/hmr）：插件三形态、inject/Config/provide/intercept、按模块 specifier 解析、依赖
+  隐式等待（提供者 Active→notify）、epoch 驱动、`[Service.init]` async generator、
+  EntryTree 事务、HMR 四层、patch 层配置式装配。
+- Rust 现状自读实证：dsh-core Plugin trait + dsh-loader（Cordis loader 移植）+ notify/
+  epoch/refresh_fiber 核心 + DshServicesPlugin（服务提供者插件）+ 各 wasm 插件都 impl
+  Plugin + dsh-diff（TS 原版 cordis trace 对比）——**装配引擎核心已存在**；缺的是「面」：
+  服务插件被 lib.rs 特判注册、`config.wasm` 特判、平名仓库缺身份模型、`!!js` 空 ctx、
+  无生成器 effect、无持久化写回。
+
+**核心缺口清单（docs/SERVICE-ASSEMBLY-HANDOFF.md 全量）**：
+- A1 插件身份键模型（回调 vs 平名仓库——最深差异）；A2 `!!js` 作用域缺 ctx 服务；
+  A3 提供者 check/strict-active；A4 注入快照/unprovide 顺序/父链 walk；A5 intercept 合并；
+  A6 `[Service.init]` 生成器 effect；A7 持久化写回。B1-B4 对齐项（extend/invoke、Group
+  折叠、HMR 模块热更、config simplify）。
+
+**阶段目标（用户确认的锚点）**：`--agent-loop` 时实际推理由 Rust 原生 loop 驱动；目标状态 =
+  cordis.yml 声明一行插件（如 llm-pi-ai 或自定义服务）→ Rust 运行时按名解析、依赖激活、
+  配置生效、可热更、持久化回写，语义与 TS cordis 等价。验收 = dsh-diff golden 行为等价 +
+  m 系列测试。
+
+**工件**：`docs/SERVICE-ASSEMBLY-HANDOFF.md`（交接文档，交付新 agent）。
+
+**影响**：模型配置 CRUD（进行中的 genai/namespace 工作）是「面向用户的功能子集」；服务
+装配单元是「根本底座」。两者并行但后者优先级更高；genai 适配器应设计为可被装配的服务插件
+（可注册进 loader 仓库），避免后续改造。
+
+**回滚点**：文档/决策无代码改动；后续架构演进各 commit 各自回滚。
+
+
 
 
 
