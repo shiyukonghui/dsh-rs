@@ -733,3 +733,35 @@ fn refresh_locates_loop_by_config_wasm_not_name() {
     assert_eq!(r["echo"], "echo: after refresh", "loop still resolved by config.wasm");
     fs::remove_dir_all(&dir).ok();
 }
+
+/// E3/A7（T6）：宿主把持久化 seam 挂到 loader 后，运行时 create/remove → 主配置原子写回；
+/// 重启 re-boot（同宿主插件）读到落盘配置并恢复装配。
+#[test]
+fn runtime_mutation_persists_to_config_and_reboots() {
+    ensure_loop_built("echo-loop");
+    let dir = unique_dir("persist-boot");
+    let config = write_cordis_yaml(&dir, "cordis.yml", "echo-loop", "echo-loop");
+    let extra = &[("dsh:test-svc", Arc::new(TestSvcPlugin) as Arc<dyn dsh_core::Plugin>)];
+
+    let boot = dsh_cli::boot_with_host_plugins(&config, &[], &wasm_base(), extra).expect("boot");
+    let loader = boot.loader.clone().expect("boot exposes loader");
+
+    // 宿主挂持久化 seam（写回主配置）→ 运行时 create 一个已声明宿主可用的服务 entry
+    dsh_cli::attach_config_persist(&loader, &config);
+    let mut svc = dsh_loader::EntryOptions::new("svc", "dsh:test-svc");
+    svc.config = dsh_core::Value::default();
+    loader.create(svc.clone()).unwrap();
+
+    // 主配置已落盘（含 svc entry）
+    let on_disk = fs::read_to_string(&config).unwrap();
+    assert!(on_disk.contains("dsh:test-svc"), "config written back: {on_disk}");
+
+    // 重启 re-boot：落盘配置包含 svc → 声明即装配 → apply 恢复可见
+    let boot2 = dsh_cli::boot_with_host_plugins(&config, &[], &wasm_base(), extra).expect("re-boot");
+    let marker = boot2
+        .ctx
+        .get_typed::<i64>("test-svc-marker")
+        .expect("persisted svc entry re-applied on re-boot");
+    assert_eq!(*marker, 42);
+    fs::remove_dir_all(&dir).ok();
+}

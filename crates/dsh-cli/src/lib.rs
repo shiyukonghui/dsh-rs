@@ -156,6 +156,20 @@ pub fn register_host_service_plugins(loader: &dsh_loader::Loader) {
     loader.register_plugin("dsh:services", Arc::new(DshServicesPlugin::all()));
 }
 
+/// 服务装配单元 E3（A7）：把 loader 的持久化 seam 挂到主配置——
+/// 运行时 loader.create/update/remove 后经 sink 把**权威入口列表**原子写回 cordis.yml
+/// （`dsh_persistence::fs_atomic::atomic_write`：temp + sync + rename）。
+/// 由宿主在 boot 完成后接线（避免启动期 include.load() 意外回写）。
+pub fn attach_config_persist(loader: &dsh_loader::Loader, config_path: &std::path::Path) {
+    let path = config_path.to_path_buf();
+    loader.set_persist(Some(Rc::new(move |entries: &[dsh_loader::EntryOptions]| {
+        let yaml = serde_yaml::to_string(entries)
+            .map_err(|e| format!("persist serialize {}: {e}", path.display()))?;
+        dsh_persistence::fs_atomic::atomic_write(&path, yaml.as_bytes())
+            .map_err(|e| format!("persist write {}: {e}", path.display()))
+    })));
+}
+
 /// 从 cordis.yml 形态的 YAML 配置启动（服务装配单元 Phase 1/E1：服务插件 entry 化）。
 ///
 /// `boot` = [`boot_with_host_plugins`] 的便捷包装（无追加宿主插件）。

@@ -6124,6 +6124,45 @@ dsh-cli 全量回归 EXIT=0；`cargo clippy -p dsh-cli --all-targets -- -D warni
 新增公开 `boot_with_host_plugins`/`register_host_service_plugins`。回滚 = `git revert` 本提交
 （独立回滚点）；S1（身份键）与 S3+（写回）互不依赖。
 
+---
+
+## D-120（服务装配单元 Phase 1 · S3 编码：E3/A7 持久化写回）
+
+**日期**：2026-08-26
+
+**触发问题**：按设计 S3=E3（A7 持久化写回——运行时 loader create/update/remove 真实写回
+cordis.yml）进入编码（TDD 红→绿）。
+
+**自下而上核实**：`LoaderState.writes: Vec<String>`（loader.rs:41-42）只记录不落盘；`write()`
+是每次成功变异的单一提交点（14 处调用，全部位于 create/update/remove 的 Result 返回函数内）；
+`dsh_persistence::fs_atomic::atomic_write(&Path, &[u8])` 签名确定、dsh-cli 已依赖 dsh-persistence；
+`Boot.loader: Option<Loader>` 在 boot() 装配（lib.rs:347）。
+
+**实现（红→绿）**：
+- dsh-loader：
+  - `PersistSink = Rc<dyn Fn(&[EntryOptions]) -> Result<(), String>>`；`Loader.persist:
+    RefCell<Option<PersistSink>>`（`Loader::new` 置 None；`#[derive(Clone)]` 兼容）。
+  - `entry_options()`：root 组声明顺序的权威入口列表（`serde_yaml::to_string` 即 cordis.yml 拓扑）。
+  - `write(record)` 改 `Result`：记录 + sink 存在则落盘，错误 `map_err(CordisError::Internal)?`
+    fail-loud；14 处调用点改 `self.write(...)?`。
+  - `set_persist(Option<PersistSink>)`。
+- dsh-cli：`attach_config_persist(loader, config_path)`——宿主在 boot 完成后把 seam 挂到 loader，
+  原子写主配置（避免启动期 include.load() 意外回写）。
+- 红测：`m17_persist.rs` ×4（create 权威列表/update+顺序/remove/sink 错误 fail-loud）+ m9_boot
+  `runtime_mutation_persists_to_config_and_reboots`（loader.create → 主配置落盘含 `dsh:test-svc` →
+  重 boot 恢复 apply，marker 可见）。
+
+**范围/DIV**：写回目标 = 主 config_path（合并后权威列表）；overlay 变更物化进主文件（DIV-2）；
+Config.simplify 由 Value→YAML 直写承担（DIV-3）；group 嵌套以 root 组 entry_config 保真
+（Round-trip 由 m9_boot 既有 group 场景零回归覆盖）。
+
+**验证（阶段门槛）**：m17_persist 4/4 + m9_boot 21/21 绿；dsh-core/dsh-loader/dsh-diff/dsh-wasmrt/
+dsh-cli 全量回归 EXIT=0；clippy `-D warnings` 零。
+
+**预期影响与回滚点**：`write()` 返回型改变但全内联（14 处 `?`）；公开量只增
+（PersistSink/set_persist/entry_options/attach_config_persist）。回滚 = `git revert` 本提交
+（独立回滚点）。
+
 
 
 

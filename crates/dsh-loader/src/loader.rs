@@ -269,6 +269,10 @@ impl Plugin for LoaderPlugin {
     }
 }
 
+/// 持久化 sink（A7）：宿主注入的落盘实现——loader 每次成功变更后接到**权威入口列表**，
+/// 返回错误 → 该变更 fail-loud（`CordisError::Internal`）。
+pub type PersistSink = Rc<dyn Fn(&[EntryOptions]) -> Result<(), String>>;
+
 /// Loader 宿主 API。
 #[derive(Clone)]
 pub struct Loader {
@@ -276,6 +280,8 @@ pub struct Loader {
     pub state: Rc<RefCell<LoaderState>>,
     /// loader 插件 fiber。
     pub fid: FiberId,
+    /// 持久化 sink（A7；None = 关闭写回）。
+    pub persist: RefCell<Option<PersistSink>>,
 }
 
 /// Group 插件（M22：对应 Cordis `Group extends EntryGroup`）。
@@ -381,6 +387,7 @@ impl Loader {
             ctx: ctx.clone(),
             state,
             fid,
+            persist: RefCell::new(None),
         })
     }
 
@@ -408,6 +415,30 @@ impl Loader {
     }
 
     // ---- 查询 ----
+
+    /// 设置持久化 sink（A7：宿主注入落盘实现；`None` = 关闭写回）。
+    pub fn set_persist(&self, sink: Option<PersistSink>) {
+        *self.persist.borrow_mut() = sink;
+    }
+
+    /// 权威入口列表（root 组声明顺序；含每个 root 入口的 `EntryOptions`，
+    /// 供 `persist`/导出——`serde_yaml::to_string` 即 cordis.yml 拓扑形态）。
+    pub fn entry_options(&self) -> Vec<EntryOptions> {
+        let st = self.state.borrow();
+        let root = st.root_group.clone();
+        let order = st
+            .groups
+            .get(&root)
+            .map(|g| g.data.clone())
+            .unwrap_or_default();
+        let mut out = Vec::with_capacity(order.len());
+        for id in &order {
+            if let Some(e) = st.entries.get(id) {
+                out.push(e.options.clone());
+            }
+        }
+        out
+    }
 
     /// 当前 name 注册的实现身份（未注册 → `None`）。
     pub fn plugin_identity(&self, name: &str) -> Option<PluginIdentity> {
@@ -498,7 +529,7 @@ impl Loader {
                 return Err(e);
             }
         }
-        self.write(&format!("create:{id}"));
+        self.write(&format!("create:{id}"))?;
         Ok(id)
     }
 
@@ -557,7 +588,7 @@ impl Loader {
                     return Err(e);
                 }
             }
-            self.write(&format!("create:{id}"));
+            self.write(&format!("create:{id}"))?;
             return Ok(());
         }
 
@@ -567,7 +598,7 @@ impl Loader {
                 self.rollback_options(id, &prev);
                 return Err(e);
             }
-            self.write(&format!("disable:{id}"));
+            self.write(&format!("disable:{id}"))?;
             return Ok(());
         }
 
@@ -577,7 +608,7 @@ impl Loader {
                 self.rollback_options(id, &prev);
                 return Err(e);
             }
-            self.write(&format!("update:{id}"));
+            self.write(&format!("update:{id}"))?;
             return Ok(());
         }
 
@@ -594,7 +625,7 @@ impl Loader {
                 let _ = self.ctx.update(fid, prev.config.clone());
                 return Err(e);
             }
-            self.write(&format!("update:{id}"));
+            self.write(&format!("update:{id}"))?;
             return Ok(());
         }
 
@@ -605,7 +636,7 @@ impl Loader {
         }
         match self.start_entry(id) {
             Ok(()) => {
-                self.write(&format!("replace:{id}"));
+                self.write(&format!("replace:{id}"))?;
                 Ok(())
             }
             Err(e) => {
@@ -644,7 +675,7 @@ impl Loader {
                 .collect();
             st.global_realms.retain(|label, _| live_labels.contains(label));
         }
-        self.write(&format!("remove:{id}"));
+        self.write(&format!("remove:{id}"))?;
         Ok(())
     }
 
@@ -700,8 +731,15 @@ impl Loader {
         }
     }
 
-    fn write(&self, record: &str) {
+    /// 记录写回事件 + 触发持久化（A7：sink 存在则把权威入口列表落盘；错误 fail-loud）。
+    fn write(&self, record: &str) -> Result<(), CordisError> {
         self.state.borrow_mut().writes.push(record.to_string());
+        let sink = self.persist.borrow().clone();
+        if let Some(sink) = sink {
+            let entries = self.entry_options();
+            sink(&entries).map_err(CordisError::Internal)?;
+        }
+        Ok(())
     }
 
     fn rollback_options(&self, id: &str, prev: &EntryOptions) {
@@ -1025,7 +1063,7 @@ impl Loader {
                 return Err(e);
             }
         }
-        self.write(&format!("create:{id}"));
+        self.write(&format!("create:{id}"))?;
         Ok(id)
     }
 
@@ -1096,7 +1134,7 @@ impl Loader {
                     return Err(e);
                 }
             }
-            self.write(&format!("create:{id}"));
+            self.write(&format!("create:{id}"))?;
             return Ok(());
         }
 
@@ -1106,7 +1144,7 @@ impl Loader {
                 self.rollback_options(id, &prev);
                 return Err(e);
             }
-            self.write(&format!("disable:{id}"));
+            self.write(&format!("disable:{id}"))?;
             return Ok(());
         }
 
@@ -1157,7 +1195,7 @@ impl Loader {
                     g.data.retain(|x| x != cid);
                 }
             }
-            self.write(&format!("update:{id}"));
+            self.write(&format!("update:{id}"))?;
             return Ok(());
         }
 
@@ -1174,7 +1212,7 @@ impl Loader {
                 let _ = self.ctx.update(fid, prev.config.clone());
                 return Err(e);
             }
-            self.write(&format!("update:{id}"));
+            self.write(&format!("update:{id}"))?;
             return Ok(());
         }
 
@@ -1185,7 +1223,7 @@ impl Loader {
         }
         match self.start_entry_async(id).await {
             Ok(()) => {
-                self.write(&format!("replace:{id}"));
+                self.write(&format!("replace:{id}"))?;
                 Ok(())
             }
             Err(e) => {
@@ -1225,7 +1263,7 @@ impl Loader {
                 .collect();
             st.global_realms.retain(|label, _| live_labels.contains(label));
         }
-        self.write(&format!("remove:{id}"));
+        self.write(&format!("remove:{id}"))?;
         Ok(())
     }
 
