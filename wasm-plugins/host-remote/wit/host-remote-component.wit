@@ -1,0 +1,13 @@
+// host-remote 组件的 world：实现 `dsh:host-remote/remote` 缝（WASM 组件承载 host 侧
+// remote 端点；D-115-Web D3）。宿主经 `remote.handle` 调用，端点反查宿主真实服务
+// 经 `host-services.get`。
+
+package dsh:host-remote-component;
+
+use dsh:host-remote/remote;
+use dsh:host-remote/host-services;
+
+world host-remote {
+  export remote;
+  import host-services;
+}

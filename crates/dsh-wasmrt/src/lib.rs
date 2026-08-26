@@ -28,6 +28,7 @@ mod plugin;
 mod services;
 
 pub mod r#loop;
+mod remote;
 
 pub use abi::{
     CAPS_EMIT, CAPS_GET, CAPS_PROVIDE, CAPS_WASI_ENV, CAPS_WASI_FS, CAPS_WASI_NET, Capabilities,
@@ -37,6 +38,7 @@ pub use component::WasmComponentPlugin;
 pub use host::{NativeHost, PluginHost, PluginKind, PluginManifest};
 pub use plugin::WasmPlugin;
 pub use r#loop::{LoopHost, WasmLoopPlugin};
+pub use remote::{RemoteServiceProjector, WasmRemoteEndpointPlugin};
 pub use services::DshServicesPlugin;
 
 pub use wasmtime;

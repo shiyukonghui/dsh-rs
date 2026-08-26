@@ -5632,6 +5632,54 @@ not-implemented，留待调研。
 
 **回滚点**：git revert 本提交（plugin_root→plugin_roots 破坏性，需协同回滚）。
 
+---
+
+## D-115-Web（D3 + D2 前两簇）：wasm 组件承载 remote 端点 + 真实端点实现
+
+**触发问题**：D1 已让浏览器渲染，但 `dsh-client-runtime` 依赖的 `remote`/`remote.commands`/
+`remote.goals` 等命名空间只有命令/目标实现了 dispatch，缺 messageFeedback(3)/
+fileReferences(1)/sessionReferenceResolver(1)/pluginInventory(1)/dynamicCordisRunner(12)
+——这些不到位，`ui-setting-plugin-inventory`、`ui-message-feedback`、`ui-reference`、
+`ui-cordis` 等 UI 仍无法用。用户裁定：**D3 全部新增端点放 wasm 插件承载**（组件模型、
+禁 C ABI 漂移）；D2 全真实实现（禁空表/占位/假数据）。
+
+**考量与抉择**：
+- 承载路径：组件模型（wasmtime::component bindgen + cargo component 0.21.1 工具链已装、
+  echo-loop 先例完整；`remote.handle` 天然返回 `list<u8>` 结果）vs C ABI（core-module
+  加载快、分发小，但 `plugin_handle_event` 无返回通道需先扩 ABI）。**选组件模型**——
+  复杂功能插件在类型安全/资源生命周期/多接口组合/结构化错误全面占优；用户明确
+  「确定走组件模型，禁止功能漂移到 C ABI」。
+- host-remote world 的 wit 放独立目录 `wit-host-remote/` + 独立 package `dsh:host-remote`
+  （避免与 wit-dsh/dsh-loop 的 `dsh:dsh` 模块冲突——bindgen 同 crate 多 world 同名模块
+  问题，D3 早期踩坑）。组件依赖经 Cargo.toml `[package.metadata.component.target.
+  dependencies]` 指向该目录。
+- 端点 get（只读投影）不够 messageFeedback 写类端点用 → host-services 补 `set`（真实
+  持久后端由宿主投影器实现）；真实时钟 `time`/真实 uuid `newVersion`/会话消息
+  `sessionMessages`/会话 identity `sessionIdentity`/持久 KV `kv` 服务均由宿主投影。
+
+**决策事项**：
+1. `dsh-wasmrt/src/remote.rs`：`WasmRemoteEndpointPlugin`（组件模型）+ `RemoteService
+   Projector` trait（get/set 宿主投影）+ `host_services::Host` for store + thread_local
+   projector 注入（send 纪律同 component.rs）。导出经 `lib.rs`。
+2. `wasm-plugins/host-remote/`：cdylib 组件，`remote.handle` 路由端点；业务逻辑在组件
+   （pluginInventory：loader 投影跳 group 映射 wire；messageFeedback：note 校验/
+   target-not-found 需要真实会话消息/version-conflict 乐观并发/持久 KV + 真实时间与
+   uuid），未知端点 → not-implemented 错误（fail-loud）。
+3. wit `host-services` 补 `set`；组件重建（cargo component build）。
+
+**TDD 验证**：`tests/m31_host_remote.rs` 5 测试全绿——承载桥回路（host→组件→host）、
+pluginInventory（group 跳过+wire 映射+真实 loader 调用）、messageFeedback 生命周期
+（put→list→delete、版本并发、note-blank/too-large、session-not-found）、未知端点
+not-implemented。dsh-wasmrt 全量回归绿。
+
+**待办（D2 剩余）**：fileReferences / sessionReferenceResolver / dynamicCordisRunner
+（真实子集 + TS-sandbox 依赖 4 方法 not-implemented）。dsh-cli EndpointHost 统一路由 +
+真实宿主投影器装配（loader/sqlite/session 真实数据源）。dynamicCordisRunner 4 方法
+待调研（getClientCode/invoke/reportRenderFailure/reportClientGuardFailure）。
+
+**回滚点**：git revert 本提交（新增 crate 模块 + wit + 组件——均为新增，回滚干净）。
+
+
 
 
 

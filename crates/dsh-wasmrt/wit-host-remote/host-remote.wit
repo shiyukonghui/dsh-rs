@@ -1,0 +1,50 @@
+// host-remote world：Rust host 经 WASM 组件承载缺失的 remote 端点
+// （D-115-Web D3；**组件模型专用，禁止功能漂移到 C ABI**）。
+//
+// **独立 package `dsh:host-remote` + 独立 wit 目录**（不与 wit-dsh/dsh-loop 的
+// `dsh:dsh` 冲突）：dsh-wasmrt 内多个 bindgen!（loop.rs 的 dsh-loop / component.rs
+// 的 dsh-plugin / 本 world）各自生成独立的顶层模块，避免同 crate 同名模块冲突。
+//
+// 与 dsh-loop（loop 缝）正交：本 world 回答「host 侧 remote 端点如何由 WASM 组件提供」。
+
+package dsh:host-remote;
+
+/// 端点处理（导出；宿主调用）。
+interface remote {
+  /// 处理一个 host 侧端点。
+  ///
+  /// `namespace`：命名空间（如 `messageFeedback`、`fileReferences`、
+  /// `sessionReferenceResolver`、`pluginInventory`、`dynamicCordisRunner`）。
+  /// `method`：方法名（如 `put`/`list`/`delete`/`candidates`/`inventory`）。
+  /// `body`：请求参数 JSON 字节（wire 字段与生成描述符一致；
+  /// agent 上下文已由宿主解析为 `agentId`/`sessionId` 平铺进 body）。
+  ///
+  /// 返回：结果 JSON 字节。成功 = 前端期望的 value 结构；失败 = 规范化
+  /// `{ok:false, error:{code,message}}`（fail-loud，绝不以假结构冒充成功）。
+  handle: func(namespace: string, method: string, body: list<u8>) -> list<u8>;
+}
+
+/// 宿主侧服务读取（import；WASM 端点反查宿主真实状态）。
+interface host-services {
+  /// 读宿主服务投影。
+  ///
+  /// `service`：服务名（`sessions`/`loader`/`settings`/`workspaces`/`kv`…）。
+  /// `payload`：读取请求 JSON 字节（含定位参数，如 sessionId / namespace）。
+  ///
+  /// 返回：服务投影 JSON 字节；未知服务/无权限 → 规范化错误字节
+  /// `{ok:false, error:{code,message}}`。
+  get: func(service: string, payload: list<u8>) -> list<u8>;
+
+  /// 写宿主服务（真实持久；`messageFeedback` 等写类端点的后端）。
+  ///
+  /// `service`：服务名（`kv`…）。
+  /// `payload`：写入请求 JSON 字节（含定位参数 + 值，如 `{namespace,key,value}`）。
+  ///
+  /// 返回：写后投影 JSON 字节（读回的新状态）；未知服务/无权限 → 规范化错误字节。
+  set: func(service: string, payload: list<u8>) -> list<u8>;
+}
+
+world host-remote {
+  export remote;
+  import host-services;
+}
