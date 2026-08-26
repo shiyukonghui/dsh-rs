@@ -6213,6 +6213,32 @@ dsh-diff `ScenarioPlugin`（Rust）已支持 `ApplyOp::Provide`（lib.rs:610，t
 **预期影响与回滚点**：`dsh web` 运行时动态装配开始落盘（重启恢复）；`boot()` 语义零变化。回滚 =
 `git revert` 本提交（WebConfig 字段 + serve 三行接线，独立回滚点）。
 
+---
+
+## D-123（服务装配单元 Phase 1 验收收口：阶段 4 关闸 + 阶段 5 部署冒烟 + acceptance 工件）
+
+**日期**：2026-08-26
+
+**触发问题**：S1-S4 + 部署接线全部落地，按瀑布流做阶段 4（测试验证）与阶段 5（部署）验收收口，
+产出可审计验收工件。
+
+**阶段 4 关闸证据**：`cargo test --workspace` EXIT=0 全绿（含 m16_identity 4/4、m17_persist 4/4、
+m9_boot 21/21 新套件）；`cargo clippy --workspace --all-targets -- -D warnings` EXIT=0 零告警；
+`node diff/ts-host/verify-diff.mjs` 18/18 PASS（新 loader-13 golden 27 行逐行一致，既有 17 场景
+golden 逐字节未变）。
+
+**阶段 5 部署冒烟**：真实 serve（生产 `target/web/cordis.yml`，port 60881）——`/` HTTP 200、
+`/api/host.describe` RPC 返回真实宿主信息、stderr 干净；persist seam 已挂载（D-122）。agent-turn
+冒烟按门控纪律诚实跳过（无 DEEPSEEK_API_KEY → fail-loud AUTH；key 仅进程环境不入库验后清除）。
+冒烟进程已停（不占 dsh.exe）。先前 60880 遗留演示服务（S1 前 Stop）恢复由用户决定（D-118 保留原
+命令行）。
+
+**工件**：`.spec/service-assembly/acceptance.md`（验收报告：交付范围/测试证据/部署运行/回滚/诚实
+边界/决策链互查）。
+
+**预期影响与回滚点**：Phase 1 全部五个阶段过关。回滚 = 各步独立 `git revert`（见 acceptance §3.3）。
+下一阶段（A2/A3/A4/A5/A6/B 类 + A1 HMR 完整链路）按 handoff 缺口清单另行立项。
+
 
 
 
