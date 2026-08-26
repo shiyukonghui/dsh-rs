@@ -242,7 +242,8 @@ fn main() {
 /// `dsh web <cordis.yml> [--web-root <dir>] [--host <h>] [--port <p>]
 /// [--overlay <f>]... [--wasm-base <dir>] [--session-dir <dir>]
 /// [--sqlite-store <file>] [--agent-loop] [--workspace-root <dir>]
-/// [--llm-base-url <url>] [--llm-model <model>] [--env-file <f>]`
+/// [--llm-base-url <url>] [--llm-model <model>] [--env-file <f>]
+/// [--dynamic-plugins-dir <dir>]`
 ///
 /// `--web-root`：前端 dist 根目录（含 index.html）。默认依次尝试环境变量
 /// `DSH_WEB_ROOT`、`D:\Program Files\DeepSeek Harness\resources\host\node_modules\@deepseek-ai\dsh-web-frontend\dist`、
@@ -264,6 +265,8 @@ fn web_main(args: &[String]) {
     let mut llm_model: Option<String> = None;
     // M6（step7）：`.env` 文件（进程环境上游；键只在进程环境生效，不落 settings/git）。
     let mut env_file: Option<PathBuf> = None;
+    // D-115-Web（阶段 C）：动态插件目录（`<dir>/<pluginId>/package.json + plugin.wasm`）。
+    let mut dynamic_plugins_dir: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -313,6 +316,10 @@ fn web_main(args: &[String]) {
             "--env-file" => {
                 i += 1;
                 env_file = Some(PathBuf::from(&args[i]));
+            }
+            "--dynamic-plugins-dir" => {
+                i += 1;
+                dynamic_plugins_dir = Some(PathBuf::from(&args[i]));
             }
             other if other.starts_with("--") => {
                 eprintln!("dsh web: unknown arg {other}");
@@ -365,6 +372,7 @@ fn web_main(args: &[String]) {
         llm_base_url,
         llm_model,
         env_file,
+        dynamic_plugins_dir,
     };
     match dsh_cli::web::serve(&mut boot, cfg) {
         Ok(server) => {

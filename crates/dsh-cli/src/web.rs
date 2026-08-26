@@ -134,6 +134,11 @@ pub struct WebConfig {
     /// 经此进入进程环境后仍由 `server_llm_runtime` 以 env 读取——key 永不落
     /// settings/库/git（IV-3）。
     pub env_file: Option<PathBuf>,
+    /// D-115-Web（阶段 C）：动态插件目录。serve 扫描 `<dir>/<pluginId>/package.json` +
+    /// `<dir>/<pluginId>/plugin.wasm`（dsh-plugin world 组件）→ RemoteHost.dynamic_packages
+    /// （面板可列「可安装包」；runHostHalf 真实装配）。缺省 None = 无动态包（面板空，
+    /// 诚实）。
+    pub dynamic_plugins_dir: Option<PathBuf>,
 }
 
 /// 一个已运行的 Web 服务器（持有实际监听地址）。
@@ -230,13 +235,18 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
     // D-115-Web（D2/D3）：装配 wasm remote 端点承载（host-remote 组件）+ 真实宿主
     // 投影器（loader / session event sink / workspaces 真实数据源）。失败 → fail-loud
     // （组件是新增端点的实现地，缺了相关 UI 仍不可用，不静默降级）。
-    let remote_projector: Rc<dyn dsh_wasmrt::RemoteServiceProjector> = Rc::new(
-        crate::remote_host::RemoteHost::new(
-            Some(host.sink.clone()),
-            boot.loader.clone(),
-            Some(boot.workspaces.clone()),
-        ),
-    );
+    let remote_host = std::rc::Rc::new(crate::remote_host::RemoteHost::new(
+        Some(host.sink.clone()),
+        boot.loader.clone(),
+        Some(boot.workspaces.clone()),
+    ));
+    // D-115-Web（阶段 C）：动态插件目录 → 注册真实可装配包（面板 list + runHostHalf 源）。
+    if let Some(dir) = cfg.dynamic_plugins_dir.as_deref() {
+        for pkg in scan_dynamic_plugins_dir(dir) {
+            remote_host.register_dynamic_package(pkg);
+        }
+    }
+    let remote_projector: Rc<dyn dsh_wasmrt::RemoteServiceProjector> = remote_host.clone();
     let host_remote_bytes = host_remote_component_bytes();
     let remote_plugin = dsh_wasmrt::WasmRemoteEndpointPlugin::new(
         "host-remote",
@@ -1106,6 +1116,64 @@ pub struct BootEntry {
 /// 页内 browse 流程不挂载。因此从 boot 图排除 browse 流程客户端，只让 native 客户端
 /// 占据 ui-workspace 的 single directory-flow 洞（系统原生目录对话框）。
 const HOST_COMPOSITION_EXCLUDED_CLIENTS: &[&str] = &["@deepseek-ai/dsh-client-ui-directory-picker-browse"];
+
+/// 扫描动态插件目录（阶段 C）：`<dir>/<pluginId>/package.json`（name/version/purpose）
+/// + `<dir>/<pluginId>/plugin.wasm`（dsh-plugin world 组件字节）→ 动态包定义列表。
+///
+/// 目录/包缺失/无效 → 跳过（诚实，不 fail-loud 阻断 serve）。
+pub fn scan_dynamic_plugins_dir(dir: &Path) -> Vec<crate::remote_host::DynamicPackage> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let plugin_dir = entry.path();
+        if !plugin_dir.is_dir() {
+            continue;
+        }
+        let plugin_id = match plugin_dir.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let Ok(pkg_text) = std::fs::read_to_string(plugin_dir.join("package.json")) else {
+            continue;
+        };
+        // 容忍 UTF-8 BOM（常见编辑器/脚本产出；Serde from_str 不接受 BOM）。
+        let pkg_text = pkg_text.strip_prefix('\u{feff}').unwrap_or(&pkg_text);
+        let Ok(pkg) = serde_json::from_str::<Value>(pkg_text) else {
+            continue;
+        };
+        let name = pkg
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or(&plugin_id)
+            .to_string();
+        let package_id = pkg
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("v1")
+            .to_string();
+        let purpose = pkg
+            .get("purpose")
+            .and_then(|p| p.as_str())
+            .unwrap_or("run")
+            .to_string();
+        let wasm = plugin_dir.join("plugin.wasm");
+        let Ok(bytes) = std::fs::read(&wasm) else {
+            continue;
+        };
+        out.push(crate::remote_host::DynamicPackage {
+            plugin_id,
+            package_id,
+            name,
+            purpose,
+            bytes,
+            has_host_half: true,
+            has_client_half: false,
+        });
+    }
+    out
+}
 
 /// 读取（如缺构建）host-remote 组件字节（生产 serve 装配 wasm remote 端点用；
 /// D-115-Web D3 组件模型——禁 C ABI）。
@@ -4392,8 +4460,20 @@ mod tests {
         std::fs::read(wasm).unwrap()
     }
 
-    /// 阶段 B（红→绿）：真实动态装配——RemoteHost 把 hello-component 包装配进真实
-    /// loader（fiber 启动 → `greeting` 服务可查），stop 后 entry 移除，undefine 移除包。
+    /// 阶段 C：scan_dynamic_plugins_dir 对真实目录（target/web/dynamic-plugins）产出包定义。
+    #[test]
+    fn scan_dynamic_plugins_dir_real_dir() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/web/dynamic-plugins");
+        let pkgs = scan_dynamic_plugins_dir(&dir);
+        assert!(!pkgs.is_empty(), "dynamic plugin dir scanned: {dir:?}");
+        let hello = pkgs.iter().find(|p| p.plugin_id == "hello").expect("hello package");
+        assert_eq!(hello.package_id, "pkg-v1");
+        assert_eq!(hello.name, "hello-component");
+        assert!(hello.has_host_half);
+        assert!(!hello.bytes.is_empty());
+        assert!(!hello.has_client_half);
+    }
+
     #[test]
     fn dynamic_assembly_activates_stops_undefines() {
         use dsh_loader::Loader;

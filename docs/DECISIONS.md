@@ -5787,6 +5787,45 @@ TS-sandbox 依赖 4 方法（getClientCode/invoke/reportRenderFailure/reportClie
 
 **回滚点**：git revert 本提交（remote_host 动态装配 + 组件新端点 + dispatch 解包）。
 
+---
+
+## D-115-Web（阶段 B/C 部署化 + 真实 key 端到端实证）
+
+**触发问题**：serve 装配需动态包**来源**（面板才有真包可装配）；发现 UTF-8 BOM 破坏
+package.json 扫描；用户提供真实 key 要求真实模型端到端验证。
+
+**决策事项**：
+1. **动态插件目录（WebConfig.dynamic_plugins_dir + `--dynamic-plugins-dir <dir>`）**：
+   serve 扫描 `<dir>/<pluginId>/package.json`（name/version/purpose）+ `<dir>/<pluginId>/
+   plugin.wasm`（dsh-plugin world 组件字节）→ 注册进 RemoteHost.dynamic_packages。
+   缺失/无效目录 → 跳过（诚实，不 fail-loud 阻断 serve）。
+2. **UTF-8 BOM 容错**：省 `strip_prefix('\u{feff}')`（PowerShell Set-Content -Encoding UTF8
+   产 BOM，Serde from_str 拒）。实证扫描目录含 BOM 时 0 包。
+3. **真实 key e2e（60886，agent-loop + `--env-file .env-e2e` + 动态插件目录 + vendored
+   dist）**：
+   - 真实模型 turn（`session.prompt`→accepted，模型 deepseek-v4-flash-0731-ext）产生真实
+     user 消息 `prompt-default`；
+   - `messageFeedback/put` 对真实消息 → **ok + uuid v4 + 墙钟**（真实 key 下完整闭环）；
+   - `dynamicCordisRunner/inventory` → **真实列出 hello 包**（serve 扫描 → 注册 → wasm
+     端点接线）；`runHostHalf` → **ok + pluginRunId:dyn:hello + startedHere**（hello 组件
+     真装配进 loader）；inventory 反映 activeRun + latestRun(running)；pluginInventory
+     显示 **dyn:hello fiberPhase active**（真实 loader 状态）；`stopFromPanel` → ok +
+     dyn:hello entry 移除（真 dispose）；
+   - **render-smoke：consoleErrors [] / pageErrors []、ok:true、bodyLen 41662、模型名
+     deepseek-v4-flash-0731-ext 渲染**——真实前端在 args 壳 + details 补全后干净。
+   关键：**上一轮 curl 平铺 payload 掩盖了前端真实 `{args}` 壳缺口**；本轮以真实浏览器
+   （playwright msedge）+ 真实 {args} 形态验证，确认修正必要且充分。
+
+**TDD 验证**：dsh-cli 221 全绿（+`scan_dynamic_plugins_dir_real_dir` 真实目录断言）、m31
+8/8、clippy 0。
+
+**待办**：浏览器「面板点按」级 puppeteer 交互（runHostHalf 按钮点击）留待真实 UI 演练；
+`@pluginId` 词法缺口已记录。stub-capability：动态包容器 = dsh-plugin world 组件（hello 为
+真实验证物；echo-loop 等非 dsh-plugin world 需转化后可作包）。
+
+**回滚点**：git revert 本提交（WebConfig 字段 + scan + serve 注册）。
+
+
 
 
 
