@@ -5892,6 +5892,52 @@ package.json 扫描；用户提供真实 key 要求真实模型端到端验证�
 
 **回滚点**：git revert 本提交（lib.rs id 唯一 + web.rs llm_providers/discoverModels）。
 
+---
+
+## D-115-Web（模型配置 CRUD 对齐 TS harness）——需求分析/系统设计
+
+**触发问题**：用户要求按瀑布流让 Rust dsh web 的模型配置增删改查与 TS harness 完全一致；
+且用户指示调研 llm crate 1.3.8 / genai 作为 pi-ai 多 provider 承载。
+
+**调研结论（决策依据）**：
+1. **llm crate 名字两次占用的澄清**（docs.rs/crate/llm/1.3.8 Note 权威）：0.1.x =
+   rustformers 本地推理库（已归档）；1.0.0+ = graniet 远程多 provider HTTP 客户端。
+   即便 1.3.8 可胜任，用户最终选定 **`genai = "0.6.5"`**（稳定版、多 provider 姿态更贴合）。
+2. **genai 0.6.5 API 双源实证**（本地 spike `cargo build` 成功 + subagent 源码核对）：
+   `Client::builder().with_adapter_kind(...)`（bound-adapter 免名嗅探）、
+   `with_auth_resolver_fn`（apiKeyEnv→`AuthData::from_env`）、`with_service_target_resolver`
+   （自定义 endpoint）、`exec_chat/exec_chat_stream`、`all_model_names(AdapterKind,
+   ProviderConfig{endpoint,auth})`。`AdapterKind` 27 变体覆盖 pi-ai 协议
+   （openai-completions→OpenAI、openai-responses→OpenAIResp、anthropic-messages→Anthropic）。
+3. **异步约束**：genai 是 tokio async（edition 2024，需 Rust 1.85+；dsh 用 1.94 ✓）；
+   dsh-core 已依赖 tokio rt+macros；现有 llm_http 是同步面 → genai 适配器内部持共享
+   tokio runtime，`block_on` 桥接同步 `LlmAdapter`。
+
+**设计决策（用户确认）**：
+- 持久化：**Rust 自有文件**（settings.yaml + .credentials.yaml），不读 TS 的 C 盘 $DSH_HOME；
+  serve 装配按 cfg 路径用 `SettingsProvider::file` + `CredentialProvider::file`，注册逻辑
+  抽象为可复用函数（boot 与 serve 共用防 drift）。
+- namespace 注册：`llm-deepseek`（扁平 {apiKeyEnv,baseURL,thinking,reasoningEffort,maxTokens,
+  defaultContextWindow,models[]}, live）、`llm-pi-ai`（providers dict, live）、
+  `agent-default-model`（{provider,model,reasoningEffort?}, live）。
+- `llm.providers` 目录行对齐：deepseek-official → settingsNs='llm-deepseek' settingsPath=[]；
+  pi-ai 行 → settingsNs='llm-pi-ai' settingsPath=['providers',route]；boot.llm 注册追加
+  settingsNs=''。（修正当前返回 settingsNs='llm' 的错误。）
+- `llm.discoverModels` 真实探测：llm-deepseek → 装配 catalog；llm-pi-ai → genai
+  `all_model_names`；失败诚实 code。
+- `session.selectModel`：校验（provider/model 可解析）+ `settings.replace('agent-default-model',
+  {provider,model,reasoningEffort?})`；未注册 → model-unavailable。
+- **genai 集成**：`dsh-cli/src/genai_llm.rs` 实现 LlmAdapter 注册 pi-ai 路由；deepseek 走
+  现有 llm_http 不动；两路径统一 LlmRuntime 的 provider 路由。
+
+**工件**：`.spec/models-config-crud/requirements.md`（定稿）、`design.md`（定稿 D-A~D-F）。
+
+**验证**：genai 0.6.5 已在 scratch crate `target/genai-spike` 编译成功（71s），Cargo.toml
+未被污染；真实 key e2e 在编码阶段后执行。
+
+**回滚点**：设计阶段无代码改动，未 commit 业务变更；实现阶段提交后 git revert 该提交即可。
+
+
 
 
 
