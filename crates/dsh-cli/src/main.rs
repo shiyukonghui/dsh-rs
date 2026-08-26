@@ -373,6 +373,7 @@ fn web_main(args: &[String]) {
         llm_model,
         env_file,
         dynamic_plugins_dir,
+        config_path,
     };
     match dsh_cli::web::serve(&mut boot, cfg) {
         Ok(server) => {

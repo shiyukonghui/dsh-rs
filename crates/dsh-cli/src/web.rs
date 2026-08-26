@@ -139,6 +139,9 @@ pub struct WebConfig {
     /// （面板可列「可安装包」；runHostHalf 真实装配）。缺省 None = 无动态包（面板空，
     /// 诚实）。
     pub dynamic_plugins_dir: Option<PathBuf>,
+    /// 服务装配单元 Phase 1（E3/A7）：主 cordis.yml 配置路径——serve 在 boot 完成后
+    /// 给 loader 挂持久化 seam（运行时 create/update/remove 真实原子写回该文件）。
+    pub config_path: PathBuf,
 }
 
 /// 一个已运行的 Web 服务器（持有实际监听地址）。
@@ -231,6 +234,13 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
         .map_err(|e| CordisError::Internal(format!("session persistence: {e}")))?;
     // seed `default`（前端会话入口）。
     let _ = host.session("default");
+
+    // 服务装配单元 Phase 1（E3/A7）：boot 完成后给 loader 挂持久化 seam——运行时
+    // loader.create/update/remove（dynamicCordisRunner 动态装配等）真实原子写回主
+    // cordis.yml（重启按落盘配置恢复）。启动期 include.load() 不含 seam，无意外回写。
+    if let Some(loader) = boot.loader.clone() {
+        crate::attach_config_persist(&loader, &cfg.config_path);
+    }
 
     // D-115-Web（D2/D3）：装配 wasm remote 端点承载（host-remote 组件）+ 真实宿主
     // 投影器（loader / session event sink / workspaces 真实数据源）。失败 → fail-loud

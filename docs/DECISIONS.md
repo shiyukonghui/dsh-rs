@@ -6191,6 +6191,28 @@ dsh-diff `ScenarioPlugin`（Rust）已支持 `ApplyOp::Provide`（lib.rs:610，t
 **预期影响与回滚点**：纯 diff 基建（loader-host + verify-diff + scenario + golden），无 Rust 运行面
 改动。回滚 = `git revert` 本提交；对 S1-S3 零影响。
 
+---
+
+## D-122（服务装配单元 Phase 1 · 部署接线：serve 挂持久化 seam + 验收报告）
+
+**日期**：2026-08-26
+
+**触发问题**：S3 的 `attach_config_persist` 只做了公开 helper + 集成测试，生产 `serve()` 未接线——
+运行时动态装配（dynamicCordisRunner loader.create/remove）在 `dsh web` 下不会落盘；按设计 §5.2
+「宿主在 boot 完成后挂 seam」补上部署接线。
+
+**实现**：
+- `WebConfig` 增 `config_path: PathBuf`（仅 main.rs 构造点 +1 字段）；
+- `serve()` 在 loader 可用处（boot 完成后、start 前）`if let Some(loader) = boot.loader.clone() {
+  crate::attach_config_persist(&loader, &cfg.config_path); }`——启动期 include.load() 无 seam，
+  无意外回写；运行时任何 loader 变更真实原子写回主 cordis.yml。
+
+**验证**：`cargo build -p dsh-cli` 绿 + m9_boot 21/21 + 全 workspace test EXIT=0 + clippy `-D warnings`
+零（serve 接线后复跑）。
+
+**预期影响与回滚点**：`dsh web` 运行时动态装配开始落盘（重启恢复）；`boot()` 语义零变化。回滚 =
+`git revert` 本提交（WebConfig 字段 + serve 三行接线，独立回滚点）。
+
 
 
 
