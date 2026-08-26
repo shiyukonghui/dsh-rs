@@ -6535,6 +6535,32 @@ clippy --workspace --all-targets -- -D warnings` EXIT=0；`node diff/ts-host/ver
 **预期影响与回滚点**：本提交 = 可运行代码 + 测试 + golden。回滚 = `git revert` 本提交（核心 +
 m19 + DSL/golden 特征级整体回滚）；DSL/golden 部分可独立回滚（`scenario-12-*` 删除或保留均可）。
 
+## D-136（服务装配单元 Phase 4 验收收口：阶段 4 关闸 + 阶段 5 部署冒烟 + acceptance 工件）
+
+**日期**：2026-08-27
+
+**触发问题**：D-135 编码关闸通过 → 阶段 4（测试验证）与阶段 5（部署与维护）验收收口。
+
+**阶段 4 关闸**：`cargo test --workspace` EXIT=0（199 目标 0 失败，含 m19 3/3 红→绿）；
+`cargo clippy --workspace --all-targets -- -D warnings` EXIT=0；`node diff/ts-host/verify-diff.mjs`
+**22/22 PASS**（21 既有 golden 逐字节零回归 + scenario-12 新 golden 14 行 TS 原版↔Rust 逐行一致）。
+
+**阶段 5 部署冒烟**：`dsh web target/web/cordis.yml --port 60884`（本轮含 dsh-core 运行时改动）
+→ `GET /` HTTP 200（len 13270），进程干净停止——真实启动链路零回归。回滚 = `git revert dd9cd1a`。
+
+**编码期发现如实收口**：T2 语义（flip 步产出先收集、pre-check 后停止）、T3 载体（scenario-host
+对 reject 的 Failed fiber 无法取回 → golden 只承载 T1、T3 由 m-series 锁定 DIV-4-5）、TS host
+箭头函数修正、Rust run_load 中途取消补 run_unload——全部按「红测定位 → 对照 TS 语义 → 修复 →
+全量重验」收口。
+
+**工件**：`.spec/service-assembly-p4/acceptance.md`（交付核对/阶段 4 证据/编码期发现/部署回滚/
+诚实边界/决策链互查）。
+
+**预期影响与回滚点**：Phase 4（A6）五阶段全闭环，「依赖激活」验收维度的最深核心缺口闭合。
+回滚 = `git revert dd9cd1a`（编码）+ 撤 D-136 工件提交。后续缺口：A5（intercept resolveConfig）/
+A2（!!js 边界）/ B1（extend）/ B2（Group 折叠）/ B4（config simplify）+ A3 动态 check spike（按
+HANDOFF 优先级续做）。
+
 
 
 
