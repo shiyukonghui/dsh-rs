@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use futures_util::future::LocalBoxFuture;
+use futures_util::stream::LocalBoxStream;
 
 use crate::context::Cordis;
 use crate::error::CordisError;
@@ -50,7 +51,17 @@ pub enum EffectOutcome {
     /// future resolve 后得到最终 outcome；在此期间 fiber 保持 Loading，
     /// 排入的子任务（如 Group 的子入口）先完成，之后才 finish（Active）。
     Await(LocalBoxFuture<'static, EffectOutcome>),
+    /// A6：异步生成器 effect（等价 Cordis `_execute` 的 async-iterator 分支，
+    /// `[Service.init]` 完整形态）——pull 式**逐项**产出 disposer（`GenItem`），
+    /// 驱动方跨 await 步进逐个**立即收集**（注册序），流结束 = 生成完成；
+    /// `Err` 项 = 生成器后续步抛错（`fail_fiber`，失败前已收集 disposer 保留）。
+    /// 驱动期间 fiber epoch 变化 → **中途取消**（停止后续收集，已收集保留）。
+    Stream(LocalBoxStream<'static, GenItem>),
 }
+
+/// 异步生成器 effect 的单步产出（A6）：`Ok(disposer)` = 一个 disposer；
+/// 流结束（`None`） = 生成完成；`Err` = 生成器抛错。
+pub type GenItem = Result<Disposer, CordisError>;
 
 /// effect 主体：`FnOnce(&Cordis) -> Result<EffectOutcome, CordisError>`。
 /// 在「无借用」上下文中运行，可重入调用其它门面方法。
@@ -134,6 +145,11 @@ impl FiberData {
             EffectOutcome::Await(_) => {
                 return make_disposer(Box::new(|_| {}));
             }
+            // A6：Stream 由驱动方在 apply 期间逐项 `push_gen_disposer`（不在此整批收集）；
+            // 此臂仅保编译（防止未经驱动直接 collect）。
+            EffectOutcome::Stream(_) => {
+                return make_disposer(Box::new(|_| {}));
+            }
         }
         let ran = Rc::new(Cell::new(false));
         let _label = label;
@@ -153,6 +169,15 @@ impl FiberData {
     /// 是否仍可注册新 effect（Cordis `assertActive`）。
     pub fn is_active(&self) -> bool {
         self.uid.is_some() && self.state != FiberState::Unloading
+    }
+
+    /// A6：逐项注册生成器产出的 disposer（**立即**、注册序），等价 cordis
+    /// `_execute` async-iterator 分支的 `safeCollect`（每步收集即时发生）。
+    /// 卸载时 `take_disposers` 逆序执行，失败/中途取消前已收集项保留。
+    pub fn push_gen_disposer(&mut self, d: Disposer) {
+        self.effects
+            .push(EffectMeta { label: "gen-item".to_string(), children: Vec::new() });
+        self.disposers.push(d);
     }
 
     /// 卸载：取出全部 disposer（注册顺序），由调用方逆序执行。

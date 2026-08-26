@@ -1,0 +1,19 @@
+{
+  "name": "scenario-12-async-generator",
+  "plugins": {
+    "g": {
+      "name": "g",
+      "gen": [
+        { "op": "yield", "text": "A" },
+        { "op": "await", "text": "m1" },
+        { "op": "yield", "text": "B" },
+        { "op": "await", "text": "m2" },
+        { "op": "yield", "text": "C" }
+      ]
+    }
+  },
+  "steps": [
+    { "op": "plugin", "id": "g" },
+    { "op": "unload", "id": "g" }
+  ]
+}

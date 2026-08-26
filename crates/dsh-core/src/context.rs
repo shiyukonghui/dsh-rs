@@ -11,13 +11,15 @@ use std::sync::Arc;
 
 use crate::error::{AggregateError, CordisError};
 use crate::events::{AsyncListener, HookCallback, HookResult, Listener};
-use crate::fiber::{Disposer, EffectBody, EffectMeta, EffectOutcome, FiberHandle, FiberState, make_disposer};
+use crate::fiber::{Disposer, EffectBody, EffectMeta, EffectOutcome, FiberHandle, FiberState, GenItem, make_disposer};
 use crate::logger::{Exporter, ExporterConfig, Logger};
 use crate::reflect::{AccessorGet, AccessorSet, CheckFn, Property};
 use crate::registry::Plugin;
 use crate::runtime::{AsyncTask, DeferredWork, Runtime, RuntimeCell, TimerKind, TimerSlot, Transition};
 use crate::service::Service;
 use crate::types::{FiberId, ScopeId, Value};
+
+use futures_util::stream::{LocalBoxStream, StreamExt};
 
 /// waterfall 的最终内置行为（等价 Cordis 中 `args.pop()` 出的 inner）。
 pub type InnerFn = Box<dyn Fn(&mut Vec<Value>) -> Option<Value>>;
@@ -130,6 +132,20 @@ fn run_chain(state: &Rc<WfChain>, ctx: &Cordis, args: &mut Vec<Value>) -> Option
 #[derive(Clone)]
 pub struct Cordis {
     pub(crate) rt: RuntimeCell,
+}
+
+/// A6 生成器驱动结果（`drive_stream_sync`/`drive_stream_async` 的收敛）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamDrive {
+    /// 生成完成 → 可 finish（Active）。
+    Completed,
+    /// 某步抛错 → 已 `fail_fiber`（失败前已收集 disposer 保留）。
+    Failed,
+    /// 驱动期间 fiber epoch 变化 → 中途取消（停止后续收集，已收集保留；
+    /// fiber 已由 refresh/notify 转入卸载/重载，不 finish）。
+    MidCancelled,
+    /// sync 模式遇真 pending 步（无事件循环不重驱）→ 保持 Loading，不 finish。
+    Pending,
 }
 
 impl Cordis {
@@ -583,6 +599,19 @@ impl Cordis {
                     };
                     let Some((plugin, config0)) = plan else { continue };
                     match self.apply_body(fid, &plugin, config0) {
+                        // A6：apply 返回生成器流 → async 驱动（逐项 await；中途取消 /
+                        // 失败停止）。仅 Completed 入队 Finish。
+                        Ok(EffectOutcome::Stream(s)) => {
+                            let drive = self.drive_stream_async(fid, s).await;
+                            if drive == StreamDrive::Completed {
+                                self.with(|rt| {
+                                    rt.pending_async_loads
+                                        .push_back(AsyncTask::Finish(fid))
+                                });
+                            }
+                            // Failed/MidCancelled：不 Finish（fiber 已 fail / 已转卸载或重载；
+                            // 生成器与已收集 disposer 的收尾一致：保留至卸载）。
+                        }
                         Ok(outcome) => {
                             // M27：apply 返回 `Await`（如 Group 的 `[Service.init]`）→
                             // current 已保留（fid 在栈顶）→ await 完成（期间排入的
@@ -726,7 +755,12 @@ impl Cordis {
         // M27：同步路径下 `Await`（如 Group 挂载子入口）在 current 上下文内
         // now_or_never 立即完成（future 为同步体）；async 模式保留 Await 由
         // `drive_async_loads` await（真异步完成、等子任务）。
-        let is_await = matches!(&result, Ok(EffectOutcome::Await(_)));
+        // A6：`Stream` 同步模式**不**在此消费——由 `drive_stream_sync` 在
+        // run_load/drain_phase1 驱动（逐项收集）；current 保留至驱动结束。
+        let is_deferred = matches!(
+            &result,
+            Ok(EffectOutcome::Await(_)) | Ok(EffectOutcome::Stream(_))
+        );
         let result = if self.with(|rt| rt.async_mode) {
             result
         } else {
@@ -736,11 +770,101 @@ impl Cordis {
                 other => other,
             }
         };
-        if !is_await {
+        if !is_deferred {
             let mut rt = self.rt.borrow_mut();
             rt.current.pop();
         }
         result
+    }
+
+    // ---- A6 异步生成器 effect 驱动（等价 cordis `_execute` async-iterator 分支） ----
+
+    /// 把 fid 从当前调用栈移除（驱动结束 / 异常路径补 pop）。
+    fn pop_current(&self, fid: FiberId) {
+        let mut rt = self.rt.borrow_mut();
+        rt.current.retain(|&x| x != fid);
+    }
+
+    /// 处理一步产出：`Ok(disposer)` 立即逐项注册；`Err` 置纤维失败。
+    /// 返回 `Some` = 应终止驱动。
+    fn process_gen_item(&self, fid: FiberId, item: GenItem) -> Option<StreamDrive> {
+        match item {
+            Ok(d) => {
+                let mut rt = self.rt.borrow_mut();
+                if let Some(f) = rt.fiber_mut(fid) {
+                    f.push_gen_disposer(d);
+                }
+                None
+            }
+            Err(e) => {
+                {
+                    let mut rt = self.rt.borrow_mut();
+                    rt.fail_fiber(fid, e);
+                }
+                Some(StreamDrive::Failed)
+            }
+        }
+    }
+
+    /// 中途取消判定：fiber 当前 epoch 相对生成起点变化（cordis `runner.epoch` 语义）。
+    fn gen_mid_cancelled(&self, fid: FiberId, old: &Option<String>) -> bool {
+        let cur = self.rt.borrow().fiber(fid).and_then(|f| f.epoch.clone());
+        cur != *old
+    }
+
+    /// A6：sync 驱动生成器（`now_or_never` 逐步；current 已由 apply_body 保留，
+    /// 本方法结束时 pop）。
+    fn drive_stream_sync(&self, fid: FiberId, stream: LocalBoxStream<'static, GenItem>) -> StreamDrive {
+        let mut s = stream;
+        let old = self.rt.borrow().fiber(fid).and_then(|f| f.epoch.clone());
+        loop {
+            if self.gen_mid_cancelled(fid, &old) {
+                self.pop_current(fid);
+                return StreamDrive::MidCancelled;
+            }
+            let mut next = s.next();
+            match futures_util::FutureExt::now_or_never(&mut next) {
+                Some(Some(item)) => {
+                    if let Some(drive) = self.process_gen_item(fid, item) {
+                        self.pop_current(fid);
+                        return drive;
+                    }
+                }
+                Some(None) => {
+                    self.pop_current(fid);
+                    return StreamDrive::Completed;
+                }
+                None => {
+                    // 真 pending：保持 Loading，不 finish（与既有 Await sync 同限）
+                    self.pop_current(fid);
+                    return StreamDrive::Pending;
+                }
+            }
+        }
+    }
+
+    /// A6：async 驱动生成器（逐项 `await`；也可在中途取消/失败时停止）。
+    async fn drive_stream_async(&self, fid: FiberId, stream: LocalBoxStream<'static, GenItem>) -> StreamDrive {
+        let mut s = stream;
+        let old = self.rt.borrow().fiber(fid).and_then(|f| f.epoch.clone());
+        loop {
+            if self.gen_mid_cancelled(fid, &old) {
+                self.pop_current(fid);
+                return StreamDrive::MidCancelled;
+            }
+            match s.next().await {
+                Some(item) => {
+                    if let Some(drive) = self.process_gen_item(fid, item) {
+                        self.pop_current(fid);
+                        return drive;
+                    }
+                }
+                None => {
+                    self.pop_current(fid);
+                    return StreamDrive::Completed;
+                }
+            }
+        }
     }
 
     /// phase 1：运行延迟的 apply（父 fiber Active 之前），收集待 Finish 的 fiber。
@@ -763,6 +887,13 @@ impl Cordis {
                         };
                         let Some((plugin, config0)) = plan else { continue };
                         match self.apply_body(fid, &plugin, config0) {
+                            // A6：嵌套生成器——sync 驱动后仅 Completed 才进入 finishes
+                            //（Failed/MidCancelled/Pending 不 Active，留给卸载/重载路径）。
+                            Ok(EffectOutcome::Stream(s)) => {
+                                if self.drive_stream_sync(fid, s) == StreamDrive::Completed {
+                                    finishes.push(fid);
+                                }
+                            }
                             Ok(outcome) => {
                                 let _disposer = {
                                     let mut rt = self.rt.borrow_mut();
@@ -1696,6 +1827,9 @@ impl Cordis {
                         EffectOutcome::Async(f) => stack.push(f.await),
                         // 卸载时 Await 同 Async（await 得到最终 outcome）。
                         EffectOutcome::Await(f) => stack.push(f.await),
+                        // A6：Stream 项已由驱动逐项收集（此处仅作为 async-disposer 的
+                        // 结束标记；卸载前未产出项按 cordis 语义不追溯）。
+                        EffectOutcome::Stream(_) => {}
                     }
                 }
                 for d in collected.iter().rev() {
@@ -1841,6 +1975,33 @@ impl Cordis {
         };
         let Some((plugin, config0)) = plan else { return };
         match self.apply_body(fid, &plugin, config0) {
+            // A6：apply 返回生成器流 → sync 驱动（逐项收集/失败/中途取消/完成）。
+            Ok(EffectOutcome::Stream(s)) => {
+                let drive = self.drive_stream_sync(fid, s);
+                match drive {
+                    StreamDrive::Completed => {
+                        // phase 1：延迟的嵌套 apply 在父 Active 之前运行
+                        let finishes = self.drain_phase1();
+                        // 父 Active（finish_load 通知已提供服务 → 依赖方转换）
+                        let transitions = {
+                            let mut rt = self.rt.borrow_mut();
+                            rt.finish_load(fid)
+                        };
+                        // phase 2：依赖转换 + 延迟 child 的 Finish（父 Active 之后）
+                        self.drain_phase2(finishes, transitions);
+                    }
+                    _ => {
+                        // Failed / Pending：不 finish（fiber 已 fail / 保持 Loading）。
+                        // MidCancelled：epoch 已变 → 等价 cordis `_reload` 在 `_execute`
+                        // 早退后的 `_unload()`——运行已收集 disposer（保留的逆序）并落
+                        // Disposed；不 finish 到 Active。run_unload 对已卸载纤维幂等。
+                        if drive == StreamDrive::MidCancelled {
+                            self.run_unload(fid);
+                        }
+                        let _ = self.drain_phase1();
+                    }
+                }
+            }
             Ok(outcome) => {
                 let _disposer = {
                     let mut rt = self.rt.borrow_mut();

@@ -6500,6 +6500,41 @@ M27 等价子集，无「逐项 yield 跨 await 立即收集 + epoch 中途取�
 
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
 
+## D-135（服务装配单元 Phase 4 编码落定：A6 Stream effect 红→绿 + DSL/golden 等价）
+
+**日期**：2026-08-27
+
+**触发问题**：D-133 设计关闸通过 → 阶段 3（TDD 编码）实现 `EffectOutcome::Stream` 双驱动 +
+`GenItem`/`push_gen_disposer`（fiber.rs）+ `StreamDrive`/`drive_stream_sync`/`drive_stream_async`
+（context.rs）+ m19 T1-T3 + DSL（`GenOp` yield/await/throw）与 TS host 生成器插件 + golden。
+
+**关键实现（TDD 红→绿 + 自下而上实证修正）**：
+- **形态**：`EffectOutcome::Stream(LocalBoxStream<'static, GenItem>)`（逐项产出 disposer）；驱动循环
+  逐项 `push_gen_disposer`（立即收集/注册序）；**epoch 中途取消**（判定键 = `fiber.epoch` 变化，
+  忠实 cordis `runner.epoch`）；`Err` 项 `fail_fiber`（失败前已收集保留）。sync `now_or_never` /
+  async `drive_async_loads` 双插桩；`run_load` 中途取消分支按 cordis `_reload` 语义 `run_unload`
+  （已收集逆序运行）。
+- **红测实证修正**：T2 首版断言「flip 步产出不收集」→ 对照 cordis `_execute` 循环语义修正为
+  「flip 步产出的 B **先**收集、此后循环顶 pre-check 停止后续（C 不收集）」；T3 经 loader fail-loud
+  （`fiber_error` → `create` Err + 回滚 → 失败前 A 保留并在回滚卸载运行）——与既有 loader-02
+  fail-loud 约定一致。
+- **TS host 实证修正**：cordis `isConstructor` 对 `function` 声明走 `new` 分支并丢弃返回值 →
+  生成器插件必须用**箭头函数**（非构造器）；`throw` 步使 `await ctx.plugin()` **reject**（scenario-host
+  无法取回 Failed fiber 引用）→ **golden 只承载 T1 排序场景**（yield A/await m1/yield B/await m2/yield C
+  → Active → unload），失败路径（T3）由 m-series 锁定（DIV-4-5）。
+- **等价证据**：`scenario-12-async-generator` golden 14 行（TS 原版 cordis async generator ↔ Rust
+  LocalBoxStream 逐行一致：`plugin:g` / `status` / `apply:g` / `effect-reg:A` / `gen-await:m1` /
+  `effect-reg:B` / `gen-await:m2` / `effect-reg:C` / Active / Unloading / `dispose:C,B,A` / Disposed）。
+  m19 T1-T3 3/3 绿（T1 逐项收集+逆序卸载 / T2 中途取消+保留 / T3 失败前保留+fail-loud）。
+
+**阶段 4 验证（编码关闸）**：`cargo test --workspace` EXIT=0（199 目标 0 失败，含 m19 3/3）；`cargo
+clippy --workspace --all-targets -- -D warnings` EXIT=0；`node diff/ts-host/verify-diff.mjs`
+**22/22 PASS**（21 既有逐字节不变 + scenario-12 新 golden）。受影响 crate：dsh-core（Stream effect +
+双驱动）+ dsh-loader（m19）+ dsh-diff（DSL/GenOp + futures-util 依赖）+ scenario-host（TS 生成器插件）。
+
+**预期影响与回滚点**：本提交 = 可运行代码 + 测试 + golden。回滚 = `git revert` 本提交（核心 +
+m19 + DSL/golden 特征级整体回滚）；DSL/golden 部分可独立回滚（`scenario-12-*` 删除或保留均可）。
+
 
 
 

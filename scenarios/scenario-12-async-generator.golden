@@ -1,0 +1,14 @@
+plugin:g
+status:g:Pending:Loading
+apply:g
+effect-reg:A
+gen-await:m1
+effect-reg:B
+gen-await:m2
+effect-reg:C
+status:g:Loading:Active
+status:g:Active:Unloading
+dispose:C
+dispose:B
+dispose:A
+status:g:Unloading:Disposed

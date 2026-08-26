@@ -21,6 +21,36 @@ const FIBER_STATE_NAMES = {
 }
 
 function buildPlugin(desc, plugins, trace) {
+  // A6：生成器体（desc.gen）→ apply 返回 async 生成器（cordis `_execute` 驱动逐项
+  // 收集；`yield`/`await`/`throw` 步进 trace 与 Rust 侧 dsh-diff 逐行一致）。
+  // 用**箭头函数**（非构造器）——cordis `isConstructor` 对 `function` 声明走 `new`
+  // 分支并丢弃返回值，生成器必须经返回对象传播。
+  if (desc.gen?.length) {
+    const plugin = (ctx, config) => {
+      trace.push(`apply:${desc.name}`)
+      return (async function* () {
+        for (const op of desc.gen) {
+          if (op.op === 'yield') {
+            const text = op.text
+            trace.push(`effect-reg:${text}`)
+            yield () => trace.push(`dispose:${text}`)
+          } else if (op.op === 'await') {
+            trace.push(`gen-await:${op.text}`)
+            await Promise.resolve()
+            yield () => {}
+          } else if (op.op === 'throw') {
+            trace.push(`gen-fail:${op.text}`)
+            throw new Error(op.text)
+          } else {
+            throw new Error(`unknown gen op ${op.op}`)
+          }
+        }
+      })()
+    }
+    Object.defineProperty(plugin, 'name', { value: desc.name, configurable: true })
+    if (desc.inject?.length) plugin.inject = desc.inject
+    return plugin
+  }
   const plugin = function (ctx, config) {
     trace.push(`apply:${desc.name}`)
     const disposers = []

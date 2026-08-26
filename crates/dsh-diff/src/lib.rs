@@ -23,6 +23,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use dsh_core::*;
+use futures_util::stream::{StreamExt, unfold};
 use serde::Deserialize;
 
 /// 场景剧本。
@@ -42,6 +43,23 @@ pub struct PluginDesc {
     pub inject: Vec<String>,
     #[serde(default)]
     pub apply: Vec<ApplyOp>,
+    /// A6：生成器体（`yield`/`await`/`throw` 步进）。非空时插件 apply 返回
+    /// `EffectOutcome::Stream`（逐项收集 / 失败保留），替 apply 列表。
+    #[serde(default)]
+    pub gen: Vec<GenOp>,
+}
+
+/// A6：异步生成器 effect 的步进操作（TS 原版 cordis `[Service.init]` 形态）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+pub enum GenOp {
+    /// 产出 disposer：产出时 `effect-reg:{text}`；运行 `dispose:{text}`。
+    Yield { text: String },
+    /// await 边界：产出时 `gen-await:{text}`；产出一个空 disposer（无 trace）。
+    /// Rust 侧为流内边界（同步即 Ready）；TS 侧为真实 `await Promise.resolve()`。
+    Await { text: String },
+    /// 抛错：产出时 `gen-fail:{text}`；产出 `Err`（fiber 失败，已收集 disposer 保留）。
+    Throw { text: String },
 }
 
 /// loader 场景的 entry 选项（与 `EntryOptions` 兼容的 JSON 形态）。
@@ -494,6 +512,37 @@ impl Plugin for ScenarioPlugin {
 
     fn apply(&self, ctx: &Cordis, config: serde_json::Value) -> Result<EffectOutcome, CordisError> {
         self.push(ctx, &format!("apply:{}", self.desc.name));
+        // A6：生成器体 → `EffectOutcome::Stream`（逐项收集/失败保留；TS 原版逐行等价）。
+        if !self.desc.gen.is_empty() {
+            let ops: std::vec::IntoIter<GenOp> = self.desc.gen.clone().into_iter();
+            let ct_owned: dsh_core::Cordis = (*ctx).clone();
+            let s = unfold(ops, move |mut it| {
+                let ct = ct_owned.clone();
+                async move {
+                    let op = it.next()?;
+                    let item = match op {
+                        GenOp::Yield { text } => {
+                            ct.with(|rt| rt.trace.push(format!("effect-reg:{text}")));
+                            let t = text;
+                            Ok(Rc::new(move |c: &Cordis| {
+                                c.with(|rt| rt.trace.push(format!("dispose:{t}")))
+                            }) as Disposer)
+                        }
+                        GenOp::Await { text } => {
+                            ct.with(|rt| rt.trace.push(format!("gen-await:{text}")));
+                            Ok(Rc::new(|_c: &Cordis| {}) as Disposer)
+                        }
+                        GenOp::Throw { text } => {
+                            ct.with(|rt| rt.trace.push(format!("gen-fail:{text}")));
+                            Err(CordisError::Internal(text))
+                        }
+                    };
+                    Some((item, it))
+                }
+            })
+            .boxed_local();
+            return Ok(EffectOutcome::Stream(s));
+        }
         let mut disposers: Vec<Disposer> = Vec::new();
         for op in &self.desc.apply {
             self.apply_op(ctx, op, &config, &mut disposers)?;
