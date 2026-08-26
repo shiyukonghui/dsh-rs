@@ -27,6 +27,8 @@ dsh-brand = { path = "../dsh-brand" }
 dsh-settings = { path = "../dsh-settings" }
 dsh-credentials = { path = "../dsh-credentials" }
 dsh-schema = { path = "../dsh-schema" }
+# D-115-Web（D2）：wasm remote 端点的宿主侧真实 uuid（messageFeedback version 源）。
+uuid = { version = "1", features = ["v4"] }
 # M4h: web RPC wiring — goal/subagent 纯域服务 + session-query 投影注册表
 dsh-goal = { path = "../dsh-goal" }
 dsh-subagent = { path = "../dsh-subagent" }

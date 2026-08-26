@@ -51,6 +51,7 @@ pub mod session_host;
 /// M4h 补实：subagent 真实进程内驱动（in-process spawn/fork + 只读 list/history +
 /// prompt 经 AgentLoopHost 驱动 + interrupt 收据）。
 pub mod subagent_runtime;
+pub mod remote_host;
 
 /// M6 step5b：真实 LLM 装配（deepseek 适配器 + dsh-core 流式 HTTP 桥 + 诚实 no-key
 /// fail-loud；key 仅 `DEEPSEEK_API_KEY` 环境变量）。
@@ -119,6 +120,18 @@ pub struct Boot {
     /// `POST /api/respond` 答复）。serve 装配 agent-loop 时 Some；None（未启 loop /
     /// 测试口）→ 不推 wire 帧、respond 一律 not-pending（无决可答，诚实）。
     pub approval_wire: Option<crate::web::approval_wire::ApprovalWireRef>,
+    /// D-115-Web（D3）：wasm 组件承载 host 侧 remote 端点（`WasmRemoteEndpointPlugin`
+    /// 加载 `host-remote` world 组件）。serve 装配 Some；None（测试口/未装配）→
+    /// dispatch 回落 not-implemented（诚实）。`Rc<RefCell>`：web RPC 只持 `&Boot`，
+    /// 组件懒实例化入 `RefCell`（单线程 accept，与 loop_plugin 同纪律）。
+    pub remote_plugin: Option<Rc<std::cell::RefCell<dsh_wasmrt::WasmRemoteEndpointPlugin>>>,
+    /// D2：真实宿主投影器（`RemoteServiceProjector`——loader/session/settings/持久 KV
+    /// 等真实数据源面）。serve 装配 Some；None（测试口）→ wasm 端点反查宿主时诚实报错。
+    pub remote_projector: Option<Rc<dyn dsh_wasmrt::RemoteServiceProjector>>,
+    /// D-115-Web（阶段 A）：真实动态装配器 `dsh-loader`（create/update/dispose +
+    /// register_plugin + fiber）——dynamicCordisRunner/pluginInventory 的真实数据源
+    /// 与「动态装配」句柄。boot() 装配 Some；None（测试口）→ 投影回退空/诚实。
+    pub loader: Option<dsh_loader::Loader>,
 }
 
 /// M56：转储生效配置（对齐生产 `dsh --dump-config`）——读主配置 + overlays
@@ -308,6 +321,9 @@ pub fn boot(
         standings: Rc::new(std::cell::RefCell::new(crate::standing::StandingRegistry::default())),
         plan_session: None,
         approval_wire: None,
+        remote_plugin: None,
+        remote_projector: None,
+        loader: Some(loader.clone()),
     })
 }
 

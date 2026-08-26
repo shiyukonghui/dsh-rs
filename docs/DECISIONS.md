@@ -5679,6 +5679,58 @@ not-implemented。dsh-wasmrt 全量回归绿。
 
 **回滚点**：git revert 本提交（新增 crate 模块 + wit + 组件——均为新增，回滚干净）。
 
+---
+
+## D-115-Web（D2 收口）：真实宿主投影器 + dispatch wasm 回落 + wire 信封对齐 + 动态装配阶段 A
+
+**触发问题**：D3 组件实现了端点业务，但 serve 未装配：无 `RemoteServiceProjector`
+（wasm 端点反查宿主落空）→ dispatch 无 wasm 回落 → 前端 Cordis/inventory 等 UI
+仍不可用。且组件返回 wire 与前端 RpcResult 信封不符（zod 拒）。
+
+**调研发现（根本解法）**：Rust **dsh-loader 本就具备真实动态装配能力**（
+`register_plugin(name, Arc<dyn Plugin>)` + `create(EntryOptions)`→`start_entry` 起
+fiber + `write` 落盘 cordis.yml），不是「无动态 cordis 装配」。缺的是端点没接线 +
+Boot 不暴露 loader。用户裁定**分阶段 A→B→C 清除根本**（不选 manifest 一次性代理）。
+
+**决策事项**：
+1. `Boot` 增 `loader: Option<dsh_loader::Loader>`（boot() clone），为投影器/动态装配
+   提供真实句柄。
+2. `dsh-cli/src/remote_host.rs`：`RemoteHost` 实现 `RemoteServiceProjector`——真实数据源：
+   `loader`（dsh-loader.entries()）、`dynamicPlugins`（真实已组合插件，agentId="default"
+   对齐 schema string）、`sessionMessages`/`sessionIdentity`/`sessionCandidates`
+   （SessionEvent sink 平坦流按 session 过滤/去重）、`agentWorkspace`/`workspaceFiles`
+   （default 工作区 + 真实 fs 扫描）、`time`（墙钟）、`newVersion`（uuid v4）、
+   `kv`（进程内持久 map）。未知/只读服务 → 规范化错误；`set` 只允许 kv（真持久）。
+3. `serve` 装配：host.sink 后构造 RemoteHost（注入 sink/loader/workspaces）+ 读
+   host-remote 组件字节 → `WasmRemoteEndpointPlugin` → `boot.remote_plugin/remote_projector`。
+4. dispatch 回落：`dispatch_wasm_remote`——`namespace/method` 拆分 → plugin.handle →
+   组件已信封透传；未装配 → `internal` 错误（诚实，占位 era 的 `{ok:true,value:[]}`
+   dynamicCordisRunner 占位**废除**）。
+
+**wire 信封修正（真浏览器抓 zod 实证）**：前端 `rpc.call` 期望 server 返回
+`{ok:true, value: <业务值>}` RpcResult 信封（value 才是 descriptor 解析对象），且
+RpcError 联合 **无 not-implemented code**。组件全部端点改信封：pluginInventory
+`{ok:true,value:{entries}}`、fileReferences/动态 inventory/sessionReference
+`{ok:true,value:[...]}`、syncInspectManifest `{ok:true,value:null}`（Rust 无 cordis
+inspect 宿主 → 诚实零态，非占位）、未知端点错误 code 用 `internal`（合法联合）；
+`agentId` 必须 string（schema `intersection(string,unknown)`，null 被 zod 拒）。
+
+**验证（D2 收口关闸）**：m31 全绿 8/8（envelope 断言 + syncInspectManifest 零态 +
+internal code）；dsh-cli 217 全绿（`rpc_dynamic_cordis_runner_unassembled` 取代占位
+era 测试）；clippy 0；60880 真浏览器 render-smoke **console/page errors 空**、bodyLen
+47149→48279、DOM 深度证实 **Cordis Plugin 面板真实渲染**（0 running，来自 wasm 端点
+读真实 loader）；`pluginInventory/list` 经 HTTP RPC 返回真实 entries（echo-loop /
+dsh:services）。
+
+**阶段 B/C（后续目标）**：dynamicCordisRunner 动态装配（runHostHalf→loader.create +
+注册 wasm 组件插件→fiber 真跑；stopFromPanel→dispose；approval 状态机投影）+ 动态
+wasm 包管理（按包路径/版本加载组件字节）。TS-sandbox 依赖 4 方法（getClientCode/
+invoke/reportRenderFailure/reportClientGuardFailure）显式 internal 错误 + message
+说明（用户已接受此诚实边界）。
+
+**回滚点**：git revert 本提交（Boot 字段 + remote_host + dispatch 回落 + 组件信封）。
+
+
 
 
 

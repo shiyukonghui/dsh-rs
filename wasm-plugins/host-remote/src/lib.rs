@@ -14,7 +14,9 @@ use serde_json::{json, Value};
 
 struct HostRemote;
 
-/// 规范化错误字节（fail-loud：绝不伪造成功）。
+/// 规范化错误字节（fail-loud：绝不伪造成功）。`code` 必须在前端 RpcError
+/// 联合内（bad-request/cancelled/.../internal——**无 not-implemented**）；统一用
+/// `internal` 并携带说明 message（诚实报告能力缺失，wire 合法）。
 fn error(code: &str, message: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "ok": false,
@@ -54,6 +56,8 @@ fn set_service(service: &str, payload: &Value) -> Result<Value, Vec<u8>> {
 }
 
 /// pluginInventory/list：从宿主 loader 投影真实条目，跳过 group 行，映射 wire。
+/// pluginInventory/list：从宿主 loader 投影真实条目，跳过 group 行，映射 wire。
+/// 返回信封 `{ok:true, value:{entries:[...]}}`。
 fn plugin_inventory_list(_body: &Value) -> Vec<u8> {
     match get_service("loader", &json!({})) {
         Ok(proj) => {
@@ -71,7 +75,7 @@ fn plugin_inventory_list(_body: &Value) -> Vec<u8> {
                     }));
                 }
             }
-            serde_json::to_vec(&json!({"entries": entries})).unwrap_or_default()
+            serde_json::to_vec(&json!({"ok": true, "value": {"entries": entries}})).unwrap_or_default()
         }
         Err(e) => e,
     }
@@ -274,6 +278,143 @@ fn write_row(session_id: &str, row: &Value) -> Result<(), Vec<u8>> {
         .map(|_| ())
 }
 
+/// fileReferences/list：按 agent 会话 cwd + query 列真实路径候选。
+/// 返回信封 `{ok:true, value:[{path}]}`（RpcResult——前端期望 value 包数组）。
+fn file_references_list(body: &Value) -> Vec<u8> {
+    let agent_id = body.get("agentId").and_then(|s| s.as_str()).unwrap_or("");
+    let query = body.get("query").and_then(|s| s.as_str()).unwrap_or("");
+    if agent_id.is_empty() {
+        return serde_json::to_vec(&json!({"ok": true, "value": []})).unwrap_or_default();
+    }
+    // 1. agent 会话的 cwd（真实投影）。失败 → 空候选（诚实）。
+    let cwd = match get_service("agentWorkspace", &json!({"agentId": agent_id})) {
+        Ok(v) => v.get("cwd").and_then(|c| c.as_str()).unwrap_or("").to_string(),
+        Err(_) => return serde_json::to_vec(&json!({"ok": true, "value": []})).unwrap_or_default(),
+    };
+    if cwd.is_empty() {
+        return serde_json::to_vec(&json!({"ok": true, "value": []})).unwrap_or_default();
+    }
+    // 2. 真实 fs 扫描：cwd 下匹配 query 前缀的路径候选。
+    match get_service("workspaceFiles", &json!({"cwd": cwd, "query": query})) {
+        Ok(v) => {
+            let paths: Vec<Value> = v
+                .get("paths")
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|p| p.as_str().map(|s| json!({"path": s})))
+                .collect();
+            serde_json::to_vec(&json!({"ok": true, "value": paths})).unwrap_or_default()
+        }
+        Err(_) => serde_json::to_vec(&json!({"ok": true, "value": []})).unwrap_or_default(),
+    }
+}
+
+// ---- sessionReferenceResolver：候选枚举 + cwd 亲缘排序 + mention 编码 ----
+
+/// base64url 编码（RFC 4648 §5；wasm 无外部 crate 的纯实现）。
+fn base64url(data: &[u8]) -> String {
+    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(ALPHA[(b0 >> 2) as usize] as char);
+        out.push(ALPHA[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHA[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHA[(b2 & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// canonical mention：`@[label](dsh-session:<base64url(JSON.stringify(sessionId))>)`。
+/// sessionId 是字符串 → JSON.stringify(sessionId) == `"<sessionId>"`。
+fn session_mention(session_id: &str, label: &str) -> String {
+    let escaped = label.replace('\\', "\\\\").replace(']', "\\]");
+    let payload = serde_json::to_string(session_id).unwrap_or_default();
+    let uri = format!("dsh-session:{}", base64url(payload.as_bytes()));
+    format!("@[{escaped}]({uri})")
+}
+
+/// sessionReferenceResolver/candidates：真实候选枚举 + 排序/过滤 + mention。
+/// 宿主按 agentId 排除自身 + cwd 亲缘排序 + query 过滤返回候选；
+/// 组件补 canonical mention（对齐 TS `formatSessionReferenceMention`）。
+fn session_reference_candidates(body: &Value) -> Vec<u8> {
+    let agent_id = body.get("agentId").and_then(|s| s.as_str()).unwrap_or("");
+    let query = body.get("query").and_then(|s| s.as_str()).unwrap_or("");
+    let candidates = match get_service("sessionCandidates", &json!({"agentId": agent_id, "query": query})) {
+        Ok(v) => v.get("candidates").and_then(|c| c.as_array()).cloned().unwrap_or_default(),
+        Err(_) => return serde_json::to_vec(&json!({"ok": true, "value": []})).unwrap_or_default(),
+    };
+    let out: Vec<Value> = candidates
+        .into_iter()
+        .filter_map(|c| {
+            let session_id = c.get("sessionId").and_then(|s| s.as_str())?;
+            let label = c
+                .get("label")
+                .and_then(|l| l.as_str())
+                .unwrap_or(session_id)
+                .to_string();
+            let mut out = json!({
+                "sessionId": session_id,
+                "label": label,
+                "mention": session_mention(session_id, &label),
+            });
+            if let Some(cw) = c.get("cwd").and_then(|w| w.as_str()) {
+                out["cwd"] = json!(cw);
+            }
+            if let Some(ts) = c.get("createdAt") {
+                out["createdAt"] = ts.clone();
+            }
+            Some(out)
+        })
+        .collect();
+    serde_json::to_vec(&json!({"ok": true, "value": out})).unwrap_or_default()
+}
+
+// ---- dynamicCordisRunner：真实子集 + not-implemented 边界 ----
+
+/// dynamicCordisRunner/inventory：Rust 已组合的 cordis 插件映射为动态插件清单。
+/// 宿主 `dynamicPlugins` 投影真实已挂载插件；组件组装信封 `{ok:true, value:[...]}`。
+/// latestRun/activeRun 缺省（Rust 无动态 cordis 运行宿主 → 诚实无 recent run）。
+fn dynamic_inventory(_body: &Value) -> Vec<u8> {
+    let plugins = match get_service("dynamicPlugins", &json!({})) {
+        Ok(v) => v.get("plugins").and_then(|p| p.as_array()).cloned().unwrap_or_default(),
+        Err(_) => return serde_json::to_vec(&json!({"ok": true, "value": []})).unwrap_or_default(),
+    };
+    let out: Vec<Value> = plugins
+        .into_iter()
+        .filter_map(|p| {
+            let plugin_id = p.get("pluginId").and_then(|s| s.as_str())?;
+            let mut o = json!({
+                "pluginId": plugin_id,
+                "agentId": p.get("agentId").cloned().unwrap_or(Value::Null),
+                "packages": p.get("packages").cloned().unwrap_or(Value::Array(vec![])),
+            });
+            // 诚实透传宿主提供的 current/next/active/latest（无则缺省——Rust 无动态运行）。
+            for key in ["currentPackageId", "nextPackageId", "activeRun", "latestRun"] {
+                if let Some(v) = p.get(key) {
+                    o[key] = v.clone();
+                }
+            }
+            Some(o)
+        })
+        .collect();
+    serde_json::to_vec(&json!({"ok": true, "value": out})).unwrap_or_default()
+}
+
+/// dynamicCordisRunner/syncInspectManifest：Rust 侧**无 cordis inspect 注册表面**
+/// → 诚实返回 `{ok:true, value:null}`（零态，非占位——Rust 确实没有 inspect providers）。
+fn dynamic_sync_inspect_manifest(_body: &Value) -> Vec<u8> {
+    serde_json::to_vec(&json!({"ok": true, "value": null})).unwrap_or_default()
+}
+
 impl Guest for HostRemote {
     fn handle(namespace: String, method: String, body: Vec<u8>) -> Vec<u8> {
         let body_value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -282,9 +423,13 @@ impl Guest for HostRemote {
             ("messageFeedback", "list") => message_feedback_list(&body_value),
             ("messageFeedback", "put") => message_feedback_put(&body_value),
             ("messageFeedback", "delete") => message_feedback_delete(&body_value),
+            ("fileReferences", "list") => file_references_list(&body_value),
+            ("sessionReferenceResolver", "candidates") => session_reference_candidates(&body_value),
+            ("dynamicCordisRunner", "inventory") => dynamic_inventory(&body_value),
+            ("dynamicCordisRunner", "syncInspectManifest") => dynamic_sync_inspect_manifest(&body_value),
             _ => error(
-                "not-implemented",
-                &format!("host-remote: no endpoint {namespace}/{method}"),
+                "internal",
+                &format!("host-remote: endpoint {namespace}/{method} not provided by this host"),
             ),
         }
     }

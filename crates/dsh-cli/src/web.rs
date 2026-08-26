@@ -227,6 +227,27 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
     // seed `default`（前端会话入口）。
     let _ = host.session("default");
 
+    // D-115-Web（D2/D3）：装配 wasm remote 端点承载（host-remote 组件）+ 真实宿主
+    // 投影器（loader / session event sink / workspaces 真实数据源）。失败 → fail-loud
+    // （组件是新增端点的实现地，缺了相关 UI 仍不可用，不静默降级）。
+    let remote_projector: Rc<dyn dsh_wasmrt::RemoteServiceProjector> = Rc::new(
+        crate::remote_host::RemoteHost::new(
+            Some(host.sink.clone()),
+            boot.loader.clone(),
+            Some(boot.workspaces.clone()),
+        ),
+    );
+    let host_remote_bytes = host_remote_component_bytes();
+    let remote_plugin = dsh_wasmrt::WasmRemoteEndpointPlugin::new(
+        "host-remote",
+        &host_remote_bytes,
+        dsh_wasmrt::Capabilities::default(),
+        None,
+    )
+    .map_err(|e| CordisError::Internal(format!("host-remote plugin: {e}")))?;
+    boot.remote_plugin = Some(std::rc::Rc::new(std::cell::RefCell::new(remote_plugin)));
+    boot.remote_projector = Some(remote_projector);
+
     // M3a+（D-098）：装配进程内原生目录选择器（`host.pickDirectory`）。Windows 桌面经
     // IFileDialog/COM（零子进程）弹系统目录框；无桌面/失败 → wire `directory-picker-unavailable`
     // （诚实，不冒充取消）。测试 Boot 不装配（None）→ 同一错误路径，由 stub 测试覆盖。
@@ -1085,6 +1106,24 @@ pub struct BootEntry {
 /// 页内 browse 流程不挂载。因此从 boot 图排除 browse 流程客户端，只让 native 客户端
 /// 占据 ui-workspace 的 single directory-flow 洞（系统原生目录对话框）。
 const HOST_COMPOSITION_EXCLUDED_CLIENTS: &[&str] = &["@deepseek-ai/dsh-client-ui-directory-picker-browse"];
+
+/// 读取（如缺构建）host-remote 组件字节（生产 serve 装配 wasm remote 端点用；
+/// D-115-Web D3 组件模型——禁 C ABI）。
+pub fn host_remote_component_bytes() -> Vec<u8> {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../wasm-plugins/host-remote");
+    let wasm = dir.join("target/wasm32-wasip1/debug/host_remote_plugin.wasm");
+    if !wasm.exists() {
+        let status = std::process::Command::new("cargo")
+            .args(["component", "build", "--manifest-path"])
+            .arg(dir.join("Cargo.toml"))
+            .status()
+            .expect("run cargo component build for host-remote");
+        if !status.success() {
+            eprintln!("host-remote component build failed; remote endpoints unavailable");
+        }
+    }
+    std::fs::read(&wasm).unwrap_or_default()
+}
 
 /// 组装 `__DSH_BOOT__`（单 root）：委托多 root 版本（`[plugin_root]`）。
 ///
@@ -4160,13 +4199,12 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
                 {"name": "subagents", "description": "列出子代理目录", "input": {"hint": "[parentSessionId]"}},
             ]})
         }
-        // cordis 插件清单 UI（dynamicCordisRunner remote）：host 侧无动态插件，
-        // inventory 空数组、syncInspectManifest 返回 null（对齐其 result schema）。
-        "dynamicCordisRunner/inventory" => {
-            serde_json::json!({"ok": true, "value": []})
-        }
-        "dynamicCordisRunner/syncInspectManifest" => {
-            serde_json::json!({"ok": true, "value": null})
+        // D-115-Web（D3）：wasm 组件承载的 remote 端点（含 dynamicCordisRunner.*——
+        // 从组件真实实现不再是占位；未装配组件 → not-implemented 诚实回落）。
+        m if m.starts_with("dynamicCordisRunner/") || m.starts_with("pluginInventory/")
+            || m.starts_with("messageFeedback/") || m.starts_with("fileReferences/")
+            || m.starts_with("sessionReferenceResolver/") => {
+            dispatch_wasm_remote(boot, m, payload)
         }
         "agent-loop" | "agent.turn" | "agent.run" => {
             if boot.agent_loop.is_some() {
@@ -4200,9 +4238,40 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
                 }}),
             }
         }
-        _ => serde_json::json!({"ok": false, "error": {
+        _ => dispatch_wasm_remote(boot, method, payload),
+    }
+}
+
+/// D-115-Web（D2/D3）：把未原生实现的 remote 端点交给 wasm 组件（WasmRemoteEndpointPlugin）。
+/// 组件返回结果 JSON 字节；组件未装配/未实现 → 规范化 not-implemented（诚实，不伪造）。
+fn dispatch_wasm_remote(boot: &Boot, method: &str, payload: &Value) -> Value {
+    // 解析 `namespace/method`（前端线�路由），无 `/` 或空 → not-implemented。
+    let Some((namespace, mm)) = method.split_once('/') else {
+        return serde_json::json!({"ok": false, "error": {
             "code": "not-implemented",
             "message": format!("method \"{method}\" not implemented by dsh web"),
+        }});
+    };
+    let Some(plugin) = boot.remote_plugin.as_ref() else {
+        return serde_json::json!({"ok": false, "error": {
+            "code": "not-implemented",
+            "message": format!("remote endpoint {method} (no wasm remote host assembled)"),
+        }});
+    };
+    // 组件 body：传给插件的 payload（agent 上下文已由前端平铺字段；直接透传）。
+    let body = serde_json::to_vec(payload).unwrap_or_default();
+    match plugin.borrow().handle(namespace, mm, &body, boot.remote_projector.clone()) {
+        Ok(v) if v.get("ok").and_then(|o| o.as_bool()) == Some(false) => {
+            let err = v.get("error").cloned().unwrap_or_else(|| {
+                serde_json::json!({"code": "internal", "message": "wasm remote endpoint error"})
+            });
+            serde_json::json!({"ok": false, "error": err})
+        }
+        // 组件结果即前端期望的 value（成功裸值或 {ok:true, value} 已含）。
+        Ok(v) => v,
+        Err(e) => serde_json::json!({"ok": false, "error": {
+            "code": "internal",
+            "message": e.to_string(),
         }}),
     }
 }
@@ -4291,6 +4360,9 @@ mod tests {
             )),
             plan_session: None,
             approval_wire: None,
+            remote_plugin: None,
+            remote_projector: None,
+            loader: None,
         }
     }
 
@@ -5220,21 +5292,21 @@ mod tests {
     /// 阶段3：dynamicCordisRunner inventory → []、syncInspectManifest → null
     /// （对齐其 result schema，清除 cordis 清单 UI 的 boot 报错）。
     #[test]
-    fn rpc_dynamic_cordis_runner_empty() {
+    /// D-115-Web：测试 Boot 未装配 wasm remote 端点 → dispatch 诚实回落
+    /// not-implemented（占位 era 的 `{ok:true, value:[]}` 已废除——wasm 组件承载
+    /// dynamicCordisRunner.*；未装配 = 无动态 cordis 宿主，诚实报错不伪造）。
+    fn rpc_dynamic_cordis_runner_unassembled() {
         let boot = boot_with_sessions();
-        for (m, expected) in [
-            ("dynamicCordisRunner/inventory", "[]"),
-            ("dynamicCordisRunner/syncInspectManifest", "null"),
-        ] {
+        for m in ["dynamicCordisRunner/inventory", "dynamicCordisRunner/syncInspectManifest"] {
             let body = serde_json::to_vec(&serde_json::json!({
                 "type": "client-request", "rpcId": "r", "method": m, "payload": {}
             })).unwrap();
             let (_, v) = handle_rpc(&boot, m, &body);
-            assert_eq!(v["result"]["ok"], true, "{m} ok");
+            assert_eq!(v["result"]["ok"], false, "{m} not ok (no wasm remote host)");
             assert_eq!(
-                serde_json::to_string(&v["result"]["value"]).unwrap(),
-                expected,
-                "{m} value"
+                v["result"]["error"]["code"],
+                "not-implemented",
+                "{m} error code"
             );
         }
     }

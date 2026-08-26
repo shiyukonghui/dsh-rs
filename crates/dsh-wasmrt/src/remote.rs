@@ -46,7 +46,7 @@ pub trait RemoteServiceProjector {
 
     /// 写入宿主服务（真实持久）。缺省 = 该服务只读（规范化错误）。
     /// 未知 service / 无权限 / 只读 → `Ok(err_json)`。
-    fn set(&self, service: &str, payload: &[u8]) -> Vec<u8> {
+    fn set(&self, service: &str, _payload: &[u8]) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "ok": false,
             "error": { "code": "read-only", "message": format!("service {service} is read-only (no set backend)") },

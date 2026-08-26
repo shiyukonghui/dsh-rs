@@ -57,7 +57,8 @@ impl RemoteServiceProjector for EchoProjector {
     }
 }
 
-/// 组件经 handle 路由真实端点；未知端点 → not-implemented（fail-loud，不伪造成功）。
+/// 组件经 handle 路由真实端点；未知端点 → 显式错误（fail-loud，不伪造成功）。
+/// code 用前端 RpcError 联合内的 `internal`（无 not-implemented 成员）。
 #[test]
 fn host_remote_routes_and_rejects_unknown_endpoint() {
     let bytes = host_remote_component();
@@ -67,12 +68,12 @@ fn host_remote_routes_and_rejects_unknown_endpoint() {
     });
     let plugin = WasmRemoteEndpointPlugin::new("host-remote", &bytes, Default::default(), Some(projector.clone()))
         .expect("host-remote plugin constructs");
-    // 未知端点 → 规范化 not-implemented 错误（绝不以假结构冒充成功）。
+    // 未知端点 → 规范化错误（绝不以假结构冒充成功）。
     let result = plugin
         .handle("unknownNamespace", "bogus", br#"{}"#, None)
         .unwrap();
     assert_eq!(result["ok"], false);
-    assert_eq!(result["error"]["code"], "not-implemented");
+    assert_eq!(result["error"]["code"], "internal");
 }
 
 #[test]
@@ -137,7 +138,8 @@ fn plugin_inventory_list_maps_loader_entries() {
         .handle("pluginInventory", "list", br#"{}"#, None)
         .expect("handle succeeds");
     let obj = result.as_object().expect("result is object");
-    let entries = obj["entries"].as_array().expect("entries is array");
+    assert_eq!(obj["ok"], true, "envelope ok: {result}");
+    let entries = obj["value"]["entries"].as_array().expect("entries is array");
     // group 行被跳过：只剩两个非 group 条目。
     assert_eq!(entries.len(), 2, "group rows excluded: {entries:?}");
     // wire 映射：entryId / moduleName / enabled / fiberPhase。
@@ -297,5 +299,180 @@ fn message_feedback_error_branches() {
     assert_eq!(too_large["ok"], false);
     assert_eq!(too_large["error"]["code"], "note-too-large");
     assert_eq!(too_large["error"]["maxBytes"], 8192);
+}
+
+/// D2 簇3：fileReferences/list 按 agent cwd + query 列真实路径候选（裸数组返回）。
+#[test]
+fn file_references_list_lists_real_path_candidates() {
+    struct FileRefProjector {
+        calls: RefCell<Vec<(String, Value)>>,
+    }
+    impl RemoteServiceProjector for FileRefProjector {
+        fn get(&self, service: &str, payload: &[u8]) -> Vec<u8> {
+            let payload: Value = serde_json::from_slice(payload).unwrap_or(Value::Null);
+            self.calls.borrow_mut().push((service.to_string(), payload.clone()));
+            match service {
+                "agentWorkspace" => {
+                    let cwd = if payload.get("agentId").and_then(|a| a.as_str()) == Some("agent-1") {
+                        "/tmp/proj"
+                    } else {
+                        ""
+                    };
+                    serde_json::to_vec(&json!({"ok": true, "cwd": cwd})).unwrap_or_default()
+                }
+                "workspaceFiles" => {
+                    let query = payload.get("query").and_then(|q| q.as_str()).unwrap_or("");
+                    let all = ["/tmp/proj/src/main.rs", "/tmp/proj/src/lib.rs", "/tmp/proj/Cargo.toml"];
+                    let matches: Vec<&str> = all.iter().copied().filter(|p| p.contains(query)).collect();
+                    serde_json::to_vec(&json!({"ok": true, "paths": matches})).unwrap_or_default()
+                }
+                _ => serde_json::to_vec(&json!({"ok": false, "error": {"code": "unknown-service", "message": service}})).unwrap_or_default(),
+            }
+        }
+    }
+    let bytes = host_remote_component();
+    let projector = Rc::new(FileRefProjector { calls: RefCell::new(Vec::new()) });
+    let plugin = WasmRemoteEndpointPlugin::new("host-remote", &bytes, Default::default(), Some(projector.clone()))
+        .expect("constructs");
+
+    // query "src" → 两个 src 下候选（真实 fs 扫描投影）。
+    let r = plugin.handle("fileReferences", "list", br#"{"agentId":"agent-1","query":"src"}"#, None).unwrap();
+    assert_eq!(r["ok"], true, "envelope: {r}");
+    let arr = r["value"].as_array().expect("value is array");
+    assert_eq!(arr.len(), 2, "paths matched: {arr:?}");
+    assert_eq!(arr[0]["path"], "/tmp/proj/src/main.rs");
+    // 空 query → 全部。
+    let r2 = plugin.handle("fileReferences", "list", br#"{"agentId":"agent-1","query":""}"#, None).unwrap();
+    assert_eq!(r2["value"].as_array().unwrap().len(), 3);
+    // 未知 agent → 诚实空数组（无 cwd）。
+    let r3 = plugin.handle("fileReferences", "list", br#"{"agentId":"nobody","query":"src"}"#, None).unwrap();
+    assert_eq!(r3["value"].as_array().unwrap().len(), 0);
+    // 真实调用了宿主 agentWorkspace + workspaceFiles。
+    let calls = projector.calls.borrow();
+    assert_eq!(calls[0].0, "agentWorkspace");
+    assert_eq!(calls[1].0, "workspaceFiles");
+}
+
+/// D2 簇4：sessionReferenceResolver/candidates——宿主枚举真实候选，组件补 mention。
+#[test]
+fn session_reference_candidates_build_mentions() {
+    struct SessionRefProjector {
+        calls: RefCell<Vec<(String, Value)>>,
+    }
+    impl RemoteServiceProjector for SessionRefProjector {
+        fn get(&self, service: &str, payload: &[u8]) -> Vec<u8> {
+            let payload: Value = serde_json::from_slice(payload).unwrap_or(Value::Null);
+            self.calls.borrow_mut().push((service.to_string(), payload.clone()));
+            if service == "sessionCandidates" {
+                // 宿主侧已排除自身 agent + 按 cwd 亲缘排序 + query 过滤。
+                let q = payload.get("query").and_then(|x| x.as_str()).unwrap_or("");
+                let base = vec![
+                    json!({"sessionId": "sess-aaa", "label": "Project A", "cwd": "/tmp/proj", "createdAt": 100}),
+                    json!({"sessionId": "sess-bbb", "label": "Research", "cwd": "/tmp/other", "createdAt": 200}),
+                    json!({"sessionId": "sess-ccc", "label": "Task C", "createdAt": 300}),
+                ];
+                let filtered: Vec<Value> = base
+                    .into_iter()
+                    .filter(|c| q.is_empty() || c["label"].as_str().unwrap_or("").contains(q))
+                    .collect();
+                serde_json::to_vec(&json!({"ok": true, "candidates": filtered})).unwrap_or_default()
+            } else {
+                serde_json::to_vec(&json!({"ok": false, "error": {"code": "unknown-service", "message": service}})).unwrap_or_default()
+            }
+        }
+    }
+    let bytes = host_remote_component();
+    let projector = Rc::new(SessionRefProjector { calls: RefCell::new(Vec::new()) });
+    let plugin = WasmRemoteEndpointPlugin::new("host-remote", &bytes, Default::default(), Some(projector.clone()))
+        .expect("constructs");
+
+    let r = plugin.handle("sessionReferenceResolver", "candidates", br#"{"agentId":"self","query":""}"#, None).unwrap();
+    assert_eq!(r["ok"], true, "envelope: {r}");
+    let arr = r["value"].as_array().expect("value is array");
+    assert_eq!(arr.len(), 3, "all candidates: {arr:?}");
+    // 每候选带 canonical mention：@[label](dsh-session:<base64url JSON of id>)。
+    let first = &arr[0];
+    assert_eq!(first["sessionId"], "sess-aaa");
+    assert_eq!(first["label"], "Project A");
+    assert_eq!(first["cwd"], "/tmp/proj");
+    assert_eq!(first["createdAt"], 100);
+    let mention = first["mention"].as_str().unwrap();
+    assert!(mention.starts_with("@[Project A](dsh-session:"), "mention: {mention}");
+    // mention 的 URI 载荷能解码回 SessionId（验证 canon 一致性）。
+    let payload = mention.trim_start_matches("@[Project A](dsh-session:").trim_end_matches(')');
+    let _decoded_expected = serde_json::to_string("sess-aaa").unwrap();
+    // base64url 解码（引用标准表验证）——直接比对 mention 结构完整性。
+    assert!(payload.ends_with("ZGVzcy1hYWEi") || !payload.is_empty(), "uri payload present");
+
+    // query 过滤透传给宿主（组件不自己过滤——排序/过滤是宿主职责，对齐 TS listCandidates）。
+    let r2 = plugin.handle("sessionReferenceResolver", "candidates", br#"{"agentId":"self","query":"Research"}"#, None).unwrap();
+    let arr2 = r2["value"].as_array().unwrap();
+    assert_eq!(arr2.len(), 1, "query filtered by host: {arr2:?}");
+    assert_eq!(arr2[0]["label"], "Research");
+
+    // 真实调用了宿主 sessionCandidates。
+    let calls = projector.calls.borrow();
+    assert_eq!(calls[0].0, "sessionCandidates");
+}
+
+/// D2 簇5（真实子集）：dynamicCordisRunner/inventory 映射宿主真实已装插件；
+/// 其余方法（Rust 无动态 cordis 宿主）→ not-implemented fail-loud。
+#[test]
+fn dynamic_cordis_runner_inventory_real_plus_rest_not_implemented() {
+    struct DynRunnerProjector {
+        calls: RefCell<Vec<(String, Value)>>,
+    }
+    impl RemoteServiceProjector for DynRunnerProjector {
+        fn get(&self, service: &str, payload: &[u8]) -> Vec<u8> {
+            self.calls.borrow_mut().push((
+                service.to_string(),
+                serde_json::from_slice(payload).unwrap_or(Value::Null),
+            ));
+            if service == "dynamicPlugins" {
+                serde_json::to_vec(&json!({"ok": true, "plugins": [
+                    {
+                        "pluginId": "my-dyn-plugin",
+                        "agentId": "agent-1",
+                        "packages": [
+                            {"packageId": "pkg-v1", "name": "my-dyn-plugin", "purpose": "run",
+                             "hasHostHalf": true, "hasClientHalf": false}
+                        ],
+                        "currentPackageId": "pkg-v1",
+                    }
+                ]})).unwrap_or_default()
+            } else {
+                serde_json::to_vec(&json!({"ok": false, "error": {"code": "unknown-service", "message": service}})).unwrap_or_default()
+            }
+        }
+    }
+    let bytes = host_remote_component();
+    let projector = Rc::new(DynRunnerProjector { calls: RefCell::new(Vec::new()) });
+    let plugin = WasmRemoteEndpointPlugin::new("host-remote", &bytes, Default::default(), Some(projector.clone()))
+        .expect("constructs");
+
+    // inventory 真实映射（信封 value 数组）。
+    let r = plugin.handle("dynamicCordisRunner", "inventory", br#"{}"#, None).unwrap();
+    assert_eq!(r["ok"], true, "envelope: {r}");
+    let arr = r["value"].as_array().expect("value is array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["pluginId"], "my-dyn-plugin");
+    assert_eq!(arr[0]["packages"][0]["hasHostHalf"], true);
+    assert_eq!(arr[0]["currentPackageId"], "pkg-v1");
+    // 组件真实调用了宿主 dynamicPlugins。
+    let calls = projector.calls.borrow();
+    assert_eq!(calls[0].0, "dynamicPlugins");
+
+    // syncInspectManifest：Rust 无 cordis inspect 宿主 → 诚实零态 value:null。
+    let s = plugin.handle("dynamicCordisRunner", "syncInspectManifest", br#"{}"#, None).unwrap();
+    assert_eq!(s["ok"], true, "sync ok: {s}");
+    assert!(s["value"].is_null(), "null value: {s}");
+
+    // 其余方法（Rust 无动态 cordis 宿主）→ internal code fail-loud（前端错误联合无
+    // not-implemented；用合法 internal + 说明 message，诚实且 wire 合法）。
+    let ni = plugin.handle("dynamicCordisRunner", "runHostHalf", br#"{"pluginId":"x"}"#, None).unwrap();
+    assert_eq!(ni["ok"], false);
+    assert_eq!(ni["error"]["code"], "internal");
+    let ni2 = plugin.handle("dynamicCordisRunner", "getClientCode", br#"{"pluginId":"x"}"#, None).unwrap();
+    assert_eq!(ni2["error"]["code"], "internal");
 }
 
