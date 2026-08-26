@@ -1,0 +1,14 @@
+loader-sync:[{"config":[{"id":"p1","name":"provider"},{"id":"c1","name":"consumer"}],"group":true,"id":"g1","isolate":{"svc":true},"name":"group"}]
+plugin:Group
+status:Group:Pending:Loading
+plugin:provider
+status:provider:Pending:Loading
+plugin:consumer
+apply:provider
+provide:svc:"v1"
+status:provider:Loading:Active
+status:consumer:Pending:Loading
+apply:consumer
+log:consumer-applied
+status:consumer:Loading:Active
+status:Group:Loading:Active

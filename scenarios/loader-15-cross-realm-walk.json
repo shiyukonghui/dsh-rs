@@ -1,0 +1,22 @@
+{
+  "name": "loader-15-cross-realm-walk",
+  "plugins": {
+    "provider": {
+      "name": "provider",
+      "apply": [{ "op": "provide", "service": "svc", "value": "v1" }]
+    },
+    "consumer": {
+      "name": "consumer",
+      "inject": ["svc"],
+      "apply": [{ "op": "log", "text": "consumer-applied" }]
+    }
+  },
+  "steps": [
+    { "op": "loader-sync", "entries": [
+      { "id": "g1", "name": "group", "group": true, "isolate": { "svc": true }, "config": [
+        { "id": "p1", "name": "provider" },
+        { "id": "c1", "name": "consumer" }
+      ] }
+    ] }
+  ]
+}

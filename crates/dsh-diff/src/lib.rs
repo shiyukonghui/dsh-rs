@@ -78,10 +78,13 @@ pub enum ApplyOp {
     },
     /// 注册 waterfall 监听但短路（不调 next）：触发时记录 `log:{log}`。
     OnShort { event: String, log: String },
-    /// 提供服务：`provide:{service}:{json(value)}`。
+    /// 提供服务：`provide:{service}:{json(value)}`。可选 `check`（false = 可用性谓词不成立 →
+    /// 依赖方保持 PENDING；缺省/true = 可用，同 06 面）。
     Provide {
         service: String,
         value: serde_json::Value,
+        #[serde(default)]
+        check: Option<bool>,
     },
     /// 注册 intercept：`intercept:{service}:{json(config)}`。
     Intercept {
@@ -607,14 +610,21 @@ impl ScenarioPlugin {
                     }),
                 )?;
             }
-            ApplyOp::Provide { service, value } => {
+            ApplyOp::Provide { service, value, check } => {
                 let service = service.clone();
                 let value = value.clone();
                 self.push(
                     ctx,
                     &format!("provide:{service}:{}", serde_json::to_string(&value).unwrap_or_default()),
                 );
-                ctx.provide(&service, Arc::new(value))?;
+                let disposer = if let Some(false) = check {
+                    // A3：check 谓词不成立 → 实现在场但依赖方 PENDING（不激活）。
+                    ctx.provide_with(&service, Arc::new(value), Some(Box::new(|| false)))?
+                } else {
+                    ctx.provide(&service, Arc::new(value))?
+                };
+                // 提供 disposer 可被 `dispose-effect` 定向（A4a：unprovide 而 fiber 不卸载）。
+                disposers.push(disposer);
             }
             ApplyOp::Intercept { service, config } => {
                 let service = service.clone();

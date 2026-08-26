@@ -21,6 +21,7 @@ const ASYNC_SCENARIOS = new Set([
   'loader-11-disabled-entry',
   'loader-12-isolate-intercept',
   'loader-13-service-entry-dependency-activation',
+  'loader-15-cross-realm-walk',
 ])
 const scenarios = readdirSync(dir).filter((f) => f.endsWith('.json')).sort()
 let failed = 0

@@ -1,0 +1,18 @@
+{
+  "name": "scenario-10-provide-check-gate",
+  "plugins": {
+    "consumer": {
+      "name": "consumer",
+      "inject": ["svc"],
+      "apply": [{ "op": "log", "text": "consumer-applied" }]
+    },
+    "provider": {
+      "name": "provider",
+      "apply": [{ "op": "provide", "service": "svc", "value": "v1", "check": false }]
+    }
+  },
+  "steps": [
+    { "op": "plugin", "id": "consumer" },
+    { "op": "plugin", "id": "provider" }
+  ]
+}

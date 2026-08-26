@@ -1,0 +1,21 @@
+{
+  "name": "scenario-11-unprovide-order",
+  "plugins": {
+    "consumer": {
+      "name": "consumer",
+      "inject": ["svc"],
+      "apply": [{ "op": "log", "text": "consumer-applied" }]
+    },
+    "provider": {
+      "name": "provider",
+      "apply": [
+        { "op": "provide", "service": "svc", "value": "v1" },
+        { "op": "dispose-effect", "index": 0 }
+      ]
+    }
+  },
+  "steps": [
+    { "op": "plugin", "id": "consumer" },
+    { "op": "plugin", "id": "provider" }
+  ]
+}

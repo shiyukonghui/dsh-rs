@@ -79,7 +79,9 @@ function applyOp(ctx, op, config, plugins, trace, disposers) {
       break
     case 'provide':
       trace.push(`provide:${op.service}:${JSON.stringify(op.value)}`)
-      ctx.provide(op.service, op.value)
+      // check === false → 可用性谓词不成立（依赖方 PENDING）；providers 的 disposer
+      // 可被 `dispose-effect` 定向（A4a：unprovide 而 fiber 不卸载）。
+      disposers.push(ctx.provide(op.service, op.value, op.check === false ? () => false : undefined))
       break
     case 'intercept': {
       trace.push(`intercept:${op.service}:${JSON.stringify(op.config)}`)

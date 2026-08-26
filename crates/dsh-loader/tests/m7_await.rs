@@ -66,3 +66,27 @@ async fn await_idle_after_dependency_gate() {
     assert_eq!(cordis.fiber_state(loader.fiber("s").unwrap()), Some(FiberState::Active));
     assert_eq!(cordis.fiber_state(c_fiber), Some(FiberState::Active));
 }
+
+/// A3（check 谓词门）：`provide_with(check=false)` → 实现在场但依赖方保持 PENDING（不激活）。
+/// 与 `scenario-10-provide-check-gate.golden` 同语义（本测为核心层 await 面锁定）。
+#[tokio::test]
+async fn await_gated_by_check_predicate() {
+    let cordis = Cordis::new();
+    let loader = Loader::new(&cordis).unwrap();
+    // provider：apply 提供 svc，但可用性谓词恒 false
+    let provider = FnPlugin::new("svc", &[], |ctx, _cfg| {
+        ctx.provide_with("svc", Arc::new(json!("v1")), Some(Box::new(|| false)))?;
+        Ok(EffectOutcome::None)
+    });
+    loader.register_plugin("svc", Arc::new(provider));
+    let consumer = FnPlugin::new("consumer", &["svc"], |_ctx, _cfg| Ok(EffectOutcome::None));
+    loader.register_plugin("consumer", Arc::new(consumer));
+
+    loader.create(EntryOptions::new("s", "svc")).unwrap();
+    loader.create(EntryOptions::new("c", "consumer")).unwrap();
+    loader.await_idle().await.unwrap();
+
+    // provider Active；consumer 因 check 谓词不成立保持 Pending（不激活）
+    assert_eq!(cordis.fiber_state(loader.fiber("s").unwrap()), Some(FiberState::Active));
+    assert_eq!(cordis.fiber_state(loader.fiber("c").unwrap()), Some(FiberState::Pending));
+}

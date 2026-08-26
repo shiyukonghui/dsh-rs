@@ -6289,6 +6289,36 @@ golden 用静态 bool（动态态变 spike 另立）；DIV-2-3 父链 walk 以�
 
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
 
+---
+
+## D-126（服务装配单元 Phase 2 编码落定：A3+A4 等价核对全过 + 零核心修复）
+
+**日期**：2026-08-26
+
+**触发问题**：按设计 S1→S2→S3 实施 A3+A4 核对（TDD 红→绿）。
+
+**实施（S1/S2/S3）**：
+- **S1 DSL 对称扩展**：scenario-host.mjs 与 Rust `ApplyOp::Provide` 增可选 `check`（false → 依赖方
+  PENDING）；`provide` 的 disposer 入 `disposers` 索引（`dispose-effect` 可定向 unprovide）。
+- **S2 golden 集**（TS 生成、Rust 逐行对齐，各首次即 PASS）：
+  - `scenario-10-provide-check-gate.golden`（6 行）：provider `provide svc` 带 `check:false` →
+    provider Active、consumer 保持 PENDING（**A3a check 门**）。
+  - `scenario-11-unprovide-order.golden`（6 行）：provide 后立即 unprovide → 后续依赖方 PENDING、
+    provider 保持 Active（**A4a unprovide 序，trace 级无可观察差**——Rust `remove_impl→notify` 与
+    TS「先 notify 再自清」等价）。
+  - `loader-15-cross-realm-walk.golden`（14 行）：group isolate realm 内 provider provide svc →
+    子 consumer 沿父链 walk 解析到组 realm → Active+apply/log（**A4c 父链 walk**）。
+- **S3 m 系列锁定**：m7_await `await_gated_by_check_predicate`（check=false → 依赖方 Pending）+ m3_isolate
+  `group_realm_walk_resolves_parent_provider`（跨组 realm 解析）——均绿。
+- **关键结论**：A3a/A4a/A4c 与 TS 等价**首次即对齐，无需 dsh-core 核心修复**（疑似 check 缺失/
+  unprovide 顺序分歧经实证不存在；A3 的 check 谓词在核心早已具备、18 剧本缺覆盖是唯一的真缺口）。
+
+**验证（阶段 3/4 关闸）**：`node verify-diff.mjs` **21/21 PASS**（新增 3 场景 + 既有 18 零回归）；
+dsh-core/dsh-loader/dsh-diff/dsh-wasmrt/dsh-cli 全量 EXIT=0；clippy `-D warnings` 零。
+
+**预期影响与回滚点**：dsh-diff DSL（Provide 加 check 字段 + disposer 索引）为兼容增量（既有剧本
+零变化）；m 系列只增测试。回滚 = `git revert` 本提交（dsh-diff/diff-ts-host/测试/剧本，独立回滚点）。
+
 
 
 

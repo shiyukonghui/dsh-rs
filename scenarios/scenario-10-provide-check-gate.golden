@@ -1,0 +1,6 @@
+plugin:consumer
+plugin:provider
+status:provider:Pending:Loading
+apply:provider
+provide:svc:"v1"
+status:provider:Loading:Active

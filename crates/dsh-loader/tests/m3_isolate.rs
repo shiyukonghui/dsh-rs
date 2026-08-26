@@ -121,3 +121,34 @@ fn intercept_entry_option_merges() {
     loader.create(e).unwrap();
     assert!(loader.fiber("e").is_some());
 }
+
+/// A4c（跨隔离父链 walk）：组入口 `isolate svc` → 子 provider 供 svc 入组 realm；
+/// 子 consumer（无自身 isolate）沿父链 walk 解析到组 realm 的 svc 并激活（apply 内断言值）。
+/// 与 `loader-15-cross-realm-walk.golden` 同语义（本测为核心层锁定）。
+#[test]
+fn group_realm_walk_resolves_parent_provider() {
+    let cordis = Cordis::new();
+    let loader = Loader::new(&cordis).unwrap();
+    loader.register_plugin("prov", provide_svc("prov", "GROUP-svc"));
+    loader.register_plugin("cons", expect_svc("cons", "GROUP-svc"));
+
+    let mut g = EntryOptions::new("g", "g");
+    g.config = json!([
+        { "id": "prov", "name": "prov" },
+        { "id": "cons", "name": "cons" }
+    ]);
+    g.group = true;
+    g.isolate.insert("svc".into(), json!(true));
+    loader.create(g).unwrap();
+
+    // provider 与 consumer 均 Active：consumer 沿父链 walk 到组 realm 的 svc
+    // （provide 落组 realm；注入解析到同一组 realm——apply 内断言值 GROUP-svc）
+    assert_eq!(
+        cordis.fiber_state(loader.fiber("prov").expect("provider child mounted")),
+        Some(FiberState::Active)
+    );
+    assert_eq!(
+        cordis.fiber_state(loader.fiber("cons").expect("consumer child mounted")),
+        Some(FiberState::Active)
+    );
+}
