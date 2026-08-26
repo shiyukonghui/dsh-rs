@@ -5976,6 +5976,46 @@ Cordis 的配置驱动/依赖激活/可热更插件装配模型**，而不只是
 
 **回滚点**：文档/决策无代码改动；后续架构演进各 commit 各自回滚。
 
+---
+
+## D-116（服务装配单元 Phase 1 需求分析定稿）
+
+**日期**：2026-08-26
+
+**触发问题**：用户按 `docs/SERVICE-ASSEMBLY-HANDOFF.md` 规划下一阶段开发——「本次只需要服务装配
+单元的开发」。按瀑布流先做需求分析（方法论二：第一性原理 + 双视角 + 复盘追问），产出阶段关卡工件。
+
+**关键调研（回答用户之问：deepseek harness 如何把前端组件作为 cordis 装配单元）**：
+subagent 对 harness fork（`deepseek-harness/`）只读检索证实：前端插件与后端服务插件是**同一个
+「插件=装配单元」模型**——同一份 vendored `@deepseek-ai/cordis` 的 Context/Fiber/Loader 运行时，
+唯一区别是「代码到达层」（前端 `__DSH_BOOT__` 清单 + `ClientModuleSystem` 挂 `ctx.loader.internal`，
+替代 Node ESM loader）。实证见 `.spec/service-assembly/harness-frontend-assembly-research.md`
+（全断言带文件:行号）。
+**Rust 侧对应现实**：`dsh web` 已做 roster 生成 + bundle 服务（前端行由浏览器内 TS cordis 激活，
+`assertEntriesActive`）；Rust 侧「服务装配单元」的真正待办 = **后端服务插件 entry 化**。
+
+**关键决策（用户逐条确认，D-S1..D-S5）**：
+1. **D-S1 范围** = Phase 1 后端服务插件 entry 化（消除 boot 名称特判 + 「非 services 必 config.wasm」
+   假设；新增自定义服务 entry 可声明装配）。**显式排除**「前端组件行的 Rust 引擎激活」（另一条大线）。
+2. **D-S2 A1 身份键** = **与 deepseek harness 一致**：插件身份 = 解析后的插件实现本体（Rust 等价 =
+   Arc 指针/新生代 uid）；name 仍为解析键，但「同名同实现=同身份、同名新实现=新身份」（cordis
+   `registry.has(callback)` / re-import=新身份 的口径）。改动面深，设计阶段细化。
+3. **D-S3 A2 `!!js` 条件装配** = 记录为边界，spike 另立。
+4. **D-S4 A7 持久化写回** = **本轮做**：运行时 loader 更新（create/update/remove）除记录外真实写回
+   cordis.yml（原子写），重启按落盘配置恢复；Config.simplify 反解随对齐面处理。
+5. **D-S5 未提交 WIP** = commit 保留（模型配置 CRUD 线检查点 `c76d37d`，与装配单元开发解耦）。
+
+**自下而上核实**：loader 按名解析已成立（loader.rs:385 注册 / loader.rs:724-728 查 `plugins.get(name)`
+→ apply）；缺口 = boot 名称特判（lib.rs:174）+「非 services 必 config.wasm」（lib.rs:176-198）+
+A1 平名仓库（loader.rs:40 / registry.rs:34）+ A7 writes 仅记录不落盘（loader.rs:41-42）。
+
+**阶段结论**：需求分析关闸工件定稿 → 进入阶段 2（系统设计）。A1/A7 实现细节（身份键结构、落盘事务/
+反解、与 include/HMR 接线）在设计阶段细化并按 TDD 落地。
+
+**预期影响与回滚点**：本提交纯文档（`.spec/service-assembly/requirements.md` + 研究报告 +
+DECISIONS 条目）。回滚 = 撤本提交即回授予前状态；后续编码各 commit 各自回滚（改动 → 提交 →
+本条目互查）。
+
 
 
 
