@@ -5825,6 +5825,74 @@ package.json 扫描；用户提供真实 key 要求真实模型端到端验证�
 
 **回滚点**：git revert 本提交（WebConfig 字段 + scan + serve 注册）。
 
+---
+
+## D-115-Web（报告期修复）：设置页模型 CRUD 不可用 + 多轮对话「multiple start Match」
+
+**触发问题**（用户报告，60886 真实 key 实例）：
+1. 设置页「模型配置」增删改查不可用（页面无 provider 行/编辑禁用/保存失败）；
+2. 前端 console 报 `conversation Context …:input-messageprompt-s3 received more than one
+   start Match`——用户在 s3 会话多轮对话后复现。
+
+**子代理调查（只读）**：
+- **② 根因**（runtime conversation-assembler 深挖）：前端 `input-message` node 的 start
+  Match **只由 `user/message` 事件触发**（message.ts:44-48），`inbox/spliced`/重放都不会；
+  `acceptMatch`（conversation-assembler.ts:395-397）对同一 key 第二个 start 抛错，one-
+  start-per-context 是**有单测的不变量**。触发它的不是事件重复——是**跨 turn 复用同一
+  消息 id**：Rust `run_rust_loop_on_host`（lib.rs:554）User 消息 id 恒为 `prompt-{session_id}`
+  （s3 两轮都是 prompt-s3），前端按 id 建 context → 第二轮 start 撞已有 → 抛错。
+  修复点=后端：user 消息 id 会话内唯一。
+- **① 根因**（api-proxy/ui-settings-models 深挖）：Rust 只注册了 `llm` settings namespace，
+  但前端模型设置页数据源是 `llm.providers`（configurable-provider 目录）+ `settings.describe`
+  + `settings.mutate` + `credentials.*` + `llm.discoverModels`。Rust `llm_providers` 读
+  `boot.llm`（旧 LlmService 注册表）恒空 → 无 provider 行（设置页静默失效）；`llm.discoverModels`
+  恒空 → 拉取模型永远 fetchEmpty。`settings.mutate('llm')` 本可写（已注册）——但前端目录行
+  的 settingsNs 决定它 mutate 哪个 ns；Rust 声明 settingsNs='llm' 即前端写 'llm' ✓。
+
+**决策事项**：
+1. **②（消息 id 唯一化）**：lib.rs `run_rust_loop_on_host` user 消息 id 改
+   `prompt-{session_id}-{host.events(session_id).len()}`——会话内单调（每次 prompt 递增，
+   恢复会话续接也单调）。旧日志（修复前跨 turn 同 id）重放仍会触发前端 one-start 防护
+   （正确拒绝 + UI 显示历史加载失败）——**向后兼容需前端 replaceWindow 重建 key
+   （{id}~{seq}）**，属 vendored 前端契约修改，非本次主修复范围（subagent：前端容忍是错的，
+   静默吞真实消息/掩盖数据损坏）。s3 为修复前测试数据：清理即可恢复打开。
+2. **①（llm.providers 真实目录 + discoverModels）**：
+   - `llm_providers`：返回**可配置 provider 目录**——deepseek 行 `{provider:'deepseek',
+     displayName:'DeepSeek', settingsNs:'llm', settingsPath:[], active: agent_loop.is_some(),
+     declared:true}` + `boot.llm` 注册路由追加（对齐 TS api-proxy providers 语义：目录∪注册表）。
+   - `llm.discoverModels`：payload `{settingsNs, provider?, baseURL?...}`；provider 匹配
+     `boot.agent_catalog` → 返回 catalog 真实模型（serve 探测获得）；非装配 provider →
+     诚实空（Rust 无 TS 外部端点探测，不伪造）。settingsNs='llm'（Rust 已注册）使前端
+     mutate/describe 直写真实 llm namespace（改 baseURL/model/apiKey/provider 真实生效）。
+3. **既有能力确认**：settings.mutate/replace/update（真实写 dsh_settings + revision 冲突）
+   + credentials.*（describe/set/unset 已实现）——「改/删/存密钥」路径 Rust 已支持，本次
+   未改。
+
+**TDD 验证**：dsh-cli 222 全绿（新增 `llm_providers_declare_directory_and_discover_models`、
+`session_create_registers_agent_and_prompt_routes` 扩展两轮 prompt → 断言两个
+`prompt-{sid}-N` 唯一 id；`rpc_session_prompt_runs_turn` 既有）；clippy 0。
+
+**真实 key e2e（60886）**：
+- 两轮真实 turn → history 两个不同 `prompt-default-11` / `prompt-default-20`（未修前都是
+  `prompt-default`）；
+- `llm.providers` → `[{provider:'deepseek', settingsNs:'llm', active:true, declared:true}]`
+  （设置页显示 provider 行）；
+- `settings.mutate('llm', set model)` → ok + revision:1，describe 读回 user.value.model 生效
+  （编辑真实可写）；
+- `llm.discoverModels` → `[{id:'deepseek-v4-flash-0731-ext'}]`（拉取模型真实）；
+- render-smoke：consoleErrors [] / pageErrors []；s3 旧会话打开 → 前端防护显示
+  「历史加载失败：…received more than one start Match」——旧坏数据边界（预期，非回归）。
+
+**待办/边界**：
+- 旧会话（修复前跨 turn 同 id 持久化）打开仍显示历史加载失败——处理选项：清测试会话
+  （s3）或后续在 vendored runtime replaceWindow 做 {id}~{seq} 向后兼容（独立 PR，改前端
+  one-start 不变量需连带更新其单测）。
+- `session.selectModel` 仍仅 echo（不持久化默认模型到 settings）——默认模型切换重启回退，
+  记录待办（可写 agent-default-model namespace 对齐 TS）。
+
+**回滚点**：git revert 本提交（lib.rs id 唯一 + web.rs llm_providers/discoverModels）。
+
+
 
 
 

@@ -551,7 +551,13 @@ pub fn run_rust_loop_on_host(
     host.ensure_agent(&configured)
         .map_err(|e| CordisError::Internal(format!("agent-loop host: {e}")))?;
     let message = dsh_llm::Message::user(
-        dsh_llm::MessageId::from_raw(format!("prompt-{session_id}")),
+        // 消息 id 必须**会话内唯一**（前端按消息 id 建 conversation context；旧格式
+        // `prompt-{session_id}` 同会话每轮重名 → 前端报「received more than one start
+        // Match」。seq = 会话当前事件数（每次 prompt 递增，恢复会话续接也单调）。
+        dsh_llm::MessageId::from_raw(format!(
+            "prompt-{session_id}-{}",
+            host.events(session_id).len()
+        )),
         vec![dsh_llm::ContentBlock::text(content)],
     );
     host.followup(&configured.id, message)

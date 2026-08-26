@@ -1966,25 +1966,42 @@ fn llm_catalog(boot: &Boot) -> (Value, Value) {
     }
 }
 
-/// LLM provider 目录（`llm.providers`）——由 `Boot.llm` 注册表驱动，对齐
+/// LLM provider 目录（`llm.providers`）——对齐前端
 /// `configurableProviderViewSchema`（{provider, displayName, settingsNs,
-/// settingsPath, active}）。空注册表 → 空数组（前端隐藏 provider 面板）。
+/// settingsPath, active, declared?}）。
+///
+/// TS 宿主语义（api-proxy.ts `llm.providers`）：**可配置 provider 目录**（声明行，含
+/// settings 地址）+ **已注册路由**（无 settings 地址的路由追加）。目录行 active 反映
+/// 该路由当前是否注册（其模型可请求）。Rust 侧：
+/// - 目录声明：`deepseek`（settingsNs=`llm`——settings.describe 已暴露该真实 namespace
+///   `{provider, baseURL, apiKey, model}` schema，即 provider profile）；active = 是否
+///   装配了 agent-loop（其 deepseek 适配器可请求真实模型）。
+/// - 追加已注册路由：`boot.llm` 注册表（C ABI/dispatcher era 的旧路由）无设置地址。
 fn llm_providers(boot: &Boot) -> Vec<Value> {
-    boot.llm
-        .lock()
-        .unwrap()
-        .providers()
-        .iter()
-        .map(|p| {
-            serde_json::json!({
-                "provider": p.id,
-                "displayName": p.id,
-                "settingsNs": "",
-                "settingsPath": [],
-                "active": true,
-            })
-        })
-        .collect::<Vec<_>>()
+    let mut out: Vec<Value> = Vec::new();
+    // 声明目录（独立于运行时注册——「能配置的 provider」，对齐 deepseek 家族）。
+    out.push(serde_json::json!({
+        "provider": "deepseek",
+        "displayName": "DeepSeek",
+        "settingsNs": "llm",
+        "settingsPath": [],
+        "active": boot.agent_loop.is_some(),
+        "declared": true,
+    }));
+    // 追加已注册路由（无 settings 地址；注册于 boot.llm，如旧 era dispatcher 路由）。
+    for p in boot.llm.lock().unwrap().providers() {
+        if out.iter().any(|v| v["provider"] == p.id) {
+            continue;
+        }
+        out.push(serde_json::json!({
+            "provider": p.id,
+            "displayName": p.id,
+            "settingsNs": "",
+            "settingsPath": [],
+            "active": true,
+        }));
+    }
+    out
 }
 
 fn now_ms() -> u64 {
@@ -4192,7 +4209,28 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
             }})
         }
         "llm.discoverModels" => {
-            serde_json::json!({"ok": true, "value": {"models": []}})
+            // 真实探测：装配 catalog 的 provider 家族（deepseek）答自身注册表模型
+            // （对齐 TS 语义——已描述路由从自身 registry 回答，无网络）。payload
+            // `{settingsNs, provider?, baseURL?, api?, apiKey?}`；provider 不在装配
+            // catalog → 诚实空（Rust 无 TS 的外部端点探测；不伪造模型）。
+            let provider = payload.get("provider").and_then(Value::as_str).unwrap_or("deepseek");
+            let mut models: Vec<Value> = Vec::new();
+            if let Some(cat) = &boot.agent_catalog {
+                let cat_provider = cat["provider"].as_str().unwrap_or("deepseek");
+                if cat_provider == provider {
+                    if let Some(arr) = cat["models"].as_array() {
+                        for m in arr {
+                            let id = m["id"].as_str().unwrap_or("?").to_string();
+                            models.push(serde_json::json!({
+                                "id": id,
+                                "name": id,
+                                "provider": cat_provider,
+                            }));
+                        }
+                    }
+                }
+            }
+            serde_json::json!({"ok": true, "value": {"models": models}})
         }
         "goal.create" | "goal.edit" | "goal.pause" | "goal.resume" | "goal.complete" | "goal.clear" => {
             goal_dispatch(boot, method, payload, host)
@@ -5412,6 +5450,21 @@ mod tests {
                     replay_state: None,
                 },
             ],
+            vec![
+                dsh_llm::StreamChunk::BlockStart {
+                    index: 0,
+                    block_type: "text".parse().unwrap(),
+                },
+                dsh_llm::StreamChunk::TextDelta { index: 0, text: "hello from second".into() },
+                dsh_llm::StreamChunk::BlockEnd {
+                    index: 0,
+                    block: dsh_llm::ContentBlock::text("hello from second"),
+                },
+                dsh_llm::StreamChunk::Finish {
+                    reason: dsh_llm::FinishReason::Stop,
+                    replay_state: None,
+                },
+            ],
         ])));
         struct Adapter {
             script: Arc<Mutex<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
@@ -5489,6 +5542,27 @@ mod tests {
             &session_host,
         );
         assert_eq!(v3["result"]["value"]["accepted"], true, "prompt accepted: {v3}");
+
+        // 修复②（D-115-Web）：同会话第二次 prompt → user/message id 必须不同
+        // （旧 `prompt-{session_id}` 跨 turn 复用 → 前端 input-message context 多
+        // start Match 报错）。id 带事件 seq 后缀唯一。
+        let v3b = call(
+            &boot,
+            "session.prompt",
+            serde_json::json!({"sessionId": sid,
+                "content": [{"type": "text", "text": "second prompt"}]}),
+            &session_host,
+        );
+        assert_eq!(v3b["result"]["value"]["accepted"], true, "second prompt: {v3b}");
+        let um: Vec<String> = session_host
+            .events(&sid)
+            .iter()
+            .filter(|e| e.kind.as_str() == "user/message")
+            .filter_map(|e| e.data.get("id").and_then(|i| i.as_str()).map(str::to_string))
+            .collect();
+        assert_eq!(um.len(), 2, "two user/messages recorded: {um:?}");
+        assert_ne!(um[0], um[1], "session-unique message ids: {um:?}");
+        assert!(um.iter().all(|id| id.starts_with(&format!("prompt-{sid}-"))), "seq-suffixed ids: {um:?}");
 
         // 共享 store：事件落新会话（user/message + assistant/message）。
         let evs = session_host.events(&sid);
@@ -10342,6 +10416,42 @@ mod tests {
             "caps default contextWindow present"
         );
         assert_eq!(caps["retry"]["mode"], "normal", "real retry policy view");
+    }
+
+    /// D-115-Web（修复①）：`llm.providers` 返回真实可配置目录——deepseek 行
+    /// （settingsNs=llm，active 随 agent_loop 装配）；`llm.discoverModels` 对装配
+    /// catalog provider 返回真实模型（设置页「拉取模型/新增」路径）。
+    #[test]
+    fn llm_providers_declare_directory_and_discover_models() {
+        let mut boot = boot_with_sessions();
+        boot.agent_catalog = Some(crate::m6_llm::server_catalog_view(
+            "http://127.0.0.1:1",
+            "deepseek-v4-flash-0731-ext",
+        ));
+        // providers：无 agent_loop → deepseek 行存在但 inactive（目录独立于注册）。
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r1", "method": "llm.providers", "payload": {},
+        }))
+        .unwrap();
+        let (_, v) = handle_rpc(&boot, "llm.providers", &body);
+        let providers = v["result"]["value"]["providers"].as_array().expect("providers array");
+        let deepseek = providers
+            .iter()
+            .find(|p| p["provider"] == "deepseek")
+            .expect("deepseek declared in directory");
+        assert_eq!(deepseek["settingsNs"], "llm", "deepseek config lives in llm namespace");
+        assert_eq!(deepseek["active"], false, "inactive without agent-loop");
+        assert_eq!(deepseek["declared"], true);
+        // discoverModels：provider=deepseek 匹配装配 catalog → 真实模型列表。
+        let dbody = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r2", "method": "llm.discoverModels",
+            "payload": {"settingsNs": "llm", "provider": "deepseek"},
+        }))
+        .unwrap();
+        let (_, v2) = handle_rpc(&boot, "llm.discoverModels", &dbody);
+        let models = v2["result"]["value"]["models"].as_array().expect("models array");
+        assert!(!models.is_empty(), "catalog models returned");
+        assert_eq!(models[0]["id"], "deepseek-v4-flash-0731-ext");
     }
 
     /// M6i 验收 step9（D-088）：skill = 通用 prompt 段注册——`register_prompt_section`
