@@ -6921,6 +6921,30 @@ EXIT=0（203 目标 0 失败）；`cargo clippy --workspace --all-targets -- -D 
 **预期影响与回滚点**：Phase 8（B2）验收完成。回滚 = `git revert 746e982` + 撤 D-151 工件提交。
 后续按目标优先级：B4 config simplify + A3 动态 check spike。
 
+## D-152（服务装配单元 Phase 9 需求+设计定稿：B4 config simplify 回写 unparse）
+
+**日期**：2026-08-27
+
+**触发问题**：B2 闭环 → 进入 B4（HANDOFF §3 B4「config simplify 回写 unparse」）。
+
+**自下而上核对（源码实证）**：fork `internal/update`（@deepseek-ai/cordis-plugin-loader index.ts:103-109）
+`entry.options.config = Config['simplify'](config)` 后 tree.write；`Config.simplify` =
+schemastery `Schema.prototype.simplify`（@deepseek-ai/schemastery src/index.ts:407-442）：默认相等→null、
+object 删 null/undefined 键、dict 保、array/tuple 映射、intersect 合并、union try resolve、else 原值。
+Rust `write_back`（loader.rs:263-285）存**原始配置**——缺 simplify。
+
+**需求收敛（阶段 1）**：dsh-schema 移植 `simplify` + loader write_back 接入（插件声明 config_schema
+时简化写回，无 schema 原样——in-memory=落盘一致，cordis 同字段）。非目标：merge 深合并（validate_config
+下次装载补默认，DIV-9-3）、golden（TS loader-host 无 Config schema 场景；B 类 m-series 先例）。
+
+**设计收敛（阶段 2）**：S1 `simplify` 逐分支措辞对齐 schemastery；S2 write_back 取
+`entries[id]→options.name→plugins[name].plugin.config_schema()` 后简化（注意借用释放）；S3 m24 T1
+（schema+默认删键，无简化则红）/T2（无 schema 原样）/T3（嵌套 object/dict/array）。DIV-9-1（deepEqual
+dict 特判降级 serde_json 深等）/DIV-9-2（在写回而非序列化前简化——避免内存=落盘分离）/DIV-9-3。
+
+**阶段结论**：需求/设计工件 `.spec/service-assembly-p9/{requirements,design}.md` 定稿 → 编码（S1→S2→S3）。
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；编码各自独立可回。
+
 
 
 
