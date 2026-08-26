@@ -6016,6 +6016,44 @@ A1 平名仓库（loader.rs:40 / registry.rs:34）+ A7 writes 仅记录不落盘
 DECISIONS 条目）。回滚 = 撤本提交即回授予前状态；后续编码各 commit 各自回滚（改动 → 提交 →
 本条目互查）。
 
+---
+
+## D-117（服务装配单元 Phase 1 系统设计定稿）
+
+**日期**：2026-08-26
+
+**触发问题**：需求关闸通过后进入阶段 2（系统设计），需把 E1（entry 化）+ E2（A1 身份键）+
+E3（A7 写回）+ E4（等价性）落成可验收设计（`.spec/service-assembly/design.md`）。
+
+**自下而上核实的新事实（设计期）**：
+- `EntryOptions` 全字段 `Serialize/Deserialize`（entry.rs:14-42）→ `serde_yaml::to_string(entries)`
+  即无损 YAML 配置反解（`merge_path_for_include` lib.rs:564 已有先例）；`dsh-cli` 已依赖
+  dsh-persistence（`fs_atomic::atomic_write` 可用）——A7 落盘无新依赖。
+- `boot()` 依赖 `dsh:services` 经 `include.load()` 应用（lib.rs:211-215 `get_typed("sessions")`——
+  证明 services entry 已走 loader 按名 apply）；E1 只改 loop 装配判定，`dsh:services` 行为零变化。
+- HMR refresh 的 loop 定位（lib.rs:255）同有 `name != "dsh:services"` 特判，随 E1 一并消除。
+- `Arc::ptr_eq` 对 `Arc<dyn Plugin>` 成立 → 可作「同实现=同身份」判定；`dyn Plugin` 指针身份用
+  每注册铸新 `Arc<()>` token（复用 dsh-scope ScopeKey 的 Arc 身份纪律）。
+
+**关键设计决策**：
+1. **E1**：`boot()` 装配循环只认 `config.wasm` 为 loop 入口；新增 `register_host_service_plugins`
+   登记面（现 dsh:services，未来 genai 适配器等追加）；其余入口全走 include.load() 按名解析。
+2. **E2（A1 实现为本身份）**：`plugins: HashMap<String, PluginRecord{ identity: PluginIdentity(Arc<()>),
+   plugin: Arc<dyn Plugin>, generation: u64 }>`；`register_plugin` 同一 Arc 幂等、不同 Arc 铸新身份
+   +generation+=1（harness re-import=新身份 口径）；`load_plugin` 把身份记录到 Entry（为 HMR
+   换代 / case-4 预备）。**范围控制**：本阶段只做注册语义+可观察身份+Entry 记录，B3 HMR 完整
+   链路后续。
+3. **E3（A7）**：loader 增通用 seam `set_persist(PersistSink)` + `entry_options()` 权威有序列表 +
+   `persist()`；触发点在 create/update/remove 的 `write()` 之后；宿主在 boot 完成后挂 seam，
+   原子写主 config_path（合并后权威列表）；Config.simplify 由 Value→YAML 直写承担（DIV-3）。
+4. **E4**：新增/扩展 dsh-diff「服务依赖激活」剧本（06-dependency-gate 形态），TS golden 对齐。
+5. **实现顺序**：S1(E2)→S2(E1)→S3(E3)→S4(E4)，各独立提交=回滚点；TDD 红→绿。
+
+**阶段结论**：系统设计关闸工件定稿（`.spec/service-assembly/design.md`）→ 进入阶段 3（编码实现，
+TDD 红→绿，S1..S4 逐提交）。
+
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；S1..S4 编码各自独立可回。
+
 
 
 
