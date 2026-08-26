@@ -6773,6 +6773,29 @@ DIV-7-1）；B1-PROOF=A（m-series m22 T1-T4 + 单测，无 golden——TS host 
 **阶段结论**：需求关闭工件 `.spec/service-assembly-p7/requirements.md` 定稿 → 进入阶段 2（系统设计）。
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
 
+## D-146（服务装配单元 Phase 7 系统设计定稿：B1 extend/invoke 原语 + srv 通道 + m22）
+
+**日期**：2026-08-27
+
+**触发问题**：D-145 需求关闸通过 → 阶段 2（系统设计）。
+
+**关键设计定案**：
+- **S1**：`Service` trait 增 `extend(self: Arc<Self>, ctx)`（默认恒等，对象安全）+ `invoke(&self,
+  ctx, args)`（默认 Err "not callable"）+ `as_any()`（派生字段读出通道）。
+- **S2**：`Runtime.srv: HashMap<(ScopeId,String), Arc<dyn Service>>`（Service 类型直达，绕开
+  Any→dyn Service 不可下转型）；`provide_service` 签名不变追加 srv 注册（同 `resolve_scope` 键）+
+  组合 disposer（Rc::new d1+d2）；`srv_lookup` 按当前纤维 scope 链镜像 impl 解析；
+  `ctx.get_extended`/`ctx.call_service`。
+- **S3 m22**：T1 自定义派生（访问方纤维名标记）/ T2 默认恒等 ptr_eq / T3 invoke 加和 / T4 不可调用
+  Err + m1_service/logger 回归（DIV-7-1）。
+- **DIV-7-1** 生产 logger 不改；**DIV-7-2** 仅 `provide_service` 进 srv 通道；**DIV-7-3** extend 默认
+  恒等（Rust 泛型克隆不可行）。
+
+**验证（设计关闸）**：`design.md` 定稿；实现 S1（TDD T1-T4 红→绿）+ S2/S3（m22）+ 回归（workspace +
+clippy）+ 阶段 4/5 关闸。
+
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
+
 
 
 
