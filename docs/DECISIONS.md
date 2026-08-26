@@ -6239,6 +6239,34 @@ golden 逐字节未变）。
 **预期影响与回滚点**：Phase 1 全部五个阶段过关。回滚 = 各步独立 `git revert`（见 acceptance §3.3）。
 下一阶段（A2/A3/A4/A5/A6/B 类 + A1 HMR 完整链路）按 handoff 缺口清单另行立项。
 
+---
+
+## D-124（服务装配单元 Phase 2 需求分析定稿：A3+A4 依赖激活核对）
+
+**日期**：2026-08-26
+
+**触发问题**：用户「继续下一阶段开发」。Phase 1 完成后，handoff 缺口清单剩余核心项：A3（提供者
+check/strict-active）、A4（注入快照/unprovide 顺序/父链 walk）、A6（生成器 effect）、A5（intercept
+合并）、B 类。范围经第一性原理定界后用户确认 **A3+A4 依赖激活核对**（闭环「按依赖自动激活」验收面）。
+
+**自下而上核实（Phase 2 预勘）**：
+- A3 核心已存在：`CheckFn`/`Impl.check`/`check_ok()`（reflect.rs:11-34）、`check_impls` false→PENDING
+  （runtime.rs:616）、`provide_with(name,value,check)`（context.rs:1275）、provide 仅 ACTIVE fiber
+  （context.rs:1284 `InactiveEffect`）。
+- A4：disposer = `remove_impl→notify`（context.rs:1308）vs TS「先 notify 再自清」（reflect.ts:297-303）
+  ——**顺序待 golden 判定**；epoch/refresh 已有（runtime.rs:633-666）；`resolve_scope` 父链 walk 已有
+  （runtime.rs:301-315）。
+- 缺口 = **等价覆盖为零**（18 个 dsh-diff 剧本均无 check 用例）+ DSL 无 check 参数（两侧对称扩展）
+  + unprovide 顺序待判定 + 跨 realm golden 缺失。
+
+**关键决策（Phase 2）**：P2-SCOPE=A3+A4；DIV-2-1 顺序分歧以 TS 为权威修复 Rust；DIV-2-2 check
+golden 用静态 bool（动态态变 spike 另立）；DIV-2-3 父链 walk 以「解析落 realm + 块级时序」为准
+（loader 级 isolate 场景承载）。
+
+**阶段结论**：需求关闸工件 `.spec/service-assembly-p2/requirements.md` 定稿 → 进入阶段 2（系统设计）。
+
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；后续设计/编码各自独立可回。
+
 
 
 
