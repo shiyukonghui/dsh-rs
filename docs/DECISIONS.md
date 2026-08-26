@@ -6685,6 +6685,25 @@ config/process/env/ctx 冲突时显式键优先）。
 **阶段结论**：需求关闭工件 `.spec/service-assembly-p6/requirements.md` 定稿 → 进入阶段 2（系统设计）。
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
 
+## D-142（服务装配单元 Phase 6 系统设计定稿：A2 eval_scope 绑注入服务 + m21）
+
+**日期**：2026-08-27
+
+**触发问题**：D-141 需求关闸通过 → 阶段 2（系统设计）。
+
+**关键设计定案**：
+- **S1**：`eval_scope_with_services(config, process, services)`——services 对象 → `ctx`（成员访问）+
+  服务名顶层裸标识符（显式键 config/process/env/ctx 优先）；空 services = 现状（m3 零回归）。
+- **S2**：internal/config 监听器从 `args[0]=fid` 取目标纤维（waterfall 早于 current.push 的约束）→
+  `{name → get_value(name)}` 遍历 `fiber(fid).inject`；disabled 表达式绑定当前纤维（best-effort）。
+- **S3 m21**：T1 裸标识符读注入服务 / T2 ctx 成员 + 显式键优先 / T3 未注入服务 fail-loud 保留。
+- **DIV-6-1** 仅 Value 型服务暴露；**DIV-6-2** get_value 按监听时刻可见性解析。
+
+**验证（设计关闸）**：`design.md` 定稿；实现 S1（TDD T1-T3 红→绿）+ S2/S3（m21）+ 回归（workspace +
+clippy）+ 阶段 4/5 关闸。
+
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
+
 
 
 
