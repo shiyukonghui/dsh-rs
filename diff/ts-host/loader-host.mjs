@@ -38,6 +38,10 @@ function buildPlugin(desc, trace) {
         case 'log-config':
           trace.push(`log-config:${JSON.stringify(config)}`)
           break
+        case 'provide':
+          trace.push(`provide:${op.service}:${JSON.stringify(op.value)}`)
+          ctx.provide(op.service, op.value)
+          break
         default:
           throw new Error(`unknown apply op ${op.op}`)
       }

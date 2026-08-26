@@ -6163,6 +6163,34 @@ dsh-cli 全量回归 EXIT=0；clippy `-D warnings` 零。
 （PersistSink/set_persist/entry_options/attach_config_persist）。回滚 = `git revert` 本提交
 （独立回滚点）。
 
+---
+
+## D-121（服务装配单元 Phase 1 · S4 编码：E4 dsh-diff 服务依赖激活等价剧本）
+
+**日期**：2026-08-26
+
+**触发问题**：按设计 S4=E4——「服务插件依赖激活」dsh-diff 等价剧本：cordis.yml 声明的服务 entry
+经 **loader 按名路径**装配：提供者 provide → 依赖方 inject 等待自动激活（与 TS cordis 语义等价）。
+
+**自下而上核实**：06-dependency-gate 已是 cordis **非 loader**（ctx.plugin 直挂）层面的依赖门等价；
+dsh-diff `ScenarioPlugin`（Rust）已支持 `ApplyOp::Provide`（lib.rs:610，trace `provide:{svc}:{json}`
+与 TS `JSON.stringify` 一致）；**loader-host.mjs（TS）的 apply DSL 只支持 log/log-config**——「loader
+按名 entry + provide 服务」的等价面缺对称支持 → 本步补齐。
+
+**实现（红→绿）**：
+- `diff/ts-host/loader-host.mjs` buildPlugin 增 `case 'provide'`（trace + `ctx.provide`），镜像
+  scenario-host；`verify-diff.mjs` 把 `loader-13-*` 加入 ASYNC_SCENARIOS。
+- 新增 `scenarios/loader-13-service-entry-dependency-activation.json`：consumer（`inject:["svc"]`）+
+  provider（`provide svc:"v1"`）经 `loader-create` 顺序挂载 + `loader-remove` + 重建。
+- golden 由 **TS loader-host（vendored cordis-plugin-loader）生成**；Rust dsh-diff 逐行对比。
+
+**验证（等价关闸）**：`node verify-diff.mjs` **18/18 PASS**——新 `loader-13` golden 27 行精确匹配
+（`plugin:consumer` PENDING（无 apply）→ provider provide → consumer Loading→Active → 卸载双 Unload →
+再挂载再激活），既有 17 场景零回归（golden 逐字节未变）。
+
+**预期影响与回滚点**：纯 diff 基建（loader-host + verify-diff + scenario + golden），无 Rust 运行面
+改动。回滚 = `git revert` 本提交；对 S1-S3 零影响。
+
 
 
 

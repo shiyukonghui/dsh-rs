@@ -1,0 +1,20 @@
+{
+  "name": "loader-13-service-entry-dependency-activation",
+  "plugins": {
+    "consumer": {
+      "name": "consumer",
+      "inject": ["svc"],
+      "apply": [{ "op": "log", "text": "consumer-applied" }]
+    },
+    "provider": {
+      "name": "provider",
+      "apply": [{ "op": "provide", "service": "svc", "value": "v1" }]
+    }
+  },
+  "steps": [
+    { "op": "loader-create", "options": { "id": "consumer", "name": "consumer" } },
+    { "op": "loader-create", "options": { "id": "provider", "name": "provider" } },
+    { "op": "loader-remove", "id": "provider" },
+    { "op": "loader-create", "options": { "id": "provider", "name": "provider" } }
+  ]
+}
