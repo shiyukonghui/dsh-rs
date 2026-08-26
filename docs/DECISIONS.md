@@ -6847,6 +6847,33 @@ provide_service 零改动）；`cargo clippy --workspace --all-targets -- -D war
 **预期影响与回滚点**：Phase 7（B1）五阶段全闭环。回滚 = `git revert 962986d` + 撤 D-148 工件提交。
 后续按目标优先级：B2 Group 折叠 / B4 config simplify + A3 动态 check spike。
 
+## D-149（服务装配单元 Phase 8 需求+设计定稿：B2 Group 子入口失败 fail-loud）
+
+**日期**：2026-08-27
+
+**触发问题**：B1 闭环后进入 B2（HANDOFF §3 B2「Group 折叠差异」）。
+
+**自下而上核对（源码实证）**：
+- HANDOFF「Rust 无独立 Group fiber」**已过时**——M22 起 `GroupPlugin`（loader.rs:341）为真实 fiber；
+  三约定中**事件顺序/init await**（loader-10 golden，async 驱动）与**group 同 realm**（m3_isolate
+  group_realm_walk + loader-15 golden）均已对齐。
+- **真缺口（红证 m23 首版）**：fork `_start`（lib/index.js:522-533）`await fiber.await()` —— 子失败
+  reject → group update 抛 → **loader 装载失败**；Rust `load_group_plugin` 只查 Group 自身 fiber_error，
+  组内子失败被吞（`.ok()` / Await 恒 None）→ group 保持 Active（m23 红：`Some(Active)` vs `Failed`）。
+
+**需求收敛（阶段 1）**：B2 = 三约定核对（已有证据收口）+ 子失败缺口按 **fail-loud + 回滚** 修复（cordis
+装载事务语义）；子失败场景无 golden（TS loader-sync reject）→ **m-series 证据**（延续 A2/B1 的 B 类
+非核心先例）。非目标：不动 dsh-core fiber 失败层、不动正常分组路径。
+
+**设计收敛（阶段 2）**：`group_child_error(gid)`（`entries[g].subgroup → groups[sg].data` 逐子
+`fiber_error`）→ `load_group_plugin`(sync) + `load_group_plugin_async` 在自身 fiber 无错后前置检查 →
+Err → `create/update` 既有回滚（`dispose_entry(g)` 级联停止子入口）清理。检测点在子入口完全 settle 后
+（H2）。DIV-8-1（无 golden）/ DIV-8-2（组中组传递覆盖）/ DIV-8-3（返回首个失败子错误）。
+
+**阶段结论**：需求/设计工件 `.spec/service-assembly-p8/{requirements,design}.md` 定稿 → 编码（m23
+红→绿）。
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；编码各自独立可回。
+
 
 
 
