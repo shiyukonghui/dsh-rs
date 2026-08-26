@@ -6319,6 +6319,27 @@ dsh-core/dsh-loader/dsh-diff/dsh-wasmrt/dsh-cli 全量 EXIT=0；clippy `-D warni
 **预期影响与回滚点**：dsh-diff DSL（Provide 加 check 字段 + disposer 索引）为兼容增量（既有剧本
 零变化）；m 系列只增测试。回滚 = `git revert` 本提交（dsh-diff/diff-ts-host/测试/剧本，独立回滚点）。
 
+---
+
+## D-127（服务装配单元 Phase 2 验收收口：阶段 4 关闸 + 阶段 5 部署冒烟 + acceptance 工件）
+
+**日期**：2026-08-26
+
+**触发问题**：Phase 2 编码完成 → 阶段 4（测试验证）与阶段 5（部署）验收收口。
+
+**阶段 4 关闸**：`cargo test --workspace` EXIT=0（含 m7_await 5/5、m3_isolate 3/3 新用例）；
+`cargo clippy --workspace --all-targets -- -D warnings` EXIT=0；`node verify-diff.mjs` 21/21 PASS
+（三个新 golden 逐行对齐）。
+
+**阶段 5 部署冒烟**：`dsh web target/web/cordis.yml`（port 60882）`/` HTTP 200、进程干净退出——
+Phase 2 零改运行面（dsh-core/boot/serve 未动），serve 零回归（冒烟后进程已停）。
+
+**工件**：`.spec/service-assembly-p2/acceptance.md`（验收报告：A3a/A4a/A4c 等价证据、阶段 4 证据、
+部署/回滚、诚实边界、决策链互查）。
+
+**预期影响与回滚点**：Phase 2 全部五阶段过关。回滚 = `git revert e97dc05`（编码，独立）/
+`3cbd48b`（设计）等。剩余缺口 A5/A6/B 类 + A3 动态 check spike 后续按需立项。
+
 
 
 
