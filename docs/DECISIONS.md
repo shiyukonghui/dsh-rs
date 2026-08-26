@@ -7041,6 +7041,28 @@ warnings 0；verify-diff **23/23**。
 
 **预期影响与回滚点**：回滚 = `git revert` 本提交。待阶段 5（serve 冒烟 + acceptance + D-157）。
 
+## D-157（服务装配单元 Phase 10 验收收口：A3 spike 阶段 4 关闸 + 阶段 5 部署冒烟 + acceptance）
+
+**日期**：2026-08-27
+
+**触发问题**：D-156 spike 落定 → 阶段 4/5 验收收口。
+
+**阶段 4 关闸**：workspace EXIT=0（205 目标）；clippy 0（红期 doc 列表缩进 lint 修复）；verify-diff
+23/23 零回归。
+
+**阶段 5 部署冒烟**：`dsh web target/web/cordis.yml --port 60890` → `GET /` HTTP 200（len 13270 基线
+一致），进程干净停止。零生产路径变化（纯测试锁定）。
+
+**关键取舍如实收口**：A3 = 谓词存在性（m7/scenario-10，既有）+ 动态触发点 parity（m25 5 断言）——
+**零生产代码改动**；纯谓词翻转非反应式系 cordis 语义（DIV-10-2），不引入越界广播；动态翻转不可
+golden（DIV-10-1），m-series 锁定。
+
+**工件**：`.spec/service-assembly-p10/acceptance.md`（交付核对/阶段 4 证据/spike 结论/部署回滚/
+诚实边界/决策链互查）。
+
+**预期影响与回滚点**：Phase 10（A3）验收完成——**目标全部缺口（A5/A2/B1/B2/B4/A3）闭环**。回滚 =
+各阶段 git revert 特征级。目标可标 complete。
+
 
 
 
