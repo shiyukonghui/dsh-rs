@@ -6054,6 +6054,43 @@ TDD 红→绿，S1..S4 逐提交）。
 
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；S1..S4 编码各自独立可回。
 
+---
+
+## D-118（服务装配单元 Phase 1 · S1 编码：A1 插件身份键落地）
+
+**日期**：2026-08-26
+
+**触发问题**：按设计 S1=E2（A1 实现为本身份）进入编码（TDD 红→绿）。
+
+**自下而上核实**：`st.plugins` 仅 dsh-loader 内部 3 处使用（register_plugin / load_plugin /
+load_plugin_async）；`Arc::ptr_eq` 对 `Arc<dyn Plugin>` 成立；`dsh-diff` 的 `.plugins` 是自己
+结构体字段（无关）。
+
+**实现（红→绿）**：
+- 新增 `crates/dsh-loader/src/identity.rs`：`PluginIdentity(Arc<()>)`（指针身份，PartialEq/Eq/Hash
+  按 `Arc::as_ptr`）+ `PluginRecord { identity, plugin, generation }`。
+- 仓库 `plugins: HashMap<String, PluginRecord>`；`register_plugin` 语义：同名**同一 Arc** → 幂等
+  （身份/generation 不变）；同名**新实现** → 铸新身份 + generation+=1（harness re-import=新身份）。
+- `load_plugin`/`load_plugin_async` 解析 `record` → 把 `identity` 记录到 `Entry.identity`。
+- 新增访问器 `plugin_identity/plugin_generation/entry_identity`；`Entry` 增 `identity: Option<..>`
+  （4 处构造点补 `identity: None`；group 合成插件不记身份——不进注册表、B2 后续）。
+- 红测 `tests/m16_identity.rs` ×4：同实现幂等 / 新实现新身份+generation 递增 / entry 记录解析
+  身份且换代重挂载更新 / 未知 name None。
+
+**范围控制（DIV-4）**：本步只做注册语义 + 可观察身份 + Entry 记录；B3（HMR 模块热更完整链路）
+后续阶段。
+
+**环境处理（D-115 同款已记）**：`target\debug\dsh.exe` 被先前阶段遗留的 60880 演示服务（PID
+36560）占用 → 按 D-115 先例 Stop-Process 后跑测试/clippy；演示服务未自动重启（恢复命令见
+D-118 提交信息保留；需要时由用户决定是否以原命令行重启）。
+
+**验证（阶段门槛）**：dsh-loader m16_identity 4/4 绿；dsh-core/dsh-loader/dsh-diff/dsh-wasmrt/
+dsh-cli 全量回归 EXIT=0；`cargo clippy -p dsh-loader --all-targets -- -D warnings` 零告警。
+
+**预期影响与回滚点**：仓库键型变更收拢 dsh-loader 内；公开量只增（PluginIdentity/PluginRecord +
+访问器），破坏性面 = `LoaderState.plugins` 字段型（无外部读）。回滚 = `git revert` 本提交
+（独立回滚点）。
+
 
 
 

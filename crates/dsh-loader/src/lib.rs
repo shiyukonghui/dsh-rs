@@ -17,11 +17,13 @@
 pub mod entry;
 pub mod group;
 pub mod hmr;
+pub mod identity;
 pub mod include;
 pub mod loader;
 
 pub use entry::{Entry, EntryOptions};
 pub use group::EntryGroup;
 pub use hmr::Hmr;
+pub use identity::{PluginIdentity, PluginRecord};
 pub use include::{apply_entry_patches, apply_entry_patches_with_warn, Include, Patch};
 pub use loader::{EntrySnapshot, Loader, LoaderPlugin, LoaderState};

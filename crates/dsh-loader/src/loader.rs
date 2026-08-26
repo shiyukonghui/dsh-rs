@@ -15,6 +15,7 @@ use dsh_core::{
 
 use crate::entry::{Entry, EntryOptions};
 use crate::group::EntryGroup;
+use crate::identity::{PluginIdentity, PluginRecord};
 
 const ROOT_GROUP: &str = "root";
 
@@ -37,7 +38,9 @@ pub struct LoaderState {
     /// fiber → 入口（internal/plugin 检测用）。
     pub fiber_to_entry: HashMap<FiberId, String>,
     /// 插件仓库（按名解析，等价 Cordis 的模块 import 结果缓存）。
-    pub plugins: HashMap<String, Arc<dyn Plugin>>,
+    /// A1：记录承载「实现 + 身份 + 换代」——身份 = 实现本体（Arc token 指针），
+    /// 同名同实现=同身份（幂等）、同名新实现=新身份（换代）。
+    pub plugins: HashMap<String, PluginRecord>,
     /// 写回记录（持久化 no-op；测试断言写回内容）。
     pub writes: Vec<String>,
     /// 入口本地 realm：`"{entry}:{service}"` → 作用域（isolate: true）。
@@ -382,11 +385,48 @@ impl Loader {
     }
 
     /// 注册可加载的插件（等价 Cordis 模块 import 的结果缓存）。
+    ///
+    /// A1 身份语义（对齐 harness「回调为身份」）：
+    /// - 同名**同一实现**（同一 Arc）重复注册 → 幂等（身份与 generation 不变）；
+    /// - 同名**新实现**（不同 Arc）→ 铸新身份、generation += 1（re-import=新身份 口径）。
     pub fn register_plugin(&self, name: &str, plugin: Arc<dyn Plugin>) {
-        self.state.borrow_mut().plugins.insert(name.to_string(), plugin);
+        let mut st = self.state.borrow_mut();
+        match st.plugins.get_mut(name) {
+            Some(rec) if Arc::ptr_eq(&rec.plugin, &plugin) => {
+                // 同实现幂等：身份/generation 不变
+            }
+            Some(rec) => {
+                // 同名新实现：铸新身份 + 换代
+                rec.identity = PluginIdentity::new();
+                rec.plugin = plugin;
+                rec.generation += 1;
+            }
+            None => {
+                st.plugins.insert(name.to_string(), PluginRecord::new(plugin));
+            }
+        }
     }
 
     // ---- 查询 ----
+
+    /// 当前 name 注册的实现身份（未注册 → `None`）。
+    pub fn plugin_identity(&self, name: &str) -> Option<PluginIdentity> {
+        self.state.borrow().plugins.get(name).map(|r| r.identity.clone())
+    }
+
+    /// 当前 name 注册的换代计数（未注册 → `None`）。
+    pub fn plugin_generation(&self, name: &str) -> Option<u64> {
+        self.state.borrow().plugins.get(name).map(|r| r.generation)
+    }
+
+    /// entry 上次加载所解析的实现身份（未加载/未知 → `None`）。
+    pub fn entry_identity(&self, id: &str) -> Option<PluginIdentity> {
+        self.state
+            .borrow()
+            .entries
+            .get(id)
+            .and_then(|e| e.identity.clone())
+    }
 
     pub fn fiber(&self, id: &str) -> Option<FiberId> {
         self.state.borrow().entries.get(id).and_then(|e| e.fiber)
@@ -439,6 +479,7 @@ impl Loader {
                     parent_group: root.clone(),
                     subgroup: None,
                     disposing: 0,
+                    identity: None,
                 },
             );
             if let Some(g) = st.groups.get_mut(&root) {
@@ -721,11 +762,13 @@ impl Loader {
                 .ok_or_else(|| CordisError::Internal(format!("no such loader entry: {id}")))?;
             (e.options.name.clone(), e.options.config.clone())
         };
-        let plugin = {
+        let record = {
             let st = self.state.borrow();
             st.plugins.get(&name).cloned()
         }
         .ok_or_else(|| CordisError::Internal(format!("loader: unknown plugin \"{name}\"")))?;
+        let plugin = record.plugin.clone();
+        let identity = record.identity;
 
         // isolate / intercept 注入（M3）
         let (isolate_opts, intercept_opts) = {
@@ -776,6 +819,7 @@ impl Loader {
             let mut st = self.state.borrow_mut();
             if let Some(e) = st.entries.get_mut(id) {
                 e.fiber = Some(fid);
+                e.identity = Some(identity);
             }
             st.fiber_to_entry.insert(fid, id.to_string());
         }
@@ -874,6 +918,7 @@ impl Loader {
                 parent_group: gid.clone(),
                 subgroup: None,
                 disposing: 0,
+                identity: None,
             },
         );
         if let Some(g) = st.groups.get_mut(&gid) {
@@ -961,6 +1006,7 @@ impl Loader {
                     parent_group: root.clone(),
                     subgroup: None,
                     disposing: 0,
+                    identity: None,
                 },
             );
             if let Some(g) = st.groups.get_mut(&root) {
@@ -1376,11 +1422,13 @@ impl Loader {
                 .ok_or_else(|| CordisError::Internal(format!("no such loader entry: {id}")))?;
             (e.options.name.clone(), e.options.config.clone())
         };
-        let plugin = {
+        let record = {
             let st = self.state.borrow();
             st.plugins.get(&name).cloned()
         }
         .ok_or_else(|| CordisError::Internal(format!("loader: unknown plugin \"{name}\"")))?;
+        let plugin = record.plugin.clone();
+        let identity = record.identity;
 
         // isolate / intercept 注入（与同步 `load_plugin` 相同）
         let (isolate_opts, intercept_opts) = {
@@ -1431,6 +1479,7 @@ impl Loader {
             let mut st = self.state.borrow_mut();
             if let Some(e) = st.entries.get_mut(id) {
                 e.fiber = Some(fid);
+                e.identity = Some(identity);
             }
             st.fiber_to_entry.insert(fid, id.to_string());
         }

@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use dsh_core::{FiberId, Value};
 
+use crate::identity::PluginIdentity;
+
 fn default_config() -> Value {
     serde_json::json!({})
 }
@@ -76,4 +78,6 @@ pub struct Entry {
     pub subgroup: Option<String>,
     /// 自处置保护计数（7-case case 6）。
     pub disposing: u32,
+    /// 本入口上次加载所解析的插件实现身份（A1：未加载/未解析 = `None`）。
+    pub identity: Option<PluginIdentity>,
 }
