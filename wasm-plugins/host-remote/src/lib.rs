@@ -415,6 +415,120 @@ fn dynamic_sync_inspect_manifest(_body: &Value) -> Vec<u8> {
     serde_json::to_vec(&json!({"ok": true, "value": null})).unwrap_or_default()
 }
 
+/// dynamicCordisRunner/runHostHalf：真实动态装配——宿主 `dynamicActivate` 把 packageId
+/// 对应的 wasm 组件包装配进 loader（fiber 真启动），host half 即 Rust 侧真实装配。
+/// Rust 无 dynamic client 包 → 无 approval → startedHere:true + waitingFor:[]。
+/// 返回 schema：`{ok:true, pluginId, packageId, pluginRunId, waitingFor, startedHere}`
+/// 或 `{ok:false, message}`（无 error 包装——与 descriptor union 严格对齐）。
+fn dynamic_run_host_half(body: &Value) -> Vec<u8> {
+    let plugin_id = body.get("pluginId").and_then(|s| s.as_str()).unwrap_or("");
+    let package_id = body.get("packageId").and_then(|s| s.as_str()).unwrap_or("");
+    if plugin_id.is_empty() || package_id.is_empty() {
+        return serde_json::to_vec(&json!({"ok": false, "message": "runHostHalf: pluginId/packageId required"})).unwrap_or_default();
+    }
+    match set_service("dynamicActivate", &json!({"pluginId": plugin_id, "packageId": package_id})) {
+        Ok(v) => {
+            let run_id = v.get("pluginRunId").and_then(|r| r.as_str()).unwrap_or(plugin_id);
+            serde_json::to_vec(&json!({
+                "ok": true,
+                "pluginId": plugin_id,
+                "packageId": package_id,
+                "pluginRunId": run_id,
+                "waitingFor": [],
+                "startedHere": true,
+            }))
+            .unwrap_or_default()
+        }
+        Err(e) => {
+            // e 是 {ok:false, error:{code,message}}——重写成 schema 的 {ok:false, message}。
+            match serde_json::from_slice::<Value>(&e) {
+                Ok(v) => serde_json::to_vec(&json!({
+                    "ok": false,
+                    "message": v.get("error").and_then(|x| x.get("message")).and_then(|m| m.as_str()).unwrap_or("activation failed"),
+                }))
+                .unwrap_or_default(),
+                Err(_) => serde_json::to_vec(&json!({"ok": false, "message": "activation failed"})).unwrap_or_default(),
+            }
+        }
+    }
+}
+
+/// dynamicCordisRunner/stopFromPanel：真实停跑（宿主 dynamicStop = dispose + 移除 entry）。
+/// 返回 schema：`{ok:true}` 或 `{ok:false, reason(plugin-missing|not-running), message}`。
+fn dynamic_stop_from_panel(body: &Value) -> Vec<u8> {
+    let plugin_id = body.get("pluginId").and_then(|s| s.as_str()).unwrap_or("");
+    if plugin_id.is_empty() {
+        return serde_json::to_vec(&json!({"ok": false, "reason": "plugin-missing", "message": "pluginId required"})).unwrap_or_default();
+    }
+    match set_service("dynamicStop", &json!({"pluginId": plugin_id})) {
+        Ok(_) => serde_json::to_vec(&json!({"ok": true})).unwrap_or_default(),
+        Err(e) => {
+            // 宿主报「not running」→ not-running；否则插件缺失/装配失败 → plugin-missing。
+            let msg = extract_message(&e).unwrap_or_else(|| "stop failed".to_string());
+            let reason = if msg.contains("not running") { "not-running" } else { "plugin-missing" };
+            serde_json::to_vec(&json!({"ok": false, "reason": reason, "message": msg}))
+                .unwrap_or_default()
+        }
+    }
+}
+
+/// dynamicCordisRunner/undefineFromPanel：真实卸载（宿主 dynamicUndefine = 移除 entry + 包）。
+/// 返回 schema：`{ok:true, wasRunning}` 或 `{ok:false, reason:plugin-missing, message}`。
+fn dynamic_undefine_from_panel(body: &Value) -> Vec<u8> {
+    let plugin_id = body.get("pluginId").and_then(|s| s.as_str()).unwrap_or("");
+    if plugin_id.is_empty() {
+        return serde_json::to_vec(&json!({"ok": false, "reason": "plugin-missing", "message": "pluginId required"})).unwrap_or_default();
+    }
+    match set_service("dynamicUndefine", &json!({"pluginId": plugin_id})) {
+        Ok(_) => serde_json::to_vec(&json!({"ok": true, "wasRunning": true})).unwrap_or_default(),
+        Err(e) => serde_json::to_vec(&json!({
+            "ok": false,
+            "reason": "plugin-missing",
+            "message": extract_message(&e).unwrap_or_else(|| "undefine failed".to_string()),
+        }))
+        .unwrap_or_default(),
+    }
+}
+
+/// 从规范化错误字节提取 message（`{ok:false, error:{code,message}}`）。
+fn extract_message(err_bytes: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(err_bytes)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        })
+}
+
+/// dynamicCordisRunner/settleUserRun：Rust 无 client half → 无 pending approval 可结算
+/// → 诚实 `{ok:false, reason:not-running}`（无决策可结算，绝不伪造 ok）。
+/// 返回 schema：`{ok:false, reason(not-running), message}`。
+fn dynamic_settle_user_run(body: &Value) -> Vec<u8> {
+    let plugin_id = body.get("pluginId").and_then(|s| s.as_str()).unwrap_or("");
+    serde_json::to_vec(&json!({
+        "ok": false,
+        "reason": "not-running",
+        "message": format!("dynamic plugin {plugin_id}: Rust has no pending client activation to settle"),
+    }))
+    .unwrap_or_default()
+}
+
+/// dynamicCordisRunner/resolveRequestRun：面板 Approve/Decline 的后台回执。Rust 无
+/// pending cordis 激活请求 → 诚实 `{accepted:false}`（无请求可决；绝不伪造 accepted）。
+/// 返回 schema：`{accepted:boolean}`。
+fn dynamic_resolve_request_run(_body: &Value) -> Vec<u8> {
+    serde_json::to_vec(&json!({"accepted": false})).unwrap_or_default()
+}
+
+/// dynamicCordisRunner/resolveInspectQuery：inspect 查询后台回执。Rust 无 pending
+/// inspect 查询 → 诚实 `{accepted:false}`。
+/// 返回 schema：`{accepted:boolean}`。
+fn dynamic_resolve_inspect_query(_body: &Value) -> Vec<u8> {
+    serde_json::to_vec(&json!({"accepted": false})).unwrap_or_default()
+}
+
 impl Guest for HostRemote {
     fn handle(namespace: String, method: String, body: Vec<u8>) -> Vec<u8> {
         let body_value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -427,6 +541,12 @@ impl Guest for HostRemote {
             ("sessionReferenceResolver", "candidates") => session_reference_candidates(&body_value),
             ("dynamicCordisRunner", "inventory") => dynamic_inventory(&body_value),
             ("dynamicCordisRunner", "syncInspectManifest") => dynamic_sync_inspect_manifest(&body_value),
+            ("dynamicCordisRunner", "runHostHalf") => dynamic_run_host_half(&body_value),
+            ("dynamicCordisRunner", "stopFromPanel") => dynamic_stop_from_panel(&body_value),
+            ("dynamicCordisRunner", "undefineFromPanel") => dynamic_undefine_from_panel(&body_value),
+            ("dynamicCordisRunner", "settleUserRun") => dynamic_settle_user_run(&body_value),
+            ("dynamicCordisRunner", "resolveRequestRun") => dynamic_resolve_request_run(&body_value),
+            ("dynamicCordisRunner", "resolveInspectQuery") => dynamic_resolve_inspect_query(&body_value),
             _ => error(
                 "internal",
                 &format!("host-remote: endpoint {namespace}/{method} not provided by this host"),

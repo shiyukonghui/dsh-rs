@@ -4254,17 +4254,26 @@ fn dispatch_wasm_remote(boot: &Boot, method: &str, payload: &Value) -> Value {
     };
     let Some(plugin) = boot.remote_plugin.as_ref() else {
         return serde_json::json!({"ok": false, "error": {
-            "code": "not-implemented",
+            "code": "internal",
             "message": format!("remote endpoint {method} (no wasm remote host assembled)"),
+            "details": {},
         }});
     };
-    // 组件 body：传给插件的 payload（agent 上下文已由前端平铺字段；直接透传）。
-    let body = serde_json::to_vec(payload).unwrap_or_default();
+    // 组件 body：前端 gateway 把端点参数包在 `payload.args`（`rpc.call('/api', e, {args})`）——
+    // 解包后透传组件（组件读平铺字段）；无 args 壳（curl/直接调用）→ 透传 payload 本身。
+    let body_payload = payload.get("args").unwrap_or(payload);
+    let body = serde_json::to_vec(body_payload).unwrap_or_default();
     match plugin.borrow().handle(namespace, mm, &body, boot.remote_projector.clone()) {
         Ok(v) if v.get("ok").and_then(|o| o.as_bool()) == Some(false) => {
-            let err = v.get("error").cloned().unwrap_or_else(|| {
+            let mut err = v.get("error").cloned().unwrap_or_else(|| {
                 serde_json::json!({"code": "internal", "message": "wasm remote endpoint error"})
             });
+            // 前端 serverResponseSchema 要求 error 必带 details；缺失补空对象。
+            if err.get("details").is_none() {
+                if let Some(obj) = err.as_object_mut() {
+                    obj.insert("details".to_string(), serde_json::json!({}));
+                }
+            }
             serde_json::json!({"ok": false, "error": err})
         }
         // 组件结果即前端期望的 value（成功裸值或 {ok:true, value} 已含）。
@@ -4272,6 +4281,7 @@ fn dispatch_wasm_remote(boot: &Boot, method: &str, payload: &Value) -> Value {
         Err(e) => serde_json::json!({"ok": false, "error": {
             "code": "internal",
             "message": e.to_string(),
+            "details": {},
         }}),
     }
 }
@@ -4364,6 +4374,175 @@ mod tests {
             remote_projector: None,
             loader: None,
         }
+    }
+
+    /// 读取（如缺构建）hello-component 组件字节（dsh-plugin world，阶段 B 动态包载体）。
+    fn hello_component_bytes() -> Vec<u8> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../wasm-plugins/hello-component");
+        let wasm = dir.join("target/wasm32-wasip1/debug/hello_component_plugin.wasm");
+        if !wasm.exists() {
+            let status = std::process::Command::new("cargo")
+                .args(["component", "build", "--manifest-path"])
+                .arg(dir.join("Cargo.toml"))
+                .status()
+                .expect("run cargo component build for hello-component");
+            assert!(status.success(), "hello-component build failed");
+        }
+        std::fs::read(wasm).unwrap()
+    }
+
+    /// 阶段 B（红→绿）：真实动态装配——RemoteHost 把 hello-component 包装配进真实
+    /// loader（fiber 启动 → `greeting` 服务可查），stop 后 entry 移除，undefine 移除包。
+    #[test]
+    fn dynamic_assembly_activates_stops_undefines() {
+        use dsh_loader::Loader;
+        let cordis = dsh_core::Cordis::new();
+        let loader = Loader::new(&cordis).unwrap();
+        let host = crate::remote_host::RemoteHost::new(None, Some(loader.clone()), None);
+        host.register_dynamic_package(crate::remote_host::DynamicPackage {
+            plugin_id: "hello".to_string(),
+            package_id: "pkg-v1".to_string(),
+            name: "hello-component".to_string(),
+            purpose: "run".to_string(),
+            bytes: hello_component_bytes(),
+            has_host_half: true,
+            has_client_half: false,
+        });
+        // activate：真实装配 → loader 出现 dyn:hello entry（fiber 启动）。
+        let (run_id, _) = host.dynamic_activate("hello", "pkg-v1").expect("activate");
+        assert_eq!(run_id, "dyn:hello");
+        let entries = loader.entries();
+        assert!(entries.iter().any(|e| e.id == "dyn:hello" && !e.disabled), "entry active");
+        // fiber 真启动（hello-component apply 提供 `greeting` 服务）。
+        let greeting = cordis.get_typed::<serde_json::Value>("greeting");
+        assert!(greeting.is_some(), "hello dynamic plugin provided greeting (fiber applied)");
+        // stop：entry 移除（保留包定义）。
+        assert!(host.dynamic_stop("hello").expect("stop"));
+        assert!(!loader.entries().iter().any(|e| e.id == "dyn:hello"), "stopped entry removed");
+        // undefine：包定义移除 → 不能再激活。
+        assert!(host.dynamic_undefine("hello").expect("undefine"));
+        assert!(host.dynamic_activate("hello", "pkg-v1").is_err(), "undefined package cannot activate");
+    }
+
+    /// 阶段 B（组件级全链路）：wasm 端点 runHostHalf → host-services.set(dynamicActivate)
+    /// → 真实宿主装配（fiber 启动）→ wire 信封; stopFromPanel → 停跑; settle → 诚实 not-running。
+    #[test]
+    fn dynamic_wasm_runner_full_chain() {
+        use dsh_loader::Loader;
+        let cordis = dsh_core::Cordis::new();
+        let loader = Loader::new(&cordis).unwrap();
+        let host = std::rc::Rc::new(crate::remote_host::RemoteHost::new(None, Some(loader.clone()), None));
+        host.register_dynamic_package(crate::remote_host::DynamicPackage {
+            plugin_id: "hello".to_string(),
+            package_id: "pkg-v1".to_string(),
+            name: "hello-component".to_string(),
+            purpose: "run".to_string(),
+            bytes: hello_component_bytes(),
+            has_host_half: true,
+            has_client_half: false,
+        });
+        let projector: std::rc::Rc<dyn dsh_wasmrt::RemoteServiceProjector> = host.clone();
+        let plugin = dsh_wasmrt::WasmRemoteEndpointPlugin::new(
+            "host-remote",
+            &super::host_remote_component_bytes(),
+            dsh_wasmrt::Capabilities::default(),
+            None,
+        )
+        .unwrap();
+
+        // runHostHalf：真实装配 + wire（{ok:true, pluginId, packageId, pluginRunId, waitingFor:[], startedHere:true}）。
+        let r = plugin.handle(
+            "dynamicCordisRunner", "runHostHalf",
+            br#"{"pluginId":"hello","packageId":"pkg-v1","mode":"run"}"#,
+            Some(projector.clone()),
+        ).unwrap();
+        assert_eq!(r["ok"], true, "run ok: {r}");
+        assert_eq!(r["pluginId"], "hello");
+        assert_eq!(r["pluginRunId"], "dyn:hello");
+        assert_eq!(r["startedHere"], true);
+        assert!(cordis.get_typed::<serde_json::Value>("greeting").is_some(), "fiber applied via wasm endpoint");
+        assert!(loader.entries().iter().any(|e| e.id == "dyn:hello"), "entry active");
+
+        // 阶段 C：inventory 反映真实包定义 + 装配状态（activeRun/latestRun running）。
+        let inv = plugin.handle(
+            "dynamicCordisRunner", "inventory",
+            br#"{}"#,
+            Some(projector.clone()),
+        ).unwrap();
+        let inv_arr = inv["value"].as_array().expect("value array");
+        assert_eq!(inv_arr.len(), 1, "one defined package: {inv}");
+        let row = &inv_arr[0];
+        assert_eq!(row["pluginId"], "hello");
+        assert_eq!(row["packages"][0]["packageId"], "pkg-v1");
+        assert_eq!(row["currentPackageId"], "pkg-v1");
+        assert_eq!(row["activeRun"]["pluginRunId"], "dyn:hello", "active run present: {inv}");
+        assert_eq!(row["latestRun"]["status"], "running");
+
+        // stopFromPanel：真停跑。
+        let s = plugin.handle(
+            "dynamicCordisRunner", "stopFromPanel",
+            br#"{"pluginId":"hello"}"#,
+            Some(projector.clone()),
+        ).unwrap();
+        assert_eq!(s["ok"], true, "stop ok: {s}");
+        assert!(!loader.entries().iter().any(|e| e.id == "dyn:hello"), "stopped");
+
+        // settleUserRun：Rust 无 pending approval → 诚实 not-running（不伪造 ok）。
+        let settle = plugin.handle(
+            "dynamicCordisRunner", "settleUserRun",
+            br#"{"pluginId":"hello","resolution":{"ok":true,"pluginRunId":"dyn:hello"}}"#,
+            Some(projector.clone()),
+        ).unwrap();
+        assert_eq!(settle["ok"], false);
+        assert_eq!(settle["reason"], "not-running");
+
+        // resolveRequestRun / resolveInspectQuery：Rust 无 pending 请求/查询 → 诚实 accepted:false。
+        let rr = plugin.handle(
+            "dynamicCordisRunner", "resolveRequestRun",
+            br#"{"pluginId":"hello","requestId":"req-1","outcome":"allowed-once"}"#,
+            Some(projector.clone()),
+        ).unwrap();
+        assert_eq!(rr["accepted"], false, "no pending run request: {rr}");
+        let rq = plugin.handle(
+            "dynamicCordisRunner", "resolveInspectQuery",
+            br#"{"requestId":"iq-1","result":null}"#,
+            Some(projector.clone()),
+        ).unwrap();
+        assert_eq!(rq["accepted"], false, "no pending inspect query: {rq}");
+    }
+
+    /// 阶段 B/C：dispatch_wasm_remote 解包前端 `payload.args` 壳（真实 gateway 形态：
+    /// `rpc.call('/api', e, {args})` → payload={args:{...}}）→ wasm 端点拿到平铺字段。
+    #[test]
+    fn dispatch_wasm_remote_unwraps_args_entry() {
+        use dsh_loader::Loader;
+        let cordis = dsh_core::Cordis::new();
+        let loader = Loader::new(&cordis).unwrap();
+        let host = std::rc::Rc::new(crate::remote_host::RemoteHost::new(None, Some(loader.clone()), None));
+        let plugin = dsh_wasmrt::WasmRemoteEndpointPlugin::new(
+            "host-remote",
+            &host_remote_component_bytes(),
+            dsh_wasmrt::Capabilities::default(),
+            None,
+        )
+        .unwrap();
+        // 手动装配 boot 的 remote_plugin/remote_projector/loader。
+        let mut boot = boot_with_sessions();
+        boot.loader = Some(loader.clone());
+        boot.remote_plugin = Some(std::rc::Rc::new(std::cell::RefCell::new(plugin)));
+        boot.remote_projector = Some(host);
+        // pluginInventory/list：前端 payload={args:{}} → 组件读到空 body → {ok:true,value:{entries}}。
+        let payload = serde_json::json!({"args": {}});
+        let v = dispatch_wasm_remote(&boot, "pluginInventory/list", &payload);
+        assert_eq!(v["ok"], true, "unwrapped args: {v}");
+        assert!(v["value"]["entries"].is_array());
+        // 未装配路径（fresh boot remote_plugin=None）→ internal + details 补全。
+        let bare = boot_with_sessions();
+        let v2 = dispatch_wasm_remote(&bare, "pluginInventory/list", &serde_json::json!({}));
+        assert_eq!(v2["ok"], false);
+        assert_eq!(v2["error"]["code"], "internal");
+        assert!(v2["error"]["details"].is_object(), "error details present: {v2}");
     }
 
     /// D-106/S1：`session.plan.mode` 宿主入口/出口——落 `plan/mode`（含 message）+
@@ -5293,7 +5472,7 @@ mod tests {
     /// （对齐其 result schema，清除 cordis 清单 UI 的 boot 报错）。
     #[test]
     /// D-115-Web：测试 Boot 未装配 wasm remote 端点 → dispatch 诚实回落
-    /// not-implemented（占位 era 的 `{ok:true, value:[]}` 已废除——wasm 组件承载
+    /// internal（占位 era 的 `{ok:true, value:[]}` 已废除——wasm 组件承载
     /// dynamicCordisRunner.*；未装配 = 无动态 cordis 宿主，诚实报错不伪造）。
     fn rpc_dynamic_cordis_runner_unassembled() {
         let boot = boot_with_sessions();
@@ -5305,7 +5484,7 @@ mod tests {
             assert_eq!(v["result"]["ok"], false, "{m} not ok (no wasm remote host)");
             assert_eq!(
                 v["result"]["error"]["code"],
-                "not-implemented",
+                "internal",
                 "{m} error code"
             );
         }

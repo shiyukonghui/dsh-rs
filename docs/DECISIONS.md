@@ -5737,6 +5737,57 @@ invoke/reportRenderFailure/reportClientGuardFailure）显式 internal 错误 + m
 
 **回滚点**：git revert 本提交（Boot 字段 + remote_host + dispatch 回落 + 组件信封）。
 
+---
+
+## D-115-Web（阶段 B/C）：dynamicCordisRunner 真实动态装配 + 动态包注册表 + wire 外壳修正
+
+**触发问题**：阶段 A 后 dynamicCordisRunner 仍有 runHostHalf/stopFromPanel/undefineFromPanel/
+settleUserRun/resolveRequestRun/resolveInspectQuery 未实现（面板 Play/Stop/Remove/Approve/
+Decline 不可用）；且前端 gateway `rpc.call('/api', e, {args})` 把参数包在 `payload.args`
+（此前 dispatch 直透 payload → 组件读平铺字段落空，真前端调用会失败——既往 curl 手写平铺
+掩盖了此缺口）；错误信封缺 `details`（前端 serverResponseSchema 要求）。
+
+**子代理调查确认**（deepseek-harness cordis-host-runner/packages）：启动热路径 = inventory +
+syncInspectManifest（板块 driver）；面板热路径 = runHostHalf(直接)/settleUserRun/stopFromPanel/
+undefineFromPanel/resolveRequestRun(拒绝)；后台 = getClientCode/invoke/report*/resolveInspectQuery。
+inventory 的 packages = 该插件已定义的全部不可变版本（define order）；必填仅 pluginId/agentId/
+packages，activeRun/latestRun 可选（诚实缺省合法）。
+
+**决策事项**：
+1. **阶段 B（真实动态装配）**：`RemoteHost` 增 `dynamic_packages` 注册表（`DynamicPackage`
+   结构：pluginId/packageId/name/purpose/wasm 组件字节）——**dsh-plugin world 组件
+   （WasmComponentPlugin，组件模型，禁 C ABI）为动态包载体**（hello-component 为真实验证物）。
+   - `dynamic_activate`：查包 → WasmComponentPlugin → `loader.register_plugin` +
+     `loader.create(entry id "dyn:<pluginId>")` → **真实 fiber 启动**；run_id=entry id。
+   - `dynamic_stop`：`loader.remove`（dispose + 移除 entry，保留包定义）；未跑 → 诚实 not-running。
+   - `dynamic_undefine`：stop + 注册表移除。
+   - host-services set: `dynamicActivate/dynamicStop/dynamicUndefine`；get: `dynamicRegistry`。
+2. **组件端点（wasm）**：runHostHalf（→dynamicActivate，收 `{ok:true,pluginId,packageId,
+   pluginRunId,waitingFor:[],startedHere:true}`）、stopFromPanel（`{ok:true}`/`{ok:false,reason(
+   plugin-missing|not-running),message}`）、undefineFromPanel（`{ok:true,wasRunning}`）、
+   settleUserRun（**诚实 `{ok:false,reason:not-running}`**——Rust 无 client half 无 pending
+   approval），resolveRequestRun/resolveInspectQuery（**`{accepted:false}` 诚实**——无 pending
+   请求/查询可决；subagent 确认此即契约正确语义非伪造）。
+3. **阶段 C（动态包注册表）**：inventory 数据源改 `dynamic_packages` 注册表（packages=已定义
+   版本）+ 装配状态（activeRun/latestRun **running 时才附**，否则缺省——optional 键 undefined
+   放行，null 会被 zod 拒）；agentId 恒 "default"（schema 拒 null）。
+4. **wire 外壳修正**：dispatch_wasm_remote 解包 `payload.args`（前端真实形态）；错误信封统一
+   补 `details:{}`（serverResponseSchema 要求）；未装配回落 code 改 `internal`（合法联合）。
+   —— subagent 实证此二缺口否则真前端调用失败。
+
+**TDD 验证**：dsh-cli 220 全绿（新增 `dynamic_assembly_activates_stops_undefines`、
+`dynamic_wasm_runner_full_chain`（含阶段 C inventory running 状态 + resolve 诚实空态 +
+args 壳）、`dispatch_wasm_remote_unwraps_args_entry`（解包 + details 补全）；m31 8/8
+（更新：runHostHalf 真实实现后 stub 下 `{ok:false,message}` + resolve 空态）；clippy 0。
+
+**待办**：真实 key 端到端（起 agent-loop 实例 + 真实 turn + 面板动态装配在浏览器实操）。
+TS-sandbox 依赖 4 方法（getClientCode/invoke/reportRenderFailure/reportClientGuardFailure）
+保持组件 internal 兜底（诚实，用户已接受）。`@pluginId` 正则词法差（loader id vs TS
+`<prefix>-<n>`）影响 `@` 引用——功能缺口已记录，暂不影响 wire。
+
+**回滚点**：git revert 本提交（remote_host 动态装配 + 组件新端点 + dispatch 解包）。
+
+
 
 
 

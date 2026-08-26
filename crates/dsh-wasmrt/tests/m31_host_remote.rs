@@ -467,12 +467,20 @@ fn dynamic_cordis_runner_inventory_real_plus_rest_not_implemented() {
     assert_eq!(s["ok"], true, "sync ok: {s}");
     assert!(s["value"].is_null(), "null value: {s}");
 
-    // 其余方法（Rust 无动态 cordis 宿主）→ internal code fail-loud（前端错误联合无
-    // not-implemented；用合法 internal + 说明 message，诚实且 wire 合法）。
-    let ni = plugin.handle("dynamicCordisRunner", "runHostHalf", br#"{"pluginId":"x"}"#, None).unwrap();
-    assert_eq!(ni["ok"], false);
-    assert_eq!(ni["error"]["code"], "internal");
+    // 阶段 B/C：runHostHalf 已真实实现——用本测试 stub（无 dynamicActivate 后端）
+    // → 宿主 set 返回 unknown-service → 组件按 runHostHalf schema 报 `{ok:false, message}`
+    // （诚实——不能装配；runHostHalf 的错误分支无 error.code 字段）。
+    let ni = plugin.handle("dynamicCordisRunner", "runHostHalf", br#"{"pluginId":"x","packageId":"p1"}"#, None).unwrap();
+    assert_eq!(ni["ok"], false, "runHostHalf fails (no activate backend): {ni}");
+    assert!(ni["message"].as_str().is_some(), "runHostHalf has message: {ni}");
+    // 仍未实现的端点（getClientCode 等 TS-sandbox 依赖）→ 组件 internal 兜底。
     let ni2 = plugin.handle("dynamicCordisRunner", "getClientCode", br#"{"pluginId":"x"}"#, None).unwrap();
+    assert_eq!(ni2["ok"], false);
     assert_eq!(ni2["error"]["code"], "internal");
+    // resolveRequestRun / resolveInspectQuery：无 pending → 诚实 accepted:false。
+    let rr = plugin.handle("dynamicCordisRunner", "resolveRequestRun", br#"{"pluginId":"x"}"#, None).unwrap();
+    assert_eq!(rr["accepted"], false);
+    let rq = plugin.handle("dynamicCordisRunner", "resolveInspectQuery", br#"{"requestId":"q"}"#, None).unwrap();
+    assert_eq!(rq["accepted"], false);
 }
 

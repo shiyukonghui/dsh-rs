@@ -30,8 +30,30 @@ pub struct RemoteHost {
     pub workspaces: Option<Rc<RefCell<crate::workspace_host::WorkspaceRegistry>>>,
     /// `kv` 的进程内后端（messageFeedback 持久；serve 可换成 SQLite）。
     pub kv: Rc<RefCell<HashMap<String, serde_json::Value>>>,
+    /// 阶段 B/C：动态插件包注册表（pluginId → 包定义）。serve/测试注入真实 wasm
+    /// 组件字节；`runHostHalf` 按 packageId 装配进 loader（真实 fiber）。
+    pub dynamic_packages: Rc<RefCell<HashMap<String, DynamicPackage>>>,
     /// 每次 handle 调用通过 host-services 反查的记账（诊断）。
     pub calls: Rc<RefCell<Vec<String>>>,
+}
+
+/// 一个动态 wasm 组件包（阶段 B/C）：真实装配单位。
+#[derive(Clone)]
+pub struct DynamicPackage {
+    /// 稳定插件 id（UI pluginId）。
+    pub plugin_id: String,
+    /// 包版本 id（packageId；对齐 CordisDynamicPackageId）。
+    pub package_id: String,
+    /// 包名（UI label）。
+    pub name: String,
+    /// 用途（UI purpose，如 "run"）。
+    pub purpose: String,
+    /// dsh-plugin world 组件字节（组件模型——禁 C ABI）。
+    pub bytes: Vec<u8>,
+    /// 是否有宿主半（Rust 装配 = 宿主半真实启动）。
+    pub has_host_half: bool,
+    /// 是否有客户端半（Rust 无 dynamic client 包 → 恒 false）。
+    pub has_client_half: bool,
 }
 
 impl RemoteHost {
@@ -45,8 +67,16 @@ impl RemoteHost {
             loader,
             workspaces,
             kv: Rc::new(RefCell::new(HashMap::new())),
+            dynamic_packages: Rc::new(RefCell::new(HashMap::new())),
             calls: Rc::new(RefCell::new(Vec::new())),
         }
+    }
+
+    /// 注册一个动态包（阶段 B/C；serve/测试注入）。
+    pub fn register_dynamic_package(&self, pkg: DynamicPackage) -> Option<DynamicPackage> {
+        self.dynamic_packages
+            .borrow_mut()
+            .insert(pkg.plugin_id.clone(), pkg)
     }
 
     fn log(&self, service: &str) {
@@ -146,6 +176,78 @@ impl RemoteHost {
             .map(|w| w.path.clone())
             .unwrap_or_default()
     }
+
+    // ---- 阶段 B：真实动态装配（dynamicCordisRunner run/stop/undefine 的宿主后端）----
+
+    /// 把动态包装配为真实 loader entry（fiber 启动）。
+    /// 返回 `(pluginRunId, message)` 或 Err（诚实失败）。
+    pub fn dynamic_activate(&self, plugin_id: &str, _package_id: &str) -> Result<(String, String), String> {
+        let Some(loader) = self.loader.as_ref() else {
+            return Err("no loader assembled (dynamic activation unavailable)".to_string());
+        };
+        let pkg = {
+            let map = self.dynamic_packages.borrow();
+            map.get(plugin_id).cloned()
+        };
+        let Some(pkg) = pkg else {
+            return Err(format!("dynamic plugin {plugin_id} is not defined"));
+        };
+        // 组件模型（禁 C ABI）：dsh-plugin world 组件 → WasmComponentPlugin。
+        let plugin = dsh_wasmrt::WasmComponentPlugin::new(
+            Box::leak(pkg.name.clone().into_boxed_str()),
+            &pkg.bytes,
+            dsh_wasmrt::Capabilities::all(),
+        )
+        .map_err(|e| format!("dynamic plugin {plugin_id} component load: {e}"))?;
+        // 注册 + 创建 entry（真实启动 fiber）。
+        loader.register_plugin(&pkg.name, std::sync::Arc::new(plugin));
+        let entry_id = format!("dyn:{plugin_id}");
+        loader
+            .create(dsh_loader::EntryOptions::new(&entry_id, &pkg.name))
+            .map_err(|e| format!("dynamic plugin {plugin_id} activate: {e}"))?;
+        Ok((entry_id, format!("dynamic plugin {plugin_id} activated ({})", pkg.package_id)))
+    }
+
+    /// 停跑一处动态插件（真实 dispose + 移除 entry，保留包定义）。
+    pub fn dynamic_stop(&self, plugin_id: &str) -> Result<bool, String> {
+        let Some(loader) = self.loader.as_ref() else {
+            return Err("no loader assembled".to_string());
+        };
+        let entry_id = format!("dyn:{plugin_id}");
+        if !loader.entries().iter().any(|e| e.id == entry_id) {
+            // 未在跑 → 诚实 not-running（对齐 TS stop 语义）。
+            return Ok(false);
+        }
+        loader
+            .remove(&entry_id)
+            .map_err(|e| format!("dynamic plugin {plugin_id} stop: {e}"))?;
+        Ok(true)
+    }
+
+    /// 从注册表移除一处动态插件（真卸载定义 + 停跑）。
+    pub fn dynamic_undefine(&self, plugin_id: &str) -> Result<bool, String> {
+        let stopped = self.dynamic_stop(plugin_id)?;
+        let removed = self.dynamic_packages.borrow_mut().remove(plugin_id).is_some();
+        Ok(stopped || removed)
+    }
+
+    /// 动态包注册表投影（阶段 C inventory 数据源：真实可装配包清单）。
+    fn dynamic_registry_json(&self) -> Vec<serde_json::Value> {
+        self.dynamic_packages
+            .borrow()
+            .values()
+            .map(|p| {
+                serde_json::json!({
+                    "pluginId": p.plugin_id,
+                    "packageId": p.package_id,
+                    "name": p.name,
+                    "purpose": p.purpose,
+                    "hasHostHalf": p.has_host_half,
+                    "hasClientHalf": p.has_client_half,
+                })
+            })
+            .collect()
+    }
 }
 
 impl RemoteServiceProjector for RemoteHost {
@@ -160,29 +262,48 @@ impl RemoteServiceProjector for RemoteHost {
                 "entries": self.loader_entries_json(),
             }))
             .unwrap_or_default(),
-            // dynamicCordisRunner/inventory 数据源：真实已装配插件（含动态创建的；
-            // 无 recent run → latestRun/activeRun 由组件诚实缺省）。
+            // dynamicCordisRunner/inventory 数据源（阶段 C 真实语义）：dynamic 注册表的
+            // 包定义（packages = 该插件已定义的全部不可变版本，对齐 TS define order）+
+            // 装配状态（entry 是否 active → latestRun）。无包在跑 → 诚实无 latestRun/activeRun。
             "dynamicPlugins" => {
-                let plugins: Vec<serde_json::Value> = self
-                    .loader_entries_json()
-                    .into_iter()
-                    .filter(|e| e.get("group").and_then(|g| g.as_bool()) != Some(true))
-                    .map(|e| {
-                        serde_json::json!({
-                            "pluginId": e.get("id").cloned().unwrap_or(serde_json::Value::Null),
-                            // agentId 必填 string（schema intersection(string,unknown)——null 会被
-                            // zod 拒）；Rust 单默认 agent → 真实 session id "default"。
-                            "agentId": "default",
-                            "packages": [{
-                                "packageId": e.get("id").cloned().unwrap_or(serde_json::Value::Null),
-                                "name": e.get("name").cloned().unwrap_or(serde_json::Value::Null),
-                                "purpose": "run",
-                                "hasHostHalf": true,
-                                "hasClientHalf": false,
-                            }],
-                        })
-                    })
-                    .collect();
+                let mut plugins: Vec<serde_json::Value> = Vec::new();
+                let entries: Vec<String> = self
+                    .loader
+                    .as_ref()
+                    .map(|l| l.entries().into_iter().map(|e| e.id).collect())
+                    .unwrap_or_default();
+                for pkg in self.dynamic_packages.borrow().values() {
+                    let entry_id = format!("dyn:{}", pkg.plugin_id);
+                    let running = entries.iter().any(|e| e == &entry_id);
+                    // 基本行（pluginId/agentId/packages 必填；activeRun/latestRun 运行时才附——
+                    // optional 键 undefined 放行，null 可能被 zod 拒）。
+                    let mut row = serde_json::json!({
+                        "pluginId": pkg.plugin_id,
+                        "agentId": "default",
+                        "packages": [{
+                            "packageId": pkg.package_id,
+                            "name": pkg.name,
+                            "purpose": pkg.purpose,
+                            "hasHostHalf": pkg.has_host_half,
+                            "hasClientHalf": pkg.has_client_half,
+                        }],
+                        "currentPackageId": pkg.package_id,
+                    });
+                    if running {
+                        row["activeRun"] = serde_json::json!({
+                            "pluginRunId": entry_id, "packageId": pkg.package_id
+                        });
+                        row["latestRun"] = serde_json::json!({
+                            "pluginRunId": entry_id,
+                            "packageId": pkg.package_id,
+                            "mode": "run",
+                            "status": "running",
+                            "host": {"status": "running", "waitingFor": []},
+                            "client": {"status": "absent", "waitingFor": []},
+                        });
+                    }
+                    plugins.push(row);
+                }
                 serde_json::to_vec(&serde_json::json!({"ok": true, "plugins": plugins}))
                     .unwrap_or_default()
             }
@@ -264,6 +385,12 @@ impl RemoteServiceProjector for RemoteHost {
                 let value = self.kv.borrow().get(key).cloned().unwrap_or(serde_json::Value::Null);
                 serde_json::to_vec(&serde_json::json!({"ok": true, "value": value})).unwrap_or_default()
             }
+            // 阶段 B/C：动态包注册表（真实可装配包清单）。
+            "dynamicRegistry" => serde_json::to_vec(&serde_json::json!({
+                "ok": true,
+                "plugins": self.dynamic_registry_json(),
+            }))
+            .unwrap_or_default(),
             _ => Self::err_json("unknown-service", &format!("no service {service}")),
         }
     }
@@ -278,6 +405,43 @@ impl RemoteServiceProjector for RemoteHost {
                 let value = payload.get("value").cloned().unwrap_or(serde_json::Value::Null);
                 self.kv.borrow_mut().insert(key, value.clone());
                 serde_json::to_vec(&serde_json::json!({"ok": true, "value": value})).unwrap_or_default()
+            }
+            // 阶段 B：动态激活（runHostHalf 宿主后端）——真实装配进 loader。
+            "dynamicActivate" => {
+                let payload: serde_json::Value =
+                    serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
+                let plugin_id = payload.get("pluginId").and_then(|v| v.as_str()).unwrap_or("");
+                let package_id = payload.get("packageId").and_then(|v| v.as_str()).unwrap_or("");
+                match self.dynamic_activate(plugin_id, package_id) {
+                    Ok((run_id, msg)) => serde_json::to_vec(&serde_json::json!({
+                        "ok": true,
+                        "pluginRunId": run_id,
+                        "message": msg,
+                    }))
+                    .unwrap_or_default(),
+                    Err(e) => Self::err_json("internal", &e),
+                }
+            }
+            // 阶段 B：停跑（stopFromPanel 宿主后端）。
+            "dynamicStop" => {
+                let payload: serde_json::Value =
+                    serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
+                let plugin_id = payload.get("pluginId").and_then(|v| v.as_str()).unwrap_or("");
+                match self.dynamic_stop(plugin_id) {
+                    Ok(true) => serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap_or_default(),
+                    Ok(false) => Self::err_json("internal", &format!("dynamic plugin {plugin_id} is not running")),
+                    Err(e) => Self::err_json("internal", &e),
+                }
+            }
+            // 阶段 B：卸载（undefineFromPanel 宿主后端）。
+            "dynamicUndefine" => {
+                let payload: serde_json::Value =
+                    serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
+                let plugin_id = payload.get("pluginId").and_then(|v| v.as_str()).unwrap_or("");
+                match self.dynamic_undefine(plugin_id) {
+                    Ok(_) => serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap_or_default(),
+                    Err(e) => Self::err_json("internal", &e),
+                }
             }
             _ => Self::err_json("read-only", &format!("service {service} is read-only")),
         }
