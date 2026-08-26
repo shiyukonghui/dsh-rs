@@ -7020,6 +7020,27 @@ noSave=true 跳过、create 不简化）——修正 T1 为运行时更新断言
 （m25 红→绿判定）。
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；spike 测试各自独立可回。
 
+## D-156（服务装配单元 Phase 10 spike 落定：A3 动态 check parity 锁定 + m25 全绿）
+
+**日期**：2026-08-27
+
+**触发问题**：D-155 关闸通过 → 阶段 3（spike 验证测试）。
+
+**spike 判定（m25，1 测试 / 5 断言，红→绿）**：
+1. 静态门：check=false → provider Active、consumer Pending（既有 m7/golden 复锁）。
+2. **纯谓词翻转（无 notify 触发点）→ consumer 保持 Pending**——cordis 非反应式同位（DIV-10-2）。
+3. `update_with(provider,false)`（卸载→re-provide→finish_load notify）+ check=true → consumer 激活。
+4. check=false + 重载 → consumer 回 Pending。
+5. check=true + 重载 → 再激活（往返）。
+**结论**：Rust 动态 check 再求值触发点与 cordis **全面 parity**——**零生产代码改动**（机制本就存在：
+provide/unprovide disposer + finish_load notify + check_impls/refresh_fiber；纯翻转非反应系 cordis
+语义而非缺口）。A3 = 直接问题（谓词存在，既有证据）+ 动态触发点 parity（m25）。
+
+**阶段 4 回归**：`cargo test --workspace` EXIT=0（**205 目标 0 失败**，m24 204 + m25）；clippy -D
+warnings 0；verify-diff **23/23**。
+
+**预期影响与回滚点**：回滚 = `git revert` 本提交。待阶段 5（serve 冒烟 + acceptance + D-157）。
+
 
 
 
