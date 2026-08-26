@@ -6561,6 +6561,30 @@ m19 + DSL/golden 特征级整体回滚）；DSL/golden 部分可独立回滚（`
 A2（!!js 边界）/ B1（extend）/ B2（Group 折叠）/ B4（config simplify）+ A3 动态 check spike（按
 HANDOFF 优先级续做）。
 
+## D-137（服务装配单元 Phase 5 需求分析定稿：A5 对象形态 inject 拦截配置合并）
+
+**日期**：2026-08-27
+
+**触发问题**：用户新目标「逐一修复剩余 HANDOFF 缺口按优先级：A5 → A2 → B 类 + A3」。A5 为第一优先
+（pi-ai 前置）。cordis 插件可写 `inject: { 'svc': cfg }` 对象形态，配置写入本 fiber 自身 intercept
+层最内层（fiber.ts:700-705），服务 `[Service.resolveConfig]`（service.ts:86-102）以最高优先级合并之。
+
+**自下而上核对（源码实证）**：
+- Rust `ctx.intercept()`（context.rs:1606）+ `resolve_config`（context.rs:1636，父链 walk + per-layer
+  值 + base/head + 浅合并）已存在且由 `07-intercept-merge` golden 对齐——运行期层叠合并不用重做。
+- **唯一真缺口** = `Plugin::inject()`（registry.rs:18-21）只有名字数组，**无配置通道** ⇒ 对象形态
+  inject 无法表达（pi-ai 前置）。
+- `resolve_config` 沿 `fd.parent` 收集（对子代可见的机制已有），只需把注入配置并入本 fiber 自身层。
+
+**关键决策（用户确认）**：A5-SCOPE=A（对象形态 inject 全流程：`Plugin::inject_configs()` 新可选方法
+默认空 + 装载并入本 fiber 最内层 + `resolve_config` 最高优先级；不破坏既有实现）；A5-GOLDEN=A
+（新增对象形态 inject golden，TS 原版↔Rust 逐行一致；m-series 作锁定）。`Config.merge` 深合并
+**不做**（缺 pi-ai 深合并证据，DIV-5-x 后续可按需立项）。
+
+**阶段结论**：需求关闭工件 `.spec/service-assembly-p5/requirements.md` 定稿（目标/非目标/假设/
+缺口核对/验收 T1-T4/决策收敛/复盘追问结论）→ 进入阶段 2（系统设计）。
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；后续设计/编码各自独立可回。
+
 
 
 
