@@ -552,6 +552,9 @@ impl Runtime {
             f.isolate.extend(pending_iso);
             f.intercept.extend(pending_ic);
         }
+        // 模块缓存按名替换（对齐 cordis `registry.plugin(name, cb)` = 覆盖该项）：
+        // 同名新实现再注册 → begin_load 取到的是**最新**实现（B3 HMR replace/reload 的
+        // 前提；此前仅 or_insert 首注册才写入，re-import 会取到陈旧实现）。
         let record = self
             .registry
             .entry(key.clone())
@@ -561,6 +564,7 @@ impl Runtime {
                 fibers: Vec::new(),
                 plugin: plugin.clone(),
             });
+        record.plugin = plugin.clone();
         record.fibers.push(fid);
         self.trace_push(&format!("plugin:{name}"));
         self.push_internal(

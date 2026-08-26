@@ -414,6 +414,61 @@ impl Loader {
         }
     }
 
+    // ---- 热更（B3：插件实现级 replace/reload） ----
+
+    /// B3 HMR 模块热更：把 name 的实现换成新实现（A1 身份换代）→ 以**旧身份**加载的
+    /// entry 自动 reload 新实现（entry 保真：id/options/group 不变，仅 fiber 以新实现
+    /// 重挂载；身份重新记录为新身份）。同实现（同一 Arc）幂等 → `Ok(0)`。
+    /// 返回受影响（已 reload）的 entry 数。依赖方经 fiber uid/epoch 自然重活
+    /// （externals→全重载 的 Rust 同构，DIV-3-1）。
+    pub fn replace_plugin(&self, name: &str, plugin: Arc<dyn Plugin>) -> Result<usize, CordisError> {
+        let same = self
+            .state
+            .borrow()
+            .plugins
+            .get(name)
+            .map(|rec| Arc::ptr_eq(&rec.plugin, &plugin))
+            .unwrap_or(false);
+        if same {
+            return Ok(0);
+        }
+        // A1 登记换代（新身份 + generation 递增）
+        self.register_plugin(name, plugin);
+        let stale = self.stale_entry_ids(name);
+        let mut reloaded = 0usize;
+        for id in stale {
+            self.reload_entry(&id)?;
+            reloaded += 1;
+        }
+        Ok(reloaded)
+    }
+
+    /// name 下以「非当前实现身份」加载的 entry id（供宿主/HMR 观测 stale 集）。
+    pub fn stale_entry_ids(&self, name: &str) -> Vec<String> {
+        let st = self.state.borrow();
+        let current = st.plugins.get(name).map(|r| r.identity.clone());
+        let mut out = Vec::new();
+        for (id, e) in &st.entries {
+            let is_stale = e.options.name == name
+                && e.identity.is_some()
+                && current.as_ref() != e.identity.as_ref();
+            if is_stale {
+                out.push(id.clone());
+            }
+        }
+        out
+    }
+
+    /// entry 保真 reload：dispose 旧 fiber + 按当前注册实现重挂载（`load_plugin` 把身份
+    /// 重新记录为新身份）。disabled entry → no-op。
+    fn reload_entry(&self, id: &str) -> Result<(), CordisError> {
+        if self.is_disabled(id) {
+            return Ok(());
+        }
+        self.dispose_entry(id)?;
+        self.start_entry(id)
+    }
+
     // ---- 查询 ----
 
     /// 设置持久化 sink（A7：宿主注入落盘实现；`None` = 关闭写回）。

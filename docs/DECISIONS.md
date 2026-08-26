@@ -6390,6 +6390,38 @@ clippy 0）+ S3 部署冒烟。
 
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
 
+## D-130（服务装配单元 Phase 3 编码落定：B3 replace_plugin + reload 红→绿 + 核心模块缓存替换根因修复）
+
+**日期**：2026-08-26
+
+**触发问题**：D-129 设计关闸通过 → 阶段 3（TDD 编码）。实现 `replace_plugin`/`stale_entry_ids`/
+`reload_entry`（loader 层）+ m18 T1-T4 红测。T1/T4 首轮红：reload 后 entry 仍 apply **旧实现 v1**。
+
+**根因（自下而上实证 + 修复，触及 dsh-core）**：
+- **现象**：`replace_plugin` 换代后 `reload_entry`→`start_entry`→`load_plugin` 取到**新** Arc
+  （loader registry 已更新），但 `ctx.plugin_arc` 走 runtime `register_plugin` 后，`begin_load`
+  （runtime.rs:672-680）从 **`self.registry[runtime_key].plugin`**（按名模块缓存）取插件——该缓存此前
+  仅在 `or_insert_with` **首次**注册时写入（runtime.rs:555-563），同名 re-import 不更新 → reload 取到
+  陈旧实现。同理暴露 `remove+create 后重载旧实现` 与 `dynamic_activate 新 entry 潜在取旧的潜伏缺陷`。
+- **修复**：runtime `register_plugin` 处**始终** `record.plugin = plugin.clone()`（按名覆盖），对齐
+  cordis `registry.plugin(name, cb)` 的**按名替换**语义（模块 re-import = 该名新实现）。既有 21
+  golden / m-series 无「同 name 换实现」用例，覆盖更新零回归；m16 A1-c 只断言 loader 级身份，不受影响。
+
+**关键实现**（均过 T1-T4 红→绿 + 清理临时 dbg 探针）：
+- `Loader::replace_plugin`：同 Arc 幂等 `Ok(0)`；新 Arc → A1 换代 + `stale_entry_ids`（identity 非当前）
+  → 逐个 `reload_entry`，返回受影响数。
+- `stale_entry_ids`：`entry.options.name==name && identity.is_some() && identity != 当前身份` 集合。
+- `reload_entry`：disabled no-op；否则 `dispose_entry + start_entry`（entry 保真，identity 重记为
+  新身份）；依赖方经 uid/epoch 自动重活（DIV-3-1 兑现，T2 锁）。
+- m18：T1 换实现重载 / T2 依赖方重活 / T3 同实现幂等 / T4 受影响计数 + stale 观测，4/4 绿。
+
+**阶段 4 验证（编码关闸）**：`cargo test --workspace` EXIT=0（198 目标 0 失败，含 m18 4/4）；
+`cargo clippy --workspace --all-targets -- -D warnings` EXIT=0；`node diff/ts-host/verify-diff.mjs`
+21/21 PASS（golden 逐字节不变）。受影响的 crate：dsh-core（运行时模块缓存替换）+ dsh-loader（热更层）+ m18。
+
+**预期影响与回滚点**：本提交 = 可运行代码 + 测试。回滚 = `git revert` 本提交（loader 层 + core
+缓存替换 + m18 随特征级整体回滚；core 修复独立回滚会使 B3 退回「reload 取旧实现」）。
+
 
 
 
