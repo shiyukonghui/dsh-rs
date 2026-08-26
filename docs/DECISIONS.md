@@ -6638,6 +6638,31 @@ clippy --workspace --all-targets -- -D warnings` EXIT=0；`node diff/ts-host/ver
 **预期影响与回滚点**：本提交 = 代码 + 测试 + golden。回滚 = `git revert` 本提交（core/loader/diff/
 host/golden 特征级整体）；scenario-13 可独立删除。
 
+## D-140（服务装配单元 Phase 5 验收收口：A5 阶段 4 关闸 + 阶段 5 部署冒烟 + acceptance 工件）
+
+**日期**：2026-08-27
+
+**触发问题**：D-139 编码关闸通过 → 阶段 4（测试验证）与阶段 5（部署与维护）验收收口。
+
+**阶段 4 关闸**：`cargo test --workspace` EXIT=0（200 目标 0 失败，含 m20 3/3 红→绿）；`cargo clippy
+--workspace --all-targets -- -D warnings` EXIT=0；`node diff/ts-host/verify-diff.mjs` **23/23 PASS**
+（22 既有 golden 逐字节零回归 + scenario-13 14 行 TS 原版↔Rust 逐行一致）。
+
+**阶段 5 部署冒烟**：`dsh web target/web/cordis.yml --port 60885`（本轮含 dsh-core register_plugin
+改动）→ `GET /` HTTP 200（len 13270 与基线一致），进程干净停止。回滚 = `git revert 260f031`。
+
+**关键取舍如实收口（DIV-5-4）**：全局 serde_json `preserve_order` 破坏 9 个既有 golden（loader/include/
+session 宿主键序为排序）→ 回退；仅 scenario-host `resolve-config` trace 用 stableStringify 键序规范化
+（JSON 键序无语义）。轮内决策日志完整记录，避免未来重蹈。m20 红测两处断言修正（base 最低优先级 /
+父 intercept `p:1` 保留）纳入验收工件。
+
+**工件**：`.spec/service-assembly-p5/acceptance.md`（交付核对/阶段 4 证据/编码期发现/部署回滚/
+诚实边界/决策链互查）。
+
+**预期影响与回滚点**：Phase 5（A5，pi-ai 前置）五阶段全闭环。回滚 = `git revert 260f031` + 撤 D-140
+工件提交。后续按目标优先级：A2（!!js 求值范围）→ B 类（B1 extend / B2 Group 折叠 / B4 config
+simplify）+ A3 动态 check spike。
+
 
 
 
