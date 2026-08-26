@@ -5722,6 +5722,13 @@ era 测试）；clippy 0；60880 真浏览器 render-smoke **console/page errors
 读真实 loader）；`pluginInventory/list` 经 HTTP RPC 返回真实 entries（echo-loop /
 dsh:services）。
 
+**端到端实证（慢 mock LLM agent-loop，60885）**：会话主线 `session.prompt` 经
+agent-loop 装配后仍工作（accepted:true，`--agent-loop` flag 必需——仅 `--llm-base-url`
+不自动启用）；真实 user/message 事件产生 messageId（`prompt-default`，**事件 data.id
+才是 messageId**——初版投影读 data.messageId/data.message.id 皆空 → 修读 data.id）；
+对真实消息 `messageFeedback/put` → **ok + 真实 uuid v4 + 真实墙钟**；`list` 读回同物品
+（持久链路组件 → host-services.get("kv") → RemoteHost.kv）。
+
 **阶段 B/C（后续目标）**：dynamicCordisRunner 动态装配（runHostHalf→loader.create +
 注册 wasm 组件插件→fiber 真跑；stopFromPanel→dispose；approval 状态机投影）+ 动态
 wasm 包管理（按包路径/版本加载组件字节）。TS-sandbox 依赖 4 方法（getClientCode/

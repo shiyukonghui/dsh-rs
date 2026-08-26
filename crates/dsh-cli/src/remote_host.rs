@@ -75,6 +75,8 @@ impl RemoteHost {
     }
 
     /// 由真实会话事件投影 message ids（user/assistant message 事件）。
+    /// 真实事件形状（history 实证）：`user/message` / `assistant/message` 事件
+    /// data = `{id, role, content, source}`——**messageId 在 data.id**。
     fn session_message_ids(&self, session_id: &str) -> Vec<String> {
         let mut ids = Vec::new();
         for (_, e) in self.session_events(session_id) {
@@ -82,7 +84,7 @@ impl RemoteHost {
                 EventKind::UserMessage | EventKind::AssistantMessage => {
                     let id = e
                         .data
-                        .get("messageId")
+                        .get("id")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
                     let id = id.or_else(|| {
