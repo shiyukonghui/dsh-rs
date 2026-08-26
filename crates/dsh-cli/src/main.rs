@@ -352,10 +352,10 @@ fn web_main(args: &[String]) {
             .unwrap_or(0)
     });
 
-    let plugin_root = default_plugin_root(&web_root);
+    let plugin_roots = default_plugin_roots(&web_root);
     let cfg = dsh_cli::web::WebConfig {
         web_root,
-        plugin_root,
+        plugin_roots,
         host: host.clone(),
         port,
         session_dir,
@@ -391,27 +391,55 @@ fn default_web_root() -> PathBuf {
     PathBuf::from("web-dist")
 }
 
-/// 默认 web 插件 bundle 根（阶段1）：web_root 的 `node_modules/@deepseek-ai` 父目录。
-/// 从 web_root（dist 在 `<pkg>/dist`）向上两级到 `@deepseek-ai`，再向上到 `node_modules`。
-fn default_plugin_root(web_root: &Path) -> PathBuf {
-    // 支持 env 覆盖
+/// 默认 web 插件 bundle 根集（D-115-Web D1：多 root——base 层 + web-app 层）。
+///
+/// 优先环境变量 `DSH_PLUGIN_ROOT`（单 root，向前兼容）；否则从 web_root 向上找
+/// `@deepseek-ai` 目录（web-app 层），并把它的兄弟 bundle（`…/base/node_modules/`
+/// 下的 `@deepseek-ai`）作为 base 层一并加入（缺一 → 浏览器 37 pending，根因）。
+/// 顺序：base 在前、web-app 在后（同名 id 后层覆盖，对齐 cordis patch）。
+fn default_plugin_roots(web_root: &Path) -> Vec<PathBuf> {
+    // env 覆盖（单 root 或冒号分隔多 root，兼容既有 DSH_PLUGIN_ROOT 用法）。
     if let Ok(p) = std::env::var("DSH_PLUGIN_ROOT") {
-        return PathBuf::from(p);
+        return p
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
     }
     // web_root = <node_modules>/@deepseek-ai/dsh-web-frontend/dist → 找 @deepseek-ai
     let mut dir: PathBuf = web_root.to_path_buf();
-    // 向上到含 @deepseek-ai 的目录
+    let mut web_scope: Option<PathBuf> = None;
     for _ in 0..3 {
         let parent = dir.parent();
         if let Some(p) = parent {
             let name: Option<&str> = p.file_name().and_then(|s| s.to_str());
             if name == Some("@deepseek-ai") {
-                return p.to_path_buf();
+                web_scope = Some(p.to_path_buf());
+                break;
             }
             dir = p.to_path_buf();
         }
     }
-    dir
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(web_scope) = web_scope {
+        // 兄弟 base 层：base bundle 与 web-app bundle 是 `packages/bundle/` 下的并列目录
+        // （web_scope 一路向上到 `…/packages/bundle`，其下 `base/node_modules/@deepseek-ai`）。
+        // 从 web_scope 逐级向上找「含 base/node_modules/@deepseek-ai 的祖辈」。
+        let mut probe = web_scope.parent();
+        while let Some(p) = probe {
+            let base_candidate = p.join("base/node_modules/@deepseek-ai");
+            if base_candidate.is_dir() {
+                roots.push(base_candidate);
+                break;
+            }
+            probe = p.parent();
+        }
+        roots.push(web_scope);
+    }
+    if roots.is_empty() {
+        roots.push(dir); // 兜底：找不到时沿用旧行为（web_root 本身）
+    }
+    roots
 }
 
 /// 处理一行 stdin（JSON turn）。

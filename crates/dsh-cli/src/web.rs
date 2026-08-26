@@ -101,9 +101,12 @@ fn mime_for(path: &str) -> &'static str {
 pub struct WebConfig {
     /// 前端 dist 根目录（含 index.html）。
     pub web_root: PathBuf,
-    /// web 插件 bundle 根目录（含 `@deepseek-ai/<pkg>/lib/client.js`）。
+    /// web 插件 bundle 根目录集（每个含 `@deepseek-ai/<pkg>/lib/client.js`）。
     /// 为 `__DSH_BOOT__` 的 `/plugins/<id>/client.js` 提供真实 bundle。
-    pub plugin_root: PathBuf,
+    /// D-115-Web（D1）：**多 root**——有序扫描合并；base 层（typert-registry /
+    /// api-gateway）在前、web-app 层在后，同名 id 后者覆盖。向后兼容：只有
+    /// plugin_root 的旧装配可用 `vec![plugin_root]`（或删字段）。
+    pub plugin_roots: Vec<PathBuf>,
     /// 监听地址（默认 127.0.0.1）。
     pub host: String,
     /// 监听端口（0 = 系统分配）。
@@ -200,9 +203,11 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
         )));
     }
 
-    // 阶段1：组装 `__DSH_BOOT__` entry graph（扫描 plugin_root 下声明 dsh.client
-    // 的 web 插件；每个是 `/plugins/<id>/client.js?rev=<hash>` 一行）。
-    let manifest = build_boot_manifest(&cfg.plugin_root)?;
+    // 阶段1：组装 `__DSH_BOOT__` entry graph（扫描多 plugin_root 下声明 dsh.client
+    // 的 web 插件；每个是 `/plugins/<id>/client.js?rev=<hash>` 一行）。D-115-Web：
+    // base 层 + web-app 层两层合并（缺一层 → 浏览器 37 pending 连锁）。
+    let roots: Vec<&Path> = cfg.plugin_roots.iter().map(|p| p.as_path()).collect();
+    let manifest = build_boot_manifest_multi(&roots)?;
 
     // D-099：HMR SSE 通道（`/plugins/events`）。Arc 共享 + 独立 watcher 线程——每
     // `HMR_POLL_INTERVAL_MS` 扫一遍 client bundle 内容变化，广播 `rebuilt` 帧；
@@ -1081,15 +1086,27 @@ pub struct BootEntry {
 /// 占据 ui-workspace 的 single directory-flow 洞（系统原生目录对话框）。
 const HOST_COMPOSITION_EXCLUDED_CLIENTS: &[&str] = &["@deepseek-ai/dsh-client-ui-directory-picker-browse"];
 
-/// 组装 `__DSH_BOOT__`：扫描 `plugin_root` 下声明 `dsh.client.platform == "web"`
-/// 的包，每个生成一个 entry。
+/// 组装 `__DSH_BOOT__`（单 root）：委托多 root 版本（`[plugin_root]`）。
 ///
 /// 判定依据（对齐 `ClientModuleRegistry.resolveMeta`）：包 package.json 的
 /// `dsh.client.platform === "web"` 且存在 `lib/client.js`。rev 取 bundle 内容
 /// sha1 前 12 hex（对齐 `shortHash`）；`immediately` 取声明值。
 pub fn build_boot_manifest(plugin_root: &Path) -> Result<BootManifest, CordisError> {
+    build_boot_manifest_multi(&[plugin_root])
+}
+
+/// 组装 `__DSH_BOOT__`（多 root，D-115-Web D1）：扫描每个 plugin_root 下声明
+/// `dsh.client.platform == "web"` 的包（`<plugin_root>/<id>/lib/client.js`）。
+/// 多个 root 按顺序合并；**同名 id 后者覆盖**（对齐 cordis patch 后层覆盖先层——
+/// base 层先、web-app 层后，name 冲突以更后 root 为赢家）。判定与 rev 同单 root。
+pub fn build_boot_manifest_multi(
+    plugin_roots: &[&Path],
+) -> Result<BootManifest, CordisError> {
     let mut entries: Vec<BootEntry> = Vec::new();
-    if plugin_root.is_dir() {
+    for plugin_root in plugin_roots {
+        if !plugin_root.is_dir() {
+            continue;
+        }
         for dir in std::fs::read_dir(plugin_root)
             .map_err(|e| CordisError::Internal(format!("web plugin_root read: {e}")))?
         {
@@ -1148,6 +1165,10 @@ pub fn build_boot_manifest(plugin_root: &Path) -> Result<BootManifest, CordisErr
                 .and_then(|c| c.get("immediately"))
                 .and_then(|i| i.as_bool())
                 .unwrap_or(false);
+            // 同名 id：移除先前 root 的 entry → 本 root（更后）为赢家。
+            if let Some(idx) = entries.iter().position(|e| e.id == id) {
+                entries.remove(idx);
+            }
             entries.push(BootEntry {
                 id,
                 bundle_root: dir.path(),
@@ -5657,6 +5678,67 @@ mod tests {
         assert!(!e.rev.is_empty());
         assert!(!m.rev.is_empty());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D-115-Web（D1）：多 plugin_root 合并——base 层（typert-registry + api-gateway）
+    /// 与 web 层（runtime/ui-*）分别位于两个 `@deepseek-ai` 目录，合并后 entries 覆盖
+    /// 13 个最小集；同名包后者覆盖（带 hmm.h 变体区分）；非 web 包保持跳过。
+    #[test]
+    fn build_boot_manifest_multi_merges_base_and_web_roots() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(100);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("dsh-web-plugins-base-{}-{n}", std::process::id()));
+        let web = std::env::temp_dir().join(format!("dsh-web-plugins-web-{}-{n}", std::process::id()));
+        let mk = |scope: &std::path::Path, name: &str, later_var: Option<&str>| {
+            let pkg = scope.join(name);
+            std::fs::create_dir_all(pkg.join("lib")).unwrap();
+            let dsh_client = r#"{"platform":"web","immediately":true}"#;
+            std::fs::write(
+                pkg.join("package.json"),
+                format!(
+                    r#"{{"name":"@deepseek-ai/{name}","dsh":{{"client":{dsh_client}}},"exports":{{"./client":"./lib/client.js"}}}}"#
+                ),
+            )
+            .unwrap();
+            // 同名包在 base 与 web 各自写不同 bundle 内容 → rev 不同；
+            // 「后者覆盖」= entries 中同名只出现一次，且 rev = 后者（web）内容哈希。
+            std::fs::write(
+                pkg.join("lib/client.js"),
+                format!("load('{name}'); /* {later:?} */", later = later_var),
+            )
+            .unwrap();
+        };
+        // base 层：核心基建（真实中来自 packages/bundle/base）
+        for name in ["dsh-typert-registry", "dsh-api-gateway"] {
+            mk(&base, name, Some("base"));
+        }
+        // web 层：runtime 等（真实中来自 packages/bundle/web-app）；api-gateway 与 base
+        // 同名但 bundle 不同（模拟两层各带；契约：后 root 覆盖）。
+        mk(&web, "dsh-client-runtime", Some("web"));
+        mk(&web, "dsh-client-ui-conversation", Some("web"));
+        mk(&web, "dsh-api-gateway", Some("web"));
+
+        let m = build_boot_manifest_multi(&[base.as_ref(), web.as_ref()]).unwrap();
+        let ids: Vec<&str> = m.entries.iter().map(|e| e.id.as_str()).collect();
+        for want in [
+            "@deepseek-ai/dsh-typert-registry",
+            "@deepseek-ai/dsh-api-gateway",
+            "@deepseek-ai/dsh-client-runtime",
+            "@deepseek-ai/dsh-client-ui-conversation",
+        ] {
+            assert!(ids.contains(&want), "merged entries include {want}: {ids:?}");
+        }
+        // 后者（web）覆盖 base 同名 api-gateway：entries 中该 id 只出现一次，
+        // 且其 rev 来自 web（后者）的 bundle 内容 hash（与 base 版本 rev 不同/匹配 web 字节）。
+        let gws: Vec<&BootEntry> = m.entries.iter().filter(|e| e.id == "@deepseek-ai/dsh-api-gateway").collect();
+        assert_eq!(gws.len(), 1, "duplicate id across roots collapses to later winner: {ids:?}");
+        let web_bytes = "load('dsh-api-gateway'); /* Some(\"web\") */";
+        assert_eq!(gws[0].rev, short_hash(web_bytes.as_bytes()), "winner is the web (later) root");
+        // 非 web 包仍应被跳过（build_boot_manifest_multi 复用单 root 的过滤）。
+        assert_eq!(m.entries.len(), 4, "only web plugins across both roots: {ids:?}");
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&web).ok();
     }
 
     /// 阶段1：serve_plugin_bundle 返回真实 bundle；未知 id → None。

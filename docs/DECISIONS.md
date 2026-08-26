@@ -5579,6 +5579,60 @@ dsh-cli 消费者）；`GenerateOptions.signal` 新字段（serde skip，wire �
 化后长 RPC 的 HTTP 响应时点不变、cancel 可 turn 中并发送达（传输中断 B + step 边界
 双保险）。回滚 = git revert 本提交（含三 crate 型面，需一起回）。
 
+---
+
+## D-115-Web（D1）：多 plugin_root —— 浏览器 roster 补 base 层，前端物化渲染
+
+**触发问题**：Rust `dsh web` 下发前端后，浏览器报「37 entries did not activate」、
+页面空白。重启无效。诊断链（需求分析见 `.spec/frontend-packaging/`）：
+- Rust `build_boot_manifest` 从**单一 plugin_root**（web-app 层 node_modules）扫描
+  `dsh.client.platform=="web"`；
+- vendored 前端 dist 是**旧协议**（queue 门面，与 Rust 注入逐字匹配），安装版 dist 是
+  新协议 N3（自装 loader 拒绝已存在）→ 必须用 vendored 编译产物随 Rust 打包；
+- **base 层**（packages/bundle/base）的 `dsh-typert-registry`（提供 `typert`）与
+  `dsh-api-gateway`（client 半提供 `remote`，inject=[typert,connection]）因 pnpm 隔离
+  不在 web-app 层 → Rust 扫不到 → 这俩 client.js 404 → `typert`/`remote` 无人提供 →
+  runtime（依赖 connection/typert/remote/remote.commands）无法激活 → slots/sessions/
+  workspaces/conversationEvents/Views 全缺 → 37 连锁 pending。
+- 权威：TS host 的 modules node 半 `compose()` 遍历 loader entries → `require.resolve`
+  逐包取 `dsh.client`——**roster 来自组合，非目录盲扫**；Rust 多 root = 复现 base+web
+  两层组合。
+
+**考虑的选项**：
+- (a) 只把 web-root 换成含 base 的单一 node_modules——不存在（pnpm 隔离，无单目录含两层）。
+- (b) 多 plugin_root 合并扫描（base 前、web 后，同名后者覆盖，对齐 cordis patch 层叠）。——
+  **选定**。
+- (c) 复制/链接 base bundle 进 web-app node_modules——维护包袱、占盘。否决。
+- (d) 弃 vendored dist 用安装版——协议 N3 错配，否决。
+
+**决策事项**：
+1. `WebConfig.plugin_root: PathBuf` → `plugin_roots: Vec<PathBuf>`（多 root，有序）。
+2. `build_boot_manifest` 单 root 委托新 `build_boot_manifest_multi(roots)`；后者遍历每
+   root 依 `dsh.client.platform=="web"` + `lib/client.js` 收录，**同名 id 后者覆盖**；
+   `HOST_COMPOSITION_EXCLUDED_CLIENTS`（native picker 流程）过滤保持。
+3. `main.rs default_plugin_root` → `default_plugin_roots`：env `DSH_PLUGIN_ROOT`（兼容）；
+   否则从 web_root 向上找 web-app 层 `@deepseek-ai`，再从祖辈逐级找
+   `…/bundle/base/node_modules/@deepseek-ai` 兄弟作 base 层（base 前、web 后）。
+   修正记录：初版 base 候选路径层级算错（按 web-app 子目录算），后改为「向上扫描
+   祖辈找 base 兄弟」——首次验证仍浏览器 37 pending 即此因（manifest 有 entry 但
+   bundle 404）。
+
+**验证（D1 关闸）**：`cargo test -p dsh-cli --lib` 217 全绿（新增
+`build_boot_manifest_multi_merges_base_and_web_roots`：两层合并、后者覆盖、非 web 跳过）；
+60884（vendored dist + 多 root）浏览器 playwright/msedge headless 验证：console/page
+errors **空**、`[class*="frame"]` 锚点命中、bodyLen 4347→42269、完整应用壳渲染
+（sidebar/新会话/工作区/设置/echo-loop），boot 页消失 → **物化达成**。
+后端已验证 base 层 gateway/typert client.js 现 200（此前 404）。
+
+**待办（后续 D2/D3）**：补齐 remote 端点真实实现（messageFeedback/fileReferences/
+sessionReferenceResolver/pluginInventory/dynamicCordisRunner）+ wasm 承载
+（host-remote world）。dynamicCordisRunner 依赖 TS sandbox 的 4 方法
+（getClientCode/invoke/reportRenderFailure/reportClientGuardFailure）用户接受显式
+not-implemented，留待调研。
+
+**回滚点**：git revert 本提交（plugin_root→plugin_roots 破坏性，需协同回滚）。
+
+
 
 
 
