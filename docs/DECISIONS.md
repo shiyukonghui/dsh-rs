@@ -6367,6 +6367,29 @@ H2 entry 保真 reload（不破坏 id/options/group）；DIV-3-2 本例无新 ds
 
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；后续设计/编码各自独立可回。
 
+---
+
+## D-129（服务装配单元 Phase 3 系统设计定稿：B3 replace_plugin + reload）
+
+**日期**：2026-08-26
+
+**触发问题**：Phase 3 需求关闸通过 → 阶段 2（系统设计）。把「身份换代 → 受影响 entry reload」落成
+可验收 API 设计。
+
+**关键设计定案**：
+- `Loader::replace_plugin(name, new_impl) -> Result<usize, CordisError>`：同 Arc 幂等（Ok(0)）；新
+  Arc → A1 换代 + 收集 `entry.options.name==name && identity!=新` 的 entry → `reload_entry`（count）。
+- `reload_entry` = `dispose_entry + start_entry`（保 entry 记录/options/group，重挂载新实现）。
+- **DIV-3-1 定案**：externals→全重载 = 依赖方经 **fiber uid 换代/epoch 自动重活**（自下而上证实：
+  dispose 置 uid None、重载重新分配 runtime.rs:208-209/755 → 提供者 reload 后 epoch 变 → 依赖方
+  自动 Load）——无需显式刷新依赖方。
+- 观测访问器 `stale_entry_ids(name)`；group 入口（合成 GroupPlugin）不参与（B2 后续）。
+
+**验证（设计关闸）**：`design.md` 定稿；实现 S1（TDD T1-T4 红→绿）+ 回归（verify-diff 21 零回归、
+clippy 0）+ S3 部署冒烟。
+
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
+
 
 
 
