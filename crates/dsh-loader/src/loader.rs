@@ -84,7 +84,9 @@ pub struct LoaderPlugin {
 }
 
 /// 入口是否禁用：自身（布尔或 `!!js` 表达式求值 truthy）或沿父组链的 group 入口禁用。
-fn entry_disabled(st: &LoaderState, id: &str) -> bool {
+/// A2：`!!js` disabled 表达式的 `ctx` 绑定检查时刻当前纤维的注入服务（best-effort，
+/// 对齐 cordis `disabledOf` 用入口 ctx；未装载入口则取当前纤维可见服务 / 空）。
+fn entry_disabled(st: &LoaderState, id: &str, ctx: &Cordis) -> bool {
     let mut cur = id.to_string();
     loop {
         let (disabled, expr, config, parent_group) = match st.entries.get(&cur) {
@@ -101,7 +103,8 @@ fn entry_disabled(st: &LoaderState, id: &str) -> bool {
         }
         // `!!js` disabled 表达式（fail-closed：求值失败视为禁用）
         if let Some(expr) = expr {
-            let scope = eval_scope(&config);
+            let services = fiber_service_ctx(ctx, ctx.current_fiber());
+            let scope = eval_scope_with_services(&config, &dsh_eval::process_facade(), &services);
             let truthy = dsh_eval::evaluate(&scope, &expr)
                 .map(|v| dsh_eval::truthy(&v))
                 .unwrap_or(true);
@@ -119,20 +122,60 @@ fn entry_disabled(st: &LoaderState, id: &str) -> bool {
     }
 }
 
-/// `!!js` 求值作用域（默认 `process` 门面 = 真实 OS 事实，D-103/P2-a）：
-/// `{ config, process, ctx, env }`。
+/// `!!js` 求值作用域（默认 `process` 门面 = 真实 OS 事实，D-103/P2-a）。
+/// A2：生产路径经 `eval_scope_with_services`（绑定注入服务 ctx）；本函数（空 services）
+/// 仅测试/确定性路径使用。
+#[cfg(test)]
 fn eval_scope(config: &Value) -> HashMap<String, Value> {
-    eval_scope_with_process(config, &dsh_eval::process_facade())
+    eval_scope_with_services(config, &dsh_eval::process_facade(), &serde_json::json!({}))
 }
 
 /// `!!js` 求值作用域 + 可注入 `process` 门面（确定性测试用；host 装配真实 facade）。
 pub fn eval_scope_with_process(config: &Value, process: &Value) -> HashMap<String, Value> {
+    eval_scope_with_services(config, process, &serde_json::json!({}))
+}
+
+/// `!!js` 求值作用域 + 注入服务 ctx（A2：绑定目标纤维注入就绪上下文）。
+///
+/// `services` = `{ 注入服务名 → Value }`：`ctx` = 该对象（成员访问 `ctx.svc`）；
+/// 服务名同时注入为**顶层裸标识符**（对齐 fork `with(ctx)` 语义）——与显式键
+/// （`config`/`process`/`env`/`ctx`）冲突时**显式键优先**（不覆盖）。
+pub fn eval_scope_with_services(
+    config: &Value,
+    process: &Value,
+    services: &Value,
+) -> HashMap<String, Value> {
     let mut scope = HashMap::new();
     scope.insert("config".to_string(), config.clone());
     scope.insert("process".to_string(), process.clone());
-    scope.insert("ctx".to_string(), serde_json::json!({}));
+    scope.insert("ctx".to_string(), services.clone());
     scope.insert("env".to_string(), serde_json::json!({}));
+    if let Some(map) = services.as_object() {
+        for (k, v) in map {
+            if !scope.contains_key(k) {
+                scope.insert(k.clone(), v.clone());
+            }
+        }
+    }
     scope
+}
+
+/// 取某纤维的注入服务上下文 `{ 注入名 → Value }`（A2；仅 Value 型服务，DIV-6-1）。
+/// `fid: None` = 空上下文（无纤维）。
+pub(crate) fn fiber_service_ctx(ctx: &Cordis, fid: Option<FiberId>) -> Value {
+    let names: Vec<String> = ctx
+        .with(|rt| {
+            fid.and_then(|fid| rt.fiber(fid))
+                .map(|f| f.inject.clone())
+                .unwrap_or_default()
+        });
+    let mut map = serde_json::Map::new();
+    for n in &names {
+        if let Some(v) = ctx.get_value(n) {
+            map.insert(n.clone(), v);
+        }
+    }
+    Value::Object(map)
 }
 
 impl Plugin for LoaderPlugin {
@@ -200,7 +243,7 @@ impl Plugin for LoaderPlugin {
                     return HookResult::Continue;
                 }
                 // case 7: 入口已禁用
-                if entry_disabled(&st, &entry_id) {
+                if entry_disabled(&st, &entry_id, ctx) {
                     return HookResult::Continue;
                 }
                 drop(st);
@@ -246,13 +289,24 @@ impl Plugin for LoaderPlugin {
         let state = self.state.clone();
         let config_interp: Listener = {
             let state = state.clone();
-            Arc::new(move |_ctx, args, next| {
+            Arc::new(move |ctx, args, next| {
                 let resolved = match next {
-                    Some(n) => n(_ctx, args),
+                    Some(n) => n(ctx, args),
                     None => args.get(1).cloned(),
                 };
                 let config = resolved.unwrap_or(Value::Null);
-                let scope = eval_scope(&config);
+                // A2：绑定**目标纤维**（args[0]）的注入就绪上下文——`apply_body` 的
+                // `internal/config` waterfall 早于 `current.push(fid)`，此处不可用
+                // current_fiber（拿到的是父纤维），须显式取 fid。仅 Value 型服务暴露。
+                let services = fiber_service_ctx(
+                    ctx,
+                    args.first().and_then(|v| v.as_u64()).map(|n| n as FiberId),
+                );
+                let scope = eval_scope_with_services(
+                    &config,
+                    &dsh_eval::process_facade(),
+                    &services,
+                );
                 match dsh_eval::interpolate(&scope, &config) {
                     Ok(v) => HookResult::Returned(Some(v)),
                     Err(e) => {
@@ -519,7 +573,7 @@ impl Loader {
     }
 
     pub fn is_disabled(&self, id: &str) -> bool {
-        entry_disabled(&self.state.borrow(), id)
+        entry_disabled(&self.state.borrow(), id, &self.ctx)
     }
 
     pub fn entries(&self) -> Vec<EntrySnapshot> {

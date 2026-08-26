@@ -6704,6 +6704,31 @@ clippy）+ 阶段 4/5 关闸。
 
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
 
+## D-143（服务装配单元 Phase 6 编码落定：A2 eval_scope 绑注入服务红→绿）
+
+**日期**：2026-08-27
+
+**触发问题**：D-142 设计关闸通过 → 阶段 3（TDD 编码）把 `!!js` 求值作用域绑定注入就绪上下文。
+
+**关键实现（红→绿）**：
+- **S1**：`eval_scope_with_services(config, process, services)`——services 对象 → `ctx`（成员访问）
+  + 服务名顶层**裸标识符**（显式键 config/process/env/ctx 优先，不做 `with` 语句）；`eval_scope`
+  改 `#[cfg(test)]`（生产路径统一走带 services 的构造）；`eval_scope_with_process` 委托空 services
+  （m3/既有单测零回归）。
+- **S2**：`fiber_service_ctx(ctx, fid)`（`fiber(fid).inject` 名单 × `get_value`，仅 Value 服务）——
+  `internal/config` 监听器从 **`args[0]=fid`**（waterfall 早于 `current.push(fid)` 的时序约束）绑定
+  目标纤维；`entry_disabled` 增 `&Cordis` 参数（disabled 表达式绑当前纤维，best-effort）。
+- **S3**：m21 T1（裸标识符读注入服务 `svc.k`）/ T2（`ctx.svc` 成员 + 服务名=config 不覆盖显式键）/
+  T3（未注入服务 fail-loud 保留原 config + eval-error 写回标记）3/3 绿。
+
+**阶段 4 验证（编码关闸）**：`cargo test --workspace` EXIT=0（201 目标 0 失败，含 m21 3/3）；`cargo
+clippy --workspace --all-targets -- -D warnings` EXIT=0；`node diff/ts-host/verify-diff.mjs`
+**23/23 PASS**（golden 零回归——listener 增 internal/get 读取与 entry_disabled 参数化对既有
+scenario/loader 场景无 trace 影响）。
+
+**预期影响与回滚点**：本提交 = 代码 + 测试。回滚 = `git revert` 本提交（S1+S2+S3 特征级整体）；
+m21 可独立删除。A2-SCOPE=B（无 golden）——等价证据由 m21 + 单测锁定。
+
 
 
 
