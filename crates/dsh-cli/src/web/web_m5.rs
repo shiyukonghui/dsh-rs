@@ -10,10 +10,8 @@
 //! run_in_background 诚实拒绝（jobs producer 桥/tick 后续轮）；read_image 待解码服务；
 //! run_code 交注册表保留传输（D-068/D-069/D-070 记录待办）。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -66,84 +64,6 @@ const M5_RENDER_MAX_BYTES: usize = 256 * 1024;
 
 /// 结构化错误 code：宿主句柄缺失（复用 M4 NOT_BOUND 词表）。
 pub use dsh_tools::m4::CODE_NOT_BOUND;
-
-// ---------------------------------------------------------------------------
-// D-115（请求面 Send+Sync 化）：单线程宿主状态线程本地桥。
-//
-// dsh-terminal / dsh-jobs / dsh-shell 的宿主值（`TerminalSessionService` /
-// `JobRegistry` / `ShellProcess`，内含 `Box<dyn Fn>`、`Rc<RefCell>`）是**非 Send**
-// 底层类型，无法直接捕获进 Send+Sync 的工具执行闭包。按 D-115/Phase 0 既有纪律
-// （`CURRENT_CTX` thread_local 桥接）：状态放**创建线程**的本地池，句柄只持 id +
-// 保活 `Arc` → 自身 Send+Sync；`.`with` 须在创建线程调用（单线程宿主纪律——serve
-// 主循环 / 测试线程，与既有 Rc/RefCell 语义完全一致）。最后一个句柄 Drop 时按 id
-// 清理池条目（测试线程短活 → 无泄漏）。
-// ---------------------------------------------------------------------------
-
-thread_local! {
-    static TLOCAL_STATES: RefCell<HashMap<u64, Box<dyn std::any::Any>>> =
-        RefCell::new(HashMap::new());
-}
-
-static NEXT_TLOCAL_ID: AtomicU64 = AtomicU64::new(1);
-
-/// 非 Send 宿主状态的 Send+Sync 句柄（见上）。`T` 仅在 `with` 时保类型安全（池内在位
-/// 由 id 唯一寻址），句柄自身不持数据 → 自动 Send+Sync。非重入：`with` 的闭包内不得
-/// 再调另一个 `with`（本模块无嵌套用法）。
-pub struct ThreadCell<T> {
-    id: u64,
-    _keepalive: Arc<()>,
-    _marker: std::marker::PhantomData<fn(T) -> T>,
-}
-
-impl<T> Clone for ThreadCell<T> {
-    fn clone(&self) -> Self {
-        ThreadCell {
-            id: self.id,
-            _keepalive: Arc::clone(&self._keepalive),
-            _marker: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<T: 'static> ThreadCell<T> {
-    /// 把非 Send 状态放入当前线程本地池，返回 Send+Sync 句柄。
-    pub fn new(state: T) -> ThreadCell<T> {
-        let id = NEXT_TLOCAL_ID.fetch_add(1, Ordering::Relaxed);
-        TLOCAL_STATES.with(|m| {
-            m.borrow_mut().insert(id, Box::new(state));
-        });
-        ThreadCell {
-            id,
-            _keepalive: Arc::new(()),
-            _marker: std::marker::PhantomData,
-        }
-    }
-
-    /// 在创建线程上访问状态（单线程纪律；跨线程调用 panic——不会被错误静默）。
-    pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        TLOCAL_STATES.with(|m| {
-            let mut m = m.borrow_mut();
-            let slot = m.get_mut(&self.id).unwrap_or_else(|| {
-                panic!("ThreadCell state missing (accessed from a different thread?)")
-            });
-            let state = slot
-                .downcast_mut::<T>()
-                .expect("ThreadCell state type mismatch");
-            f(state)
-        })
-    }
-}
-
-impl<T> Drop for ThreadCell<T> {
-    fn drop(&mut self) {
-        // 最后一个句柄（保活 Arc strong_count 含本副本）→ 清理线程本地池条目。
-        if Arc::strong_count(&self._keepalive) == 1 {
-            TLOCAL_STATES.with(|m| {
-                m.borrow_mut().remove(&self.id);
-            });
-        }
-    }
-}
 
 /// fs 宿主：LocalFileSystem（root 解析）+ observation gate（owner 写/编守卫）+ agent→OwnerId
 /// 稳定登记（Web 无 WeakMap；宿主会话结束时需清理——本轮接线不装会话清理钩子，D-069 记录）。
@@ -257,34 +177,46 @@ impl ShellHost {
 /// 单线程注册表不自驱动 settle（D-004 诚实降级）。注册成功前不 spawn（producer 延迟
 /// start 在 jobs.start 内）；`start_bash` 失败由调用方掐掉进程。
 ///
-/// Send+Sync（工具执行闭包捕获）：`JobRegistry`/`ShellProcess` 为非 Send 底层类型 →
-/// 整份状态经 [`ThreadCell`] 落创建线程本地池，桥自身只持句柄。
+/// Send+Sync（工具执行闭包捕获）：`JobRegistry`/`ShellProcess` 均 Send → 整份状态落
+/// `Arc<Mutex<_>>`，桥与 M4 的 job_* 工具可在任意线程安全访问（D-115 Phase 4）。
 pub struct BashJobsBridge {
-    state: ThreadCell<BashJobsState>,
+    state: Arc<Mutex<BashJobsState>>,
 }
 
-/// `BashJobsBridge` 的单线程状态（仅经 `ThreadCell` 在创建线程可见）。
+/// `BashJobsBridge` 的共享状态（`Arc<Mutex>` 承载；跨线程安全访问）。
+/// `registry` 为共享 `Arc<Mutex<JobRegistry>>`（D-115 Phase 4：与 M4 job_* 工具
+/// 同一事实源；bash 后台 job 可被 job_kill/job_read 命中）。
 struct BashJobsState {
-    registry: JobRegistry,
-    processes: HashMap<String, Rc<ShellProcess>>,
+    registry: Arc<Mutex<JobRegistry>>,
+    processes: HashMap<String, Arc<ShellProcess>>,
     outputs: HashMap<String, String>,
 }
 
 impl Default for BashJobsBridge {
     fn default() -> Self {
-        Self {
-            state: ThreadCell::new(BashJobsState {
-                registry: JobRegistry::new(JobRegistryConfig::default()),
-                processes: HashMap::new(),
-                outputs: HashMap::new(),
-            }),
-        }
+        // 独立注册表（M4 job_* 未装配/单测独立路径）：保持既有行为。
+        BashJobsBridge::with_registry(Arc::new(Mutex::new(JobRegistry::new(
+            JobRegistryConfig::default(),
+        ))))
     }
 }
 
 impl BashJobsBridge {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// D-115（Phase 4）：与 M4 job_* 工具**共享**同一 `JobRegistry`——bash 后台
+    /// job 由 agent（worker 线程 turn）注册进共享注册表，job_kill/job_read 经
+    /// M4 工具可见可命中（跨 M4/M5 宿主单一事实源；设计文档 §4.4）。
+    pub fn with_registry(registry: Arc<Mutex<JobRegistry>>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(BashJobsState {
+                registry,
+                processes: HashMap::new(),
+                outputs: HashMap::new(),
+            })),
+        }
     }
 
     /// 注册一个已 spawn 的后台 shell 进程为 job（owner 归属 caller；label 缺省命令
@@ -295,94 +227,97 @@ impl BashJobsBridge {
         kind: &str,
         owner: &str,
         label: &str,
-        process: Rc<ShellProcess>,
+        process: Arc<ShellProcess>,
     ) -> Result<String, JobStartError> {
-        self.state.with(|s| {
-            let proc = process.clone();
-            let id = s.registry.start(StartSpec {
-                kind,
-                label,
-                owner: Some(owner.to_string()),
-                producer: Box::new(move || {
-                    let killer = proc.clone();
-                    ProducerHooks {
-                        on_cancel: Box::new(move |_reason| {
-                            killer.kill();
-                        }),
-                        read_output: None, // final-output 语义：终态 settle 携全文，不流式滚入
-                    }
-                }),
-            })?;
-            s.processes.insert(id.clone(), process);
-            Ok(id)
-        })
+        let mut s = self.state.lock().unwrap();
+        let proc = process.clone();
+        let id = s.registry.lock().unwrap().start(StartSpec {
+            kind,
+            label,
+            owner: Some(owner.to_string()),
+            producer: Box::new(move || {
+                let killer = proc.clone();
+                ProducerHooks {
+                    on_cancel: Box::new(move |_reason| {
+                        killer.kill();
+                    }),
+                    read_output: None, // final-output 语义：终态 settle 携全文，不流式滚入
+                }
+            }),
+        })?;
+        s.processes.insert(id.clone(), process);
+        Ok(id)
     }
 
     /// 合作推进泵：滚动增量（终态走私全文）+ 探测终态 + settle + 移除。
     /// 返回本次结算条数。由宿主 tick（M5g）或测试循环调用；幂等。
     pub fn pump(&self) -> usize {
-        self.state.with(|s| {
-            let mut finished: Vec<(String, ShellProcessStatus, Option<i32>)> = Vec::new();
-            {
-                let procs = &s.processes;
-                for (id, proc) in procs.iter() {
-                    // 先 done() 等到退出（collector 已 join，管道缓冲已全部落盘），
-                    // 再 read_output() 收尾增量：终态轮拿到的是全文（含此前 running 轮
-                    // 已消费的首段——offset 消费性，累计即完整终态输出）。
-                    proc.done();
-                    let delta = proc.read_output().delta;
-                    if !delta.is_empty() {
-                        s.outputs.entry(id.clone()).or_default().push_str(&delta);
-                    }
-                    let st = proc.status();
-                    if st == ShellProcessStatus::Completed || st == ShellProcessStatus::Killed {
-                        finished.push((id.clone(), st, proc.exit_code()));
-                    }
-                }
+        let mut s = self.state.lock().unwrap();
+        // 克隆 (id, Arc) 快照再迭代：不跨守卫持有 `s.processes` 的借用，泵循环内可安全
+        // 更新 `s.outputs`（同守卫下 split-borrow 经 Deref 不被受理）。
+        let proc_list: Vec<(String, Arc<ShellProcess>)> = s
+            .processes
+            .iter()
+            .map(|(id, p)| (id.clone(), p.clone()))
+            .collect();
+        let mut finished: Vec<(String, ShellProcessStatus, Option<i32>)> = Vec::new();
+        for (id, proc) in &proc_list {
+            // 先 done() 等到退出（collector 已 join，管道缓冲已全部落盘），
+            // 再 read_output() 收尾增量：终态轮拿到的是全文（含此前 running 轮
+            // 已消费的首段——offset 消费性，累计即完整终态输出）。
+            proc.done();
+            let delta = proc.read_output().delta;
+            if !delta.is_empty() {
+                s.outputs.entry(id.clone()).or_default().push_str(&delta);
             }
-            for (id, st, code) in &finished {
-                let status = if *st == ShellProcessStatus::Killed {
-                    JobStatus::Killed
-                } else {
-                    JobStatus::Completed
-                };
-                let output = s.outputs.remove(id).unwrap_or_default();
-                let detail = code
-                    .map(|c| format!("exit code {c}"))
-                    .unwrap_or_else(|| "killed".to_string());
-                s.registry.settle(
-                    id,
-                    JobSettlement {
-                        status,
-                        detail: Some(detail),
-                        output: Some(output),
-                    },
-                );
-                s.processes.remove(id);
+            let st = proc.status();
+            if st == ShellProcessStatus::Completed || st == ShellProcessStatus::Killed {
+                finished.push((id.clone(), st, proc.exit_code()));
             }
-            finished.len()
-        })
+        }
+        for (id, st, code) in &finished {
+            let status = if *st == ShellProcessStatus::Killed {
+                JobStatus::Killed
+            } else {
+                JobStatus::Completed
+            };
+            let output = s.outputs.remove(id).unwrap_or_default();
+            let detail = code
+                .map(|c| format!("exit code {c}"))
+                .unwrap_or_else(|| "killed".to_string());
+            s.registry.lock().unwrap().settle(
+                id,
+                JobSettlement {
+                    status,
+                    detail: Some(detail),
+                    output: Some(output),
+                },
+            );
+            s.processes.remove(id);
+        }
+        finished.len()
     }
 
     /// job 只读投影（caller 授权围栏由注册表执行）。
     pub fn read(&self, id: &str, caller: Option<&str>) -> Result<JobRead, dsh_jobs::JobOpsError> {
-        self.state.with(|s| s.registry.read(id, caller))
+        self.state.lock().unwrap().registry.lock().unwrap().read(id, caller)
     }
 
     /// M6 step2（D-082）：关停全部后台 bash job——kill 进程树 + 合作泵结算（Killed）。
     /// 幂等：无存活进程/已结算 → no-op。宿主生命周期清理（`M5Host::shutdown`）调用，
     /// 保证 serve 退出时不遗留孤儿进程（验收 #3）。
     pub fn kill_all(&self) {
-        self.state.with(|s| {
+        {
+            let s = self.state.lock().unwrap();
             let ids: Vec<String> = s.processes.keys().cloned().collect();
-            let procs: Vec<Rc<ShellProcess>> = ids
+            let procs: Vec<Arc<ShellProcess>> = ids
                 .iter()
                 .filter_map(|id| s.processes.get(id).cloned())
                 .collect();
             for p in procs {
                 p.kill();
             }
-        });
+        }
         // settle：kill 后 `pump()` 的 done() 等在进程退出（collector join）再 settle Killed。
         self.pump();
     }
@@ -455,8 +390,8 @@ pub fn m5g_tick_once(
 #[derive(Default)]
 pub struct M5HostServices {
     /// 终端会话注册表（terminal_open/send/read/signal/close/list 的真实句柄。
-    /// 内部 `TerminalSessionService` 为非 Send 底层值 → `ThreadCell` 桥（创建线程可见）。
-    pub terminal: Option<ThreadCell<TerminalSessionService>>,
+    /// `TerminalSessionService` 为 Send 底层值 → `Arc<Mutex<_>>`（任意线程安全访问）。
+    pub terminal: Option<Arc<Mutex<TerminalSessionService>>>,
     /// fs 宿主（read/write/edit/glob/grep/str_replace_editor 的真实句柄）。
     pub fs: Option<Arc<FsHost>>,
     /// shell 宿主（bash 工具前台执行的真实句柄）。
@@ -476,9 +411,16 @@ pub struct M5Host {
 }
 
 impl M5Host {
-    pub fn assemble(root: PathBuf) -> Result<Self, String> {
+    /// 装配 M5 宿主。`shared_jobs: Option<Arc<Mutex<JobRegistry>>>`——Some 时
+    /// `BashJobsBridge` 与 M4 job_* 工具共享同一注册表（D-115 Phase 4：worker
+    /// 线程 turn 里 run_in_background 起的 bash job 可被 job_kill/job_read 命中）；
+    /// None → 独立注册表（单测独立路径）。
+    pub fn assemble(
+        root: PathBuf,
+        shared_jobs: Option<Arc<Mutex<dsh_jobs::registry::JobRegistry>>>,
+    ) -> Result<Self, String> {
         let root_abs = root.canonicalize().unwrap_or(root);
-        let terminal = ThreadCell::new(TerminalSessionService::new());
+        let terminal = Arc::new(Mutex::new(TerminalSessionService::new()));
         // P3-e（A 并行收口）：真实 PTY 后端在册——bash（resolve_bash_program）与
         // pwsh（resolve_pwsh_program，win32 = powershell.exe 5.1 兜底）。terminal_open
         // 按 `type` 后端名开真实会话；spawn 失败 → 诚实 NoBackend。
@@ -486,45 +428,48 @@ impl M5Host {
             let bash_program = dsh_shell::resolve_bash_program(&BashConfig::default());
             let pwsh_program = dsh_shell::resolve_pwsh_program(&BashConfig::default());
             terminal
-                .with(|t| {
-                    t.register_backend(
-                        dsh_terminal::BackendDefinition {
-                            id: "bash".into(),
-                            kind: dsh_terminal::TerminalBackendKind::Bash,
-                            label: format!("bash pty ({bash_program})"),
-                        },
-                        Box::new(move |_cfg| {
-                            Box::new(dsh_terminal::PtyBackend::new(
-                                "bash",
-                                &bash_program,
-                                dsh_terminal::TerminalBackendKind::Bash,
-                            ))
-                        }),
-                    )
-                })
+                .lock()
+                .unwrap()
+                .register_backend(
+                    dsh_terminal::BackendDefinition {
+                        id: "bash".into(),
+                        kind: dsh_terminal::TerminalBackendKind::Bash,
+                        label: format!("bash pty ({bash_program})"),
+                    },
+                    Box::new(move |_cfg| {
+                        Box::new(dsh_terminal::PtyBackend::new(
+                            "bash",
+                            &bash_program,
+                            dsh_terminal::TerminalBackendKind::Bash,
+                        ))
+                    }),
+                )
                 .map_err(|e| format!("register terminal backend bash: {e}"))?;
             terminal
-                .with(|t| {
-                    t.register_backend(
-                        dsh_terminal::BackendDefinition {
-                            id: "pwsh".into(),
-                            kind: dsh_terminal::TerminalBackendKind::PowerShell,
-                            label: format!("pwsh pty ({pwsh_program})"),
-                        },
-                        Box::new(move |_cfg| {
-                            Box::new(dsh_terminal::PtyBackend::new(
-                                "pwsh",
-                                &pwsh_program,
-                                dsh_terminal::TerminalBackendKind::PowerShell,
-                            ))
-                        }),
-                    )
-                })
+                .lock()
+                .unwrap()
+                .register_backend(
+                    dsh_terminal::BackendDefinition {
+                        id: "pwsh".into(),
+                        kind: dsh_terminal::TerminalBackendKind::PowerShell,
+                        label: format!("pwsh pty ({pwsh_program})"),
+                    },
+                    Box::new(move |_cfg| {
+                        Box::new(dsh_terminal::PtyBackend::new(
+                            "pwsh",
+                            &pwsh_program,
+                            dsh_terminal::TerminalBackendKind::PowerShell,
+                        ))
+                    }),
+                )
                 .map_err(|e| format!("register terminal backend pwsh: {e}"))?;
         }
         let fs = Arc::new(FsHost::new(root_abs.clone()));
         let shell = Arc::new(ShellHost::new(root_abs.clone())?);
-        let bash_jobs = Arc::new(BashJobsBridge::new());
+        let bash_jobs = Arc::new(match shared_jobs {
+            Some(jobs) => BashJobsBridge::with_registry(jobs),
+            None => BashJobsBridge::new(),
+        });
         let code = dsh_code_runtime::python_available()
             .then(|| Arc::new(PythonCodeRuntime::new(PythonConfig::default())));
         Ok(M5Host {
@@ -553,7 +498,7 @@ impl M5Host {
             b.kill_all();
         }
         if let Some(t) = &self.services.terminal {
-            t.with(|t| t.dispose());
+            t.lock().unwrap().dispose();
         }
     }
 }
@@ -999,7 +944,7 @@ fn shell_background(
     let process = executor
         .start(spec)
         .map_err(|e| shell_failure(name, e))?;
-    let process = Rc::new(process);
+    let process = Arc::new(process);
     let label = {
         let joined: String = command.trim().chars().take(60).collect();
         if joined.is_empty() {
@@ -1183,13 +1128,15 @@ fn terminal_list_tool() -> M5Tool {
     .expect("terminal_list defines")
 }
 
-fn terminal_open_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecute {
+fn terminal_open_executor(svc: Arc<Mutex<TerminalSessionService>>) -> ToolExecute {
     Arc::new(move |args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "terminal_open")?;
         let (backend, name, _cwd) =
             parse_terminal_open_args(args).map_err(|m| invalid_args("terminal_open", m))?;
         let id = svc
-            .with(|s| s.open(owner, &backend, name.as_deref(), TerminalConfig::default()))
+            .lock()
+            .unwrap()
+            .open(owner, &backend, name.as_deref(), TerminalConfig::default())
             .map_err(|e| terminal_failure("terminal_open", e))?;
         Ok(json!({
             "sessionId": id.as_str(),
@@ -1199,7 +1146,7 @@ fn terminal_open_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecut
     })
 }
 
-fn terminal_send_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecute {
+fn terminal_send_executor(svc: Arc<Mutex<TerminalSessionService>>) -> ToolExecute {
     Arc::new(move |args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "terminal_send")?;
         let (id, text, submit, background) =
@@ -1215,7 +1162,9 @@ fn terminal_send_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecut
             signal: None,
         };
         let res = svc
-            .with(|s| s.send(owner, &TerminalSessionId::from_raw(id.clone()), &req))
+            .lock()
+            .unwrap()
+            .send(owner, &TerminalSessionId::from_raw(id.clone()), &req)
             .map_err(|e| terminal_failure("terminal_send", e))?;
         Ok(json!({
             "sessionId": id,
@@ -1227,13 +1176,15 @@ fn terminal_send_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecut
     })
 }
 
-fn terminal_read_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecute {
+fn terminal_read_executor(svc: Arc<Mutex<TerminalSessionService>>) -> ToolExecute {
     Arc::new(move |args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "terminal_read")?;
         let (id, offset, count) =
             parse_terminal_read_args(args).map_err(|e| terminal_failure("terminal_read", e))?;
         let text = svc
-            .with(|s| s.read(owner, &TerminalSessionId::from_raw(id.clone())))
+            .lock()
+            .unwrap()
+            .read(owner, &TerminalSessionId::from_raw(id.clone()))
             .map_err(|e| terminal_failure("terminal_read", e))?;
         let total = text.matches('\n').count() + usize::from(!text.is_empty());
         let begin = offset.map(|o| o as usize).unwrap_or(0).min(total);
@@ -1249,14 +1200,16 @@ fn terminal_read_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecut
     })
 }
 
-fn terminal_signal_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecute {
+fn terminal_signal_executor(svc: Arc<Mutex<TerminalSessionService>>) -> ToolExecute {
     Arc::new(move |args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "terminal_signal")?;
         let (id, sig) =
             parse_terminal_signal_args(args).map_err(|e| terminal_failure("terminal_signal", e))?;
         let parsed = parse_signal(&sig)
             .ok_or_else(|| invalid_args("terminal_signal", format!("unknown signal: {sig}")))?;
-        svc.with(|s| s.signal(owner, &TerminalSessionId::from_raw(id.clone()), parsed))
+        svc.lock()
+            .unwrap()
+            .signal(owner, &TerminalSessionId::from_raw(id.clone()), parsed)
             .map_err(|e| terminal_failure("terminal_signal", e))?;
         Ok(json!({
             "sessionId": id,
@@ -1266,22 +1219,26 @@ fn terminal_signal_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExec
     })
 }
 
-fn terminal_close_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecute {
+fn terminal_close_executor(svc: Arc<Mutex<TerminalSessionService>>) -> ToolExecute {
     Arc::new(move |args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "terminal_close")?;
         let id =
             parse_terminal_close_args(args).map_err(|e| terminal_failure("terminal_close", e))?;
-        svc.with(|s| s.close(owner, &TerminalSessionId::from_raw(id.clone())))
+        svc.lock()
+            .unwrap()
+            .close(owner, &TerminalSessionId::from_raw(id.clone()))
             .map_err(|e| terminal_failure("terminal_close", e))?;
         Ok(json!({ "sessionId": id, "outcome": "closed" }))
     })
 }
 
-fn terminal_list_executor(svc: ThreadCell<TerminalSessionService>) -> ToolExecute {
+fn terminal_list_executor(svc: Arc<Mutex<TerminalSessionService>>) -> ToolExecute {
     Arc::new(move |_args, ctx| {
         let owner = required_agent(ctx.agent.as_deref(), "terminal_list")?;
         let sessions: Vec<Value> = svc
-            .with(|s| s.list())
+            .lock()
+            .unwrap()
+            .list()
             .into_iter()
             .filter(|v| v.owner == owner)
             .map(|v| {

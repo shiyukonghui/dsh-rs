@@ -181,6 +181,7 @@ pub fn build_request(
         stop: config.stop,
         session_id: Some(session.id().clone()),
         purpose: None,
+        signal: None,
     };
 
     Ok(BuiltRequest {

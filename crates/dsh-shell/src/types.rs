@@ -6,6 +6,7 @@
 //! executor 落地时随其类型一并加入，见 DECISIONS）。
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 /// 托管环境变量前缀（对齐 `dsh-subprocess` 的 scrubbed 词表）。
 pub const DSH_ENV_PREFIX: &str = "DSH_";
@@ -124,10 +125,10 @@ impl std::error::Error for ShellError {}
 
 /// 后台进程句柄（readOutput 增量 / kill / done settle 一次）。
 ///
-/// 单线程纪律：内部 `Rc<RefCell>` 承载状态 + subprocess 句柄（后台进程永不跨线程
+/// 线程安全纪律：内部 `Arc<Mutex>` 承载状态 + subprocess 句柄（后台进程可跨线程
 /// 迁移；jobs 层在 step7 以 JobHandle 包装之）。
 pub struct ShellProcess {
-    inner: std::rc::Rc<std::cell::RefCell<ShellProcessInner>>,
+    inner: Arc<Mutex<ShellProcessInner>>,
 }
 
 struct ShellProcessInner {
@@ -145,7 +146,7 @@ impl ShellProcess {
     /// 由已 spawn 的 subprocess 句柄构造（状态 Running）。
     pub fn new(handle: dsh_subprocess::SubprocessHandle) -> ShellProcess {
         ShellProcess {
-            inner: std::rc::Rc::new(std::cell::RefCell::new(ShellProcessInner {
+            inner: Arc::new(Mutex::new(ShellProcessInner {
                 status: ShellProcessStatus::Running,
                 exit_code: None,
                 signal: None,
@@ -159,21 +160,21 @@ impl ShellProcess {
     }
 
     pub fn status(&self) -> ShellProcessStatus {
-        self.inner.borrow().status
+        self.inner.lock().unwrap().status
     }
 
     pub fn exit_code(&self) -> Option<i32> {
-        self.inner.borrow().exit_code
+        self.inner.lock().unwrap().exit_code
     }
 
     pub fn signal(&self) -> Option<String> {
-        self.inner.borrow().signal.clone()
+        self.inner.lock().unwrap().signal.clone()
     }
 
     /// 等待进程关闭并 settle 一次（空闲重复调用为 no-op；从不 reject）。
     /// settle 后同行职业读取器拿到的将是完整流（collector 已 join）。
     pub fn done(&self) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().unwrap();
         if inner.status != ShellProcessStatus::Running {
             return;
         }
@@ -191,7 +192,7 @@ impl ShellProcess {
 
     /// 增量读取 stdout+stderr 合并增量（消费性：连续读取不重复）。
     pub fn read_output(&self) -> ShellProcessRead {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().unwrap();
         let mut result = ShellProcessRead::default();
         let (mut new_stdout, mut new_stderr) = (inner.stdout_offset, inner.stderr_offset);
         if let Some(handle) = inner.handle.as_ref() {
@@ -217,7 +218,7 @@ impl ShellProcess {
 
     /// 终止进程树。返回 false = 已结束（no-op）；幂等。
     pub fn kill(&self) -> bool {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().unwrap();
         if inner.status != ShellProcessStatus::Running {
             return false;
         }

@@ -49,7 +49,7 @@ pub fn server_llm_runtime_with_key(base_url: &str, model: &str, key: Option<&str
         let (b, m) = (base_url.clone(), model.clone());
         Arc::new(move || deepseek_connection(&b, &m))
     };
-    let resolve: PayloadsResolver = Arc::new(move |_conn, wire, _opts| {
+    let resolve: PayloadsResolver = Arc::new(move |_conn, wire, opts| {
         let Some(k) = &key else {
             return Err(LlmError::new(
                 format!(
@@ -60,7 +60,19 @@ pub fn server_llm_runtime_with_key(base_url: &str, model: &str, key: Option<&str
         };
         let body = serde_json::to_string(wire)
             .map_err(|e| LlmError::new(format!("request encode: {e}"), "INTERNAL"))?;
-        let body_result = dsh_core::llm_http::chat_completions_stream(&base_url, Some(k.as_str()), &body)
+        // D-115（Phase 4）：请求级取消 → 可中断读。cancel 谓词穿透 `options.signal`
+        // （worker/accept 线程经共享令牌轮询）；置位 → 主动断开在途阻塞读（对齐 TS
+        // `fetch(url, {signal})`；abort 不是传输错误，以 `Aborted` finish 归一）。
+        // owned 闭包托住 `s` 的 Clone；取引用传调用方，owned 存活至本函数结束。
+        let _cancel_owned: Option<Box<dyn Fn() -> bool + Send + Sync>> = opts
+            .signal
+            .as_ref()
+            .map(|s| -> Box<dyn Fn() -> bool + Send + Sync> {
+                let s = s.clone();
+                Box::new(move || s.aborted())
+            });
+        let cancel: Option<&(dyn Fn() -> bool + Send + Sync)> = _cancel_owned.as_deref();
+        let body_result = dsh_core::llm_http::chat_completions_stream_abortable(&base_url, Some(k.as_str()), &body, cancel)
             .map_err(|e| {
                 let code = if e.status == 0 {
                     "NETWORK".to_string()
@@ -69,6 +81,11 @@ pub fn server_llm_runtime_with_key(base_url: &str, model: &str, key: Option<&str
                 };
                 LlmError::new(e.to_string(), code)
             })?;
+        if body_result.aborted {
+            // 已取消：不留 partial 给解析器（SSE 可能未闭合）——返回空 payload，
+            // 由适配器按 `FinishReason::Aborted` 归一（对齐 TS ABORTED finish）。
+            return Ok(Vec::new());
+        }
         let payloads = parse_sse(&body_result.bytes)
             .map_err(|e| LlmError::new(format!("SSE parse: {e}"), "BAD_STREAM"))?;
         Ok(payloads)
@@ -177,6 +194,7 @@ pub fn stream_once(runtime: &LlmRuntime, model: &str) -> Vec<StreamChunk> {
         stop: None,
         session_id: None,
         purpose: None,
+        signal: None,
     };
     runtime.stream(options).collect()
 }
@@ -338,5 +356,83 @@ mod tests {
             "retry mode present: {}",
             view["retry"]
         );
+    }
+
+    /// 慢速服务端：写响应头（Content-Length 声明远大于实际）+ 首段 SSE 后挂起
+    /// 保持连接（模拟长生成流；客户端读端被 200ms 短超时轮询 cancel）。
+    fn serve_slow_hang() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(_) => break,
+                }
+            }
+            let sse = r#"data: {"choices":[{"delta":{"content":"first"}}]}"#;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000000\r\nConnection: close\r\n\r\n{sse}\n\n"
+            );
+            sock.write_all(header.as_bytes()).unwrap();
+            sock.flush().unwrap();
+            // 挂起不关闭：客户端不能借 Content-Length/close 结束，只能靠 cancel 谓词。
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+            let _ = sock;
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// D-115（Phase 4 传输中断）：长生成（慢速流挂起）中置 cancel 信号 →
+    /// 阻塞读被打断 → 适配器以 `Aborted` finish 归一，且调用**及时返回**
+    /// （不等待服务端 2s 挂起 / 原 30s 超时）。
+    #[test]
+    fn server_llm_runtime_aborts_slow_stream_on_signal() {
+        let model = "deepseek-v4-flash-0731-ext";
+        let base = serve_slow_hang();
+        let rt = server_llm_runtime_with_key(&base, model, Some("K"));
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let setter = flag.clone();
+        // 60ms 后置 cancel（首个读超时窗口内醒来轮询谓词）。
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            setter.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let mut options = dsh_llm::types::GenerateOptions {
+            provider: "deepseek".into(),
+            model: model.to_string(),
+            messages: vec![],
+            system: None,
+            tools: None,
+            reasoning_effort: None,
+            temperature: None,
+            max_tokens: None,
+            stop: None,
+            session_id: None,
+            purpose: None,
+            signal: None,
+        };
+        let f = flag.clone();
+        options.signal = Some(dsh_llm::AbortSignal::new(move || f.load(std::sync::atomic::Ordering::SeqCst)));
+        let start = std::time::Instant::now();
+        let chunks: Vec<dsh_llm::types::StreamChunk> = rt.stream(options).collect();
+        let took = start.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "signal must abort the blocking read well before the 2s hang / 30s timeout; took {took:?}"
+        );
+        match chunks.first() {
+            Some(dsh_llm::types::StreamChunk::Finish {
+                reason: dsh_llm::types::FinishReason::Aborted { failure },
+                ..
+            }) => {
+                assert_eq!(failure.code, "ABORTED", "aborted finish surfaced to chunks");
+            }
+            other => panic!("expected Aborted finish, got {other:?}"),
+        }
     }
 }

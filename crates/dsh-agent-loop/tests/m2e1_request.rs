@@ -99,6 +99,7 @@ fn go(
         stop: None,
         session_id,
         purpose: None,
+        signal: None,
     }
 }
 

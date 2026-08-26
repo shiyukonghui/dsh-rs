@@ -854,7 +854,18 @@ impl ReactLoopAgent {
                 built.request_header_logged,
                 std::sync::atomic::Ordering::SeqCst,
             );
-            let request = built.request.options().clone();
+            let mut request = built.request.options().clone();
+            // D-115（Phase 4）：请求级取消信号 = 共享取消令牌的**非消费**谓词 →
+            // 传输层阻塞读可被 accept 线程写入的 cancel 主动中断（对齐 TS
+            // `GenerateOptions.signal` / `fetch(url,{signal})`）。原 `abort_reason()`
+            // 在 step 边界消费令牌的语义不变。
+            if request.signal.is_none() {
+                request.signal = Some(dsh_llm::AbortSignal::new({
+                    let token = self.cancel_token.clone();
+                    move || token.lock().unwrap().is_some()
+                }));
+            }
+            let request = request;
             if let Some(c) = self.abort_reason() {
                 return Err(Halt::Aborted(c));
             }

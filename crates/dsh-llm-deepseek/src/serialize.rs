@@ -285,6 +285,7 @@ mod tests {
             stop: None,
             session_id: None,
             purpose: None,
+            signal: None,
         }
     }
 

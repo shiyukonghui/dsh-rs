@@ -27,10 +27,10 @@ pub trait TerminalBackend {
 }
 
 /// 后端提供者：给定配置构造一个活的后端实例。
-pub type BackendProvider = Box<dyn Fn(TerminalConfig) -> Box<dyn TerminalBackend>>;
+pub type BackendProvider = Box<dyn Fn(TerminalConfig) -> Box<dyn TerminalBackend + Send> + Send>;
 
 /// owner 存活校验钩子（缺省 = 恒在）。
-pub type OwnerLiveness = Box<dyn Fn(&str) -> bool>;
+pub type OwnerLiveness = Box<dyn Fn(&str) -> bool + Send>;
 
 /// 一个已注册的后端定义（open 用其名字引用）。
 #[derive(Debug, Clone)]
@@ -44,7 +44,7 @@ struct TerminalSession {
     id: TerminalSessionId,
     owner: String,
     name: Option<String>,
-    backend: Box<dyn TerminalBackend>,
+    backend: Box<dyn TerminalBackend + Send>,
     cfg: TerminalConfig,
     busy: bool,
     status: TerminalSessionStatus,

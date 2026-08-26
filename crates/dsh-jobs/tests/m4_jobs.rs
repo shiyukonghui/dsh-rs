@@ -7,8 +7,7 @@
 use dsh_jobs::registry::{
     JobRegistry, JobRegistryConfig, StartSpec, JobStartError, JobOpsError, JobStatus, JobSettlement,
 };
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 fn registry() -> JobRegistry {
     JobRegistry::new(JobRegistryConfig { max_concurrent_per_owner: 10, now: Box::new(|| 1000) })
@@ -16,14 +15,15 @@ fn registry() -> JobRegistry {
 
 // 用递增时钟（首次 1000，之后每次 +1000）注册 registry —— 便于 startedAt≠finishedAt 断言。
 fn registry_tick() -> JobRegistry {
-    let tick = std::rc::Rc::new(std::cell::Cell::new(1000_i64));
+    let tick = std::sync::Arc::new(std::sync::Mutex::new(1000_i64));
     let tick2 = tick.clone();
     JobRegistry::new(JobRegistryConfig {
         max_concurrent_per_owner: 10,
         now: Box::new(move || {
-            let t = tick2.get();
-            tick2.set(t + 1000);
-            t
+            let mut t = tick2.lock().unwrap();
+            let cur = *t;
+            *t += 1000;
+            cur
         }),
     })
 }
@@ -184,14 +184,14 @@ fn start_owned(kind: &'static str, label: &'static str, owner: &'static str) -> 
 }
 
 /// 构造内存 producer（cancel 记录 + no-op done）。
-fn fake_start() -> Box<dyn FnMut() -> dsh_jobs::registry::ProducerHooks> {
-    let reads = Rc::new(RefCell::new(Vec::<String>::new()));
+fn fake_start() -> Box<dyn FnMut() -> dsh_jobs::registry::ProducerHooks + Send> {
+    let reads = Arc::new(Mutex::new(Vec::<String>::new()));
     Box::new(move || {
         let reads = reads.clone();
         dsh_jobs::registry::ProducerHooks {
             on_cancel: Box::new(|_| {}),
             read_output: Some(Box::new(move || {
-                let mut v = reads.borrow_mut();
+                let mut v = reads.lock().unwrap();
                 if v.is_empty() { String::new() } else { v.remove(0) }
             })),
         }

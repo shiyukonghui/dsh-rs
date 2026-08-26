@@ -498,9 +498,22 @@ pub fn run_turn(boot: &Boot, input: &Value) -> Result<Value, CordisError> {
 /// 返回（D-106）：该 turn 后**仍待审批**的调用 id 列表（空 = 无审批挂起）；GUI 以此
 /// 感知弹窗并把 `session.approval.decide` 作为回执。
 pub fn run_rust_loop(boot: &Boot, session_id: &str, content: &str) -> Result<Vec<String>, CordisError> {
-    let host = boot.agent_loop.as_ref().ok_or_else(|| {
+    let host = boot.agent_loop.clone().ok_or_else(|| {
         CordisError::Internal("no Rust AgentLoopHost assembled in this boot".into())
     })?;
+    run_rust_loop_on_host(&host, session_id, content)
+}
+
+/// D-115（Phase 4 serve worker 化）：与 [`run_rust_loop`] 同语义，但只依赖
+/// `Arc<AgentLoopHost>`（Send+Sync）而非整个 `&Boot`（含 Rc/RefCell 非 Send
+/// 字段）——供 serve 的 worker 线程以 owned `Arc` 驱动整轮 turn（长 RPC 不占
+/// accept 循环；HTTP 同步契约不变）。worker 线程内调用即真·生成中可被并发的
+/// `session.cancel` 中断（共享取消令牌经 transport signal 直达阻塞读）。
+pub fn run_rust_loop_on_host(
+    host: &Arc<dsh_agent_loop::AgentLoopHost>,
+    session_id: &str,
+    content: &str,
+) -> Result<Vec<String>, CordisError> {
     let configured = match host.configured_for_session(session_id) {
         Some(c) => c,
         None => {
@@ -509,7 +522,7 @@ pub fn run_rust_loop(boot: &Boot, session_id: &str, content: &str) -> Result<Vec
             // fail loud（修复不放行任意 id）。
             let sid = dsh_session::types::SessionId::from_raw(session_id.to_string());
             if host.store.get(&sid).is_some() {
-                ensure_session_agent(boot, session_id, None)?;
+                ensure_session_agent_on_host(host, session_id, None)?;
                 host.configured_for_session(session_id)
                     .expect("just-registered session agent must resolve")
             } else {
@@ -537,18 +550,13 @@ pub fn run_rust_loop(boot: &Boot, session_id: &str, content: &str) -> Result<Vec
         .collect())
 }
 
-/// D-101：给一个**运行时铸出**的会话（web `session.create`/`fork`）挂接一个真实
-/// agent——否则 `session.prompt` 对非配置会话报 `no configured agent maps to session`。
-/// - 模板 = 装配期 `default` agent（provider/model/cwd 继承部署默认）；
-/// - `cwd`：调用方（web 侧已知工作区路径时）优先，否则模板 cwd；
-/// - 未装配 agent-loop（M1 WASM 路径）→ no-op（该路径不依赖 per-session agent）；
-/// - 幂等（`register_session_agent`：会话已有身份则复用，不重复装配）。
-pub fn ensure_session_agent(boot: &Boot, session_id: &str, cwd: Option<&str>) -> Result<(), CordisError> {
-    let host = match &boot.agent_loop {
-        Some(host) => host.clone(),
-        None => return Ok(()),
-    };
-    // 幂等：会话已被配置命中 → 无需新建。
+/// D-115（Phase 4）：`ensure_session_agent` 的 host 参数化版（worker 线程同语义，
+/// 只依赖 `Arc<AgentLoopHost>`，见 [`run_rust_loop_on_host`]）。
+pub fn ensure_session_agent_on_host(
+    host: &Arc<dsh_agent_loop::AgentLoopHost>,
+    session_id: &str,
+    cwd: Option<&str>,
+) -> Result<(), CordisError> {
     if host.configured_for_session(session_id).is_some() {
         return Ok(());
     }
@@ -570,6 +578,20 @@ pub fn ensure_session_agent(boot: &Boot, session_id: &str, cwd: Option<&str>) ->
     host.register_session_agent(configured)
         .map_err(|e| CordisError::Internal(format!("agent-loop host: {e}")))?;
     Ok(())
+}
+
+/// D-101：给一个**运行时铸出**的会话（web `session.create`/`fork`）挂接一个真实
+/// agent——否则 `session.prompt` 对非配置会话报 `no configured agent maps to session`。
+/// - 模板 = 装配期 `default` agent（provider/model/cwd 继承部署默认）；
+/// - `cwd`：调用方（web 侧已知工作区路径时）优先，否则模板 cwd；
+/// - 未装配 agent-loop（M1 WASM 路径）→ no-op（该路径不依赖 per-session agent）；
+/// - 幂等（`register_session_agent`：会话已有身份则复用，不重复装配）。
+pub fn ensure_session_agent(boot: &Boot, session_id: &str, cwd: Option<&str>) -> Result<(), CordisError> {
+    let host = match &boot.agent_loop {
+        Some(host) => host.clone(),
+        None => return Ok(()),
+    };
+    ensure_session_agent_on_host(&host, session_id, cwd)
 }
 
 /// headless 单发任务的结果（对齐 DSH `dsh --profile headless "job"`：

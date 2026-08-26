@@ -53,6 +53,7 @@ fn options() -> GenerateOptions {
         stop: None,
         session_id: None,
         purpose: None,
+        signal: None,
     }
 }
 
@@ -98,6 +99,7 @@ fn options_from_config(config: &dsh_llm::CallConfig) -> GenerateOptions {
         stop: config.stop.clone(),
         session_id: None,
         purpose: None,
+        signal: None,
     }
 }
 

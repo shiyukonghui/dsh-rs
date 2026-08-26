@@ -21,7 +21,7 @@ fn start_plain(r: &mut JobRegistry, kind: &'static str, label: &'static str) -> 
     r.start(StartSpec { kind, label, owner: None, producer: fake_start() }).unwrap()
 }
 
-fn fake_start() -> Box<dyn FnMut() -> ProducerHooks> {
+fn fake_start() -> Box<dyn FnMut() -> ProducerHooks + Send> {
     Box::new(move || ProducerHooks {
         on_cancel: Box::new(|_| {}),
         read_output: None,

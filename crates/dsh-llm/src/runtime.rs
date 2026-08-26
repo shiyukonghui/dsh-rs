@@ -646,6 +646,7 @@ mod tests {
             stop: None,
             session_id: None,
             purpose: None,
+            signal: None,
         };
         let result = stream_fn(options.clone());
         assert!(result.is_ok());
@@ -679,6 +680,7 @@ mod tests {
             stop: None,
             session_id: None,
             purpose: None,
+            signal: None,
         };
         assert!(stream_fn(options).is_err());
     }
@@ -698,6 +700,7 @@ mod tests {
             stop: None,
             session_id: None,
             purpose: None,
+            signal: None,
         };
         let chunks: Vec<StreamChunk> = rt.stream(options).collect();
         assert_eq!(chunks.len(), 1);
@@ -732,6 +735,7 @@ mod tests {
             stop: None,
             session_id: None,
             purpose: None,
+            signal: None,
         };
         let chunks = stream_fn(options).unwrap().collect::<Vec<_>>();
         assert_eq!(chunks.len(), 2);
@@ -774,6 +778,7 @@ mod tests {
             stop: None,
             session_id: None,
             purpose: None,
+            signal: None,
         };
         let chunks: Vec<StreamChunk> = rt.stream(options).collect();
         let mut assembler = BlockAssembler::new();

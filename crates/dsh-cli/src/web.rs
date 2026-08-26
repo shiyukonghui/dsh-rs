@@ -20,7 +20,6 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-#[cfg(test)]
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -427,6 +426,304 @@ fn plan_session_ref_on(boot: &crate::Boot, sid: Option<&str>) -> Option<Arc<dsh_
     })
 }
 
+// ---------------------------------------------------------------------------
+// D-115（Phase 4 serve worker 化）：长 RPC 的 worker 线程 Send 事实 + host 参数化
+// 帮手。worker 无法取 `&Boot`（含 Rc/RefCell 非 Send 字段）——长 RPC（session.prompt
+// [agent-loop 装配时]/agent.run|loop|turn/commands/execute 的 /plan <msg>/审批 decide
+// kick）只需下述 `Arc` 句柄（均 Send+Sync）。`session.cancel` 与短 RPC 不 workerize。
+// ---------------------------------------------------------------------------
+
+/// serve worker 线程所需的 Send 事实（对齐设计文档 §4.6 表格）。
+#[derive(Clone)]
+pub struct ServeWorkerFacts {
+    pub agent_loop: Option<Arc<dsh_agent_loop::AgentLoopHost>>,
+    pub plan_session: Option<Arc<std::sync::Mutex<String>>>,
+    pub approval_wire: Option<crate::web::approval_wire::ApprovalWireRef>,
+}
+
+impl ServeWorkerFacts {
+    /// 从 `&Boot` 提取 Send 事实（Boot 的非 Send 字段全部丢弃——worker 用不到）。
+    pub fn from_boot(boot: &crate::Boot) -> Self {
+        ServeWorkerFacts {
+            agent_loop: boot.agent_loop.clone(),
+            plan_session: boot.plan_session.clone(),
+            approval_wire: boot.approval_wire.clone(),
+        }
+    }
+}
+
+/// `plan_state_active` 的 host 参数化版（worker 线程同语义，见 [`plan_state_active_on`]）。
+fn plan_state_active_on_host(
+    facts: &ServeWorkerFacts,
+    sid: Option<&str>,
+) -> bool {
+    let sid = sid.map(str::to_string).unwrap_or_else(|| {
+        facts
+            .plan_session
+            .as_ref()
+            .map(|ps| ps.lock().unwrap().clone())
+            .unwrap_or_else(|| "default".to_string())
+    });
+    match facts.agent_loop.as_ref().and_then(|h| {
+        h.store
+            .get(&dsh_session::types::SessionId::from_raw(sid))
+    }) {
+        Some(s) => dsh_plan::fold_plan_mode(&s.events()),
+        None => false,
+    }
+}
+
+/// `plan_session_ref` 的 host 参数化版（worker 线程同语义，见 [`plan_session_ref_on`]）。
+fn plan_session_ref_on_host(
+    facts: &ServeWorkerFacts,
+    sid: Option<&str>,
+) -> Option<Arc<dsh_session::Session>> {
+    let sid = sid.map(str::to_string).unwrap_or_else(|| {
+        facts
+            .plan_session
+            .as_ref()
+            .map(|ps| ps.lock().unwrap().clone())
+            .unwrap_or_else(|| "default".to_string())
+    });
+    facts.agent_loop.as_ref().and_then(|h| {
+        h.store
+            .get(&dsh_session::types::SessionId::from_raw(sid))
+    })
+}
+
+/// `commands_execute` 的 host 参数化版（worker 线程同语义，见 [`commands_execute`]）：
+/// 只依赖 `ServeWorkerFacts`（Send+Sync），不取 `&Boot`。
+pub fn commands_execute_on_host(
+    facts: &ServeWorkerFacts,
+    agent_id: Option<&str>,
+    line: &str,
+    images: &[Value],
+) -> Value {
+    use dsh_session::EventKind;
+    let Some(rest) = line.trim().strip_prefix('/') else {
+        return serde_json::json!({"ok": true, "value": Value::Null});
+    };
+    let (name, args) = match rest.find(char::is_whitespace) {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, ""),
+    };
+    if name != "plan" {
+        return serde_json::json!({"ok": true, "value": Value::Null});
+    }
+    let Some(session) = plan_session_ref_on_host(facts, agent_id) else {
+        return serde_json::json!({"ok": false, "error": {"code": "internal", "message": "no Rust SessionHost assembled in this boot"}});
+    };
+    let command_id = format!("cmd-{}", session.events().len());
+    let appended = session.append(
+        EventKind::CommandRun,
+        serde_json::json!({
+            "commandId": command_id,
+            "name": name,
+            "args": args,
+            "source": {"kind": "user"},
+        }),
+        None,
+    );
+    if let Err(e) = appended {
+        return serde_json::json!({"ok": false, "error": {"code": "internal", "message": e.0}});
+    }
+    let finish = |session: &dsh_session::Session, command_id: &str, result: Value| -> Value {
+        let mut data = serde_json::Map::new();
+        data.insert("commandId".into(), serde_json::json!(command_id));
+        if let Some(obj) = result.as_object() {
+            for (k, v) in obj {
+                data.insert(k.clone(), v.clone());
+            }
+        }
+        let _ = session.append(EventKind::CommandDone, Value::Object(data), None);
+        serde_json::json!({"ok": true, "value": {"commandId": command_id, "result": result}})
+    };
+    let message = args.trim();
+    let outcome = if message == "off" {
+        if !images.is_empty() {
+            serde_json::json!({"kind": "error", "text": "Image attachments cannot accompany /plan off."})
+        } else {
+            let was_active = plan_state_active_on_host(facts, agent_id);
+            match crate::web::approval::set_plan_mode_on_host(
+                facts.agent_loop.as_ref().ok_or("no Rust AgentLoopHost assembled in this boot").unwrap(),
+                facts.plan_session.as_ref(),
+                agent_id,
+                false,
+                None,
+            ) {
+                Ok(_) => serde_json::json!({"kind": "success", "text": if was_active {
+                    "Plan mode off."
+                } else {
+                    "Plan mode is already inactive."
+                }}),
+                Err(e) => return serde_json::json!({"ok": false, "error": {"code": "internal", "message": e}}),
+            }
+        }
+    } else {
+        let msg = if message.is_empty() { None } else { Some(message) };
+        match crate::web::approval::set_plan_mode_on_host(
+            facts.agent_loop.as_ref().ok_or("no Rust AgentLoopHost assembled in this boot").unwrap(),
+            facts.plan_session.as_ref(),
+            agent_id,
+            true,
+            msg,
+        ) {
+            Ok(_) => (),
+            Err(e) => return serde_json::json!({"ok": false, "error": {"code": "internal", "message": e}}),
+        }
+        // fork `/plan <message>` 语义：非空消息 `agent.steer(createUserMessage(...))`——
+        // 投入用户消息并驱动下一轮（真浏览器发现 RPC 成功但 UI 不前进的原缺口）。
+        // 目标会话 = agentId（回退 plan_session）；与已设的 plan/mode 同会话。
+        if !message.is_empty() {
+            let target_sid = match agent_id {
+                Some(a) => a.to_string(),
+                None => facts
+                    .plan_session
+                    .as_ref()
+                    .map(|ps| ps.lock().unwrap().clone())
+                    .unwrap_or_else(|| "default".to_string()),
+            };
+            let Some(host) = facts.agent_loop.as_ref() else {
+                return serde_json::json!({"ok": false, "error": {"code": "internal", "message": "no Rust AgentLoopHost assembled in this boot"}});
+            };
+            if let Err(e) = crate::run_rust_loop_on_host(host, &target_sid, message) {
+                return serde_json::json!({"ok": false, "error": {"code": "internal", "message": e.to_string()}});
+            }
+        }
+        serde_json::json!({"kind": "success", "text": "Plan mode on. Use /plan off to leave."})
+    };
+    finish(&session, &command_id, outcome)
+}
+
+/// 长 RPC 的 worker 线程分派：`method`/`payload` → 与 [`dispatch`] 的长分支**同语义**
+/// 的 `{ok,value|error}`（HTTP 同步契约不变）。worker 线程内以 `ServeWorkerFacts`
+/// 驱动真实 agent-loop；accept 循环不被 long turn 占用（`session.cancel` 可并发送达）。
+/// 仅处理设计文档 §4.6 列出的长方法；其余交由 accept 线程的既有 `dispatch`。
+pub fn dispatch_long_rpc(
+    facts: &ServeWorkerFacts,
+    method: &str,
+    payload: &Value,
+) -> Value {
+    match method {
+        "session.prompt" => {
+            let sid = payload.get("sessionId").and_then(|v| v.as_str()).unwrap_or("default").to_string();
+            let content = payload.get("content").cloned().unwrap_or(Value::Null);
+            let host = match facts.agent_loop.as_ref() {
+                Some(h) => h.clone(),
+                None => {
+                    // 未装配 agent-loop（M1 WASM 路径）→ 不 workerize（短路径，accept 内联）。
+                    return serde_json::json!({"ok": false, "error": {
+                        "code": "internal",
+                        "message": "not a long RPC (agent-loop not assembled)",
+                    }});
+                }
+            };
+            // 取首个 text 块为 prompt 文本（与 dispatch 分支同形状）。
+            let text = content
+                .as_array()
+                .and_then(|blocks| {
+                    blocks.iter().find_map(|b| {
+                        (b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                            .then(|| b.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string())
+                    })
+                })
+                .unwrap_or_default();
+            match crate::run_rust_loop_on_host(&host, &sid, &text) {
+                Ok(approval_pending) => {
+                    serde_json::json!({"ok": true, "value": {"accepted": true, "approvalPending": approval_pending}})
+                }
+                Err(e) => serde_json::json!({"ok": false, "error": {
+                    "code": "internal",
+                    "message": e.to_string(),
+                }}),
+            }
+        }
+        "agent-loop" | "agent.turn" | "agent.run" => {
+            let text = payload
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            let sid = payload
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("default")
+                .to_string();
+            let host = match facts.agent_loop.as_ref() {
+                Some(h) => h.clone(),
+                None => return serde_json::json!({"ok": false, "error": {
+                    "code": "internal",
+                    "message": "not a long RPC (agent-loop not assembled)",
+                }}),
+            };
+            match crate::run_rust_loop_on_host(&host, &sid, &text) {
+                Ok(approval_pending) => serde_json::json!({"ok": true, "value": {"accepted": true, "approvalPending": approval_pending}}),
+                Err(e) => serde_json::json!({"ok": false, "error": {
+                    "code": "internal",
+                    "message": e.to_string(),
+                }}),
+            }
+        }
+        "commands/execute" => {
+            let args = payload.get("args").unwrap_or(payload);
+            let agent_id = args.get("agentId").and_then(Value::as_str);
+            let line = args.get("line").and_then(Value::as_str).unwrap_or("").to_string();
+            let images = args.get("images").and_then(Value::as_array).cloned().unwrap_or_default();
+            commands_execute_on_host(facts, agent_id, &line, &images)
+        }
+        "session.approval.decide" => {
+            let call_id = payload
+                .get("toolCallId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let decision = payload
+                .get("decision")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if call_id.is_empty()
+                || (decision != crate::web::approval::DECISION_ALLOWED_ONCE
+                    && decision != crate::web::approval::DECISION_REJECTED)
+            {
+                return serde_json::json!({"ok": false, "error": {
+                    "code": "invalid-args",
+                    "message": "session.approval.decide requires toolCallId + decision (allowedOnce|rejected)",
+                }});
+            }
+            let host = match facts.agent_loop.as_ref() {
+                Some(h) => h.clone(),
+                None => return serde_json::json!({"ok": false, "error": {
+                    "code": "internal",
+                    "message": "no Rust AgentLoopHost assembled in this boot",
+                }}),
+            };
+            match crate::web::approval::decide_on_host(&host, facts.approval_wire.as_ref(), &call_id, &decision) {
+                Ok(remaining) => serde_json::json!({"ok": true, "value": {
+                    "resumed": true, "approvalPending": remaining,
+                }}),
+                Err(e) => serde_json::json!({"ok": false, "error": {
+                    "code": "internal",
+                    "message": e,
+                }}),
+            }
+        }
+        other => serde_json::json!({"ok": false, "error": {
+            "code": "not-a-long-rpc",
+            "message": format!("method {other} is not workerized"),
+        }}),
+    }
+}
+
+/// 某方法是否应走 serve worker 线程（长 RPC 白名单）。`session.cancel` 刻意排除——
+/// 它必须留在 accept 线程做「并发送达 → 写 token → 中断 worker 的 turn」。
+pub fn is_long_rpc_method(method: &str) -> bool {
+    matches!(
+        method,
+        "session.prompt" | "agent-loop" | "agent.turn" | "agent.run" | "commands/execute" | "session.approval.decide"
+    )
+}
+
 /// `commands/execute`（前端 `/plan` 命令路径，真浏览器测试发现缺失后补）。
 /// 对齐 fork `dsh-client-commands` 的 remote 契约 + `@deepseek-ai/dsh-plan-mode` 的
 /// `/plan` handler：命名命令执行时**落 `command/run` + `command/done` 生命周期事件**
@@ -625,12 +922,41 @@ fn dispatch_request(
                 let _ = request.respond(resp);
             }
             (Method::Post, m) if !m.is_empty() => {
-                // 读 body → RPC 分派 → JSON 响应
-                let mut body = Vec::new();
-                let _ = std::io::Read::read_to_end(&mut request.as_reader(), &mut body);
-                let (status, json) = handle_rpc_host(boot, m, &body, host);
-                let resp = json_response(status, &json);
-                let _ = request.respond(resp);
+                if crate::web::is_long_rpc_method(m) {
+                    // D-115（Phase 4 serve worker 化）：长 RPC 上 worker 线程——
+                    // move `tiny_http::Request` + Send 事实进线程，worker 内读 body、
+                    // 以 host 参数化核心驱动整轮 turn、完成后 `request.respond`。
+                    // accept 循环不被 long turn 占用 → `session.cancel`（仍在 accept
+                    // 同步处理）可并发送达，真·生成中停止（含传输中断，B）。
+                    let facts = crate::web::ServeWorkerFacts::from_boot(boot);
+                    let m2 = m.to_string();
+                    std::thread::spawn(move || {
+                        let mut body = Vec::new();
+                        let _ = std::io::Read::read_to_end(&mut request.as_reader(), &mut body);
+                        let rpc_id = rpc_id_of(&body);
+                        let result = if !rpc_envelope_ok(&body, &m2) {
+                            serde_json::json!({"ok": false, "error": {
+                                "code": "bad-request",
+                                "message": "invalid client-request message",
+                            }})
+                        } else {
+                            let payload = serde_json::from_slice::<Value>(&body)
+                                .ok()
+                                .and_then(|v| v.get("payload").cloned())
+                                .unwrap_or(Value::Null);
+                            crate::web::dispatch_long_rpc(&facts, &m2, &payload)
+                        };
+                        let resp = json_response(200, &rpc_response(&rpc_id, result));
+                        let _ = request.respond(resp);
+                    });
+                } else {
+                    // 读 body → RPC 分派 → JSON 响应（短操作，accept 同步保持）。
+                    let mut body = Vec::new();
+                    let _ = std::io::Read::read_to_end(&mut request.as_reader(), &mut body);
+                    let (status, json) = handle_rpc_host(boot, m, &body, host);
+                    let resp = json_response(status, &json);
+                    let _ = request.respond(resp);
+                }
             }
             (Method::Get, "events.mux") | (Method::Get, "events.host") => {
                 let is_host = method == "events.host";
@@ -1958,13 +2284,14 @@ fn subagent_dispatch(
 /// 宿主（fail loud 不再 NOT_BOUND）；无句柄 → 注册定义但保持 `NOT_BOUND`（诚实：
 /// 宿主未装配时绝不伪装成功，D-052 已记录）。
 ///
-/// 句柄均 Send+Sync（被 Send+Sync 工具执行闭包捕获）：JobRegistry 为非 Send 底层值 →
-/// `ThreadCell` 桥；schedule/todo/plan-mode 宿主为 `Arc` + 内部 Mutex。
+/// 句柄均 Send+Sync（被 Send+Sync 工具执行闭包捕获）：JobRegistry 为 Send 底层值 →
+/// `Arc<Mutex<_>>` 共享；schedule/todo/plan-mode 宿主为 `Arc` + 内部 Mutex。
 #[derive(Default)]
 pub struct M4HostServices {
-    /// 共享 JobRegistry（真实生命周期状态机；`ThreadCell` 桥——JobRegistry 内含
-    /// `Box<dyn Fn>` 为非 Send，单线程纪律不变）。
-    pub jobs: Option<crate::web::web_m5::ThreadCell<dsh_jobs::registry::JobRegistry>>,
+    /// 共享 JobRegistry（真实生命周期状态机；`Arc<Mutex<_>>`——D-115 Phase 4：
+    /// job_* 执行闭包跨线程捕获，worker 线程与 serve 主线程共享同一注册表；
+    /// M5 BashJobsBridge 亦引用同实例，bash 后台 job 对 job_kill/job_read 可见）。
+    pub jobs: Option<Arc<Mutex<dsh_jobs::registry::JobRegistry>>>,
     /// schedule 域：`schedule/change` 事件 fold 与到期注入（挂在会话事件上）。
     pub schedule: Option<Arc<dsh_cli_host::ScheduleHost>>,
     /// todo 域：把 `todo/write` 事件落到属主 agent 的会话（todo 工具的真实句柄）。
@@ -2463,10 +2790,10 @@ fn todo_write_with_host_executor(
 // ---- job_* 宿主 executor（bind 目标） ----
 
 fn job_output_executor(
-    jobs: crate::web::web_m5::ThreadCell<dsh_jobs::registry::JobRegistry>,
+    jobs: Arc<Mutex<dsh_jobs::registry::JobRegistry>>,
 ) -> dsh_tools::types::ToolExecute {
     use dsh_tools::types::{ToolFailureData, CODE_INVALID_ARGS};
-    Arc::new(move |args, _ctx| {
+    Arc::new(move |args, ctx| {
         let id = args
             .get("job_id")
             .and_then(|v| v.as_str())
@@ -2474,61 +2801,61 @@ fn job_output_executor(
                 ToolFailureData::new("job_output requires job_id", CODE_INVALID_ARGS, "JobError")
             })?;
         let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
-        jobs.with(|reg| {
-            // wait=true → 等终态（本宿主纯内存、单线程：非终态即返回当前快照）；
-            // wait=false → read（text + snapshot）。
-            let read = reg.read(id, None);
-            let (text, job_view) = match read {
-                Ok(r) => {
-                    let view = dsh_jobs::snapshot_to_view(&r.snapshot);
-                    (r.text.clone(), view)
+        // caller = ctx.agent：授权围栏（owner 只见自己的 + 无主）下，owner 能读到
+        // 自己的 job——D-115 共享注册表后 agent 的 bash 后台 job 亦在此可见。
+        let caller = ctx.agent.as_deref();
+        let read = jobs.lock().unwrap().read(id, caller);
+        let (text, job_view) = match read {
+            Ok(r) => {
+                let view = dsh_jobs::snapshot_to_view(&r.snapshot);
+                (r.text.clone(), view)
+            }
+            Err(e) => {
+                return Err(ToolFailureData::new(
+                    format!("job read failed: {e:?}"),
+                    dsh_tools::CODE_INVALID_TOOL_OUTPUT,
+                    "JobError",
+                ));
+            }
+        };
+        if wait {
+            match jobs.lock().unwrap().wait(id, caller) {
+                Ok(s) => {
+                    let view = dsh_jobs::snapshot_to_view(&s);
+                    let text2 = view["detail"]
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| text.clone());
+                    return Ok(serde_json::json!({ "text": text2, "job": view }));
                 }
                 Err(e) => {
                     return Err(ToolFailureData::new(
-                        format!("job read failed: {e:?}"),
+                        format!("job wait failed: {e:?}"),
                         dsh_tools::CODE_INVALID_TOOL_OUTPUT,
                         "JobError",
                     ));
                 }
-            };
-            if wait {
-                match reg.wait(id, None) {
-                    Ok(s) => {
-                        let view = dsh_jobs::snapshot_to_view(&s);
-                        let text2 = view["detail"]
-                            .as_str()
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| text.clone());
-                        return Ok(serde_json::json!({ "text": text2, "job": view }));
-                    }
-                    Err(e) => {
-                        return Err(ToolFailureData::new(
-                            format!("job wait failed: {e:?}"),
-                            dsh_tools::CODE_INVALID_TOOL_OUTPUT,
-                            "JobError",
-                        ));
-                    }
-                }
             }
-            Ok(serde_json::json!({ "text": text, "job": job_view }))
-        })
+        }
+        Ok(serde_json::json!({ "text": text, "job": job_view }))
     })
 }
 
 fn job_list_executor(
-    jobs: crate::web::web_m5::ThreadCell<dsh_jobs::registry::JobRegistry>,
+    jobs: Arc<Mutex<dsh_jobs::registry::JobRegistry>>,
 ) -> dsh_tools::types::ToolExecute {
-    Arc::new(move |_args, _ctx| {
-        let snaps = jobs.with(|reg| reg.list(None));
+    Arc::new(move |_args, ctx| {
+        // 授权围栏：caller = ctx.agent → owner 见自己的 + 无主（非总览 all）。
+        let snaps = jobs.lock().unwrap().list(ctx.agent.as_deref());
         Ok(dsh_jobs::jobs_frame(&snaps))
     })
 }
 
 fn job_kill_executor(
-    jobs: crate::web::web_m5::ThreadCell<dsh_jobs::registry::JobRegistry>,
+    jobs: Arc<Mutex<dsh_jobs::registry::JobRegistry>>,
 ) -> dsh_tools::types::ToolExecute {
     use dsh_tools::types::CODE_INVALID_ARGS;
-    Arc::new(move |args, _ctx| {
+    Arc::new(move |args, ctx| {
         let id = args
             .get("job_id")
             .and_then(|v| v.as_str())
@@ -2540,12 +2867,14 @@ fn job_kill_executor(
                 )
             })?;
         let reason = args.get("reason").and_then(|v| v.as_str()).map(str::to_string);
-        let outcome = jobs.with(|reg| reg.kill(id, None, reason.as_deref()));
+        let caller = ctx.agent.as_deref();
+        let outcome =
+            { jobs.lock().unwrap().kill(id, caller, reason.as_deref()) };
         match outcome {
             Ok(kill_outcome) => {
                 let (outcome_str, job) = match kill_outcome {
                     dsh_jobs::KillOutcome::AlreadyFinished => {
-                        let snap = jobs.with(|reg| reg.get(id, None)).unwrap_or_else(|_| {
+                        let snap = jobs.lock().unwrap().get(id, caller).unwrap_or_else(|_| {
                             // 极端：kill 后瞬时不可达 → 最小 view（不应发生；防御）。
                             dsh_jobs::JobSnapshot {
                                 id: id.to_string(),
@@ -2562,7 +2891,7 @@ fn job_kill_executor(
                         ("already-finished", dsh_jobs::snapshot_to_view(&snap))
                     }
                     dsh_jobs::KillOutcome::Requested => {
-                        let snap = jobs.with(|reg| reg.get(id, None)).unwrap_or_else(|_| {
+                        let snap = jobs.lock().unwrap().get(id, caller).unwrap_or_else(|_| {
                             dsh_jobs::JobSnapshot {
                                 id: id.to_string(),
                                 kind: String::new(),
@@ -2825,14 +3154,15 @@ pub fn assemble_server_runtime_with_llm(
     model: &str,
 ) -> Result<ServerLoopBundle, String> {
     let session = host.session("default").map_err(|e| e.to_string())?;
-    // JobRegistry 为非 Send 底层类型（`now` 为 `Box<dyn Fn>`）→ `ThreadCell` 桥（单线程
-    // 纪律不变；被 Send+Sync 的 job_* 执行闭包捕获时才需要该桥）。
-    let jobs = crate::web::web_m5::ThreadCell::new(dsh_jobs::registry::JobRegistry::new(
+    // JobRegistry 为 Send 底层类型 → `Arc<Mutex<_>>` 共享（D-115 Phase 4：job_* 执行
+    // 闭包跨线程捕获，worker 线程与 serve 主线程共享同一注册表；M5 BashJobsBridge
+    // 亦引用同实例，bash 后台 job 对 job_kill/job_read 可见）。
+    let jobs = Arc::new(Mutex::new(dsh_jobs::registry::JobRegistry::new(
         dsh_jobs::registry::JobRegistryConfig {
             max_concurrent_per_owner: 8,
             now: Box::new(system_now_ms),
         },
-    ));
+    )));
     let schedule = Arc::new(dsh_cli_host::ScheduleHost::new(session));
     let todo = Arc::new(dsh_cli_host::TodoWriteHost::new(host.clone(), "default".into()));
     todo.bind_agent("default", "default");
@@ -2846,12 +3176,12 @@ pub fn assemble_server_runtime_with_llm(
     ));
     plan_mode.bind_agent("default", "default");
     let m4 = M4HostServices {
-        jobs: Some(jobs),
+        jobs: Some(jobs.clone()),
         schedule: Some(schedule.clone()),
         todo: Some(todo),
         plan_mode: Some(plan_mode),
     };
-    let m5 = web_m5::M5Host::assemble(workspace_root.clone())?;
+    let m5 = web_m5::M5Host::assemble(workspace_root.clone(), Some(jobs))?;
     let bash_jobs = m5.services.bash_jobs.clone();
     // E-03（D-103/P4 补）：宿主运行时 prompt 变量——vendored personas
     // （standard/code/cordis）引用 `{{model}}`/`{{cwd}}`。缺注册时
@@ -3960,7 +4290,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
         std::fs::create_dir_all(&root).unwrap();
-        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let m5 = web_m5::M5Host::assemble(root.clone(), None).expect("m5 assembles");
         let llm = Arc::new(dsh_llm::LlmRuntime::new());
         let loop_host = assemble_server_loop(
             session_host.store.clone(),
@@ -4020,7 +4350,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
         std::fs::create_dir_all(&root).unwrap();
-        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let m5 = web_m5::M5Host::assemble(root.clone(), None).expect("m5 assembles");
         let llm = Arc::new(dsh_llm::LlmRuntime::new());
         let loop_host = assemble_server_loop(
             session_host.store.clone(),
@@ -4107,7 +4437,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("dsh-m6-cmdsid-{}", std::process::id()));
         if root.exists() { let _ = std::fs::remove_dir_all(&root); }
         std::fs::create_dir_all(&root).unwrap();
-        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let m5 = web_m5::M5Host::assemble(root.clone(), None).expect("m5 assembles");
         let llm = Arc::new(dsh_llm::LlmRuntime::new());
         let loop_host = assemble_server_loop(
             session_host.store.clone(), root.clone(), llm, "mock", "mock-model", m4, m5,
@@ -4153,7 +4483,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("dsh-m6-cmdwrap-{}", std::process::id()));
         if root.exists() { let _ = std::fs::remove_dir_all(&root); }
         std::fs::create_dir_all(&root).unwrap();
-        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let m5 = web_m5::M5Host::assemble(root.clone(), None).expect("m5 assembles");
         let llm = Arc::new(dsh_llm::LlmRuntime::new());
         let loop_host = assemble_server_loop(
             session_host.store.clone(), root.clone(), llm, "mock", "mock-model", m4, m5,
@@ -6872,12 +7202,12 @@ mod tests {
     fn register_m4_tools_with_job_registry_binds_really() {
         use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
         let registry = ToolRegistry::new(ToolExecutionMode::Native);
-        let jobs = crate::web::web_m5::ThreadCell::new(dsh_jobs::registry::JobRegistry::new(
+        let jobs = Arc::new(Mutex::new(dsh_jobs::registry::JobRegistry::new(
             dsh_jobs::registry::JobRegistryConfig {
                 max_concurrent_per_owner: 10,
                 now: Box::new(|| 1000),
             },
-        ));
+        )));
         let host = M4HostServices {
             jobs: Some(jobs.clone()),
             schedule: None,
@@ -6892,15 +7222,14 @@ mod tests {
                 on_cancel: Box::new(|_| {}),
                 read_output: None,
             };
-            jobs.with(|r| {
-                r.start(StartSpec {
+            jobs.lock().unwrap()
+                .start(StartSpec {
                     kind: "bash",
                     label: "echo hi",
                     owner: None,
                     producer: Box::new(producer),
                 })
                 .unwrap()
-            })
         };
         assert_eq!(id, "bash-1");
         // job_list：真实 frame（taskViewSchema），含刚起的 job。
@@ -6912,16 +7241,14 @@ mod tests {
         assert_eq!(arr[0]["kind"], "bash");
         assert_eq!(arr[0]["status"], "running");
         // settle completed → job_output 真实 read。
-        jobs.with(|r| {
-            r.settle(
-                &id,
-                dsh_jobs::JobSettlement {
-                    status: dsh_jobs::JobStatus::Completed,
-                    detail: Some("exit 0".into()),
-                    output: Some("done".into()),
-                },
-            )
-        });
+        jobs.lock().unwrap().settle(
+            &id,
+            dsh_jobs::JobSettlement {
+                status: dsh_jobs::JobStatus::Completed,
+                detail: Some("exit 0".into()),
+                output: Some("done".into()),
+            },
+        );
         let input = ToolExecutionInput::new("o1", "job_output", serde_json::json!({ "job_id": id }), Some("agent-1".into()));
         let res = registry.execute(&input, None);
         assert!(!res.is_error, "job_output ok: {:?}", res.error);
@@ -7345,9 +7672,9 @@ mod tests {
     fn register_m5_tools_with_terminal_host_binds_really() {
         use dsh_tools::{ToolExecutionInput, ToolExecutionMode, ToolRegistry};
         let registry = ToolRegistry::new(ToolExecutionMode::Native);
-        let term = crate::web::web_m5::ThreadCell::new(dsh_terminal::TerminalSessionService::new());
-        term.with(|s| {
-            s.register_backend(
+        let term = Arc::new(Mutex::new(dsh_terminal::TerminalSessionService::new()));
+        term.lock().unwrap()
+            .register_backend(
                 dsh_terminal::BackendDefinition {
                     id: "bash".into(),
                     kind: dsh_terminal::TerminalBackendKind::Bash,
@@ -7355,8 +7682,7 @@ mod tests {
                 },
                 Box::new(|_cfg| Box::new(M5FakeBackend::default())),
             )
-        })
-        .expect("register fake backend");
+            .expect("register fake backend");
         let host = M5HostServices { terminal: Some(term), fs: None, shell: None, bash_jobs: None, code: None };
         register_m5_tools_with_host(&registry, Some(&host));
 
@@ -8136,7 +8462,7 @@ mod tests {
         }
         std::fs::create_dir_all(&root).unwrap();
 
-        let host = web_m5::M5Host::assemble(root.clone()).expect("m5 host assembles");
+        let host = web_m5::M5Host::assemble(root.clone(), None).expect("m5 host assembles");
         // 全部宿主句柄在场。
         assert!(host.services.terminal.is_some());
         assert!(host.services.fs.is_some());
@@ -8271,7 +8597,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
         std::fs::create_dir_all(&root).unwrap();
-        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let m5 = web_m5::M5Host::assemble(root.clone(), None).expect("m5 assembles");
 
         let loop_host = assemble_server_loop(
             session_host.store.clone(),
@@ -8423,7 +8749,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
         std::fs::create_dir_all(&root).unwrap();
-        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let m5 = web_m5::M5Host::assemble(root.clone(), None).expect("m5 assembles");
         let loop_host = assemble_server_loop(
             session_host.store.clone(),
             root.clone(),
@@ -8565,7 +8891,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
         std::fs::create_dir_all(&root).unwrap();
-        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let m5 = web_m5::M5Host::assemble(root.clone(), None).expect("m5 assembles");
         let loop_host = assemble_server_loop(
             session_host.store.clone(),
             root.clone(),
@@ -8671,7 +8997,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
         std::fs::create_dir_all(&root).unwrap();
-        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let m5 = web_m5::M5Host::assemble(root.clone(), None).expect("m5 assembles");
         let loop_host = assemble_server_loop(
             session_host.store.clone(),
             root.clone(),
@@ -8845,7 +9171,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
         std::fs::create_dir_all(&root).unwrap();
-        let mut m5 = match web_m5::M5Host::assemble(root.clone()) {
+        let mut m5 = match web_m5::M5Host::assemble(root.clone(), None) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("m5 assemble deferred (bash/pty unavailable?): {e}");
@@ -8855,9 +9181,9 @@ mod tests {
         };
         // 终端：注册 FakeBackend（生产 PTY backend 装配属后续里程碑；此处确定性验证
         // dispose 清空会话表）。bash 保持真实桥（孤儿杀验证）。
-        let term = crate::web::web_m5::ThreadCell::new(dsh_terminal::TerminalSessionService::new());
-        term.with(|s| {
-            s.register_backend(
+        let term = Arc::new(Mutex::new(dsh_terminal::TerminalSessionService::new()));
+        term.lock().unwrap()
+            .register_backend(
                 dsh_terminal::BackendDefinition {
                     id: "bash".into(),
                     kind: dsh_terminal::TerminalBackendKind::Bash,
@@ -8865,8 +9191,7 @@ mod tests {
                 },
                 Box::new(|_cfg| Box::new(M5FakeBackend::default())),
             )
-        })
-        .expect("register fake backend");
+            .expect("register fake backend");
         m5.services.terminal = Some(term);
         let registry = ToolRegistry::new(ToolExecutionMode::Native);
         m5.register(&registry);
@@ -8914,7 +9239,7 @@ mod tests {
         assert!(!tres.is_error, "terminal_open: {:?}", tres.error);
         let terminal_svc = m5.services.terminal.clone().unwrap();
         assert_eq!(
-            terminal_svc.with(|s| s.list().len()),
+            terminal_svc.lock().unwrap().list().len(),
             1,
             "one terminal session before shutdown"
         );
@@ -8934,7 +9259,7 @@ mod tests {
 
         // 终端会话全部 dispose（list 空）。
         assert!(
-            terminal_svc.with(|s| s.list().is_empty()),
+            terminal_svc.lock().unwrap().list().is_empty(),
             "terminal sessions disposed on shutdown"
         );
 
@@ -9053,6 +9378,77 @@ mod tests {
             "bg output landed (completed before pump)"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// D-115（Phase 4）：M4 job_* 工具与 M5 BashJobsBridge **共享同一 JobRegistry**
+    /// ——agent 端 `run_in_background` 起的 bash 后台 job 在共享注册表可见，可被
+    /// M4 `job_list`/`job_kill` 命中（跨 M4/M5 宿主单一事实源；设计文档 §4.4）。
+    #[test]
+    fn bash_background_job_visible_to_m4_job_tools_shared_registry() {
+        use dsh_tools::ToolExecutionInput;
+        let host = SessionHost::in_memory();
+        let _ = host.session("default");
+        let root = std::env::temp_dir().join(format!("dsh-m6-sharedjobs-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let bundle = match crate::web::assemble_server_runtime(
+            &host,
+            root.clone(),
+            "http://127.0.0.1:1",
+            "deepseek-v4-flash-0731-ext",
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("assemble_server_runtime deferred (bash unavailable?): {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+        };
+        let registry = bundle.host.tools.clone();
+        let agent = Some("agent-1".to_string());
+        // agent 跑 bash 后台 job（M5 工具路径）→ 落共享注册表。
+        let bres = registry.execute(
+            &ToolExecutionInput::new(
+                "b1",
+                "bash",
+                serde_json::json!({
+                    "command": format!("echo SHARED > {}", root.join("shared.txt").display().to_string().replace('\\', "/")),
+                    "description": "shared registry probe",
+                    "run_in_background": true
+                }),
+                agent.clone(),
+            ),
+            None,
+        );
+        assert!(!bres.is_error, "bash bg: {:?}", bres.error);
+        let bgid = bres.value.unwrap()["jobId"].as_str().unwrap().to_string();
+        // 经 M4 job_list 可见（同一注册表实例；跨宿主不隐藏）。
+        let lres = registry.execute(
+            &ToolExecutionInput::new("l1", "job_list", serde_json::json!({}), agent.clone()),
+            None,
+        );
+        assert!(!lres.is_error, "job_list ok: {:?}", lres.error);
+        let arr = lres.value.unwrap();
+        assert!(
+            arr.as_array().unwrap().iter().any(|j| j["id"] == bgid),
+            "M4 job_list sees the M5 bash background job (shared registry), got: {arr}"
+        );
+        // 经 M4 job_kill 命中（同一注册表 → 能断开其 producer 的 on_cancel 钩子）。
+        let kres = registry.execute(
+            &ToolExecutionInput::new("k1", "job_kill", serde_json::json!({ "job_id": bgid }), agent.clone()),
+            None,
+        );
+        assert!(!kres.is_error, "job_kill ok: {:?}", kres.error);
+        let kout = kres.value.unwrap();
+        assert!(
+            kout["outcome"].as_str() == Some("cancellation-requested")
+                || kout["outcome"].as_str() == Some("already-finished")
+                || kout["job"]["status"].as_str() == Some("stopping"),
+            "job_kill reached the shared-registry job (got: {kout})"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -9214,6 +9610,222 @@ mod tests {
         let (_, h) = handle_rpc_host(&boot, "session.history", &body2, &session_host);
         assert_eq!(h["result"]["value"]["events"].as_array().unwrap().len(), evs.len());
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// D-115（Phase 4 serve worker 化）：完整装配路径下，长 RPC 走 **worker 线程**
+    /// （`dispatch_long_rpc` on `ServeWorkerFacts`）与 accept 内联的 `handle_rpc_host`
+    /// **同语义**——HTTP 同步契约不变（accepted + 事件落共享 store）。worker 线程
+    /// 驱动真实 agent-loop；测试把 `dispatch_long_rpc` 显式放在 `std::thread::spawn`
+    /// 内（模拟 serve worker），并断言 worker 超过一个 turn 仍能驱动（同 phase 机）。
+    #[test]
+    fn serve_worker_dispatch_long_rpc_matches_inline_semantics() {
+        use std::collections::VecDeque;
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let root = std::env::temp_dir().join(format!("dsh-m6-worker-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let script = Arc::new(Mutex::new(VecDeque::from_iter([vec![
+            dsh_llm::StreamChunk::BlockStart {
+                index: 0,
+                block_type: "text".parse().unwrap(),
+            },
+            dsh_llm::StreamChunk::TextDelta { index: 0, text: "worker says hi".into() },
+            dsh_llm::StreamChunk::BlockEnd {
+                index: 0,
+                block: dsh_llm::ContentBlock::text("worker says hi"),
+            },
+            dsh_llm::StreamChunk::Finish {
+                reason: dsh_llm::FinishReason::Stop,
+                replay_state: None,
+            },
+        ]])));
+        struct Adapter {
+            script: Arc<Mutex<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
+        }
+        impl dsh_llm::LlmAdapter for Adapter {
+            fn stream(
+                &self,
+                _options: dsh_llm::GenerateOptions,
+            ) -> Box<dyn Iterator<Item = dsh_llm::StreamChunk>> {
+                let next = self.script.lock().unwrap().pop_front().unwrap_or_default();
+                Box::new(next.into_iter())
+            }
+        }
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Arc::new(Adapter { script })).unwrap();
+        let bundle = match crate::web::assemble_server_runtime_with_llm(
+            &session_host,
+            root.clone(),
+            llm,
+            "mock",
+            "mock-model",
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("assemble deferred (bash unavailable?): {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+        };
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(bundle.host.clone());
+        let facts = crate::web::ServeWorkerFacts::from_boot(&boot);
+        let sid = "default".to_string();
+        let text = "hi via worker".to_string();
+        // worker 线程内驱动（模拟 serve worker；Send 事实跨线程 Move）。
+        let worker = std::thread::spawn(move || {
+            let payload = serde_json::json!({
+                "sessionId": sid,
+                "content": [{"type": "text", "text": text}],
+            });
+            crate::web::dispatch_long_rpc(&facts, "session.prompt", &payload)
+        });
+        let v = worker.join().expect("worker turn finished");
+        assert_eq!(v["ok"], true, "worker accepted: {v}");
+        assert_eq!(v["value"]["accepted"], true, "accepted: {v}");
+        // 共享 store 与 inline 路径同事实源。
+        let evs = session_host.events("default");
+        assert!(evs.iter().any(|e| e.kind.as_str() == "user/message"));
+        assert!(evs.iter().any(|e| e.kind.as_str() == "assistant/message"));
+        let assistant = evs.iter().find(|e| e.kind.as_str() == "assistant/message").unwrap();
+        assert_eq!(
+            assistant.data["message"]["content"][0]["text"],
+            "worker says hi",
+            "worker-driven turn lands in shared store"
+        );
+        assert!(evs.iter().any(|e| e.kind.as_str() == "turn/end"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// D-115（Phase 4 验收 #4）：长生成中 accept 线程**不被占死**——worker 线程在慢
+    /// turn（mock LLM 逐 chunk sleep，模拟长生成）里阻塞时，`session.cancel` 从
+    /// accept 线程**并发送达并立即返回**（{ok:true}），随后 driver 在 chunk 间隙
+    /// 消费取消令牌 → turn aborted。这是「真一键即停」的 serve 层行为探针：
+    /// worker 化 = accept 空闲 = cancel 可达（对齐传输中断 B 的到达路径）。
+    #[test]
+    fn accept_thread_sends_cancel_while_worker_turn_runs() {
+        use std::time::{Duration, Instant};
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let root = std::env::temp_dir().join(format!("dsh-m6-cancel-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Mock LLM：长流——逐 chunk sleep 的 lazy 迭代器（模拟慢生成；worker 阻塞中）。
+        let chunks: Vec<dsh_llm::StreamChunk> = {
+            let mut v = vec![dsh_llm::StreamChunk::BlockStart {
+                index: 0,
+                block_type: "text".parse().unwrap(),
+            }];
+            for i in 0..60 {
+                v.push(dsh_llm::StreamChunk::TextDelta { index: 0, text: format!("c{i}") });
+            }
+            v.push(dsh_llm::StreamChunk::BlockEnd {
+                index: 0,
+                block: dsh_llm::ContentBlock::text("done"),
+            });
+            v.push(dsh_llm::StreamChunk::Finish { reason: dsh_llm::FinishReason::Stop, replay_state: None });
+            v
+        };
+        struct SlowAdapter {
+            chunks: Vec<dsh_llm::StreamChunk>,
+            started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl dsh_llm::LlmAdapter for SlowAdapter {
+            fn stream(
+                &self,
+                _options: dsh_llm::GenerateOptions,
+            ) -> Box<dyn Iterator<Item = dsh_llm::StreamChunk>> {
+                self.started.store(1, std::sync::atomic::Ordering::SeqCst);
+                // 惰性迭代器：每 chunk yield 前 sleep 30ms → 60 chunk ≈ 1.8s 长流。
+                Box::new(std::iter::from_fn({
+                    let mut it = self.chunks.clone().into_iter();
+                    move || {
+                        std::thread::sleep(Duration::from_millis(30));
+                        it.next()
+                    }
+                }))
+            }
+        }
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(
+            &["mock"],
+            Arc::new(SlowAdapter { chunks: chunks.clone(), started: started.clone() }),
+        )
+        .unwrap();
+        let bundle = match crate::web::assemble_server_runtime_with_llm(
+            &session_host,
+            root.clone(),
+            llm,
+            "mock",
+            "mock-model",
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("assemble deferred (bash unavailable?): {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+        };
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(bundle.host.clone());
+        let facts = crate::web::ServeWorkerFacts::from_boot(&boot);
+        let facts2 = facts.clone();
+
+        // worker 线程驱动长 turn。
+        let worker = std::thread::spawn(move || {
+            let payload = serde_json::json!({
+                "sessionId": "default",
+                "content": [{"type": "text", "text": "please take forever"}],
+            });
+            crate::web::dispatch_long_rpc(&facts2, "session.prompt", &payload)
+        });
+        // accept 线程：等 LLM 流启动（worker 已进入长生成）。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while started.load(std::sync::atomic::Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1, "worker stream started");
+
+        // accept 线程并发送达 session.cancel（worker 阻塞的路径下应**立即**返回）。
+        let cancel_body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "c1", "method": "session.cancel",
+            "payload": {"sessionId": "default"},
+        }))
+        .unwrap();
+        let t0 = Instant::now();
+        let (_, cv) = handle_rpc_host(&boot, "session.cancel", &cancel_body, &session_host);
+        let cancel_took = t0.elapsed();
+        assert_eq!(cv["result"]["value"]["accepted"], true, "cancel accepted: {cv}");
+        assert!(
+            cancel_took < Duration::from_secs(2),
+            "session.cancel must return promptly while worker turn runs (accept not starved), took {cancel_took:?}"
+        );
+
+        // worker turn 收敛：aborted（chunk 间隙消费令牌）或 completed（慢流先跑完——
+        // 60×30ms 慢流下 cancel 到达后 driver 在下一 chunk 间隙中止）。
+        let wv = worker.join().expect("worker turn settled");
+        assert_eq!(wv["ok"], true, "worker response ok: {wv}");
+        let evs = session_host.events("default");
+        let aborted = evs.iter().any(|e| {
+            e.kind.as_str() == "turn/end"
+                && e.data.get("reason")
+                    .and_then(|r| r.get("kind"))
+                    .and_then(|v| v.as_str())
+                    == Some("aborted")
+        });
+        assert!(
+            aborted,
+            "turn ended aborted after accept-thread cancel (one-click stop); events: {:?}",
+            evs.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -9437,7 +10049,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
         std::fs::create_dir_all(&root).unwrap();
-        let m5 = web_m5::M5Host::assemble(root.clone()).expect("m5 assembles");
+        let m5 = web_m5::M5Host::assemble(root.clone(), None).expect("m5 assembles");
         let loop_host = assemble_server_loop(
             session_host.store.clone(),
             root.clone(),

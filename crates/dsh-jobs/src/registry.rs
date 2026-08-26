@@ -48,15 +48,15 @@ pub struct JobSettlement {
 /// producer 同步 start 的 hooks（单线程模型）。
 pub struct ProducerHooks {
     /// 请求终止（同步、幂等）；reason 逐字转发。
-    pub on_cancel: Box<dyn Fn(&str)>,
+    pub on_cancel: Box<dyn Fn(&str) + Send>,
     /// 消费自上次读取以来的输出增量（stream）。
-    pub read_output: Option<Box<dyn FnMut() -> String>>,
+    pub read_output: Option<Box<dyn FnMut() -> String + Send>>,
 }
 
 /// 注册表配置。
 pub struct JobRegistryConfig {
     pub max_concurrent_per_owner: usize,
-    pub now: Box<dyn Fn() -> i64>,
+    pub now: Box<dyn Fn() -> i64 + Send>,
 }
 
 impl std::fmt::Debug for JobRegistryConfig {
@@ -80,7 +80,7 @@ pub struct StartSpec<'a> {
     /// owner session id（无主 job 则 None = 任何 caller 可见）。
     pub owner: Option<String>,
     /// 启动工作并同步返回 hooks。
-    pub producer: Box<dyn FnMut() -> ProducerHooks + 'a>,
+    pub producer: Box<dyn FnMut() -> ProducerHooks + Send + 'a>,
 }
 
 /// start 错误。
@@ -105,7 +105,7 @@ struct JobRecord {
     finished_at: Option<i64>,
     reported: bool,
     output_buf: Vec<String>,
-    on_cancel: Box<dyn Fn(&str)>,
+    on_cancel: Box<dyn Fn(&str) + Send>,
 }
 
 /// 只读投影。

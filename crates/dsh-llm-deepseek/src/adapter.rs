@@ -273,6 +273,26 @@ impl LlmAdapter for DeepSeekAdapter {
                         replay_state: None,
                     })),
                     Ok(payloads) => {
+                        // D-115（Phase 4 传输中断）：请求级取消 → 适配器以
+                        // `Aborted` finish 归一（对齐 TS `adapterFailureChunk`：
+                        // `signal.aborted` → `{kind:'aborted'}`）。首个 chunk 若在
+                        // 读取前/中已被取消（payload 为空且 signal aborted），
+                        // 不再产出 text，直接 Aborted。translate 前的空 payload 且
+                        // aborted → Aborted；否则走正常 translate（空响应仍是空响应）。
+                        if payloads.is_empty() && options.signal.as_ref().is_some_and(|s| s.aborted()) {
+                            return Box::new(std::iter::once(dsh_llm::types::StreamChunk::Finish {
+                                reason: dsh_llm::types::FinishReason::Aborted {
+                                    failure: dsh_llm::types::LlmFailure {
+                                        message: "DeepSeek request aborted by caller".into(),
+                                        code: "ABORTED".into(),
+                                        status: None,
+                                        provider_retry_after_ms: None,
+                                        request_id: None,
+                                    },
+                                },
+                                replay_state: None,
+                            }));
+                        }
                         match translate(payloads) {
                             Ok(chunks) => Box::new(chunks.into_iter()),
                             Err(err) => Box::new(std::iter::once(dsh_llm::types::StreamChunk::Finish {
@@ -339,6 +359,7 @@ mod tests {
             stop: None,
             session_id: None,
             purpose: None,
+            signal: None,
         }
     }
 
@@ -411,6 +432,42 @@ mod tests {
             }),
         };
         assert_eq!(http_error_code(400, Some(&context_err)), "CONTEXT_WINDOW_EXCEEDED");
+    }
+
+    /// D-115（Phase 4 传输中断）：请求级取消置位（`options.signal.aborted()`）且
+    /// payload 为空（传输层已被中断、不留 partial）→ 适配器以 `Aborted` finish 归一，
+    /// **不**落入 EMPTY_RESPONSE 错误（对齐 TS `adapterFailureChunk`：`signal.aborted`
+    /// → `{kind:'aborted'}`）。
+    #[test]
+    fn aborted_signal_with_empty_payload_finishes_aborted_not_error() {
+        let adapter = adapter_with_payload(vec![]);
+        let mut ops = options();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let f = flag.clone();
+        ops.signal = Some(dsh_llm::AbortSignal::new(move || f.load(std::sync::atomic::Ordering::SeqCst)));
+        let chunks: Vec<StreamChunk> = adapter.stream(ops).collect();
+        assert_eq!(chunks.len(), 1, "aborted → single finish chunk");
+        match &chunks[0] {
+            StreamChunk::Finish { reason: FinishReason::Aborted { failure }, .. } => {
+                assert_eq!(failure.code, "ABORTED");
+            }
+            other => panic!("expected Aborted finish, got {other:?}"),
+        }
+    }
+
+    /// 取消谓词**未**置位 → 空 payload 仍是原错误 finish（`translate` 的空流语义，
+    /// 不因 signal 字段引入的缺省行为而改变）。
+    #[test]
+    fn unset_signal_empty_payload_still_translate_error() {
+        let adapter = adapter_with_payload(vec![]);
+        let chunks: Vec<StreamChunk> = adapter.stream(options()).collect();
+        assert_eq!(chunks.len(), 1);
+        match &chunks[0] {
+            StreamChunk::Finish { reason: FinishReason::Error { failure }, .. } => {
+                assert_eq!(failure.code, "STREAM_CLOSED");
+            }
+            other => panic!("expected error finish, got {other:?}"),
+        }
     }
 
     #[test]

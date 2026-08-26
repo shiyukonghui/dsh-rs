@@ -8,6 +8,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
 use std::time::Duration;
 
 use crate::types::Value;
@@ -230,15 +231,56 @@ fn build_request(path: &str, api_key: Option<&str>, body: &str) -> String {
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
+/// 可中断读取：连接后可选的取消谓词 + 读取超时轮询间隔（None = 原 30s 单次阻塞）。
+struct ReadBudget<'a> {
+    /// 每次 `read` 阻塞上限（短超时轮询 cancel 谓词的前提）。
+    pub read_timeout: Duration,
+    /// 谓词置位 → 主动中断（返回已读部分 + 置 `abort_flag`）。
+    pub abort_flag: Option<Arc<AtomicBool>>,
+    pub cancel: Option<&'a (dyn Fn() -> bool + Send + Sync)>,
+}
+
 fn tcp_exchange(
     scheme: &str,
     host: &str,
     port: u16,
     request: &str,
 ) -> Result<Vec<u8>, String> {
+    tcp_exchange_core(scheme, host, port, request, &ReadBudget {
+        read_timeout: Duration::from_secs(30),
+        abort_flag: None,
+        cancel: None,
+    })
+}
+
+/// 可中断变体（D-115 Phase 4）：`cancel` 置位 → 置 `abort_flag` 并立即返回
+/// 已读部分（socket 关闭由 drop 完成；不等待剩余响应）。
+fn tcp_exchange_abortable(
+    scheme: &str,
+    host: &str,
+    port: u16,
+    request: &str,
+    cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    abort_flag: Arc<AtomicBool>,
+) -> Result<Vec<u8>, String> {
+    tcp_exchange_core(scheme, host, port, request, &ReadBudget {
+        // 短读超时：让 cancel 谓词可在流中尽快被观察（对齐 TS fetch abort 响应性）。
+        read_timeout: Duration::from_millis(200),
+        abort_flag: Some(abort_flag),
+        cancel,
+    })
+}
+
+fn tcp_exchange_core(
+    scheme: &str,
+    host: &str,
+    port: u16,
+    request: &str,
+    budget: &ReadBudget<'_>,
+) -> Result<Vec<u8>, String> {
     let tcp = TcpStream::connect((host, port))
         .map_err(|e| format!("connect {host}:{port}: {e}"))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    tcp.set_read_timeout(Some(budget.read_timeout)).ok();
     let mut stream: Box<dyn ReadWrite> = if scheme == "https" {
         let connector = native_tls::TlsConnector::builder()
             .build()
@@ -256,6 +298,13 @@ fn tcp_exchange(
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];
     loop {
+        // 读前先查 cancel：置位 → 中断（带出已读部分 + abort 标志）。
+        if let (Some(flag), Some(cancel)) = (&budget.abort_flag, &budget.cancel) {
+            if cancel() {
+                flag.store(true, Ordering::SeqCst);
+                break;
+            }
+        }
         match stream.read(&mut tmp) {
             Ok(0) => break,
             Ok(n) => {
@@ -268,6 +317,9 @@ fn tcp_exchange(
                     }
                 }
             }
+            // 可中断模式：短读超时是轮询 cancel 谓词的醒来时刻——继续循环（超时
+            // 非错误）；原 30s 单次阻塞模式把 IO 错误（含超时）当断开（保持原语义）。
+            Err(_) if budget.abort_flag.is_some() => continue,
             Err(_) => break,
         }
     }
@@ -332,6 +384,55 @@ impl std::fmt::Display for StreamHttpError {
         let st = if self.status == 0 { "network/io".to_string() } else { format!("HTTP {}", self.status) };
         write!(f, "{st}: {}", self.detail)
     }
+}
+
+/// 可中断读取的产物（D-115 Phase 4）：`aborted = true` 表示读取因取消谓词被
+/// **主动中断**（调用方不再等待完整响应；partial bytes 为已读部分）。对齐 TS
+/// `fetch(url, {signal})` 的 abort 语义——abort 不是传输错误，是正常终止的一支。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AbortableStreamBody {
+    pub status: u16,
+    pub bytes: Vec<u8>,
+    pub aborted: bool,
+}
+
+/// POST 流式 chat/completions 的可中断变体：读取循环以短读超时轮询 `cancel`
+/// 谓词；谓词置位 → 关闭 socket、返回 `aborted: true`（不返回 Error）。阻塞读因此
+/// 可被外部取消信号打断（真·生成中停止的前提）。`base`/`api_key`/`body` 语义与
+/// [`chat_completions_stream`] 一致。
+///
+/// 返回约定：`aborted == true` 时 `status` 为 0、`bytes` 为空（调用方以 Aborted
+/// 归一，无需已读部分）；否则与 [`chat_completions_stream`] 相同（非 2xx → Err）。
+pub fn chat_completions_stream_abortable(
+    base: &str,
+    api_key: Option<&str>,
+    body: &str,
+    cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
+) -> Result<AbortableStreamBody, StreamHttpError> {
+    let (scheme, host, port, path) = match parse_base(base) {
+        Some(v) => v,
+        None => return Err(StreamHttpError { status: 0, detail: "invalid base url".into() }),
+    };
+    let request = build_request(&path, api_key, body);
+    // abort 标志经共享指针从读取循环带出（tcp_exchange 只返回 bytes）。
+    let abort_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let response = match tcp_exchange_abortable(&scheme, &host, port, &request, cancel, abort_flag.clone()) {
+        Ok(r) => r,
+        Err(e) => return Err(StreamHttpError { status: 0, detail: e }),
+    };
+    let aborted = abort_flag.load(std::sync::atomic::Ordering::SeqCst);
+    if aborted {
+        return Ok(AbortableStreamBody { status: 0, bytes: Vec::new(), aborted: true });
+    }
+    let (status, bytes) = match split_response(&response) {
+        Some(v) => v,
+        None => return Err(StreamHttpError { status: 0, detail: "malformed HTTP response".into() }),
+    };
+    if !(200..300).contains(&status) {
+        let detail = String::from_utf8_lossy(&bytes);
+        return Err(StreamHttpError { status, detail: detail.into_owned() });
+    }
+    Ok(AbortableStreamBody { status, bytes, aborted: false })
 }
 
 /// POST 流式 chat/completions：`body` 须为已序列化的请求 JSON（含 `"stream": true`）。
@@ -438,5 +539,81 @@ mod tests {
     fn chat_completions_stream_invalid_base() {
         let err = chat_completions_stream("not-a-url", None, "{}").expect_err("must error");
         assert_eq!(err.status, 0);
+    }
+
+    /// 本地慢速服务端：写响应头 + 首段 body（Content-Length 声明较大总数）后
+    /// 保持连接挂起，持续写入增量（模拟长生成 SSE 流）。
+    fn serve_slow(budget_chunks: usize) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w = written.clone();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            while !buf.windows(4).any(|b| b == b"\r\n\r\n") {
+                match sock.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(_) => break,
+                }
+            }
+            sock.set_read_timeout(Some(std::time::Duration::from_millis(100))).ok();
+            // 声明总长远超实际内容：客户端无法凭 Content-Length 提前结束，只能靠
+            // close 或取消谓词终止——正是「阻塞读可被中断」的探测点。
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000000\r\nConnection: close\r\n\r\n";
+            sock.write_all(header.as_bytes()).unwrap();
+            for i in 0..budget_chunks {
+                let chunk = format!("data: {{{{\"choices\":[{{\"delta\":{{\"content\":\"c{i}\"}}}}]}}}}\n\n");
+                sock.write_all(chunk.as_bytes()).unwrap();
+                sock.flush().unwrap();
+                w.store(i + 1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            // 超出预算后继续挂起，等客户端 close。
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = sock;
+        });
+        let _ = handle;
+        (port, written)
+    }
+
+    /// D-115 Phase 4：cancel 谓词在流中置位 → 阻塞读在下个轮询窗口内返回
+    /// `aborted: true`（不等待完整响应 / 无 30s 阻塞）。真·生成中停止的前提。
+    #[test]
+    fn chat_completions_stream_abortable_interrupts_blocking_read() {
+        let (_port, _written) = serve_slow(100);
+        let base = format!("http://127.0.0.1:{_port}");
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c1 = cancel.clone();
+        let predicate = move || c1.load(std::sync::atomic::Ordering::SeqCst);
+        // 服务端先于取消写首段 → 客户端进入阻塞读；随后置 cancel。
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let start = std::time::Instant::now();
+        let res = chat_completions_stream_abortable(&base, Some("K"), r#"{"stream":true}"#, Some(&predicate))
+            .expect("abortable read returns Ok (abort is not an error)");
+        let took = start.elapsed();
+        assert!(res.aborted, "read must be marked aborted when cancel fires mid-stream");
+        assert!(took < std::time::Duration::from_secs(5), "abort must beat the 30s blocking read, took {took:?}");
+    }
+
+    /// cancel 谓词从未置位 → 可中断变体与原函数等价（完整响应 + aborted=false）。
+    #[test]
+    fn chat_completions_stream_abortable_no_cancel_matches_baseline() {
+        let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let (port, _handle) = serve_once("HTTP/1.1 200 OK", sse);
+        let base = format!("http://127.0.0.1:{port}");
+        let never = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let n1 = never.clone();
+        let predicate = move || n1.load(std::sync::atomic::Ordering::SeqCst);
+        let res = chat_completions_stream_abortable(&base, Some("K"), r#"{"stream":true}"#, Some(&predicate))
+            .expect("abortable stream ok");
+        assert!(!res.aborted, "no cancel → not aborted");
+        assert_eq!(res.status, 200);
+        assert_eq!(res.bytes, sse.to_vec());
     }
 }

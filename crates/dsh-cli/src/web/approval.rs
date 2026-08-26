@@ -233,6 +233,19 @@ pub fn decide(boot: &crate::Boot, call_id: &str, decision: &str) -> Result<usize
         .agent_loop
         .as_ref()
         .ok_or_else(|| "no Rust AgentLoopHost assembled in this boot".to_string())?;
+    decide_on_host(host, boot.approval_wire.as_ref(), call_id, decision)
+}
+
+/// D-115（Phase 4 serve worker 化）：[`decide`] 的 worker 线程变体——只依赖
+/// `Arc<AgentLoopHost>` + 可选 `ApprovalWireRef`（Send+Sync），不取 `&Boot`
+/// （含 Rc/RefCell 非 Send 字段）。长 RPC 的恢复 kick 可在 worker 线程完成，
+/// accept 循环不被占用（真一键即停的审批侧补齐）。
+pub fn decide_on_host(
+    host: &Arc<dsh_agent_loop::AgentLoopHost>,
+    wire: Option<&super::approval_wire::ApprovalWireRef>,
+    call_id: &str,
+    decision: &str,
+) -> Result<usize, String> {
     let (agent_id, session) = host
         .pending_by_call_id(call_id)
         .ok_or_else(|| format!("no pending approval for toolCallId \"{call_id}\""))?;
@@ -248,7 +261,7 @@ pub fn decide(boot: &crate::Boot, call_id: &str, decision: &str) -> Result<usize
         )
         .map_err(|e| e.0)?;
     // D-108/G：decide 落定 → wire 按 call id 结算（resolved 广播；前端 pending 不悬挂）。
-    if let Some(w) = &boot.approval_wire {
+    if let Some(w) = wire {
         let outcome = if decision == DECISION_ALLOWED_ONCE {
             super::approval_wire::WIRE_OUTCOME_ALLOWED_ONCE
         } else {
@@ -281,18 +294,29 @@ pub fn set_plan_mode_on(
     active: bool,
     message: Option<&str>,
 ) -> Result<bool, String> {
-    let sid = sid
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            boot.plan_session
-                .as_ref()
-                .map(|ps| ps.lock().unwrap().clone())
-                .unwrap_or_else(|| "default".to_string())
-        });
     let host = boot
         .agent_loop
         .as_ref()
         .ok_or_else(|| "no Rust AgentLoopHost assembled in this boot".to_string())?;
+    set_plan_mode_on_host(host, boot.plan_session.as_ref(), sid, active, message)
+}
+
+/// D-115（Phase 4 serve worker 化）：[`set_plan_mode_on`] 的 worker 线程变体——
+/// 只依赖 `Arc<AgentLoopHost>` + 可选 `plan_session`（Send+Sync），不取 `&Boot`。
+pub fn set_plan_mode_on_host(
+    host: &Arc<dsh_agent_loop::AgentLoopHost>,
+    plan_session: Option<&Arc<std::sync::Mutex<String>>>,
+    sid: Option<&str>,
+    active: bool,
+    message: Option<&str>,
+) -> Result<bool, String> {
+    let sid = sid
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            plan_session
+                .map(|ps| ps.lock().unwrap().clone())
+                .unwrap_or_else(|| "default".to_string())
+        });
     let session = host
         .store
         .get(&dsh_session::types::SessionId::from_raw(sid.clone()))

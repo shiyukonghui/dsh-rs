@@ -5490,6 +5490,96 @@ ToolExecFactory `+Send+Sync`）。
 
 ---
 
+## D-115（实施·Phase 4）：serve worker 化 + 传输中断化——长 RPC 上 worker 线程、M5 底物 Send 化、阻塞读可中断（round 4）
+
+**触发问题**：serve 主循环（`recv_timeout` → `dispatch_request` 内联）把
+`session.prompt`/`agent.run` 同步驱动整轮 turn：turn 排空期间 accept 循环被占死，
+`session.cancel`（以及任何其它 RPC）无法并发送达 → 「生成中一键即停」不可达（HANDOFF
+0.3 明示是 D-114 的设计使然，等 D-115 完成）。Phase 1-3 已把请求面全部 Send+Sync，
+解锁 worker 线程执行长 RPC。需求/设计文档：
+`.spec/phase4-serve-worker/requirements.md`、`design.md`。
+
+**考虑的选项**：
+- **取消语义（用户两轮提问拍板）**：(A) 仅 worker + step 边界合作式取消——长生成中
+  cancel 要等整段 LLM 阻塞读读完才生效，不是真·生成中停止；(B) worker + **传输中断**
+  ——请求级取消谓词直插阻塞读循环，abort 主动断开在途读（对齐 TS
+  `packages/llm/llm-deepseek/src/adapter.ts` 的 `AbortSignal.any([options.signal, ...])`
+  → `fetch(url,{signal})` + `adapterFailureChunk` 的 ABORTED）。**选 B**（用户第二次
+  提问确认）。研究确认：Rust 现状 `dsh_core::llm_http::chat_completions_stream` 是
+  **整段阻塞读**（Get-Content 式读到 Content-Length/close），`parse_sse` 一次性解析；
+  `GenerateOptions` 无 signal 字段——不改传输则 worker 化只省「UI 不卡死」，停不下来。
+- **worker 结果回填**：D-115 §3 原文「Result 经 channel 回填 accept」 vs pickDirectory
+  先例（worker 持 `tiny_http::Request` 直接 respond）。**选后者**——同文件既有先例
+  （web.rs `host.pickDirectory`），accept 完全不占、HTTP 同步契约不变，零额外路由。
+- **M5 底物**：三 crate（dsh-jobs/dsh-shell/dsh-terminal）整体 Send 化 + 移除 Phase 3
+  的 `ThreadCell` 桥改 `Arc<Mutex>`。`TerminalBackend` trait 不加 `Send` supertrait
+  （只 Box 处 `+ Send`；`PtyBackend` 已 Send）。**用户二次确认共享 JobRegistry**：
+  M4 job_* 工具与 M5 BashJobsBridge 共享同一 `Arc<Mutex<JobRegistry>>`（worker 线程
+  里 run_in_background 起的 bash job 可被 job_kill/job_read 命中）；连锁把 M4 job_*
+  执行器的 caller 从 `None` 改为 `ctx.agent`（授权围栏下 owner 才能读自己的 job——
+  自下而上发现 `list(None)` 只返无主 job，共享注册表不传 caller 等于依旧不可见）。
+
+**最终选择与理由**：
+1. **传输中断化（B）**：`dsh_core::llm_http::chat_completions_stream_abortable` +
+   `tcp_exchange_abortable`（200ms 短读超时轮询 cancel 谓词；置位 → 置 abort 标志、
+   立即返回已读部分、不报错——abort 是正常终止语义）。`GenerateOptions.signal:
+   Option<dsh_llm::AbortSignal>`（Send+Sync 共享谓词；serde skip 不入 wire/日志）。
+   `dsh-llm-deepseek::DeepSeekAdapter::stream`：空 payload + signal aborted →
+   `FinishReason::Aborted`（不落 EMPTY_RESPONSE/STREAM_CLOSED）。`dsh-cli::m6_llm`
+   resolver 用可中断读并绑 `opts.signal`。`dsh-agent-loop` driver 装配
+   `request.signal` = `cancel_token` 的**非消费**谓词（step 边界 `abort_reason()` 仍
+   消费令牌；传输轮询只观察）。理由：真·生成中一键即停（D-115 目标）+ 对齐 TS 参考。
+   预期影响：既有非 abort 路径零变化（signal=None 缺省语义不变）。
+2. **serve worker 化**：`dispatch_request` 的通用 Post arm 对长方法白名单
+   （`session.prompt`/`agent-loop`/`agent.turn`/`agent.run`/`commands/execute`/
+   `session.approval.decide`）→ spawn 线程、move `Request` + `ServeWorkerFacts`
+   （agent_loop/plan_session/approval_wire 三个 Arc——全部 Send+Sync）、worker 内读
+   body → `dispatch_long_rpc`（host 参数化核心 `run_rust_loop_on_host`/
+   `ensure_session_agent_on_host`/`decide_on_host`/`set_plan_mode_on_host`/
+   `commands_execute_on_host`，摆脱 `&Boot`）→ `request.respond`。`session.cancel`、
+   短 RPC、SSE/WS/静态、`respond`（审批 wire 收据）**刻意留 accept 同步**。每 driver
+   单 turn 由相位机保证（`followup` 非 Idle 追加 inbox）；跨会话并行是扩展点。
+   测试：worker 线程驱动完整 turn 与 inline 同语义（accept 不占）+ **一键即停验收**
+   `accept_thread_sends_cancel_while_worker_turn_runs`：慢 mock 流在 worker 阻塞时
+   `session.cancel` 从 accept 并发送达立即返回 + turn/end reason aborted。
+3. **M5 底物 Send 化 + 移 ThreadCell + 共享注册表**：dsh-jobs `Box<dyn Fn>` →
+   `+Send`；dsh-shell `ShellProcess` `Rc<RefCell<Inner>>` → `Arc<Mutex<Inner>>`（
+   `SubprocessHandle` 已 Send——含 `win_job::Job` 既有 `unsafe impl Send`）；dsh-terminal
+   `BackendProvider`/`OwnerLiveness`/`TerminalSession.backend` → `+Send`。dsh-cli 删
+   `ThreadCell` 全桥（web_m5.rs + web.rs 25 处 `.with` → `lock`），`M5Host::assemble`
+   取可选共享注册表；新增编译期 `send_asserts.rs`（每 crate 一文件）。理由：worker
+   线程调 M5 工具是常态路径，`ThreadCell` 跨线程 panic 与目标直接冲突。
+
+**自下而上发现（超出原库存，已显式处理）**：① 设计文档 §4.4 承诺的跨 M4/M5 注册表
+共享**原代码不存在**（两实例各自独立）——本次实现共享 + 测试证明；② 共享后 M4
+`job_list(None)` 仍看不到 owner 化 job（授权围栏设计如此）——执行器改传
+`ctx.agent`，语义从「总览 all」转为「owner 见自己的 + 无主」。
+
+**验证（Phase 4 关闸）**：`cargo test --workspace` 全绿 EXIT=0（194 套 ok；新增：
+dsh-core abortable read 2 项、deepseek Aborted 映射 2 项、m6_llm 慢流中断 1 项、
+driver signal 装配 1 项（m2e2 `request_signal_observes_shared_cancel_token`）、
+三 crate send_asserts 各 1 项、dsh-cli worker 语义 + 一键即停 + 共享注册表 3 项；
+dsh-cli lib 212→216）；`cargo clippy --workspace --all-targets` EXIT=0 零告警。
+60880 演示服务以原命令行重启 → HTTP 200（kill 前 `cargo test`/build，装后重启，已按
+既有批准模式执行）。
+
+**环境事故与纪律强化**：Phase 4 中期误用 PS 5.1 批量文本替换打坏 `web.rs`（UTF-8 被
+GBK 重编码、中文注释不可逆损坏）。修复 = `git checkout HEAD --` + 按已枚举清单重新
+应用（子代理报告逐条 + 本会话已知改动），`cargo check`/`test`/`clippy` 全量验证等价。
+纪律：对含中文文件一律用 `edit`/`write`/`cmd`/`bash`（原生 UTF-8），禁用 PS 5.1 文本
+重写；多实例替换用 `edit replace_all`。
+
+**被否决**：(a) 仅 worker + 合作式取消（非真即停——用户 B）；(b) worker 结果经 channel
+回填 accept + pending Request 表（无收益复杂度）；(c) 每会话常驻 worker/线程池
+（扩展点不强做）；(d) `TerminalBackend` trait 加 `Send` supertrait（破坏性扩面，Pty
+已 Send 无需）；(e) 不共享注册表（bash job 对 job_kill 不可见——用户选共享）。
+
+**预期影响与回滚点**：三 crate 公开类型破坏性换型（`+Send`/`Arc<Mutex>`，编译期连锁
+dsh-cli 消费者）；`GenerateOptions.signal` 新字段（serde skip，wire 不变）；worker
+化后长 RPC 的 HTTP 响应时点不变、cancel 可 turn 中并发送达（传输中断 B + step 边界
+双保险）。回滚 = git revert 本提交（含三 crate 型面，需一起回）。
+
+
 
 
 

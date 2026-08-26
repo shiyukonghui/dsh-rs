@@ -952,6 +952,45 @@ pub struct GenerateOptions {
     pub session_id: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<Purpose>,
+    /// 请求级取消（对齐 TS `GenerateOptions.signal?: AbortSignal`）：`aborted()`
+    /// 谓词穿透到传输层阻塞读（D-115 Phase 4 传输中断）；Send+Sync（worker 线程
+    /// 轮询）。serde skip——进程内句柄不入 wire/日志。
+    #[serde(skip)]
+    pub signal: Option<AbortSignal>,
+}
+
+/// 请求级取消信号（对齐 TS `AbortSignal` 的最小同步面）：共享 `aborted()`
+/// 谓词，Send+Sync（worker 线程 + 传输阻塞读轮询）。`new` 包一个闭包；`Some`
+/// 代表「有可观察的取消」，None = 不可取消（缺省同步语义）。
+#[derive(Clone)]
+pub struct AbortSignal {
+    inner: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl AbortSignal {
+    /// 包一个取消谓词（谓词置位 = 请求被取消）。
+    pub fn new(f: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        AbortSignal { inner: std::sync::Arc::new(f) }
+    }
+
+    /// 当前是否已取消（传输层阻塞读循环以它轮询中断）。
+    pub fn aborted(&self) -> bool {
+        (self.inner)()
+    }
+}
+
+impl std::fmt::Debug for AbortSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AbortSignal").finish_non_exhaustive()
+    }
+}
+
+/// 同源句柄相等（同一 `Arc` 谓词）；跨源句柄不等——用于 `GenerateOptions`
+/// 的派生 `PartialEq`（信号句柄不进 wire 比较）。
+impl PartialEq for AbortSignal {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 // ---- 路由/模型元数据（对齐 TS `llm/llm/src/types.ts` 的 LlmProviderInfo/…）----

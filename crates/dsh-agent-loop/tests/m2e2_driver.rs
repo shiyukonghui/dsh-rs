@@ -573,6 +573,43 @@ fn cancel_mid_turn_aborts_without_error_event() {
 }
 
 #[test]
+fn request_signal_observes_shared_cancel_token() {
+    // D-115（Phase 4 传输中断）：driver 装配的 GenerateOptions 必须携带请求级取消
+    // 信号（`options.signal`），谓词直读共享取消令牌（Send+Sync 旁路）——accept
+    // 线程写 token → 传输层阻塞读谓词置位 → 阻塞读被主动中断（真·生成中停止的
+    // 传递路径）。本测试验证「request.signal 已装配 + token 置位 → signal.aborted()」。
+    let w = TestWorld::new();
+    let a = w.agent("a");
+    // 捕获 driver 派发给 stream dep 的 request（含 signal）。
+    let captured: Arc<Mutex<Option<GenerateOptions>>> = Arc::new(Mutex::new(None));
+    let cap = captured.clone();
+    let stream = Arc::new(move |req: &GenerateOptions| -> Result<Vec<StreamChunk>, LlmError> {
+        *cap.lock().unwrap() = Some(req.clone());
+        Ok(vec![
+            StreamChunk::TextDelta { index: 0, text: "ok".into() },
+            StreamChunk::Finish { reason: FinishReason::Stop, replay_state: None },
+        ])
+    });
+    let driver = ReactLoopAgent::new(
+        a.clone(),
+        w.reg.clone(),
+        deps(mock_assemble("sys"), stream, mock_tool_never()),
+    );
+    driver.followup(user_msg("m1", "hi")).unwrap();
+
+    let req = captured.lock().unwrap().clone().expect("stream received a request");
+    let signal = req.signal.expect("request carries an AbortSignal in Phase 4");
+    assert!(!signal.aborted(), "signal starts not-aborted");
+    // accept 线程写共享取消令牌 → 传输谓词置位（不消费——step 边界 `abort_reason`
+    // 才是消费方；传输轮询只观察）。
+    *driver.cancel_token().lock().unwrap() = Some(AgentCancelCause::User);
+    assert!(
+        signal.aborted(),
+        "signal must observe the shared cancel token (accept-thread write → transport poll)"
+    );
+}
+
+#[test]
 fn request_error_retry_once_then_succeeds() {
     let w = TestWorld::new();
     let a = w.agent("a");
