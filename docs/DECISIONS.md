@@ -6585,6 +6585,29 @@ HANDOFF 优先级续做）。
 缺口核对/验收 T1-T4/决策收敛/复盘追问结论）→ 进入阶段 2（系统设计）。
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；后续设计/编码各自独立可回。
 
+## D-138（服务装配单元 Phase 5 系统设计定稿：A5 对象形态 inject + m20 + golden）
+
+**日期**：2026-08-27
+
+**触发问题**：D-137 需求关闸通过 → 阶段 2（系统设计）。把「对象形态 inject（inject: {svc:cfg} →
+最内层）」落成可验收设计。
+
+**关键设计定案**：
+- **S1**：`Plugin::inject_configs() -> Vec<(String,Value)>`（新可选方法默认空，不破坏既有实现）；
+  依赖名集 = `inject()` 名字 ∪ 配置键（cordis `Object.keys(inject)`=deps）；`register_plugin` 装载时
+  `f.intercept.extend(pending_ic) + extend(own_cfgs)`（最内层；同名胜后者赢）。
+- **S2**：m20 T1（子注入配置最内层 > 父 intercept）/ T2（base→注入层→head）/ T3（父注入配置沿父链
+  对子代可见）；需 provider 提供注入键（键即依赖）。
+- **S3 golden**：`scenario-13-object-inject-config`（父 provide+srv + intercept{a:1,p:1} + 子
+  injectConfig{srv:{a:9,b:2}} + resolve-config → {"a":9,"b":2}）TS 原版↔Rust 逐行一致。
+- **DIV-5-1** 浅合并（`Config.merge` 深合并不做，缺证据）；**DIV-5-2** 配置键即依赖（cordis 语义）；
+  **DIV-5-3** `inject_configs()` 返回 Vec（元数据量小）。
+
+**验证（设计关闸）**：`design.md` 定稿；实现 S1（TDD T1-T3 红→绿）+ S2/S3（m20 + scenario-13）+ 回归
+（verify-diff 23 全过含新 golden）+ 阶段 4/5 关闸。
+
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
+
 
 
 
