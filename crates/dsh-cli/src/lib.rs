@@ -294,6 +294,8 @@ pub fn boot(
         // ui-conversation/shell/agent-loop/permission）——使用阶段发现前端必读写，
         // 缺注册即 settings-rejected。
         register_host_settings(&mut sp);
+        // D-115-Web（模型配置 CRUD 对齐 TS）：llm-deepseek / llm-pi-ai / agent-default-model。
+        register_model_config_settings(&mut sp);
     }
 
     Ok(Boot {
@@ -414,6 +416,103 @@ pub fn register_host_settings(sp: &mut dsh_settings::SettingsProvider) {
     // P1-b（D-103/C-04）：agent-presets settings namespace {default}——新会话未选时的
     // 初始预设（base=工程默认；default 会话不隐式 join）。
     crate::preset_host::register_agent_presets_settings(sp);
+}
+
+/// D-115-Web（模型配置 CRUD 对齐 TS）：注册模型配置相关 settings namespace——
+/// `llm-deepseek`（扁平，对齐 TS llm-deepseek Config）、`llm-pi-ai`（providers dict，
+/// 对齐 TS llm-pi-ai Config）、`agent-default-model`（selectModel 默认模型持久化）。
+/// 全部 Applies=Live（对齐 TS installSettingsSection 默认 live）。
+///
+/// schema 为**宽进**（非 strict）：TS 前端 editor 可能写未列字段（models 子字段、
+/// profile 的各类容量），我们以类型级校验 + 真实语义验证（genai/适配器）为准，不因
+/// schema 漏列拒绝前端可写配置。
+pub fn register_model_config_settings(sp: &mut dsh_settings::SettingsProvider) {
+    use dsh_schema::Schema;
+    let mut profile_fields = std::collections::HashMap::new();
+    // llm-pi-ai provider profile：对齐 TS PiAiProviderProfile 核心字段（宽进）。
+    profile_fields.insert(
+        "apiKeyEnv".into(),
+        Schema::role(&Schema::string(), "credential-ref"),
+    );
+    profile_fields.insert("displayName".into(), Schema::string());
+    profile_fields.insert(
+        "api".into(),
+        Schema::union(vec![
+            Schema::const_value(serde_json::json!("openai-completions")),
+            Schema::const_value(serde_json::json!("openai-responses")),
+            Schema::const_value(serde_json::json!("anthropic-messages")),
+        ]),
+    );
+    profile_fields.insert("baseURL".into(), Schema::string());
+    profile_fields.insert("transport".into(), Schema::string());
+    profile_fields.insert("defaultContextWindow".into(), Schema::number());
+    profile_fields.insert("defaultMaxTokens".into(), Schema::number());
+
+    // models 数组：id 必填 + 可选 name/contextWindow/maxTokens；数组项对象构造成 lazy-ref
+    // 免循环（models → profile → models 的交叉应用在 settings 层不需要，宽进即可）。
+    let mut model_fields = std::collections::HashMap::new();
+    model_fields.insert("id".into(), Schema::required(&Schema::string()));
+    model_fields.insert("name".into(), Schema::string());
+    model_fields.insert("contextWindow".into(), Schema::number());
+    model_fields.insert("maxTokens".into(), Schema::number());
+    profile_fields.insert(
+        "models".into(),
+        Schema::array(Schema::object(model_fields.clone())),
+    );
+
+    // llm-pi-ai：`{ providers: dict(route → Profile) }`；空 dict = dormant（对齐 TS）。
+    let mut pi_ai = std::collections::HashMap::new();
+    pi_ai.insert(
+        "providers".into(),
+        Schema::dict(Schema::object(profile_fields.clone()), Schema::string()),
+    );
+    sp.register("llm-pi-ai", &Schema::object(pi_ai), None, dsh_settings::Applies::Live);
+
+    // llm-deepseek：扁平 {apiKeyEnv, baseURL, thinking, reasoningEffort, maxTokens,
+    // defaultContextWindow, models[]}（对齐 TS Config；apiKeyEnv 是 credential-ref）。
+    let mut deepseek = std::collections::HashMap::new();
+    deepseek.insert(
+        "apiKeyEnv".into(),
+        Schema::with_default(
+            &Schema::role(&Schema::string(), "credential-ref"),
+            serde_json::json!("DEEPSEEK_API_KEY"),
+        ),
+    );
+    deepseek.insert("baseURL".into(), Schema::string());
+    deepseek.insert(
+        "thinking".into(),
+        Schema::union(vec![
+            Schema::const_value(serde_json::json!("enabled")),
+            Schema::const_value(serde_json::json!("disabled")),
+        ]),
+    );
+    deepseek.insert(
+        "reasoningEffort".into(),
+        Schema::union(vec![
+            Schema::const_value(serde_json::json!("off")),
+            Schema::const_value(serde_json::json!("low")),
+            Schema::const_value(serde_json::json!("high")),
+            Schema::const_value(serde_json::json!("max")),
+        ]),
+    );
+    deepseek.insert("maxTokens".into(), Schema::number());
+    deepseek.insert("defaultContextWindow".into(), Schema::number());
+    deepseek.insert("models".into(), Schema::array(Schema::object(model_fields)));
+    sp.register("llm-deepseek", &Schema::object(deepseek), None, dsh_settings::Applies::Live);
+
+    // agent-default-model：{provider, model, reasoningEffort?}（对齐 TS 语义——selectModel
+    // 持久化默认模型）。provider/model 用 optional（非 required）：boot 泛用无 compose base，
+    // 空 section（未设置默认）必须能 resolve；selectModel 成功时写成完整对象。
+    let mut adm = std::collections::HashMap::new();
+    adm.insert("provider".into(), Schema::string());
+    adm.insert("model".into(), Schema::string());
+    adm.insert("reasoningEffort".into(), Schema::string());
+    sp.register(
+        "agent-default-model",
+        &Schema::object(adm),
+        None,
+        dsh_settings::Applies::Live,
+    );
 }
 
 /// 读取 YAML 入口列表。
@@ -825,5 +924,63 @@ mod tests {
             .mutate("ui-evil", &serde_json::json!([{"op":"set","path":["x"],"value":1}]), None)
             .unwrap_err();
         assert!(matches!(err, dsh_settings::SettingsError::NotRegistered(_)), "guard holds: {err:?}");
+    }
+
+    /// D-115-Web（模型配置 CRUD 对齐 TS）：`register_model_config_settings` 注册
+    /// llm-deepseek（扁平）/ llm-pi-ai（providers dict）/ agent-default-model，且可
+    /// write/mutate（前端增删改查路径落到真实 settings）。
+    #[test]
+    fn register_model_config_settings_exposes_and_writes() {
+        let mut sp = dsh_settings::SettingsProvider::memory();
+        crate::register_model_config_settings(&mut sp);
+
+        let names = sp
+            .describe_all()
+            .into_iter()
+            .map(|d| d.ns)
+            .collect::<Vec<_>>();
+        for want in ["llm-deepseek", "llm-pi-ai", "agent-default-model"] {
+            assert!(names.contains(&want.to_string()), "namespace {want} registered (got {names:?})");
+        }
+
+        // llm-deepseek：前端扁平写（settingsPath=[] 每字段一 op）→ baseURL + models set。
+        let deepseek = sp
+            .mutate(
+                "llm-deepseek",
+                &serde_json::json!([
+                    {"op":"set","path":["baseURL"],"value":"http://100.105.152.101:18080/v1"},
+                    {"op":"set","path":["models"],"value":[{"id":"deepseek-v4-flash-0731-ext","name":"V4"}]},
+                ]),
+                None,
+            )
+            .expect("llm-deepseek mutate accepted");
+        assert_eq!(deepseek.value["baseURL"], serde_json::json!("http://100.105.152.101:18080/v1"));
+        assert_eq!(deepseek.value["models"][0]["id"], serde_json::json!("deepseek-v4-flash-0731-ext"));
+
+        // llm-pi-ai：dict 写 {providers:{openai:{...}}}（settingsPath=['providers',route]）。
+        let pi = sp
+            .mutate(
+                "llm-pi-ai",
+                &serde_json::json!([
+                    {"op":"set","path":["providers","openai"],"value":{
+                        "displayName":"OpenAI","api":"openai-completions",
+                        "baseURL":"https://api.openai.com/v1","apiKeyEnv":"OPENAI_API_KEY"}},
+                ]),
+                None,
+            )
+            .expect("llm-pi-ai mutate accepted");
+        assert_eq!(pi.value["providers"]["openai"]["api"], serde_json::json!("openai-completions"));
+        assert_eq!(pi.value["providers"]["openai"]["apiKeyEnv"], serde_json::json!("OPENAI_API_KEY"));
+
+        // agent-default-model：selectModel 持久化路径 {provider, model, reasoningEffort?}。
+        let adm = sp
+            .replace(
+                "agent-default-model",
+                &serde_json::json!({"provider":"deepseek-official","model":"deepseek-v4-flash-0731-ext"}),
+                None,
+            )
+            .expect("agent-default-model replace accepted");
+        assert_eq!(adm.value["provider"], serde_json::json!("deepseek-official"));
+        assert_eq!(adm.value["model"], serde_json::json!("deepseek-v4-flash-0731-ext"));
     }
 }
