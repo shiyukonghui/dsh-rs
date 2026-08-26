@@ -6446,6 +6446,33 @@ clippy 0）+ S3 部署冒烟。
 **预期影响与回滚点**：Phase 3 五阶段全闭环。回滚 = `git revert a8793e3`（编码）+ 撤 D-131 工件提交；
 文档提交可独立撤。后续缺口：A6/A5/A2/B1/B2(Group 折叠)/B4 + A3 动态 check spike。
 
+## D-132（服务装配单元 Phase 4 需求分析定稿：A6 异步生成器 effect，[Service.init] 完整形态）
+
+**日期**：2026-08-27
+
+**触发问题**：用户新目标「推进 A6（最深核心缺口）」。验收五维「依赖激活」的最后一坑：cordis 长效插件
+标准形态是 `async* [Service.init] { yield 清理项; await 启动体; … }`，Rust `EffectOutcome::Await` 只是
+M27 等价子集，无「逐项 yield 跨 await 立即收集 + epoch 中途取消 + 失败前 disposer 保留」。
+
+**自下而上核对（源码实证）**：
+- cordis `_execute` async-iterator 分支（npm cordis 4.0.0-rc.8 `lib/index.js:798-840` 与
+  `@deepseek-ai/cordis src/fiber.ts:356-400` **逐字一致**）：`await Promise.resolve()` → 每轮
+  `if (runner.epoch !== oldEpoch) return`（中途取消）→ `await iter.next()` → `safeCollect(值)`；
+  卸载 `splice(0).reverse()` 逆序。
+- Rust `EffectOutcome`：`Many` 已覆盖同步生成器（整批）、`Await` 已覆盖 thenable/单 future；
+  **唯一真缺口 = 异步生成器逐项形态**。
+- Rust `Group`（loader.rs:304-344）已用 `Await + ctx.effect("group-stop")` 近似「先注册清理再挂子项」——不改（保持兼容）。
+- 等价基础设施：dsh-diff DSL/TS host（scenario-host.mjs 目前只生成函数 apply）需小扩展以支持
+  「apply 返回生成器」插件 + yield/await 步进（A6-GOLDEN=A）。
+
+**关键决策（用户确认）**：A6-SCOPE=A（核心 effect 能力补齐 + 等价证明，新增 async 生成器 effect
+形态 + sync now_or_never/async drive_async_loads 双驱动 + m-series；不改 Group）；A6-GOLDEN=A
+（新增 1 个 async-generator golden，TS 原版 ↔ Rust 逐行一致，m-series 作锁定）。
+
+**阶段结论**：需求关闭工件 `.spec/service-assembly-p4/requirements.md` 定稿（目标/非目标/假设/
+缺口核对/验收 T1-T4/决策收敛）→ 进入阶段 2（系统设计）。
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；后续设计/编码各自独立可回。
+
 
 
 
