@@ -6473,6 +6473,33 @@ M27 等价子集，无「逐项 yield 跨 await 立即收集 + epoch 中途取�
 缺口核对/验收 T1-T4/决策收敛）→ 进入阶段 2（系统设计）。
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；后续设计/编码各自独立可回。
 
+## D-133（服务装配单元 Phase 4 系统设计定稿：A6 Stream effect + 双驱动 + golden 等价）
+
+**日期**：2026-08-27
+
+**触发问题**：D-132 需求关闸通过 → 阶段 2（系统设计）。把「异步生成器 effect（[Service.init] 完整
+形态）」落成可验收设计。
+
+**关键设计定案**：
+- **S1 dsh-core**：`EffectOutcome::Stream(LocalBoxStream<'static, GenItem>)`（`GenItem = Result<Disposer,
+  CordisError>`）+ `FiberData::push_gen_disposer`（逐项直插 `disposers` 注册序）。async 驱动
+  （`drive_async_loads` Apply 分支）与 sync 驱动（`now_or_never(s.next())`）共用循环：逐项立即收集、
+  卸载逆序、**epoch 中途取消**（判定键 = `fiber.epoch` 变化，忠实 cordis `runner.epoch`）、
+  **失败前 disposer 保留**（`Some(Err)` → `fail_fiber`，已收集保留）。
+- **S2 m-series**：`m19_async_gen.rs` T1 逐项收集+逆序卸载 / T2 生成器体内同步翻转自身 epoch 的中途
+  取消（确定性、无运行时）/ T3 失败前 disposer 保留。
+- **S3 golden**：场景 DSL 扩 `gen`（yield/await/throw 步进）+ scenario-host 生成 async-generator 插件
+  + Rust dsh-diff 同 DSL 建流 → `scenario-12-async-generator`（**T1+T3 融合**：yield A / await m1 /
+  yield B / await m2 / throw boom + unload → dispose:B,A 逆序）逐行等价。
+- **DIV-4-1** Rust 用 LocalBoxStream（pull）表达、语义对 `_execute` async-iterator 分支逐行等价；
+  **DIV-4-2** 真 pending 仅 async 模式推进（sync 与 Await 同限）；**DIV-4-3** T2 中途取消仅 m-series
+  （单 await 步内不可外部中断）；**DIV-4-4** 不改 Group/Await（A6-SCOPE=A）。
+
+**验证（设计关闸）**：`design.md` 定稿；实现 S1（TDD T1-T3 红→绿）+ S2/S3（m19 + golden）+ 回归
+（verify-diff 22 全过含新 golden） + 阶段 4/5 关闸。
+
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
+
 
 
 
