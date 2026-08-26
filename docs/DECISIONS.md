@@ -6608,6 +6608,36 @@ HANDOFF 优先级续做）。
 
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
 
+## D-139（服务装配单元 Phase 5 编码落定：A5 对象形态 inject 红→绿 + golden）
+
+**日期**：2026-08-27
+
+**触发问题**：D-138 设计关闸通过 → 阶段 3（TDD 编码）实现对象形态 inject。
+
+**关键实现（红→绿 + 自下而上实证修正）**：
+- **S1**：`Plugin::inject_configs() -> Vec<(String,Value)>`（registry.rs 新可选方法默认空）；
+  `runtime.register_plugin` 依赖名集 = `inject()` 名字 ∪ 配置键（cordis `Object.keys(inject)`=deps），
+  本 fiber 自身 intercept 层 `extend(pending_ic) + extend(own_cfgs)`（最内层/最高优先级）。
+- **S2**：`FnPlugin` 增 `inject_configs` 字段/构造器；m20 T1（子注入配置 > 父 intercept）/ T2（base→注入层
+  →head 浅合并序）/ T3（父注入配置沿父链对子代可见）3/3 绿。红测修正：T1/T2 首版断言把 base 当
+  「最高」——对照 cordis `Object.assign({}, base, …)` 修正为 base **最低**（被注入层覆盖 b:2）；
+  父 intercept 的 `p:1` 保留（非覆盖）。
+- **S3 DSL/golden**：`PluginDesc.inject_config`（`#[serde(rename="injectConfig")]`——JSON camelCase
+  与 serde 字段名失配是首轮红因）；`ScenarioPlugin.inject()` 含配置键 + `inject_configs()`；
+  scenario-host `plugin.inject = { ...injectConfig }`（对象）。`scenario-13-object-inject-config`
+  golden 14 行 TS 原版↔Rust 逐行一致（child 注入配置最内层 → resolve-config {"a":9,"b":2,"p":1}）。
+- **追证（preserve_order 取舍）**：曾试全局 serde_json `preserve_order`（插入序）——**破坏 9 个既有
+  golden**（loader/include/session 宿主键序为**排序**，非插入序）。回退；改为仅对 scenario-host
+  `resolve-config` trace 用 `stableStringify`（对象键递归字典序）规范化——JSON 键序无语义，两侧
+  键序确定性一致；既有 22 golden 逐字节不变。DIV-5-4。
+
+**阶段 4 验证（编码关闸）**：`cargo test --workspace` EXIT=0（200 目标 0 失败，含 m20 3/3）；`cargo
+clippy --workspace --all-targets -- -D warnings` EXIT=0；`node diff/ts-host/verify-diff.mjs`
+**23/23 PASS**（22 既有逐字节不变 + scenario-13）。
+
+**预期影响与回滚点**：本提交 = 代码 + 测试 + golden。回滚 = `git revert` 本提交（core/loader/diff/
+host/golden 特征级整体）；scenario-13 可独立删除。
+
 
 
 

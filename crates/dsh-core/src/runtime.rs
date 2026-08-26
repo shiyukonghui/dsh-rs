@@ -521,7 +521,14 @@ impl Runtime {
         let name = plugin.name();
         let key = name.to_string();
         let parent = self.current_fiber();
-        let inject = plugin.inject().iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A5：依赖名集 = `inject()` 名字 ∪ 对象形态 inject 配置键（cordis `Object.keys(inject)` = deps）。
+        let own_cfgs = plugin.inject_configs();
+        let mut inject: Vec<String> = plugin.inject().iter().map(|s| s.to_string()).collect();
+        for (n, _) in &own_cfgs {
+            if !inject.iter().any(|x| x == n) {
+                inject.push(n.clone());
+            }
+        }
         let entry = self.pending_entry.take().or_else(|| {
             parent
                 .and_then(|p| self.fiber(p))
@@ -550,7 +557,10 @@ impl Runtime {
                 f.isolate = pi;
             }
             f.isolate.extend(pending_iso);
+            // A5：本 fiber 自身 intercept 层最内层 = entry 声明（pending_ic）+ 插件对象形态
+            // inject 配置（后 append 者同名胜；`resolve_config` 最内层最高优先级，子代沿父链可见）。
             f.intercept.extend(pending_ic);
+            f.intercept.extend(own_cfgs);
         }
         // 模块缓存按名替换（对齐 cordis `registry.plugin(name, cb)` = 覆盖该项）：
         // 同名新实现再注册 → begin_load 取到的是**最新**实现（B3 HMR replace/reload 的

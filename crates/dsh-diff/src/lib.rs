@@ -41,6 +41,9 @@ pub struct PluginDesc {
     pub name: String,
     #[serde(default)]
     pub inject: Vec<String>,
+    /// A5：对象形态 inject 配置（`inject: { svc: cfg }`；键即依赖，配置入本 fiber 最内层）。
+    #[serde(default, rename = "injectConfig")]
+    pub inject_config: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     pub apply: Vec<ApplyOp>,
     /// A6：生成器体（`yield`/`await`/`throw` 步进）。非空时插件 apply 返回
@@ -500,14 +503,32 @@ impl Plugin for ScenarioPlugin {
     }
 
     fn inject(&self) -> &'static [&'static str] {
-        // 泄漏注入表（场景级有限）
-        let leaked: Vec<&'static str> = self
+        // 泄漏注入表（场景级有限）；对象形态 inject 的键也是依赖（A5）
+        let mut names: Vec<&'static str> = self
             .desc
             .inject
             .iter()
             .map(|s| Box::leak(s.clone().into_boxed_str()) as &'static str)
             .collect();
-        Box::leak(leaked.into_boxed_slice())
+        if let Some(map) = &self.desc.inject_config {
+            for k in map.keys() {
+                let leaked = Box::leak(k.clone().into_boxed_str()) as &'static str;
+                if !names.contains(&leaked) {
+                    names.push(leaked);
+                }
+            }
+        }
+        Box::leak(names.into_boxed_slice())
+    }
+
+    /// A5：对象形态 inject 配置（`{ svc: cfg }` → 本 fiber 最内层）。
+    fn inject_configs(&self) -> Vec<(String, dsh_core::Value)> {
+        self.desc
+            .inject_config
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
     }
 
     fn apply(&self, ctx: &Cordis, config: serde_json::Value) -> Result<EffectOutcome, CordisError> {

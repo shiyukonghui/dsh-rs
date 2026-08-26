@@ -20,6 +20,13 @@ pub trait Plugin {
         &[]
     }
 
+    /// A5：对象形态 inject 配置（cordis `inject: { svc: cfg }`）——除依赖名外携带各服务的
+    /// intercept 配置；装载时写入本 fiber 自身 intercept 层**最内层**（最高优先级），键同时也是
+    /// 依赖。默认空（无对象形态 inject，纯粹依赖名走 [`Plugin::inject`]）。
+    fn inject_configs(&self) -> Vec<(String, Value)> {
+        Vec::new()
+    }
+
     /// 配置校验 schema（Cordis `Plugin.Base.Config`；M4 dsh-schema）。
     /// 加载/更新时校验，失败 → `CordisError::Validation` → fiber FAILED；
     /// 通过后按 default 填充再传给 [`Plugin::apply`]。

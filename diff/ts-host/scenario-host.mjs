@@ -20,6 +20,19 @@ const FIBER_STATE_NAMES = {
   [FiberState.UNLOADING]: 'Unloading',
 }
 
+// 键字典序稳定 JSON（对象键递归排序，数组保序）——对齐 Rust serde_json::Map（BTreeMap
+// 确定性键序），保证两侧 trace 的对象键序一致（键序无语义，属规范化）。
+function stableStringify(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(',')}]`
+  }
+  if (value !== null && typeof value === 'object') {
+    const keys = Object.keys(value).sort()
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
 function buildPlugin(desc, plugins, trace) {
   // A6：生成器体（desc.gen）→ apply 返回 async 生成器（cordis `_execute` 驱动逐项
   // 收集；`yield`/`await`/`throw` 步进 trace 与 Rust 侧 dsh-diff 逐行一致）。
@@ -59,7 +72,13 @@ function buildPlugin(desc, plugins, trace) {
     }
   }
   Object.defineProperty(plugin, 'name', { value: desc.name, configurable: true })
-  if (desc.inject?.length) plugin.inject = desc.inject
+  // A5：对象形态 inject（`{ svc: cfg }`）→ cordis Inject.resolve 原生处理（键即依赖+本 fiber 最内层）；
+  // 否则名字数组（依赖）。
+  if (desc.injectConfig) {
+    plugin.inject = { ...desc.injectConfig }
+  } else if (desc.inject?.length) {
+    plugin.inject = desc.inject
+  }
   return plugin
 }
 
@@ -130,7 +149,9 @@ function applyOp(ctx, op, config, plugins, trace, disposers) {
         intercept = Object.getPrototypeOf(intercept)
       }
       Object.assign(merged, ...configs)
-      trace.push(`resolve-config:${op.service}:${JSON.stringify(merged)}`)
+      // A5/等价规范化：对象键按字典序输出（JSON 键序无语义；与 Rust serde_json Map 的
+      // 确定性排序对齐——`[Service.resolveConfig]` 合并结果键序两侧稳定且一致）。
+      trace.push(`resolve-config:${op.service}:${stableStringify(merged)}`)
       break
     }
     case 'plugin':

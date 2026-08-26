@@ -14,6 +14,8 @@ pub type PluginBody = Rc<dyn Fn(&Cordis, Value) -> Result<EffectOutcome, CordisE
 pub struct FnPlugin {
     pub name: &'static str,
     pub inject: &'static [&'static str],
+    /// A5：对象形态 inject 配置（`{ svc: cfg }`；键也即依赖）。
+    pub inject_configs: Vec<(String, Value)>,
     pub body: PluginBody,
 }
 
@@ -26,8 +28,15 @@ impl FnPlugin {
         FnPlugin {
             name,
             inject,
+            inject_configs: Vec::new(),
             body: Rc::new(body),
         }
+    }
+
+    /// A5：声明对象形态 inject 配置（name → config）。
+    pub fn with_inject_config(mut self, name: &str, config: Value) -> Self {
+        self.inject_configs.push((name.to_string(), config));
+        self
     }
 
     pub fn noop(name: &'static str) -> FnPlugin {
@@ -42,6 +51,10 @@ impl Plugin for FnPlugin {
 
     fn inject(&self) -> &'static [&'static str] {
         self.inject
+    }
+
+    fn inject_configs(&self) -> Vec<(String, Value)> {
+        self.inject_configs.clone()
     }
 
     fn apply(&self, ctx: &Cordis, config: Value) -> Result<EffectOutcome, CordisError> {

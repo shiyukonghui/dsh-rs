@@ -1,0 +1,29 @@
+{
+  "name": "object-inject-config",
+  "plugins": {
+    "prov": {
+      "name": "prov",
+      "apply": [
+        { "op": "provide", "service": "srv", "value": {} }
+      ]
+    },
+    "parent": {
+      "name": "parent",
+      "apply": [
+        { "op": "intercept", "service": "srv", "config": { "a": 1, "p": 1 } },
+        { "op": "plugin", "id": "child" }
+      ]
+    },
+    "child": {
+      "name": "child",
+      "injectConfig": { "srv": { "a": 9, "b": 2 } },
+      "apply": [
+        { "op": "resolve-config", "service": "srv" }
+      ]
+    }
+  },
+  "steps": [
+    { "op": "plugin", "id": "prov" },
+    { "op": "plugin", "id": "parent" }
+  ]
+}
