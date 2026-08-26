@@ -6340,6 +6340,33 @@ Phase 2 零改运行面（dsh-core/boot/serve 未动），serve 零回归（冒�
 **预期影响与回滚点**：Phase 2 全部五阶段过关。回滚 = `git revert e97dc05`（编码，独立）/
 `3cbd48b`（设计）等。剩余缺口 A5/A6/B 类 + A3 动态 check spike 后续按需立项。
 
+---
+
+## D-128（服务装配单元 Phase 3 需求分析定稿：B3 HMR 模块热更）
+
+**日期**：2026-08-26
+
+**触发问题**：用户「继续下一阶段开发」。验收五维度中「可热更」仍未闭合（`hmr.rs` 只做配置文件
+watcher，缺插件实现级热更）。范围经第一性原理定界后用户确认 **B3 HMR 模块热更**（借 Phase 1 A1
+的身份换代基础，直接闭环「可热更」验收维）。
+
+**自下而上核实（Phase 3 预勘）**：
+- A1 检测数据已就绪：`register_plugin` 同名新 Arc → 新身份+generation（loader.rs:392-408）；
+  `Entry.identity` 记录（Phase 1）；访问器 `plugin_identity/generation/entry_identity`。
+- 缺「同 name 换实现」路径：`loader.update` 的 replace 分支只认 name/group/inject 差
+  （loader.rs:575）；`remove+create` 破坏性（dispose/group 抖动）；无 identity 换代驱动的
+  replace/reload 层；dynamic_activate 无同 entry 换代。
+- 依赖方重活：epoch=owner uid 拼接（runtime.rs:633-666）——reload 后 uid 是否换、依赖方是否
+  自动重活，**设计期自下而上定**（DIV-3-1：uid 复用则显式刷新受影响依赖方）。
+
+**关键决策**：P3-SCOPE=B3；H1 换代入口=`replace_plugin(name,new_impl)`（走 A1 语义 + 驱动 reload）；
+H2 entry 保真 reload（不破坏 id/options/group）；DIV-3-2 本例无新 dsh-diff golden（DSL 无法表达
+同 name 换实现）→ m-series 红→绿为等价主证据。
+
+**阶段结论**：需求关闸工件 `.spec/service-assembly-p3/requirements.md` 定稿 → 进入阶段 2（系统设计）。
+
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；后续设计/编码各自独立可回。
+
 
 
 
