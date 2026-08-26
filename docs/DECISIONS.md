@@ -6729,6 +6729,30 @@ scenario/loader 场景无 trace 影响）。
 **预期影响与回滚点**：本提交 = 代码 + 测试。回滚 = `git revert` 本提交（S1+S2+S3 特征级整体）；
 m21 可独立删除。A2-SCOPE=B（无 golden）——等价证据由 m21 + 单测锁定。
 
+## D-144（服务装配单元 Phase 6 验收收口：A2 阶段 4 关闸 + 阶段 5 部署冒烟 + acceptance 工件）
+
+**日期**：2026-08-27
+
+**触发问题**：D-143 编码关闸通过 → 阶段 4（测试验证）与阶段 5（部署与维护）验收收口。
+
+**阶段 4 关闸**：`cargo test --workspace` EXIT=0（201 目标 0 失败，含 m21 3/3）；`cargo clippy
+--workspace --all-targets -- -D warnings` EXIT=0；`node diff/ts-host/verify-diff.mjs` **23/23 PASS**
+（listener 增 internal/get 读取与 entry_disabled 参数化对既有 golden 逐字节零回归）。
+
+**阶段 5 部署冒烟**：`dsh web target/web/cordis.yml --port 60886`（本轮含 dsh-loader internal/config
+改动）→ `GET /` HTTP 200（len 13270 与基线一致），进程干净停止。回滚 = `git revert 1dd6476`。
+
+**关键取舍如实收口**：`internal/config` waterfall 早于 `current.push(fid)`（时序约束）→ 经
+`args[0]=fid` 取目标纤维；`get_value` 嵌套 waterfall 可重入（独立 WfChain）已核实；`eval_scope`
+生产路径统一走 `eval_scope_with_services`（空 services 行为不变）；A2-SCOPE=B 等价证据退档 m21 +
+单测（用户确认）。
+
+**工件**：`.spec/service-assembly-p6/acceptance.md`（交付核对/阶段 4 证据/编码期发现/部署回滚/
+诚实边界/决策链互查）。
+
+**预期影响与回滚点**：Phase 6（A2）五阶段全闭环。回滚 = `git revert 1dd6476` + 撤 D-144 工件提交。
+后续按目标优先级：B 类（B1 extend / B2 Group 折叠 / B4 config simplify）+ A3 动态 check spike。
+
 
 
 
