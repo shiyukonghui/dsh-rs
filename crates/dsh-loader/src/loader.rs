@@ -896,7 +896,37 @@ impl Loader {
         if let Some(err) = self.ctx.fiber_error(fid) {
             return Err(err);
         }
+        // B2：group 子入口失败 → 组装载 fail-loud（对齐 cordis `_start` 的
+        // `await fiber.await()` 拒绝 → group init 失败 → loader 装载失败回滚；
+        // `create`/`update` 的 dispose_entry(g) 级联停止子入口）。检测点在子入口完全
+        // settle 之后（sync 两阶段 / async Finish 均已跑完），不可提前。
+        if let Some(err) = self.group_child_error(id) {
+            return Err(err);
+        }
         Ok(())
+    }
+
+    /// B2：组内任一子入口 fiber 失败 → 返回其错误（fail-loud）。子入口完全 settle 后调用。
+    fn group_child_error(&self, gid: &str) -> Option<CordisError> {
+        let children: Vec<String> = {
+            let st = self.state.borrow();
+            match st.entries.get(gid).and_then(|e| e.subgroup.clone()) {
+                Some(sg) => st.groups.get(&sg).map(|g| g.data.clone()).unwrap_or_default(),
+                None => Vec::new(),
+            }
+        };
+        for c in children {
+            let fid = {
+                let st = self.state.borrow();
+                st.entries.get(&c).and_then(|e| e.fiber)
+            };
+            if let Some(f) = fid {
+                if let Some(err) = self.ctx.fiber_error(f) {
+                    return Some(err);
+                }
+            }
+        }
+        None
     }
 
     /// 加载插件：pending_entry/isolate/intercept → plugin_arc → 关联 fiber。
@@ -1538,6 +1568,10 @@ impl Loader {
             st.fiber_to_entry.insert(fid, id.to_string());
         }
         if let Some(err) = self.ctx.fiber_error(fid) {
+            return Err(err);
+        }
+        // B2：子入口失败 → 组装载 fail-loud（同 sync 路径语义）
+        if let Some(err) = self.group_child_error(id) {
             return Err(err);
         }
         Ok(())

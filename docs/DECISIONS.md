@@ -6874,6 +6874,30 @@ Err → `create/update` 既有回滚（`dispose_entry(g)` 级联停止子入口�
 红→绿）。
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；编码各自独立可回。
 
+## D-150（服务装配单元 Phase 8 编码落定：B2 group_child_error + m23 红→绿）
+
+**日期**：2026-08-27
+
+**触发问题**：D-149 需求+设计关闸通过 → 阶段 3（TDD 编码）。
+
+**关键实现（红→绿）**：
+- **S1**：`group_child_error(gid)`（dsh-loader）——`entries[g].subgroup → groups[sg].data` 逐子
+  `ctx.fiber_error`（首个失败子返回其错误）；`load_group_plugin`(sync) 与 `load_group_plugin_async`
+  在 Group 自身 fiber_error 检查之后前置调用 → Err → `create`/`update` 既有回滚
+  （`dispose_entry(g)` 级联停止子入口）完成清理。
+- **S2**：m23 首版红（修复前 `create(g)` 返回 Ok、group Active——实锤吞错）→ 修订断言为
+  **fail-loud + 回滚**契约（`unwrap_err` 含 "boom"；`applied>=1`（c1 先加载）；`fiber("c1"/"c2"/"g")`
+  均 None）→ 绿。修订理由：cordis 是**装载事务失败**（loader-sync reject + 回滚），非「Group 纤维留存
+  Failed」——按 m20 T3/loader-02 fail-loud 先例。
+
+**阶段 4 验证（编码关闸）**：`cargo test -p dsh-loader` EXIT=0（含 m23）；`cargo test --workspace`
+EXIT=0（203 目标 0 失败）；`cargo clippy --workspace --all-targets -- -D warnings` EXIT=0；
+`node diff/ts-host/verify-diff.mjs` **23/23 PASS**（loader-10 等正常分组路径零回归——healthy 子入口
+无 fiber_error，新检查不触发）。
+
+**预期影响与回滚点**：本提交 = 代码 + 测试。回滚 = `git revert` 本提交（两组检查 + m23）;DIV-8-1
+（无 golden，m-series 证据）。B4/A3 后续。
+
 
 
 
