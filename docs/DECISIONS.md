@@ -6898,6 +6898,29 @@ EXIT=0（203 目标 0 失败）；`cargo clippy --workspace --all-targets -- -D 
 **预期影响与回滚点**：本提交 = 代码 + 测试。回滚 = `git revert` 本提交（两组检查 + m23）;DIV-8-1
 （无 golden，m-series 证据）。B4/A3 后续。
 
+## D-151（服务装配单元 Phase 8 验收收口：B2 阶段 4 关闸 + 阶段 5 部署冒烟 + acceptance 工件）
+
+**日期**：2026-08-27
+
+**触发问题**：D-150 编码关闸通过 → 阶段 4（测试验证）与阶段 5（部署与维护）验收收口。
+
+**阶段 4 关闸**：`cargo test -p dsh-loader` EXIT=0（含 m23）；`cargo test --workspace` EXIT=0
+（203 目标 0 失败）；`cargo clippy --workspace --all-targets -- -D warnings` EXIT=0；
+`node diff/ts-host/verify-diff.mjs` **23/23 PASS**（loader-10/15 正常分组路径零回归）。
+
+**阶段 5 部署冒烟**：`dsh web target/web/cordis.yml --port 60888`（本轮含 dsh-loader 组装载检查）→
+`GET /` HTTP 200（len 13270 与基线一致），进程干净停止。回滚 = `git revert 746e982`。
+
+**关键取舍如实收口**：HANDOFF B2 条目已过时（真实 fiber 早已存在——M22）；三约定既有证据锁定；剩余
+真缺口 = 子失败吞错（m23 红证）→ 按 cordis **装载事务**语义 fail-loud + 回滚（修订 m23 断言：非
+「Group 留存 Failed」）；修复在 loader 事务层，dsh-core 零改动（DIV-8-1..3）。
+
+**工件**：`.spec/service-assembly-p8/acceptance.md`（交付核对/阶段 4 证据/编码期发现/部署回滚/
+诚实边界/决策链互查）。
+
+**预期影响与回滚点**：Phase 8（B2）验收完成。回滚 = `git revert 746e982` + 撤 D-151 工件提交。
+后续按目标优先级：B4 config simplify + A3 动态 check spike。
+
 
 
 
