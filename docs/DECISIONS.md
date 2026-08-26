@@ -6663,6 +6663,28 @@ session 宿主键序为排序）→ 回退；仅 scenario-host `resolve-config` 
 工件提交。后续按目标优先级：A2（!!js 求值范围）→ B 类（B1 extend / B2 Group 折叠 / B4 config
 simplify）+ A3 动态 check spike。
 
+## D-141（服务装配单元 Phase 6 需求分析定稿：A2 !!js 求值作用域绑定注入服务）
+
+**日期**：2026-08-27
+
+**触发问题**：A5 闭环后按目标优先级进入 A2（!!js 求值范围——HANDOFF §3 A2）。
+
+**自下而上核对（源码实证，含 fork 权威读取）**：
+- fork eval：`new Function('ctx','expr','with(ctx){ return eval(expr) }')` + `interpolate(ctx,value)`
+  递归替换 `{__jsExpr}`（fork config/utils.ts:5-22）；ctx = 入口扩展 Context（注入服务混入属性 →
+  裸标识符 + `ctx.svc` 均可读，lib/index.js:338/370）。
+- Rust `eval_scope`（loader.rs:124-136）= `{config, process, ctx:{}, env:{}}`——**ctx 空**（唯一缺口）。
+- `internal/config` waterfall（context.rs:742-748）早于 `current.push(fid)`（753）——绑定须经
+  `args[0]=fid` 取目标纤维，不可用 current_fiber 时序。
+- 服务值暴露通道 = `get_value`（Value 型；`Arc<dyn Any>` 非 JSON）。TS host 现无 `!!js` 支持。
+
+**关键决策（用户确认）**：A2-SCOPE=B（仅 Rust 侧——ctx 绑定 + 成员/裸标识符 + m21 m-series/单测；
+无 golden，证据退一档）；A2-BARE=A（ctx 成员 + **裸标识符**：服务名注入顶层作用域，与显式键
+config/process/env/ctx 冲突时显式键优先）。
+
+**阶段结论**：需求关闭工件 `.spec/service-assembly-p6/requirements.md` 定稿 → 进入阶段 2（系统设计）。
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
+
 
 
 
