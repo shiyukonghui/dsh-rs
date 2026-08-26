@@ -1447,10 +1447,65 @@ impl Cordis {
     }
 
     /// 注册一个 Service（名字/check 由 trait 提供；随 fiber 卸载）。
+    /// B1：追加 Service 类型直达通道（srv 同键注册）——供 `get_extended`/`call_service`。
     pub fn provide_service<S: Service + 'static>(&self, svc: Arc<S>) -> Result<Disposer, CordisError> {
         let name = svc.service_name();
         let check_svc: Arc<dyn Service> = svc.clone();
-        self.provide_with(name, svc, Some(Box::new(move || check_svc.check())))
+        // Any 通道（既有：属性声明/notify/依赖可见性）+ Service 通道（B1）
+        let any_impl: Arc<dyn Any + Send + Sync> = svc.clone();
+        let svc_trait: Arc<dyn Service> = svc;
+        let d1 = self.provide_with(name, any_impl, Some(Box::new(move || check_svc.check())))?;
+        let fid = self.current_fiber().ok_or(CordisError::InactiveEffect)?;
+        let name_s = name.to_string();
+        let d2 = self.effect("ctx.svc()", Box::new(move |ctx| {
+            let key = {
+                let mut rt = ctx.rt.borrow_mut();
+                // 与 insert_impl 的作用域解析**完全一致**（scope_for 兜底），确保 srv 键
+                // 与 services 键对齐（拆分 effect 自身执行晚于 insert_impl——不能依赖
+                // 执行顺带来的 scopes 预填，必须显式同源解析）。
+                let scope = rt
+                    .resolve_scope(Some(fid), &name_s)
+                    .unwrap_or_else(|| rt.scope_for(&name_s));
+                rt.srv.insert((scope, name_s.clone()), svc_trait.clone());
+                (scope, name_s.clone())
+            };
+            Ok(EffectOutcome::One(make_disposer(Box::new(move |ctx| {
+                ctx.with(|rt| {
+                    rt.srv.remove(&key);
+                });
+            }))))
+        }))?;
+        // 组合 disposer：Any 通道释放 + Service 通道释放
+        Ok(Rc::new(move |ctx| {
+            d1(ctx);
+            d2(ctx);
+        }))
+    }
+
+    /// B1：按当前纤维作用域链解析 Service 类型实例（镜像 impl 解析；仅 `provide_service`
+    /// 注册的 Service 型服务，DIV-7-2）。
+    pub fn srv_lookup(&self, name: &str) -> Option<Arc<dyn Service>> {
+        let rt = self.rt.borrow();
+        let scope = rt.resolve_scope(rt.current_fiber(), name)?;
+        rt.srv.get(&(scope, name.to_string())).cloned()
+    }
+
+    /// B1：获取**派生作用域实例**（Cordis `Service[extend]`）——`extend` 返回
+    /// `Some(derived)` → 派生实例；`None`（默认）→ 原实例（恒等）。
+    pub fn get_extended(&self, name: &str) -> Option<Arc<dyn Service>> {
+        let svc = self.srv_lookup(name)?;
+        match svc.extend(self) {
+            Some(derived) => Some(derived),
+            None => Some(svc),
+        }
+    }
+
+    /// B1：调用可调用服务（Cordis 可调用服务调用）——未提供或不可调用 → 明确错误。
+    pub fn call_service(&self, name: &str, args: &[Value]) -> Result<Value, CordisError> {
+        match self.srv_lookup(name) {
+            Some(svc) => svc.invoke(self, args),
+            None => Err(CordisError::Internal(format!("service `{name}` is not provided"))),
+        }
     }
 
     /// 覆盖服务值（Cordis `ctx.set`；仅提供者 fiber 可写）。

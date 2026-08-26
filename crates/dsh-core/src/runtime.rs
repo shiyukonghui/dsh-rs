@@ -16,6 +16,7 @@ use crate::fiber::{FiberData, FiberState};
 use crate::logger::LoggerState;
 use crate::reflect::{CheckFn, Impl, Property};
 use crate::registry::{Plugin, RuntimeRecord};
+use crate::service::Service;
 use crate::types::{FiberId, HookId, ImplId, ScopeId, Value};
 
 /// 需要由门面执行的 fiber 转换。
@@ -97,6 +98,10 @@ pub struct Runtime {
     pub impls: HashMap<ImplId, Impl>,
     /// 服务索引：(作用域, 服务名) → 实现 id。
     pub services: HashMap<(ScopeId, String), ImplId>,
+    /// B1：Service 类型直达通道（`provide_service` 注册；(作用域, 服务名) → 服务实例）。
+    /// 与 `services` 同键镜像——经此通道的 `Arc<dyn Service>` 支持 `extend`/`invoke`
+    /// （`impls` 的 `Arc<dyn Any>` 无法下转型到 `dyn Service`，DIV-7-2）。
+    pub srv: HashMap<(ScopeId, String), Arc<dyn Service>>,
     /// 事件钩子表。
     pub hooks: HashMap<String, Vec<Hook>>,
     /// 上下文属性表（service | accessor）。
@@ -164,6 +169,7 @@ impl Runtime {
             fibers: Vec::new(),
             impls: HashMap::new(),
             services: HashMap::new(),
+            srv: HashMap::new(),
             hooks: HashMap::new(),
             props: HashMap::new(),
             pending_internal: Vec::new(),

@@ -6796,6 +6796,34 @@ clippy）+ 阶段 4/5 关闸。
 
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
 
+## D-147（服务装配单元 Phase 7 编码落定：B1 extend/invoke 原语 + srv 通道红→绿）
+
+**日期**：2026-08-27
+
+**触发问题**：D-146 设计关闸通过 → 阶段 3（TDD 编码）实现 Service 派生/可调用原语。
+
+**关键实现（红→绿 + 自下而上实证修正）**：
+- **S1**：`Service` trait 增 `extend(&self, ctx) -> Option<Arc<dyn Service>>`（默认 `None`=恒等）+ `invoke`
+  （默认 Err "not callable"）。**红测实证修正**：`self: Arc<Self>` receiver 的默认体 `{ self }` 对
+  unsized `Self`（dyn 使用）无法编译（E0277）→ 改为 `&self` + `Option`（None=恒等，`get_extended`
+  内保持原 Arc）——更简单且对象安全；`as_any` 因同 unsized 问题弃用（T1 改用**观察日志**读取派生
+  标记，沿用 m-series 模式）。
+- **S2**：`Runtime.srv: HashMap<(ScopeId,String), Arc<dyn Service>>`（独立服务通道，绕开
+  Any→dyn Service 不可下转型）；`provide_service` 签名不变、追加 srv 注册（**与 `insert_impl` 同
+  源作用域解析**：`resolve_scope(...).unwrap_or_else(scope_for)`——拆分 effect 执行晚于 insert_impl，
+  不能依赖执行顺序预填 scopes，必须显式同源保证键对齐）+ 组合 disposer（Rc::new d1+d2）；
+  `srv_lookup`（当前纤维 scope 链）/ `get_extended`（None→恒等）/ `call_service`。
+- **S3**：m22 T1（自定义派生绑定访问方纤维，观察日志 "derived:child"）/ T2（默认恒等 Arch::ptr_eq）/
+  T3（invoke 加和 → 3）/ T4（不可调用 Err）4/4 绿。Service 需 `Send + Sync` → 观察日志用
+  `Arc<Mutex<Vec<String>>>`。
+
+**阶段 4 验证（编码关闸）**：`cargo test --workspace` EXIT=0（202 目标 0 失败，含 m22 4/4）；`cargo
+clippy --workspace --all-targets -- -D warnings` EXIT=0；`node diff/ts-host/verify-diff.mjs`
+**23/23 PASS**（golden 零回归）。`provide_service` 既有唯一使用（m1_service）零改动。
+
+**预期影响与回滚点**：本提交 = 代码 + 测试。回滚 = `git revert` 本提交（S1+S2+S3 特征级整体）；
+m22 可独立删除。B1-PROOF=A（无 golden）；生产 logger 不改（DIV-7-1）。
+
 
 
 
