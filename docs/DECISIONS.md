@@ -6992,6 +6992,34 @@ noSave=true 跳过、create 不简化）——修正 T1 为运行时更新断言
 **预期影响与回滚点**：Phase 9（B4）验收完成。回滚 = `git revert e65546a` + 撤 D-154 工件提交。
 后续按目标优先级：**A3 动态 check spike**（最后一个 HANDOFF 缺口）。
 
+## D-155（服务装配单元 Phase 10 需求+设计定稿：A3 动态 check spike）
+
+**日期**：2026-08-27
+
+**触发问题**：B4 闭环 → 进入 A3（HANDOFF §A3「提供者可用性谓词 check + strict-active」）——目标原文
+「动态 check spike」。
+
+**自下而上核对（源码实证）**：
+- **HANDOFF 直接问题已否**：Rust `provide` **有** check 谓词——`provide_with(name, value,
+  Some(CheckFn))`（context.rs:1406）+ `check_ok()` + `check_impls`（runtime.rs:630）+ 静态门已被
+  `m7_await::await_gated_by_check_predicate` 与 `scenario-10-provide-check-gate.golden` 锁定。
+- **cordis 动态再求值触发点**：provide-while-Active / unprovide / 提供者 ACTIVE↔NON-ACTIVE 翻转 →
+  `notify` → 依赖方 `_checkImpl`（重求值 check，不成立删 store→epoch INACTIVE）→ `_refresh`。
+  Rust 由 produce-disposer 驱动的卸载路径（unload → remove_impl+notify → re-provide → finish_load
+  notify）+ `check_impls`/`refresh_fiber` 覆盖同语义。纯谓词翻转（无 notify 触发点）在 cordis
+  **非反应式**——Rust 须同位。
+
+**需求收敛（阶段 1）**：spike 验证（非修复）——m25 断言 5 序列（静态门 / 纯翻转非反应式 /
+重载+true→激活 / 重载+false→失效 / 往返），pass = 全绿；红则回需求重评估。
+
+**设计收敛（阶段 2）**：m25 用 `Arc<AtomicBool>` 谓词 + `update_with` 驱动 provider 重载观察 consumer
+状态（`fiber_state`）。DIV-10-1（动态不可 golden，m-series 锁定）/DIV-10-2（不加剧自动 notify，cordis
+非反应式同位）/DIV-10-3（A3 闭环 = 存在性 + parity，**零生产改动**）。
+
+**阶段结论**：需求/设计工件 `.spec/service-assembly-p10/{requirements,design}.md` 定稿 → spike
+（m25 红→绿判定）。
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；spike 测试各自独立可回。
+
 
 
 
