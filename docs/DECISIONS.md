@@ -6267,6 +6267,28 @@ golden 用静态 bool（动态态变 spike 另立）；DIV-2-3 父链 walk 以�
 
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；后续设计/编码各自独立可回。
 
+---
+
+## D-125（服务装配单元 Phase 2 系统设计定稿：A3+A4 核对分解）
+
+**日期**：2026-08-26
+
+**触发问题**：Phase 2 需求关闸通过 → 阶段 2（系统设计）。把 A3/A4 核对分解为可验收设计。
+
+**设计要点**：
+- **S1**：dsh-diff DSL 对称扩展——`provide` op 增可选 `check`（bool；TS scenario-host 与 Rust
+  `ApplyOp::Provide` 两侧对称）——A3 的 check 门可在剧本表达。
+- **S2**（golden 集）：`scenario-10-provide-check-gate`（A3a）、`scenario-11-unprovide-order`
+  （A4a，provide+立即 unprovide）、`loader-15-cross-realm-walk`（A4c，group isolate realm 父链 walk）；
+  A3b strict-active 由既有 06/loader-13 覆盖。
+- **S3**：m 系列锁定（m7 check await / m3_isolate 跨 realm）。
+- 关键设计决策：`provide` 的 disposer 亦入 `disposers` 索引（可被 `dispose-effect` 定向——A4a
+  unprovide 而不卸 fiber 的载体）；顺序分歧若 golden 暴露 → 以 TS 为权威修复（DIV-2-1）。
+
+**验证（设计关闸）**：.spec/service-assembly-p2/design.md 定稿；实现按 S1→S2→S3 TDD。
+
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
+
 
 
 
