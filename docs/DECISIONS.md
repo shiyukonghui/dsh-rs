@@ -6091,6 +6091,39 @@ dsh-cli 全量回归 EXIT=0；`cargo clippy -p dsh-loader --all-targets -- -D wa
 访问器），破坏性面 = `LoaderState.plugins` 字段型（无外部读）。回滚 = `git revert` 本提交
 （独立回滚点）。
 
+---
+
+## D-119（服务装配单元 Phase 1 · S2 编码：E1 服务插件 entry 化）
+
+**日期**：2026-08-26
+
+**触发问题**：按设计 S2=E1（entry 化——boot 装配循环只认 `config.wasm` 为 loop；消除
+`dsh:services` 名称特判与「非 services 必 config.wasm」假设）进入编码（TDD 红→绿）。
+
+**实现（红→绿）**：
+- 新增公开 `register_host_service_plugins(loader)`：宿主可用服务插件登记面（现 `dsh:services`；
+  未来 genai/llm-pi-ai 适配器在此追加）——「名称 → 实现」登记收敛于此，消除 boot 内联特判。
+- `boot_with_host_plugins(config, overlays, wasm_base, extra_host_plugins)`：boot 前把宿主/测试
+  追加的服务插件按名注册进仓库 → include.load() 按名解析 apply；`boot()` = 便捷包装（`&[]`）。
+- loop 装配：只认 `config.wasm` 入口构建 `WasmLoopPlugin`；其余入口（服务/普通插件）由
+  include.load() 处理（服务插件 entry 化判据）。
+- HMR refresh 的 loop 定位由 `name != "dsh:services"` 改为 `config.wasm` 存在性判定（否则
+  「服务 entry 出现在 loop 前」会把 loop 误指到服务行）。
+- 红测 T1/T2（m9_boot.rs）：cordis.yml 声明 `dsh:test-svc`（自定义服务，apply 时
+  `provide("test-svc-marker", Arc::new(42i64))`，loop 置于其后）→ 修改前 `boot_with_host_plugins`
+  不存在（E0425 红）/ loop 定位误判；修改后 boot 成功、按名 apply、marker 可见 + refresh 不误判
+  loop、run_turn 仍由 echo-loop 驱动。
+
+**偏差（DIV-1 落地）**：「新增服务插件 entry」的实现可用性 = 宿主登记（静态）+ 测试注入
+（`boot_with_host_plugins` extra）；cordis.yml 声明而仓库缺失 → `unknown plugin` fail-loud。
+
+**验证（阶段门槛）**：m9_boot 20/20 绿（含 2 新）；dsh-core/dsh-loader/dsh-diff/dsh-wasmrt/
+dsh-cli 全量回归 EXIT=0；`cargo clippy -p dsh-cli --all-targets -- -D warnings` 零告警。
+
+**预期影响与回滚点**：`boot()` 签名不变（wrapper 语义），主调用方（main.rs/m9_boot）零改动；
+新增公开 `boot_with_host_plugins`/`register_host_service_plugins`。回滚 = `git revert` 本提交
+（独立回滚点）；S1（身份键）与 S3+（写回）互不依赖。
+
 
 
 

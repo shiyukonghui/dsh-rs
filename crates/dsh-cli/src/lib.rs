@@ -147,18 +147,34 @@ pub fn dump_config(config_path: &Path, overlays: &[PathBuf]) -> Result<String, C
         .map_err(|e| CordisError::Internal(format!("dump-config serialize: {e}")))
 }
 
-/// 从 cordis.yml 形态的 YAML 配置启动。
+/// 宿主可用服务插件登记面（服务装配单元 E1）：收敛「名称 → 实现」登记。
 ///
-/// - `config_path`：主配置（YAML 入口列表）。
-/// - `overlays`：profile 叠加层（按顺序应用；同 id entry 后者覆盖 config——
-///   bundle/patch 语义，对应 DSH 的 overlay 层）。
-/// - `wasm_base`：WASM loop 组件的解析基址。entry `config.wasm` 两种形态：
-///   - 目录名（如 `echo-loop`）→ `<wasm_base>/<dir>/target/wasm32-wasip1/debug/<dir>_plugin.wasm`
-///   - 直接 `.wasm` 文件路径（相对 wasm_base 或绝对）。
+/// 现注册 `dsh:services`（`DshServicesPlugin::all()`：sessions/tools/llm）；未来
+/// genai/llm-pi-ai 等适配器在此追加。cordis.yml 声明而仓库缺失的 name 由 loader
+/// include.load() 报 `unknown plugin {name}`（fail-loud，诚实——不伪装可用）。
+pub fn register_host_service_plugins(loader: &dsh_loader::Loader) {
+    loader.register_plugin("dsh:services", Arc::new(DshServicesPlugin::all()));
+}
+
+/// 从 cordis.yml 形态的 YAML 配置启动（服务装配单元 Phase 1/E1：服务插件 entry 化）。
+///
+/// `boot` = [`boot_with_host_plugins`] 的便捷包装（无追加宿主插件）。
 pub fn boot(
     config_path: &Path,
     overlays: &[PathBuf],
     wasm_base: &Path,
+) -> Result<Boot, CordisError> {
+    boot_with_host_plugins(config_path, overlays, wasm_base, &[])
+}
+
+/// boot + 追加宿主插件注册（服务装配单元 E1）：在 include.load() 前把宿主可用的
+/// 服务插件按名注册进 loader 仓库——cordis.yml 声明的服务 entry（如未来的
+/// llm-pi-ai 适配器 / 自定义服务）由此可按名解析 apply（服务插件 entry 化）。
+pub fn boot_with_host_plugins(
+    config_path: &Path,
+    overlays: &[PathBuf],
+    wasm_base: &Path,
+    extra_host_plugins: &[(&str, Arc<dyn Plugin>)],
 ) -> Result<Boot, CordisError> {
     // 读主配置 + 叠加层，合并 entries（同 id 后者覆盖）
     let mut entries = read_entries(config_path)?;
@@ -170,23 +186,21 @@ pub fn boot(
     let cordis = Cordis::new();
     let loader = Loader::new(&cordis)?;
 
-    // 注册插件仓库：services + 每个非 services entry 按 config.wasm 构建 WASM loop
-    loader.register_plugin("dsh:services", Arc::new(DshServicesPlugin::all()));
+    // 宿主可用服务插件登记面（E1：消除 dsh:services 名称特判 → 统一按名解析）。
+    register_host_service_plugins(&loader);
+    // 额外宿主插件（服务装配单元：测试注入受控服务 / 未来 llm-pi-ai 等适配器打包）。
+    for (name, plugin) in extra_host_plugins {
+        loader.register_plugin(name, plugin.clone());
+    }
+
+    // loop 装配：只认声明 `config.wasm` 的入口为 WASM loop（run_turn 需具体类型）；
+    // 其余入口（服务/普通插件）由 include.load() 按名解析 apply——服务插件 entry 化
+    // 的关键判据（不再假设「非 services 即 loop」）。
     let mut loop_plugin: Option<Arc<WasmLoopPlugin>> = None;
     for entry in &entries {
-        if entry.name == "dsh:services" {
+        let Some(wasm) = entry.config.get("wasm").and_then(|v| v.as_str()) else {
             continue;
-        }
-        let wasm = entry
-            .config
-            .get("wasm")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                CordisError::Internal(format!(
-                    "boot: entry \"{}\" needs config.wasm (component dir or .wasm path)",
-                    entry.id
-                ))
-            })?;
+        };
         let bytes = load_component(wasm_base, wasm)?;
         // loop 是 dsh-loop world 组件：直接构造 WasmLoopPlugin（run_turn 需具体类型）。
         // 能力按 entry 配置授予（`config.caps` 数组；缺省 = ABI 能力，无 WASI）。
@@ -197,7 +211,7 @@ pub fn boot(
         loop_plugin = Some(plugin);
     }
     let loop_plugin = loop_plugin.ok_or_else(|| {
-        CordisError::Internal("boot: no loop entry (non-services) in cordis.yml".into())
+        CordisError::Internal("boot: no loop entry (config.wasm) in cordis.yml".into())
     })?;
     // M58：可变 loop 句柄（HMR refresh 换组件时替换）
     let loop_cell: Rc<std::cell::RefCell<Arc<WasmLoopPlugin>>> =
@@ -252,7 +266,12 @@ pub fn boot(
         })?;
         // M58：HMR 换 loop 组件——按合并后 loop entry 的 config.wasm 重建
         // WasmLoopPlugin 并替换句柄（config.wasm 变化时新组件生效）。
-        if let Some(loop_entry) = merged.iter().find(|e| e.name != "dsh:services") {
+        // E1：loop 定位按 config.wasm 判定（以 `name != "dsh:services"` 定位会误判
+        // 「服务插件 entry 出现在 loop 前」的场景）。
+        if let Some(loop_entry) = merged
+            .iter()
+            .find(|e| e.config.get("wasm").and_then(|v| v.as_str()).is_some())
+        {
             let wasm = loop_entry
                 .config
                 .get("wasm")

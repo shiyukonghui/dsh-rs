@@ -646,3 +646,90 @@ fn boot_refresh_swaps_loop_component() {
     assert_eq!(r2["summary"], "2 + 3 = 5", "after refresh, loop is tool-loop");
     fs::remove_dir_all(&dir).ok();
 }
+
+// ---- 服务装配单元 Phase 1（E1 entry 化）：新增服务插件 entry 可声明装配 ----
+
+/// 受控自定义服务插件：apply 时 provide 一个可观察标记服务（模拟未来 llm-pi-ai/自定义服务）。
+struct TestSvcPlugin;
+impl dsh_core::Plugin for TestSvcPlugin {
+    fn name(&self) -> &'static str {
+        "dsh:test-svc"
+    }
+
+    fn apply(
+        &self,
+        ctx: &dsh_core::Cordis,
+        _config: dsh_core::Value,
+    ) -> Result<dsh_core::EffectOutcome, dsh_core::CordisError> {
+        ctx.provide("test-svc-marker", Arc::new(42i64))?;
+        Ok(dsh_core::EffectOutcome::None)
+    }
+}
+
+/// 带第二个服务插件的 cordis.yml（loop 在最后，服务 entry 在 loop 前——暴露
+/// 「非 services 即 loop」假设：修改前 boot 因 `needs config.wasm` 失败）。
+fn write_cordis_with_extra_service(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("cordis-extra-svc.yml");
+    let yaml = r#"
+- id: services
+  name: dsh:services
+  config:
+    services: [sessions]
+- id: svc
+  name: dsh:test-svc
+- id: loop
+  name: echo-loop
+  config:
+    wasm: echo-loop
+"#;
+    fs::write(&path, yaml).unwrap();
+    path
+}
+
+/// E1（T1）：cordis.yml 声明新增服务插件 entry（非 dsh:services）→
+/// `boot_with_host_plugins` 经「cordis.yml entry → loader 按名解析 → apply」装配，
+/// 服务可见——从「非 services 必 config.wasm」假设中解放。
+#[test]
+fn boot_assembles_declared_service_plugin_entry_by_name() {
+    ensure_loop_built("echo-loop");
+    let dir = unique_dir("svc-entry");
+    let config = write_cordis_with_extra_service(&dir);
+
+    let boot = dsh_cli::boot_with_host_plugins(
+        &config,
+        &[],
+        &wasm_base(),
+        &[("dsh:test-svc", Arc::new(TestSvcPlugin) as Arc<dyn dsh_core::Plugin>)],
+    )
+    .expect("boot with a declared (non-services) service entry");
+
+    let marker = boot
+        .ctx
+        .get_typed::<i64>("test-svc-marker")
+        .expect("declared service entry applied and provided its service");
+    assert_eq!(*marker, 42);
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// E1（T2）：HMR refresh 的 loop 定位按 config.wasm 判定（不看 name != dsh:services）；
+/// 服务 entry 在 loop 前也不误判 loop。
+#[test]
+fn refresh_locates_loop_by_config_wasm_not_name() {
+    ensure_loop_built("echo-loop");
+    let dir = unique_dir("refresh-svc");
+    let config = write_cordis_with_extra_service(&dir);
+
+    let boot = dsh_cli::boot_with_host_plugins(
+        &config,
+        &[],
+        &wasm_base(),
+        &[("dsh:test-svc", Arc::new(TestSvcPlugin) as Arc<dyn dsh_core::Plugin>)],
+    )
+    .expect("boot with extra service entry");
+
+    // refresh 重读主配置 + 重挂载：不因服务 entry 出现在 loop 前而把「loop 定位」误指到服务行
+    (boot.refresh)().expect("refresh with a service entry before the loop entry");
+    let r = dsh_cli::run_turn(&boot, &json!({"content": "after refresh"})).unwrap();
+    assert_eq!(r["echo"], "echo: after refresh", "loop still resolved by config.wasm");
+    fs::remove_dir_all(&dir).ok();
+}
