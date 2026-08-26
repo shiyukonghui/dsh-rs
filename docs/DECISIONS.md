@@ -6753,6 +6753,26 @@ m21 可独立删除。A2-SCOPE=B（无 golden）——等价证据由 m21 + 单�
 **预期影响与回滚点**：Phase 6（A2）五阶段全闭环。回滚 = `git revert 1dd6476` + 撤 D-144 工件提交。
 后续按目标优先级：B 类（B1 extend / B2 Group 折叠 / B4 config simplify）+ A3 动态 check spike。
 
+## D-145（服务装配单元 Phase 7 需求分析定稿：B1 Service 派生作用域实例 + 可调用服务）
+
+**日期**：2026-08-27
+
+**触发问题**：A2 闭环后按目标优先级进入 B1（HANDOFF §3 B1：[Service.extend] 派生作用域实例 +
+可调用服务，service.ts:65-73）。
+
+**自下而上核对（源码实证，含 fork 权威读取）**：fork `createCallable`（utils.ts:226/logger.ts:208，
+`Service[invoke]` → 可调用如 `ctx.logger()`）+ `Service[extend]`（service.ts:65-73：callable→rebuild；
+else `Object.create(this)`+assign）；Rust `Service = name+check`（service.rs）且 `provide_service` 注册
+`Arc<dyn Any>`、`get` 平 Arc——**无通用 invoke/extend 原语**；缺 Service 类型直达通道（Any→dyn
+Service 无法下转型）。
+
+**关键决策（用户确认）**：B1-SCOPE=A（可调用+派生全流程——`extend(self: Arc<Self>)` 默认恒等 +
+`invoke` 默认 Err + 独立 `srv_store` 通道 + `ctx.get_extended/call_service`；logger 演示不改生产，
+DIV-7-1）；B1-PROOF=A（m-series m22 T1-T4 + 单测，无 golden——TS host 无 Service 子类支持）。
+
+**阶段结论**：需求关闭工件 `.spec/service-assembly-p7/requirements.md` 定稿 → 进入阶段 2（系统设计）。
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
+
 
 
 
