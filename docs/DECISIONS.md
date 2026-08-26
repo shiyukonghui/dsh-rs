@@ -6824,6 +6824,29 @@ clippy --workspace --all-targets -- -D warnings` EXIT=0；`node diff/ts-host/ver
 **预期影响与回滚点**：本提交 = 代码 + 测试。回滚 = `git revert` 本提交（S1+S2+S3 特征级整体）；
 m22 可独立删除。B1-PROOF=A（无 golden）；生产 logger 不改（DIV-7-1）。
 
+## D-148（服务装配单元 Phase 7 验收收口：B1 阶段 4 关闸 + 阶段 5 部署冒烟 + acceptance 工件）
+
+**日期**：2026-08-27
+
+**触发问题**：D-147 编码关闸通过 → 阶段 4（测试验证）与阶段 5（部署与维护）验收收口。
+
+**阶段 4 关闸**：`cargo test --workspace` EXIT=0（202 目标 0 失败，含 m22 4/4 + m1_service 既有
+provide_service 零改动）；`cargo clippy --workspace --all-targets -- -D warnings` EXIT=0；
+`node diff/ts-host/verify-diff.mjs` **23/23 PASS**（golden 零回归）。
+
+**阶段 5 部署冒烟**：`dsh web target/web/cordis.yml --port 60887`（本轮含 dsh-core Service 改动）→
+`GET /` HTTP 200（len 13270 与基线一致），进程干净停止。回滚 = `git revert 962986d`。
+
+**关键取舍如实收口**：E0277（`self: Arc<Self>` 默认体对 unsized Self 不编译）→ `&self + Option`
+（None=恒等）；作用域键与 `insert_impl` 同源解析（不依赖执行顺序）；`as_any` 弃用改观察日志（Send+Sync
+用 Mutex）。B1-PROOF=A 证据退档 m22 + 单测（用户确认）。
+
+**工件**：`.spec/service-assembly-p7/acceptance.md`（交付核对/阶段 4 证据/编码期发现/部署回滚/
+诚实边界/决策链互查）。
+
+**预期影响与回滚点**：Phase 7（B1）五阶段全闭环。回滚 = `git revert 962986d` + 撤 D-148 工件提交。
+后续按目标优先级：B2 Group 折叠 / B4 config simplify + A3 动态 check spike。
+
 
 
 
