@@ -7115,6 +7115,28 @@ DECISIONS 补文档化偏差（DIV-A1-1 一名一实现顺序换代/同名多实
 
 **预期影响与回滚点**：回滚 = `git revert` 本提交。待阶段 5（serve 冒烟 + acceptance + D-160）。
 
+## D-160（beyond 目标 Phase A1 验收收口：阶段 4 关闸 + 阶段 5 部署冒烟 + acceptance）
+
+**日期**：2026-08-27
+
+**触发问题**：D-159 编码关闸通过 → 阶段 4/5 验收收口。
+
+**阶段 4 关闸**：workspace EXIT=0（206 目标）；clippy 0；verify-diff 23/23 零回归（replace/HMR
+路径不动）。
+
+**阶段 5 部署冒烟**：`dsh web target/web/cordis.yml --port 60891` → `GET /` HTTP 200（len 13270 基线
+一致），进程干净停止。回滚 = `git revert e169ef3`。
+
+**关键取舍如实收口**：A1 已形核（身份 token + generation + replace_plugin/B3，非从零）；收口三件 =
+remove_plugin / case-4 可触发验证 / 文档化偏差。顺序不变量实证（先删记录后 unload，否则 case-4 误落
+case-7）。对照 T2 复锁站部语义。DIV-A1-1..3（多实现宿主层 / m-series 证据 / 不写持久化）。
+
+**工件**：`.spec/service-assembly-a1/acceptance.md`（交付核对/阶段 4 证据/编码期发现/部署回滚/
+诚实边界/决策链互查）。
+
+**预期影响与回滚点**：beyond 目标 A1 验收完成。回滚 = `git revert e169ef3` + 撤 D-158/160 工件提交。
+下一步候选：A4（注入快照/unprovide 顺序/父链 walk）/ A6 已闭环 / B4 已闭环——由用户指派优先级。
+
 
 
 
