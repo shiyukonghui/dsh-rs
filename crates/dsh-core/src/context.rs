@@ -613,33 +613,32 @@ impl Cordis {
                             // 生成器与已收集 disposer 的收尾一致：保留至卸载）。
                         }
                         Ok(outcome) => {
-                            // M27：apply 返回 `Await`（如 Group 的 `[Service.init]`）→
-                            // current 已保留（fid 在栈顶）→ await 完成（期间排入的
-                            // 子任务先入队；子入口注册 parent = Group）→ pop → 得最终
-                            // outcome。标记 await_children：Finish 等子任务完成后执行。
-                            let outcome = match outcome {
-                                EffectOutcome::Await(fut) => {
-                                    let o = fut.await;
-                                    {
-                                        let mut rt = self.rt.borrow_mut();
-                                        rt.current.pop();
-                                        if let Some(f) = rt.fiber_mut(fid) {
-                                            f.await_children = true;
-                                        }
-                                    }
-                                    o
-                                }
-                                other => other,
-                            };
-                            let _disposer = {
+                            // M27/M28-B：apply 返回 `Await`（如 Group 的 `[Service.init]`）。
+                            // current 已由 apply_body 保留（fid 在栈顶），子入口注册
+                            // parent = Group。
+                            // D-169：Await future 的执行**延迟为一个队列 hop**——孙辈/子
+                            // 入口注册落在兄弟扁平子的 `Finish(p)` 之后（对齐 cordis 子
+                            // 入口 create 的 import→fiber→reload hop 链；DIV-nested-2 解决）。
+                            // 先标记 await_children（组在延迟窗口内即被识别），存 future、
+                            // 入队 `Await(fid)`；由 Await 臂执行 fut → collect → Finish。
+                            if let EffectOutcome::Await(fut) = outcome {
                                 let mut rt = self.rt.borrow_mut();
-                                rt.fiber_mut(fid)
-                                    .map(|f| f.collect_effect("plugin-apply", outcome))
-                            };
-                            // Finish 排到队尾（在 apply 期间入队的嵌套 Apply 之后）
-                            self.with(|rt| {
-                                rt.pending_async_loads.push_back(AsyncTask::Finish(fid))
-                            });
+                                if let Some(f) = rt.fiber_mut(fid) {
+                                    f.await_children = true;
+                                }
+                                rt.pending_awaits.insert(fid, fut);
+                                rt.pending_async_loads.push_back(AsyncTask::Await(fid));
+                            } else {
+                                let _disposer = {
+                                    let mut rt = self.rt.borrow_mut();
+                                    rt.fiber_mut(fid)
+                                        .map(|f| f.collect_effect("plugin-apply", outcome))
+                                };
+                                // Finish 排到队尾（在 apply 期间入队的嵌套 Apply 之后）
+                                self.with(|rt| {
+                                    rt.pending_async_loads.push_back(AsyncTask::Finish(fid))
+                                });
+                            }
                         }
                         Err(e) => {
                             // Await 失败路径：current 可能未 pop（apply_body 保留）——补 pop
@@ -649,17 +648,73 @@ impl Cordis {
                         }
                     }
                 }
+                AsyncTask::Await(fid) => {
+                    // M28-B（D-169）：延迟执行 `Await` future——子/孙入口注册在此发生。
+                    // 晚于兄弟扁平子的 `Finish(p)`（其由 `Apply(p)` 更早入队），对齐
+                    // cordis「扁平子 Active 抢在组兄弟孙辈注册之前」（DIV-nested-2）。
+                    // 有 future 才执行（防御：无挂起 → 视为空 outcome）。
+                    Self::yield_now().await;
+                    {
+                        // 延迟窗口内多个 deferred apply 都留在 current 栈（push 序），
+                        // Await 任务按 FIFO 执行时栈顶未必是本组 fid——抬到栈顶，使
+                        // future 内注册的子入口 parent = 本组（否则误挂兄弟组 → 其
+                        // isolate 令注入依赖不可见，消费方永久 Pending）。
+                        let mut rt = self.rt.borrow_mut();
+                        rt.current.retain(|&x| x != fid);
+                        rt.current.push(fid);
+                    }
+                    let fut = {
+                        let mut rt = self.rt.borrow_mut();
+                        rt.pending_awaits.remove(&fid)
+                    };
+                    let outcome = match fut {
+                        Some(fut) => fut.await,
+                        None => EffectOutcome::None,
+                    };
+                    {
+                        // 运行毕移除本组 current 记录（保留其下其它 deferred 组）。
+                        let mut rt = self.rt.borrow_mut();
+                        rt.current.retain(|&x| x != fid);
+                    }
+                    let _disposer = {
+                        let mut rt = self.rt.borrow_mut();
+                        rt.fiber_mut(fid)
+                            .map(|f| f.collect_effect("plugin-apply", outcome))
+                    };
+                    // Finish 排到队尾（在 future 期间入队的嵌套 Apply 之后）
+                    self.with(|rt| {
+                        rt.pending_async_loads.push_back(AsyncTask::Finish(fid))
+                    });
+                }
                 AsyncTask::Finish(fid) => {
                     // M27：`await_children` 标记的 fiber（Group）等待 Loading 后代
                     // 完成后再 finish（等价 Cordis init await 子任务）。普通 fiber
                     // 不受影响（_reload 的父先 Active 时序保持不变）。
+                    // M28（D-168）：对齐 Cordis 批次语义——组延迟条件 = ①Loading 后裔
+                    // （父不先于子）OR ②批内仍有普通 fiber（await_children=false）的排队
+                    // Apply/Finish 任务，使 Pending-only 子组的组也不提前 finish（C1 聚末尾）。
+                    // 无死锁：仅组延迟；普通任务不延迟且必然排空；②消失后叶组（无 Loading
+                    // 后裔）即刻 finish、父组经 ① 紧随，树序收敛。
                     let should_wait = self.with(|rt| {
                         rt.fiber(fid).map(|f| f.await_children).unwrap_or(false)
-                            && rt.fibers.iter().flatten().any(|f| {
-                                f.id != fid
-                                    && f.state == FiberState::Loading
-                                    && rt.fiber_chain_contains(f.id, fid)
-                            })
+                            && {
+                                let loading_desc = rt.fibers.iter().flatten().any(|f| {
+                                    f.id != fid
+                                        && f.state == FiberState::Loading
+                                        && rt.fiber_chain_contains(f.id, fid)
+                                });
+                                let queued_plain = rt.pending_async_loads.iter().any(|t| {
+                                    let c = match t {
+                                        AsyncTask::Apply(c) | AsyncTask::Finish(c) => *c,
+                                        // M28-B：延迟 Await 任务的目标是组（await_children），
+                                        // 天然不被 `!await_children` 计数；仅需穷尽 match。
+                                        AsyncTask::Await(c) => *c,
+                                    };
+                                    c != fid
+                                        && rt.fiber(c).map(|f| !f.await_children).unwrap_or(false)
+                                });
+                                loading_desc || queued_plain
+                            }
                     });
                     if should_wait {
                         self.with(|rt| {

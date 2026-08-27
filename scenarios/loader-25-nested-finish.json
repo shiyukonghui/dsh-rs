@@ -1,0 +1,17 @@
+{
+  "name": "loader-25-nested-finish",
+  "plugins": {
+    "p": { "name": "p", "apply": [{ "op": "provide", "service": "svc", "value": "r" }] },
+    "c": { "name": "c", "inject": ["svc"], "apply": [{ "op": "log", "text": "c-applied" }] },
+    "b": { "name": "b", "inject": ["svc"], "apply": [{ "op": "log", "text": "b-applied" }] }
+  },
+  "steps": [
+    { "op": "loader-sync", "entries": [
+      { "id": "g1", "name": "group", "group": true, "config": [
+        { "id": "p", "name": "p" },
+        { "id": "gInner", "name": "group", "group": true, "config": [ { "id": "c", "name": "c" } ] },
+        { "id": "gIso", "name": "group", "group": true, "isolate": { "svc": true }, "config": [ { "id": "b", "name": "b" } ] }
+      ] }
+    ] }
+  ]
+}

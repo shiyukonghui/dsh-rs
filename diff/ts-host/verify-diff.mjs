@@ -24,6 +24,7 @@ const ASYNC_SCENARIOS = new Set([
   'loader-15-cross-realm-walk',
   'loader-22-unprovide-self-access',
   'loader-24-reload-store-snapshot',
+  'loader-25-nested-finish',
 ])
 const scenarios = readdirSync(dir).filter((f) => f.endsWith('.json')).sort()
 let failed = 0

@@ -44,6 +44,10 @@ pub enum AsyncTask {
     Apply(FiberId),
     /// apply 后让出 → finish_load（Active + notify 依赖方）。
     Finish(FiberId),
+    /// M28-B（D-169）：`Await` future 的执行本身延迟为一个队列 hop——孙辈/子入口
+    /// 注册晚一步，落在兄弟扁平子的 `Finish(p)` 之后（对齐 cordis 子入口 create 的
+    /// import→fiber→reload hop 链；future 存 `Runtime.pending_awaits`）。
+    Await(FiberId),
 }
 
 /// M40：timer 条目（等价 Cordis `ctx.timeout`/`interval` 内部注册的 timer）。
@@ -113,6 +117,9 @@ pub struct Runtime {
     /// M7 async：异步微任务队列（FIFO；等价 Cordis 微任务队列）。
     /// `Apply` = apply 前让出 → apply → 排入 `Finish`；`Finish` = apply 后让出 → 收尾。
     pub pending_async_loads: std::collections::VecDeque<AsyncTask>,
+    /// M28-B（D-169）：`EffectOutcome::Await` future 暂存（延迟执行；fid → future）。
+    pub pending_awaits:
+        HashMap<FiberId, futures_util::future::LocalBoxFuture<'static, crate::fiber::EffectOutcome>>,
     /// M7 async：是否正在异步加载驱动中（嵌套注册走 async 入队而非两阶段延迟）。
     pub async_mode: bool,
     /// M13 async：fire-and-forget 调度钩子（宿主注入 tokio/LocalSet 驱动；
@@ -175,6 +182,7 @@ impl Runtime {
             pending_internal: Vec::new(),
             deferred: Vec::new(),
             pending_async_loads: std::collections::VecDeque::new(),
+            pending_awaits: HashMap::new(),
             async_mode: false,
             spawn: None,
             timer_clock: None,

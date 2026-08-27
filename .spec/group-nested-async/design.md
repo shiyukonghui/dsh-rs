@@ -61,6 +61,38 @@ should_wait = 组 fiber(await_children=true) && (
 3. m28 绿 + `cargo test --workspace` 全绿 + `verify-diff`（goldens 不得回归）+ clippy 0。
 4. 尝试恢复嵌套组 golden（若 byte 对齐则入；否则留 m28 + DIV-nested-2 记录）→ 阶段 5 验收。
 
+## 5b. 更新（D-169，B 口径 mount 时序）：DIV-nested-2 的顺延法解决——用户裁决 B
+
+**编码期实测**（loader-25-nested-finish，3 次运行稳定）：M28 修复后组 finish 位置已对齐
+（三组聚末尾），剩余**唯一**偏差 = `status:p:Loading:Active` 的落点：Rust 在 `plugin:c`/
+`plugin:b`（孙辈注册）**之后**，cordis 在**之前**。机制（研读 vendored cordis src）：
+cordis 各子入口 `create()` = `entry.update → init → import → _start(registry.plugin →
+fiber 构造: emit internal/plugin → _refresh → _reload) → fiber.await()`，import+构造+reload
+的多跳（≥3 微任务）使**扁平子的 Active（~2 跳）抢在组兄弟的孙辈注册（≥3 跳）之前**；
+Rust `drive_async_loads` 的 F1F0 在 `Apply(gInner)` 内联注册孙辈 → 提前跳。
+
+**修法（顺延法 / deferred-await，最小 core 变更）**：
+- `AsyncTask` 增 `Await(FiberId)` 变体；`Runtime` 增 `pending_awaits: HashMap<FiberId,
+  LocalBoxFuture<EffectOutcome>>` 存 `EffectOutcome::Await` 的 future。
+- drive `Apply` 臂遇 `Await(fut)`：**不内联 `fut.await`**；标记 `await_children=true`、
+  存 future、入队 `Await(fid)`。新 `Await(fid)` 臂：yield → 取出并 `fut.await`（孙辈/子
+  入口注册在此发生）→ `pop_current(fid)` → collect → 入队 `Finish(fid)`。
+- 效果：孙辈注册晚**恰好一个队列 hop**，落在兄弟扁平子 `Finish(p)`（其先入队）之后 →
+  loader-25 字节对齐。flat（loader-10）不变（`Await(g1)` 紧随 `Apply(g1)` 无插入项）。
+- `should_wait` 的 `queued_plain` match 增 `Await(_) => false`（不计数——组 finish 由
+  ①Loading 后裔 + ②普通 Apply/Finish 排队 保住批次；经 loader-25 推演与全 golden 校验）。
+
+**划界更新**：
+- **DIV-nested-2（已解决）**：mount 时序偏差 → 顺延法复刻 cordis 的孙辈注册 hop 数。
+  回滚点：撤销 `AsyncTask::Await` 变体 + `pending_awaits` + drive Await 臂（半成品即回滚至
+  D-168 状态，m28 语义不受影响——Finish 批次规则独立于 mount hop）。
+- 其它划界（disposer 并发 DIV-A4-5、unprovide 唤醒 A4、父链 walk m27 T2）不变。
+
+## 5c. B 验收口径（替换 §6 通用句）
+
+- loader-25 字节级 PASS（新增 golden，包含 isolate 边界 + Pending-only 组 + 3 层嵌套）；
+  既有 25 golden 不回归；m28 C1/C2 保持；clippy 0；serve 冒烟基线一致。
+
 ## 6. 验收
 
 - C1/C2 由 m28 确定性锁定；全回归基线保持（cargo test 0 失败 / clippy 0 / verify-diff 25/25）。
