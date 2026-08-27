@@ -3,8 +3,8 @@
 //! 对应 deepseek-harness 的 app-boot（profile → bundle → cordis.patch → 挂载）：
 //! 1. 读 YAML 入口列表（services + loop entries），叠加 profile overlays
 //!    （同 id entry 后者覆盖 config——bundle/patch 语义）；
-//! 2. 注册插件仓库：`dsh:services`（缝的承载）+ WASM loop 插件（按 entry 的
-//!    `config.wasm` 指明组件目录或 `.wasm` 文件路径构建）；
+//! 2. 注册插件仓库：`dsh:services`（缝的承载）+ 插件包（**文件夹**：wasm 组件 +
+//!    前端组件，文件夹名 = 注册名；`plugin.json` 清单或构建目录约定定位 wasm）；
 //! 3. `Include` 挂载；
 //! 4. 宿主经 `run_turn` 驱动 WASM loop（输入来自调用方）。
 
@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use dsh_core::*;
 use dsh_loader::{EntryOptions, Include, Loader};
-use dsh_wasmrt::{Capabilities, DshServicesPlugin, WasmLoopPlugin};
+use dsh_wasmrt::{
+    ComponentKind, DshServicesPlugin, WasmLoopPlugin, load_wasm_component_plugin,
+};
 
 /// `dsh web`——服务 DeepSeek Harness 前端 + `/api` RPC（M70）。
 pub mod web;
@@ -52,6 +54,9 @@ pub mod session_host;
 /// prompt 经 AgentLoopHost 驱动 + interrupt 收据）。
 pub mod subagent_runtime;
 pub mod remote_host;
+
+/// 插件包（文件夹）解析：插件 = 文件夹（wasm 组件 + 前端组件），文件夹名 = 注册名。
+pub mod plugin_pkg;
 
 /// M6 step5b：真实 LLM 装配（deepseek 适配器 + dsh-core 流式 HTTP 桥 + 诚实 no-key
 /// fail-loud；key 仅 `DEEPSEEK_API_KEY` 环境变量）。
@@ -132,6 +137,9 @@ pub struct Boot {
     /// register_plugin + fiber）——dynamicCordisRunner/pluginInventory 的真实数据源
     /// 与「动态装配」句柄。boot() 装配 Some；None（测试口）→ 投影回退空/诚实。
     pub loader: Option<dsh_loader::Loader>,
+    /// 插件包（文件夹）装配结果（wasm + 前端）：web serve 据此挂 `/plugins/<name>/**`
+    /// 静态资源（D2）。boot() 填充；非包入口不列入。
+    pub packages: Vec<crate::plugin_pkg::PluginPackage>,
 }
 
 /// M56：转储生效配置（对齐生产 `dsh --dump-config`）——读主配置 + overlays
@@ -207,25 +215,13 @@ pub fn boot_with_host_plugins(
         loader.register_plugin(name, plugin.clone());
     }
 
-    // loop 装配：只认声明 `config.wasm` 的入口为 WASM loop（run_turn 需具体类型）；
-    // 其余入口（服务/普通插件）由 include.load() 按名解析 apply——服务插件 entry 化
-    // 的关键判据（不再假设「非 services 即 loop」）。
-    let mut loop_plugin: Option<Arc<WasmLoopPlugin>> = None;
-    for entry in &entries {
-        let Some(wasm) = entry.config.get("wasm").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let bytes = load_component(wasm_base, wasm)?;
-        // loop 是 dsh-loop world 组件：直接构造 WasmLoopPlugin（run_turn 需具体类型）。
-        // 能力按 entry 配置授予（`config.caps` 数组；缺省 = ABI 能力，无 WASI）。
-        let caps = Capabilities::from_json(entry.config.get("caps"));
-        let plugin = Arc::new(WasmLoopPlugin::new_owned(&entry.name, &bytes, caps)?);
-        let dyn_plugin: Arc<dyn Plugin> = plugin.clone();
-        loader.register_plugin(&entry.name, dyn_plugin);
-        loop_plugin = Some(plugin);
-    }
-    let loop_plugin = loop_plugin.ok_or_else(|| {
-        CordisError::Internal("boot: no loop entry (config.wasm) in cordis.yml".into())
+    // 插件包装配（D4 重构）：`name` 未命中内置/宿主注册 → 解析为文件夹包
+    // （wasm + 前端；plugin.json 清单或约定回退）。world 判别选适配器：
+    // dsh-loop → WasmLoopPlugin（首个 = turn 句柄）；dsh-plugin → WasmComponentPlugin。
+    // 移除 config.wasm 特判。
+    let (loop_plugin_opt, packages) = assemble_plugin_packages(&loader, wasm_base, &entries)?;
+    let loop_plugin = loop_plugin_opt.ok_or_else(|| {
+        CordisError::Internal("boot: no loop entry (dsh-loop world plugin package) in cordis.yml".into())
     })?;
     // M58：可变 loop 句柄（HMR refresh 换组件时替换）
     let loop_cell: Rc<std::cell::RefCell<Arc<WasmLoopPlugin>>> =
@@ -263,6 +259,10 @@ pub fn boot_with_host_plugins(
             let layer = read_entries(overlay)?;
             merged = merge_entries(merged, layer);
         }
+        // 插件包装配（D4）：新出现/改名条目重新解析注册；首个 dsh-loop 包重建
+        // loop 句柄（组件变化经 refresh 生效）。已注册名跳过（注册保持）。
+        let (new_loop, _packages) =
+            assemble_plugin_packages(&refresh_loader, &refresh_wasm_base, &merged)?;
         let tmp = merge_path_for_include(&refresh_config, &merged)?;
         let include = Include::new(&refresh_loader, &tmp, vec![]);
         // async 事务：全部入口都尝试 create/update（一个失败不阻断其他）、
@@ -278,24 +278,8 @@ pub fn boot_with_host_plugins(
                 agg.errors.len()
             ))
         })?;
-        // M58：HMR 换 loop 组件——按合并后 loop entry 的 config.wasm 重建
-        // WasmLoopPlugin 并替换句柄（config.wasm 变化时新组件生效）。
-        // E1：loop 定位按 config.wasm 判定（以 `name != "dsh:services"` 定位会误判
-        // 「服务插件 entry 出现在 loop 前」的场景）。
-        if let Some(loop_entry) = merged
-            .iter()
-            .find(|e| e.config.get("wasm").and_then(|v| v.as_str()).is_some())
-        {
-            let wasm = loop_entry
-                .config
-                .get("wasm")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    CordisError::Internal("hmr refresh: loop entry needs config.wasm".into())
-                })?;
-            let bytes = load_component(&refresh_wasm_base, wasm)?;
-            let caps = Capabilities::from_json(loop_entry.config.get("caps"));
-            let plugin = Arc::new(WasmLoopPlugin::new_owned(&loop_entry.name, &bytes, caps)?);
+        // M58/（D4）：换 loop 句柄——refresh 后首个 dsh-loop 包的实例；无 loop 包则保持。
+        if let Some(plugin) = new_loop {
             *refresh_loop_cell.borrow_mut() = plugin;
         }
         Ok(())
@@ -359,6 +343,7 @@ pub fn boot_with_host_plugins(
         remote_plugin: None,
         remote_projector: None,
         loader: Some(loader.clone()),
+        packages,
     })
 }
 
@@ -601,32 +586,65 @@ fn merge_path_for_include(config_path: &Path, entries: &[EntryOptions]) -> Resul
     Ok(tmp)
 }
 
-/// 读取 WASM loop 组件字节。
+/// 插件包装配（D4）：扫描入口，`name` 未命中内置/宿主注册 → 解析为文件夹包
+/// （wasm + 前端；plugin.json 清单或约定回退）；**world 判别**选适配器并注册：
+/// - dsh-loop → `WasmLoopPlugin`（**首个** = turn 句柄，`run_turn` 具体类型）；
+/// - dsh-plugin → `WasmComponentPlugin`（通用 apply）；
+/// - Unknown → fail-loud（非 dsh world）。
 ///
-/// `spec` 两种形态：
-/// - 目录名（如 `echo-loop`）→ `<wasm_base>/<dir>/target/wasm32-wasip1/debug/<dir>_plugin.wasm`
-/// - 以 `.wasm` 结尾 → 相对 wasm_base 或绝对路径直接读取。
-fn load_component(wasm_base: &Path, spec: &str) -> Result<Vec<u8>, CordisError> {
-    let path = if spec.ends_with(".wasm") {
-        let p = PathBuf::from(spec);
-        if p.is_absolute() {
-            p
-        } else {
-            wasm_base.join(p)
+/// boot 与 HMR refresh 共用。`world` 清单提示可显式覆盖字节探测快路径。
+fn assemble_plugin_packages(
+    loader: &Loader,
+    wasm_base: &Path,
+    entries: &[EntryOptions],
+) -> Result<(Option<Arc<WasmLoopPlugin>>, Vec<crate::plugin_pkg::PluginPackage>), CordisError> {
+    let mut loop_handle: Option<Arc<WasmLoopPlugin>> = None;
+    let mut packages = Vec::new();
+    for entry in entries {
+        let Some(pkg) = crate::plugin_pkg::resolve_package(wasm_base, &entry.name)? else {
+            continue;
+        };
+        let bytes = std::fs::read(&pkg.wasm).map_err(|e| {
+            CordisError::Internal(format!("boot: read wasm component {}: {e}", pkg.wasm.display()))
+        })?;
+        let caps = crate::plugin_pkg::effective_caps(&entry.config, &pkg);
+        let world = match pkg.world.as_deref() {
+            Some("loop") => ComponentKind::Loop,
+            Some("plugin") => ComponentKind::Plugin,
+            _ => dsh_wasmrt::detect_component_kind(&bytes),
+        };
+        let already = loader.has_plugin(&entry.name);
+        match world {
+            ComponentKind::Loop => {
+                let plugin = Arc::new(WasmLoopPlugin::new_owned(&entry.name, &bytes, caps)?);
+                if loop_handle.is_none() {
+                    loop_handle = Some(plugin.clone());
+                }
+                if !already {
+                    let dyn_plugin: Arc<dyn Plugin> = plugin.clone();
+                    loader.register_plugin(&entry.name, dyn_plugin);
+                }
+            }
+            ComponentKind::Plugin => {
+                if !already {
+                    let plugin = load_wasm_component_plugin(
+                        Box::leak(entry.name.clone().into_boxed_str()),
+                        &bytes,
+                        caps,
+                    )?;
+                    loader.register_plugin(&entry.name, plugin);
+                }
+            }
+            ComponentKind::Unknown => {
+                return Err(CordisError::Internal(format!(
+                    "boot: plugin package {} is not a dsh-plugin or dsh-loop component",
+                    entry.name
+                )));
+            }
         }
-    } else {
-        let wasm_name = format!("{}_plugin.wasm", spec.replace('-', "_"));
-        wasm_base
-            .join(spec)
-            .join("target/wasm32-wasip1/debug")
-            .join(wasm_name)
-    };
-    std::fs::read(&path).map_err(|e| {
-        CordisError::Internal(format!(
-            "boot: read wasm component {}: {e}",
-            path.display()
-        ))
-    })
+        packages.push(pkg);
+    }
+    Ok((loop_handle, packages))
 }
 
 /// 驱动一个 turn（宿主侧：注入 ctx → run_turn）。

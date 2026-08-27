@@ -35,7 +35,7 @@ fn loop_component(dir: &str) -> Vec<u8> {
 }
 
 /// 写一个 cordis.yml 形态的 YAML 入口列表到临时文件。
-fn write_cordis_yaml(dir: &Path, loop_name: &str, loop_wasm_dir: &str) -> PathBuf {
+fn write_cordis_yaml(dir: &Path, loop_name: &str) -> PathBuf {
     let path = dir.join("cordis.yml");
     let yaml = format!(
         r#"
@@ -45,8 +45,6 @@ fn write_cordis_yaml(dir: &Path, loop_name: &str, loop_wasm_dir: &str) -> PathBu
     services: [sessions, tools, llm]
 - id: loop
   name: {loop_name}
-  config:
-    wasm: {loop_wasm_dir}
 "#
     );
     fs::write(&path, yaml).unwrap();
@@ -72,7 +70,7 @@ fn assemble_with_yaml(
     // Include 从 YAML 挂载（每测试唯一目录，避免并行覆盖）
     let dir = std::env::temp_dir().join(format!("dsh-m9-yaml-{}-{}", loop_name, std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    let path = write_cordis_yaml(&dir, loop_name, loop_dir);
+    let path = write_cordis_yaml(&dir, loop_name);
     let include = Include::new(&loader, &path, vec![]);
     include.load().unwrap();
     fs::remove_dir_all(&dir).ok();
@@ -168,7 +166,7 @@ fn yaml_patch_overrides_loop_config() {
 
     let dir = std::env::temp_dir().join(format!("dsh-m9-yaml-patch-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    let path = write_cordis_yaml(&dir, "echo-loop", "echo-loop");
+    let path = write_cordis_yaml(&dir, "echo-loop");
     // patch：把 loop entry 的 config 换成自定义（验证 patch 机制在 DSH 组装中生效）
     let patches = vec![Patch {
         id: Some("loop".to_string()),
@@ -257,8 +255,6 @@ fn yaml_declared_http_llm() {
         model: yaml-model
 - id: loop
   name: llm-loop
-  config:
-    wasm: llm-loop
 "#
     );
     fs::write(&path, yaml).unwrap();

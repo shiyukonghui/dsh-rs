@@ -41,7 +41,7 @@ fn loop_component(dir: &str) -> Vec<u8> {
     fs::read(wasm).expect("read loop component")
 }
 
-fn write_cordis_yaml(dir: &std::path::Path, file: &str, loop_name: &str, wasm: &str) -> PathBuf {
+fn write_cordis_yaml(dir: &std::path::Path, file: &str, loop_name: &str) -> PathBuf {
     let path = dir.join(file);
     let yaml = format!(
         r#"
@@ -51,8 +51,6 @@ fn write_cordis_yaml(dir: &std::path::Path, file: &str, loop_name: &str, wasm: &
     services: [sessions, tools, llm]
 - id: loop
   name: {loop_name}
-  config:
-    wasm: {wasm}
 "#
     );
     fs::write(&path, yaml).unwrap();
@@ -74,7 +72,7 @@ fn unique_dir(tag: &str) -> PathBuf {
 fn boot_loads_and_runs_turn() {
     ensure_loop_built("echo-loop");
     let dir = unique_dir("basic");
-    let config = write_cordis_yaml(&dir, "cordis.yml", "echo-loop", "echo-loop");
+    let config = write_cordis_yaml(&dir, "cordis.yml", "echo-loop");
 
     let boot = dsh_cli::boot(&config, &[], &wasm_base()).expect("boot");
     let result = dsh_cli::run_turn(&boot, &json!({"content": "boot hello"})).expect("run_turn");
@@ -90,7 +88,7 @@ fn boot_loads_and_runs_turn() {
 fn boot_runs_multiple_turns() {
     ensure_loop_built("echo-loop");
     let dir = unique_dir("multi");
-    let config = write_cordis_yaml(&dir, "cordis.yml", "echo-loop", "echo-loop");
+    let config = write_cordis_yaml(&dir, "cordis.yml", "echo-loop");
 
     let boot = dsh_cli::boot(&config, &[], &wasm_base()).expect("boot");
     let r1 = dsh_cli::run_turn(&boot, &json!({"content": "one"})).unwrap();
@@ -109,8 +107,8 @@ fn boot_profile_overlay_swaps_loop() {
     ensure_loop_built("echo-loop");
     ensure_loop_built("tool-loop");
     let dir = unique_dir("overlay");
-    let base = write_cordis_yaml(&dir, "base.yml", "echo-loop", "echo-loop");
-    let overlay = write_cordis_yaml(&dir, "overlay.yml", "tool-loop", "tool-loop");
+    let base = write_cordis_yaml(&dir, "base.yml", "echo-loop");
+    let overlay = write_cordis_yaml(&dir, "overlay.yml", "tool-loop");
 
     let boot = dsh_cli::boot(&base, &[overlay], &wasm_base()).expect("boot");
     // 注册 add 工具（宿主承载；tool-loop 经 tools 缝调用）
@@ -129,7 +127,8 @@ fn boot_profile_overlay_swaps_loop() {
     fs::remove_dir_all(&dir).ok();
 }
 
-/// manifest 形态：config.wasm 指向 .wasm 文件路径（非构建目录）。
+/// plugin.json 清单形态：`wasm` 显式声明组件文件路径（非构建目录约定）——包览
+/// `plugin.json` 定向加载该文件；`name`=包目录名即注册名。
 #[test]
 fn boot_manifest_wasm_path() {
     ensure_loop_built("echo-loop");
@@ -137,9 +136,14 @@ fn boot_manifest_wasm_path() {
     let wasm_file = wasm_base()
         .join("echo-loop/target/wasm32-wasip1/debug/echo_loop_plugin.wasm");
     assert!(wasm_file.exists(), "echo-loop wasm built");
-    let config = write_cordis_yaml(&dir, "cordis.yml", "echo-loop", &wasm_file.to_string_lossy());
-
-    let boot = dsh_cli::boot(&config, &[], &wasm_base()).expect("boot with .wasm manifest");
+    // 隔离的 wasm-base：唯一包 `mypkg`，仅 plugin.json 显式指向 echo-loop 输出
+    let fakes_base = dir.join("wasm-base");
+    let pkg_dir = fakes_base.join("mypkg");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    let manifest = serde_json::json!({ "wasm": wasm_file.to_string_lossy().into_owned() });
+    fs::write(pkg_dir.join("plugin.json"), manifest.to_string()).unwrap();
+    let config = write_cordis_yaml(&dir, "cordis.yml", "mypkg");
+    let boot = dsh_cli::boot(&config, &[], &fakes_base).expect("boot with plugin.json wasm");
     let result = dsh_cli::run_turn(&boot, &json!({"content": "manifest"})).unwrap();
     assert_eq!(result["echo"], "echo: manifest");
     fs::remove_dir_all(&dir).ok();
@@ -158,6 +162,82 @@ fn boot_requires_loop_entry() {
     assert!(
         err.to_string().contains("no loop entry"),
         "expected missing-loop error, got: {err}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// S1/S2 锁点（插件包装配）：echo-loop（dsh-loop world → turn 句柄）+ hello-component
+/// （dsh-plugin world → 通用组件插件）两个**文件夹包**并存——各自按名注册；dsh-plugin 包
+/// apply 生效（提供 `greeting` 服务，取值自 entry config）。无 config.wasm。
+#[test]
+fn boot_assembles_wasm_component_package_sibling_to_loop() {
+    ensure_loop_built("echo-loop");
+    ensure_loop_built("hello-component");
+    let dir = unique_dir("pkg-sib");
+    let config = dir.join("cordis.yml");
+    fs::write(
+        &config,
+        r#"
+- id: services
+  name: dsh:services
+  config:
+    services: [sessions, tools, llm]
+- id: loop
+  name: echo-loop
+- id: comp
+  name: hello-component
+  config:
+    greeting: hi-pkg
+"#,
+    )
+    .unwrap();
+
+    let boot = dsh_cli::boot(&config, &[], &wasm_base()).expect("boot with a component plugin package");
+
+    // dsh-loop 包 = turn 句柄（run_turn 具体类型）
+    let r = dsh_cli::run_turn(&boot, &json!({"content": "pkg-sib"})).unwrap();
+    assert_eq!(r["echo"], "echo: pkg-sib");
+
+    // dsh-plugin 包按注册名 apply：greeting 服务可见（config 注入）
+    let greeting = boot
+        .ctx
+        .get_typed::<serde_json::Value>("greeting")
+        .expect("hello-component package applied and provided greeting");
+    assert_eq!(
+        greeting.get("text").and_then(|v| v.as_str()),
+        Some("hi-pkg"),
+        "component package config (greeting) applied"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// S2/S4 锁点：既不是内置/host 注册、也不存在包目录的名 → 未知插件 fail-loud（现状保持）。
+#[test]
+fn boot_unknown_non_package_name_fails_loud() {
+    ensure_loop_built("echo-loop");
+    let dir = unique_dir("unknown-pkg");
+    let config = dir.join("cordis.yml");
+    fs::write(
+        &config,
+        r#"
+- id: services
+  name: dsh:services
+  config:
+    services: [sessions, tools, llm]
+- id: loop
+  name: echo-loop
+- id: ghost
+  name: no-such-plugin-dir
+"#,
+    )
+    .unwrap();
+    let err = match dsh_cli::boot(&config, &[], &wasm_base()) {
+        Ok(_) => panic!("boot should fail on unknown plugin name"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("unknown plugin"),
+        "expected unknown-plugin error, got: {err}"
     );
     fs::remove_dir_all(&dir).ok();
 }
@@ -181,8 +261,6 @@ fn boot_declared_tools_and_llm() {
       behavior: tool-first
 - id: loop
   name: tool-loop
-  config:
-    wasm: tool-loop
 "#;
     let config = dir.join("cordis.yml");
     fs::write(&config, yaml).unwrap();
@@ -213,8 +291,6 @@ fn boot_multi_turn_shared_context() {
       behavior: tool-first
 - id: loop
   name: llm-loop
-  config:
-    wasm: llm-loop
 "#;
     let config = dir.join("cordis.yml");
     fs::write(&config, yaml).unwrap();
@@ -247,7 +323,7 @@ fn boot_multi_turn_shared_context() {
 fn boot_works_without_wasi_caps() {
     ensure_loop_built("echo-loop");
     let dir = unique_dir("nowasi");
-    let config = write_cordis_yaml(&dir, "cordis.yml", "echo-loop", "echo-loop");
+    let config = write_cordis_yaml(&dir, "cordis.yml", "echo-loop");
 
     // boot 用 abi_only 能力构建 loop 插件（WASI 空上下文）
     let cordis = Cordis::new();
@@ -349,7 +425,6 @@ fn boot_caps_from_entry_config() {
 - id: loop
   name: echo-loop
   config:
-    wasm: echo-loop
     caps: [provide, emit, get]
 "#;
     let config = dir.join("cordis.yml");
@@ -424,8 +499,6 @@ fn boot_refresh_async_transaction_reports_failure() {
     services: [sessions, tools, llm]
 - id: loop
   name: {loop_name}
-  config:
-    wasm: {loop_name}
 "#
         )
     };
@@ -444,8 +517,6 @@ fn boot_refresh_async_transaction_reports_failure() {
     services: [sessions, tools, llm]
 - id: loop
   name: no-such-loop
-  config:
-    wasm: echo-loop
 "#,
     )
     .unwrap();
@@ -470,7 +541,7 @@ fn boot_refresh_async_transaction_reports_failure() {
 fn headless_echo_loop_returns_answer_and_reason() {
     ensure_loop_built("echo-loop");
     let dir = unique_dir("headless-echo");
-    let config = write_cordis_yaml(&dir, "cordis.yml", "echo-loop", "echo-loop");
+    let config = write_cordis_yaml(&dir, "cordis.yml", "echo-loop");
 
     let boot = dsh_cli::boot(&config, &[], &wasm_base()).expect("boot");
     let result = dsh_cli::run_headless(&boot, "hello headless").expect("headless run");
@@ -498,8 +569,6 @@ fn headless_llm_loop_full_turn() {
       behavior: tool-first
 - id: loop
   name: llm-loop
-  config:
-    wasm: llm-loop
 "#;
     let config = dir.join("cordis.yml");
     fs::write(&config, yaml).unwrap();
@@ -532,8 +601,6 @@ fn restore_session_resumes_context() {
       behavior: tool-first
 - id: loop
   name: llm-loop
-  config:
-    wasm: llm-loop
 "#;
     let config = dir.join("cordis.yml");
     fs::write(&config, yaml).unwrap();
@@ -571,7 +638,7 @@ fn restore_session_resumes_context() {
 fn restore_session_missing_file_fails() {
     ensure_loop_built("echo-loop");
     let dir = unique_dir("resume-missing");
-    let config = write_cordis_yaml(&dir, "cordis.yml", "echo-loop", "echo-loop");
+    let config = write_cordis_yaml(&dir, "cordis.yml", "echo-loop");
     let boot = dsh_cli::boot(&config, &[], &wasm_base()).expect("boot");
 
     let err = dsh_cli::restore_session(&boot, &dir.join("nope.jsonl")).unwrap_err();
@@ -584,8 +651,8 @@ fn restore_session_missing_file_fails() {
 #[test]
 fn dump_config_merges_overlays() {
     let dir = unique_dir("dump");
-    let base = write_cordis_yaml(&dir, "base.yml", "echo-loop", "echo-loop");
-    let overlay = write_cordis_yaml(&dir, "overlay.yml", "tool-loop", "tool-loop");
+    let base = write_cordis_yaml(&dir, "base.yml", "echo-loop");
+    let overlay = write_cordis_yaml(&dir, "overlay.yml", "tool-loop");
 
     let yaml = dsh_cli::dump_config(&base, &[overlay]).expect("dump-config");
     // overlay 替换 loop 的 name（echo-loop → tool-loop）
@@ -599,15 +666,15 @@ fn dump_config_merges_overlays() {
     fs::remove_dir_all(&dir).ok();
 }
 
-/// M58：HMR refresh 换 loop 组件——修改 config.wasm 指向不同组件（echo-loop
-/// → tool-loop），refresh 后 `run_turn` 走新组件（返回 summary 而非 echo）。
+/// M58/（D4）：HMR refresh 换 loop 组件——改 `name`（指向另一 dsh-loop 包：echo-loop →
+/// tool-loop），refresh 重新解析包并换句柄，`run_turn` 走新组件（summary 而非 echo）。
 #[test]
 fn boot_refresh_swaps_loop_component() {
     ensure_loop_built("echo-loop");
     ensure_loop_built("tool-loop");
     let dir = unique_dir("hmr-swap");
     let config = dir.join("cordis.yml");
-    let base_yaml = |wasm: &str| {
+    let base_yaml = |loop_name: &str| {
         format!(
             r#"
 - id: services
@@ -615,9 +682,7 @@ fn boot_refresh_swaps_loop_component() {
   config:
     services: [sessions, tools, llm]
 - id: loop
-  name: loop
-  config:
-    wasm: {wasm}
+  name: {loop_name}
 "#
         )
     };
@@ -638,7 +703,7 @@ fn boot_refresh_swaps_loop_component() {
     let r1 = dsh_cli::run_turn(&boot, &json!({"content": "first"})).unwrap();
     assert_eq!(r1["echo"], "echo: first", "initial loop is echo-loop");
 
-    // 改 config.wasm → tool-loop → refresh
+    // 改 name → tool-loop（另一文件夹包）→ refresh
     fs::write(&config, base_yaml("tool-loop")).unwrap();
     (boot.refresh)().expect("refresh swaps loop component");
 
@@ -667,7 +732,7 @@ impl dsh_core::Plugin for TestSvcPlugin {
 }
 
 /// 带第二个服务插件的 cordis.yml（loop 在最后，服务 entry 在 loop 前——暴露
-/// 「非 services 即 loop」假设：修改前 boot 因 `needs config.wasm` 失败）。
+/// 「非 services 即 loop」假设；旧版按 config.wasm 判 loop，本版按 dsh-loop 包）。
 fn write_cordis_with_extra_service(dir: &std::path::Path) -> PathBuf {
     let path = dir.join("cordis-extra-svc.yml");
     let yaml = r#"
@@ -679,8 +744,6 @@ fn write_cordis_with_extra_service(dir: &std::path::Path) -> PathBuf {
   name: dsh:test-svc
 - id: loop
   name: echo-loop
-  config:
-    wasm: echo-loop
 "#;
     fs::write(&path, yaml).unwrap();
     path
@@ -711,10 +774,10 @@ fn boot_assembles_declared_service_plugin_entry_by_name() {
     fs::remove_dir_all(&dir).ok();
 }
 
-/// E1（T2）：HMR refresh 的 loop 定位按 config.wasm 判定（不看 name != dsh:services）；
-/// 服务 entry 在 loop 前也不误判 loop。
+/// E1（T2）：HMR refresh 的 loop 定位按「首个 dsh-loop 包装配」（不看 name != dsh:services）；
+/// 服务 entry 在 loop 前也不误判 loop（`dsh:test-svc` 已注册 → 跳过；echo-loop 包 → loop）。
 #[test]
-fn refresh_locates_loop_by_config_wasm_not_name() {
+fn refresh_locates_loop_by_dsh_loop_package() {
     ensure_loop_built("echo-loop");
     let dir = unique_dir("refresh-svc");
     let config = write_cordis_with_extra_service(&dir);
@@ -730,7 +793,7 @@ fn refresh_locates_loop_by_config_wasm_not_name() {
     // refresh 重读主配置 + 重挂载：不因服务 entry 出现在 loop 前而把「loop 定位」误指到服务行
     (boot.refresh)().expect("refresh with a service entry before the loop entry");
     let r = dsh_cli::run_turn(&boot, &json!({"content": "after refresh"})).unwrap();
-    assert_eq!(r["echo"], "echo: after refresh", "loop still resolved by config.wasm");
+    assert_eq!(r["echo"], "echo: after refresh", "loop resolved by dsh-loop package");
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -740,7 +803,7 @@ fn refresh_locates_loop_by_config_wasm_not_name() {
 fn runtime_mutation_persists_to_config_and_reboots() {
     ensure_loop_built("echo-loop");
     let dir = unique_dir("persist-boot");
-    let config = write_cordis_yaml(&dir, "cordis.yml", "echo-loop", "echo-loop");
+    let config = write_cordis_yaml(&dir, "cordis.yml", "echo-loop");
     let extra = &[("dsh:test-svc", Arc::new(TestSvcPlugin) as Arc<dyn dsh_core::Plugin>)];
 
     let boot = dsh_cli::boot_with_host_plugins(&config, &[], &wasm_base(), extra).expect("boot");

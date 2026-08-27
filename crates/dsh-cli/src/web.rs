@@ -911,6 +911,19 @@ fn dispatch_request(
         return;
     }
 
+    // 插件包装配前端（D2）：`/plugins/<name>/<rest>`——包 web 目录静态资源。
+    // 先于 client.js bundle 分支；包名为文件夹名（无 `@scope`），与客户端插件
+    // id（@deepseek-ai/...）不冲突。miss 回落 client.js / 404。
+    if path.starts_with("/plugins/") && !boot.packages.is_empty() {
+        if let Some((status, ct, body)) = serve_package_asset(&boot.packages, &path) {
+            let resp = Response::from_data(body)
+                .with_status_code(status)
+                .with_header(Header::from_bytes(&b"Content-Type"[..], ct.as_bytes()).unwrap());
+            let _ = request.respond(resp);
+            return;
+        }
+    }
+
     // 阶段1：`/plugins/<id>/client.js`——服务 web 插件真实 bundle（非 SPA fallback）。
     if path.starts_with("/plugins/") {
         if let Some(body) = serve_plugin_bundle(manifest, &path) {
@@ -1325,6 +1338,35 @@ fn serve_plugin_bundle(manifest: &BootManifest, path: &str) -> Option<Vec<u8>> {
     let entry = manifest.entries.iter().find(|e| e.id == id)?;
     let bundle = entry.bundle_root.join("lib/client.js");
     std::fs::read(&bundle).ok()
+}
+
+/// 服务插件包前端资源 `/plugins/<name>/<rest>`（D2）：从包 `web` 目录读静态文件；目录
+/// 根/子目录 → `index.html`；未知包、无 web 目录或 miss → None（回落 client.js / 404）。
+fn serve_package_asset(
+    packages: &[crate::plugin_pkg::PluginPackage],
+    path: &str,
+) -> Option<(u16, &'static str, Vec<u8>)> {
+    let rest = path.strip_prefix("/plugins/")?;
+    let mut parts = rest.splitn(2, '/');
+    let name = parts.next()?;
+    let pkg = packages.iter().find(|p| p.name == name)?;
+    let web = pkg.web.as_ref()?;
+    let sub = parts.next().unwrap_or("");
+    // 规范化，防目录穿越（与 static_response 同纪律）
+    let clean: String = sub
+        .replace("..", "")
+        .trim_start_matches('/')
+        .to_string();
+    let target = if clean.is_empty() {
+        web.join("index.html")
+    } else if clean.ends_with('/') {
+        web.join(format!("{clean}index.html"))
+    } else {
+        web.join(&clean)
+    };
+    let body = std::fs::read(&target).ok()?;
+    let ct = mime_for(target.to_str().unwrap_or(""));
+    Some((200, ct, body))
 }
 
 /// 渲染 `/` 的 index.html：读 dist index.html，注入 web boot 三件套（对齐
@@ -4489,6 +4531,7 @@ mod tests {
             remote_plugin: None,
             remote_projector: None,
             loader: None,
+            packages: Vec::new(),
         }
     }
 
@@ -6167,6 +6210,47 @@ mod tests {
         // 未知 id
         assert!(serve_plugin_bundle(&m, "/plugins/@deepseek-ai/nope/client.js").is_none());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// S3 锁点（插件包装配前端，D2）：`/plugins/<name>/<rest>` 从包 web 目录读静态资源；
+    /// 根/子目录 → index.html；未知包 / 无 web / miss → None（回落 client.js / 404）。
+    #[test]
+    fn serve_package_asset_reads_package_web_dir() {
+        let base = std::env::temp_dir().join(format!("dsh-web-pkg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pkg_dir = base.join("hello-component");
+        let web = pkg_dir.join("web");
+        std::fs::create_dir_all(&web).unwrap();
+        std::fs::write(web.join("ui.js"), "window.ui = 1;").unwrap();
+        std::fs::write(web.join("index.html"), "<html>pkg</html>").unwrap();
+        let pkg = crate::plugin_pkg::PluginPackage {
+            name: "hello-component".into(),
+            dir: pkg_dir.clone(),
+            wasm: pkg_dir.join("plugin.wasm"),
+            web: Some(web.clone()),
+            caps: None,
+            world: None,
+        };
+        let pkgs = vec![pkg];
+
+        let (status, ct, body) =
+            serve_package_asset(&pkgs, "/plugins/hello-component/ui.js").expect("asset served");
+        assert_eq!(status, 200);
+        assert_eq!(String::from_utf8(body).unwrap(), "window.ui = 1;");
+        assert!(ct.contains("javascript"), "mime by extension");
+        // 根 → index.html
+        let (_, _, body) = serve_package_asset(&pkgs, "/plugins/hello-component/").expect("index");
+        assert_eq!(String::from_utf8(body).unwrap(), "<html>pkg</html>");
+        // miss / 未知包 / 无 web 目录 → None
+        assert!(serve_package_asset(&pkgs, "/plugins/hello-component/nope.js").is_none());
+        assert!(serve_package_asset(&pkgs, "/plugins/ghost/ui.js").is_none());
+        let noweb = crate::plugin_pkg::PluginPackage {
+            name: "loop".into(),
+            web: None,
+            ..pkgs[0].clone()
+        };
+        assert!(serve_package_asset(&[noweb], "/plugins/loop/ui.js").is_none());
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// D-099：`/plugins/events` 路由决策——GET→SSE 流、HEAD→事件流头、其他方法→405；

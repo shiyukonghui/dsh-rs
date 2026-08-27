@@ -1,8 +1,8 @@
 //! DSH CLI：从 cordis.yml 启动并交互式驱动 WASM loop。
 //!
 //! 用法：`dsh <cordis.yml> [--overlay <file> | --patch <file>]... [--wasm-base <dir>] [--watch] [--once <task>] [--session-in <file>] [--session-out <file>] [--dump-config]`
-//! - `<cordis.yml>`：主配置（services + loop entries；loop 的 config.wasm 指明
-//!   组件目录或 `.wasm` 路径）。
+//! - `<cordis.yml>`：主配置（services + 插件包 entries；`name` = 插件包文件夹名，
+//!   内含 wasm 组件 + 前端组件；`plugin.json` 清单或构建目录约定定位 wasm/前端）。
 //! - `--overlay <file>` / `--patch <file>`（M52 别名，对齐生产 `dsh --patch`）：
 //!   profile 叠加层（可多次；argv 顺序——同 id entry 的完整 config 替换，
 //!   新 id 追加插入；对应生产 patch overlay 语义）。

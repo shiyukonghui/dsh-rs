@@ -34,7 +34,7 @@ pub use abi::{
     CAPS_EMIT, CAPS_GET, CAPS_PROVIDE, CAPS_WASI_ENV, CAPS_WASI_FS, CAPS_WASI_NET, Capabilities,
 };
 pub use combo::{ComboEvaluator, FallbackEval, NativeComboEvaluator, WasmComboEvaluator};
-pub use component::WasmComponentPlugin;
+pub use component::{detect_component_kind, ComponentHostState, ComponentKind, WasmComponentPlugin};
 pub use host::{NativeHost, PluginHost, PluginKind, PluginManifest};
 pub use plugin::WasmPlugin;
 pub use r#loop::{LoopHost, WasmLoopPlugin};

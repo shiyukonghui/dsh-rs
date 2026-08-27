@@ -285,3 +285,43 @@ impl WasmComponentPlugin {
             .unwrap_or_default()
     }
 }
+
+/// WASM 组件 world（按**导出接口**判别的 ABI 事实，非配置推断）。
+/// 插件包解析据此选适配器（loop→`WasmLoopPlugin` / plugin→`WasmComponentPlugin`）；
+/// `Unknown` = 组件编译失败或非 dsh world（装配层 fail-loud）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentKind {
+    /// dsh-plugin world：导出 `dsh:plugin/plugin-api`（通用 apply）。
+    Plugin,
+    /// dsh-loop world：导出 `dsh:dsh/agent-loop`（turn 驱动，run_turn 具体类型）。
+    Loop,
+    /// 非 dsh world 或组件编译失败。
+    Unknown,
+}
+
+/// 预检组件字节的 world（wasmtime 34 `types::Component::exports` 遍历导出名）。
+/// loop 优先（dsh-loop 导出 `agent-loop` / `tools-handler`；dsh-plugin 导出 `plugin-api`）。
+pub fn detect_component_kind(bytes: &[u8]) -> ComponentKind {
+    let engine = Engine::default();
+    let component = match Component::from_binary(&engine, bytes) {
+        Ok(c) => c,
+        Err(_) => return ComponentKind::Unknown,
+    };
+    let mut has_plugin = false;
+    let mut has_loop = false;
+    for (name, _) in component.component_type().exports(&engine) {
+        if name.contains("agent-loop") {
+            has_loop = true;
+        }
+        if name.contains("plugin-api") {
+            has_plugin = true;
+        }
+    }
+    if has_loop {
+        return ComponentKind::Loop;
+    }
+    if has_plugin {
+        return ComponentKind::Plugin;
+    }
+    ComponentKind::Unknown
+}

@@ -4,5 +4,4 @@
     services: [sessions, tools, llm]
 - id: loop
   name: echo-loop
-  config:
-    wasm: echo-loop
+

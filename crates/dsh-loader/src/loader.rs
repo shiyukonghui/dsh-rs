@@ -706,6 +706,11 @@ impl Loader {
         entry_disabled(&self.state.borrow(), id, &self.ctx)
     }
 
+    /// 插件仓库是否已注册该名（装配层判别「内置/host 已注册」vs「文件夹包」用）。
+    pub fn has_plugin(&self, name: &str) -> bool {
+        self.state.borrow().plugins.contains_key(name)
+    }
+
     pub fn entries(&self) -> Vec<EntrySnapshot> {
         let st = self.state.borrow();
         let mut list: Vec<EntrySnapshot> = st

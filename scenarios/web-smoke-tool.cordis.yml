@@ -4,5 +4,4 @@
     services: [sessions, tools, llm]
 - id: loop
   name: tool-loop
-  config:
-    wasm: tool-loop
+
