@@ -50,6 +50,10 @@
 
 ## 6. 验收标准（阶段关卡）
 
+> 更新（D-169/D-170）：编码期实测 `status:p:Loading:Active` 落点 = DIV-nested-2（mount
+> 时序），用户裁决扩口径到 **B（mount 时序）**；验收标准 1 已按 B 达成——`loader-25`（3 层嵌套
+> + isolate 边界 + Pending-only 组）**字节级 PASS**（verify-diff 26/26），详见 design.md §5b/5c。
+
 1. 新增/恢复嵌套组 golden（≥1，含 isolate 边界与 Pending-only 组）在 verify-diff 字节级 PASS。
 2. `cargo test --workspace` 0 失败；`cargo clippy -- ---D warnings` 0；既有 25 golden 全绿。
 3. M27/M28 修复点有明确 DECISIONS 条目与回滚点；DIV-A4-5 边界保持文档化不受影响。

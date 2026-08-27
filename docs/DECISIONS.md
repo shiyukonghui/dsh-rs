@@ -7298,6 +7298,61 @@ Finish 不保证偏序 → probe-nested-finish（3 组）中 Pending-only 组中
 **阶段结论**：工件 `.spec/group-nested-async/design.md` 定稿 → 阶段 3（TDD 编码）。
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
 
+## D-169（M27/M28 编码实现 B 口径：顺延法 deferred-await 解决 DIV-nested-2 + loader-25）
+
+**日期**：2026-08-27
+
+**触发问题**：编码期实测（loader-25，3 次稳定）M28 后组 finish 已对齐，**唯一**剩余偏差 =
+`status:p:Loading:Active` 落点：Rust 在 `plugin:c`/`plugin:b`（孙辈注册）后、cordis 在前 →
+DIV-nested-2（mount 时序）。当晚用户问询时提供 A（按设计回退）与 B（扩口径 mount 时序）二选一；
+**用户裁决 = B**。
+
+**机制（研读 vendored cordis src）**：cordis 组子入口 `create()` = `entry.update → init →
+import → _start(registry.plugin → fiber 构造: internal/plugin → _refresh → _reload) →
+fiber.await()`——import+构造+reload 的多 hop（≥3 微任务）使**扁平子 Active（~2 hop）抢在组兄弟
+孙辈注册（≥3 hop）之前**；Rust `drive_async_loads` 在 `Apply(gInner)` 内联注册孙辈 → 提前 hop。
+
+**实现（顺延法，最小 core 变更）**：
+- `AsyncTask::Await(FiberId)` 变体 + `Runtime.pending_awaits: HashMap<FiberId,
+  LocalBoxFuture<EffectOutcome>>` 暂存 `EffectOutcome::Await` future。
+- drive `Apply` 臂遇 Await：**不内联 `fut.await`**；标记 `await_children`、存 future、入队
+  `Await(fid)`。新 `Await(fid)` 臂：yield → 取出 `fut.await`（子/孙入口注册在此发生）→
+  `pop_current` → collect → 入队 `Finish`。
+- **current 栈修复**（顺延的必要配套）：延迟窗口内多个组 apply 都留在 `current`（push 序），
+  Await 任务 FIFO 执行时栈顶未必本组 → 子入口 `parent` 误挂兄弟组（其 isolate 遮 svc → 消费方
+  永久 Pending）；Await 臂执行前 `retain != fid + push(fid)` 抬顶、运行毕 `retain != fid`。
+- `should_wait.queued_plain` match 增 `Await(_) => false`（不计数；组 finish 由①Loading 后裔 +
+  ②普通任务排队保住批次）。
+- 效果：孙辈注册晚一个队列 hop → loader-25 字节对齐；flat（loader-10）不变；m28 C1/C2 保持。
+
+**验证**：红（回退 context.rs → m28 C1 FAIL）→ 绿；loader-25 字节逐行一致（21 行）；
+`cargo test --workspace` EXIT=0；`clippy -D warnings` 0；`verify-diff.mjs` **26/26**
+（25 旧零回归 + loader-25）；serve 冒烟 HTTP 200/13270（基线一致）。
+
+**预期影响与回滚点**：改动集中在 dsh-core 异步装载驱动 Await 处理 + loader 组路径；golden
+26/26 + m-series 全绿锁定。回滚 = 撤销 `AsyncTask::Await` 变体 + `pending_awaits` + drive Await
+臂与 current 顶抬（复现 D-168 状态）；m28 C1/C2 不依赖 hop 结构，回滚后仍绿；loader-25 golden
+与 verify-diff 登记随回滚移除。
+
+## D-170（M27/M28 验收过闸：B 口径达成，目标段闭环）
+
+**日期**：2026-08-27
+
+**阶段结论**：M27/M28（group 嵌套异步时序，B 口径 mount 时序）**闭环**：
+D-167（需求，用户确认起点= M27/M28）→ D-168（设计，Finish 批次+A 划界）→ 编码实测定位
+DIV-nested-2 → **用户裁决 B** → D-169（编码：顺延法 + current 修复 + loader-25 字节 golden）→
+D-170（本验收）。验收标准全部达成：loader-25（3 层嵌套 + isolate + Pending-only）字节级 PASS、
+旧 25 golden 零回归（verify-diff 26/26）、cargo test 0 失败、clippy 0、serve 200/13270。
+验收工件 `.spec/group-nested-async/acceptance.md`；requirements §6 记录 B 口径更新。
+
+**诚实边界**：顺延法给「组子入口创建」统一加一个 hop；更复杂批内形态（多组兄弟互依、
+>3 层少分支深链）与 cordis 精确微任务序的逐字节一致性仅由现有 26 golden + m28 语义锁定，
+未测试形态不背书。卸载/更新/HMR 路径不受 load 顺延影响（loader-24/m15/m16/m18 全绿）。
+DIV-A4-5（disposer 并发）保持文档化、未触碰。
+
+**预期影响与回滚点**：见 D-169 回滚点。下一步候选（beyond 目标剩余项）：A2 收口复查 /
+harness FIXME（插件文件→name 解析）。
+
 
 
 
