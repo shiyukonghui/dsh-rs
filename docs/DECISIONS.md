@@ -7273,6 +7273,31 @@ FIXME（插件文件→name 解析），从更底层的任务做起」（goal-68
 **阶段结论**：需求工件 `.spec/group-nested-async/requirements.md` 定稿 → 阶段 2（系统设计）。
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
 
+## D-168（M27/M28 系统设计过闸：Finish 时序批次规则 + m28 + 划界）
+
+**日期**：2026-08-27
+
+**触发问题**：D-167 需求确认后进入阶段 2（设计）。
+
+**S1 实证（三探针 + fork 源码）**：cordis `Group = async* [Service.init]` 的 inertia 挂在其
+`await update(children)`（`Promise.allSettled(children.create)`）上 → **偏序：父组 finish 晚于
+全部后裔 settle**；Rust `await_children`（context.rs Finish 臂）只查 Loading 后裔、独立入队
+Finish 不保证偏序 → probe-nested-finish（3 组）中 Pending-only 组中途出队。排除
+`associate:'loader'`（仅为 proxy 转发，非激活门）。已实证 2 层嵌套/隔离探针的组位置双侧一致。
+
+**S2 设计**：Finish 臂 `should_wait` 扩展——组延迟条件 = ①Loading 后裔（现行）OR ②批内存在
+普通 fiber（await_children=false）的排队 Apply/Finish 任务。②使 Pending-only 组纳入批次末尾
+（C1 G>L），@仅组延迟、普通任务必然排空 → **无死锁**；不动 notify/disposer/unload/sync 路径。
+
+**划界**：DIV-nested-1（Pending-only 提前 finish → ②修复）；DIV-nested-2（mount 时序两阶段
+= 装载调度非 Finish，B 口径预留）；DIV-A4-5（disposer 并发）不动。
+
+**实现顺序（TDD）**：m28 红（3 层嵌套+隔离；末态 + G>L 不变量 via take_trace）→ Finish 臂② →
+绿 + 全回归 + 尝试嵌套 golden。
+
+**阶段结论**：工件 `.spec/group-nested-async/design.md` 定稿 → 阶段 3（TDD 编码）。
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
+
 
 
 
