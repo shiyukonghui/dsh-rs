@@ -7353,6 +7353,64 @@ DIV-A4-5（disposer 并发）保持文档化、未触碰。
 **预期影响与回滚点**：见 D-169 回滚点。下一步候选（beyond 目标剩余项）：A2 收口复查 /
 harness FIXME（插件文件→name 解析）。
 
+## D-171（A2 收口复查 需求+设计过闸：三缺口实证 + F1-F4 修复设计）
+
+**日期**：2026-08-27
+
+**触发问题**：M27/M28 闭环后，beyond 目标剩余两项（A2 收口复查 / harness FIXME）；经自下而上
+比对 A2（loader 层）较 harness FIXME（顶层装配）更底层；**用户确认 next_task=A2 收口复查、
+fix_or_record=A 修复＋测试锁定**。工件 `.spec/a2-closure-review/requirements.md`。
+
+**探针取证**：
+- P1（红）：provider Active + 消费方 `disabled_expr` 引用注入服务 → 顶层 create 无 current fiber
+  → 服务不可见 → fail-closed **误禁用**（`P1 snapshot=[]`）。fork 在 loader ctx 根化的 entry
+  扩展 Context 求值则可见。
+- P2（绿=既有锁定）：`interpolate` **原子**——任一 `__jsExpr` 失败整树保留原 config。
+- fork 对照（index.ts:117-123）：`internal/plugin` 时 `Inject.resolve(fiber.entry.options.inject,
+  fiber.inject)` **合并 entry 级 inject**；Rust `load_plugin` 未合并（entry.rs 注释未实现）。
+
+**修复设计（F1-F4）**：F1 `Cordis::get_value_from(ctx_fiber,name)`（指定上下文解析 Value 服务）；
+F2 `fiber_service_ctx` 值改**目标视图**（同 fid，修 DIV-6-2 '调用方可见≠目标可见' 错位）；
+F3 `entry_disabled` 绑**入口上下文**（entry inject ∪ 插件 inject × loader 根 realm，显式键优先、
+未知仍 fail-closed）；F4 `Runtime.pending_entry_inject` 并入 fiber inject（load/group_load 三径同填）。
+
+**预期影响与回滚点**：见 D-172。工件 design.md 定稿 → 阶段 3（TDD 编码）。
+
+## D-172（A2 收口复查 编码落定：F1-F4 红→绿 + m29 锁点）
+
+**日期**：2026-08-27
+
+**关键实现（TDD）**：F1 `get_value_from`（context.rs，Public，resolve_impl+Value downcast，不经
+internal/get 拦截=决策快照，DIV 记录）；F2 `fiber_service_ctx` 值解析 `get_value_from(fid,n)`；
+F3 `entry_disabled` 绑入口上下文 + `entry_inject_names` helper；F4 `pending_entry_inject` 字段
+（runtime.rs）+ register_plugin 并入 + `load_plugin`/`load_group_plugin`/`load_group_plugin_async`
+填值。锁点 **m29_a2_review 4/4**：T-L1 disabled 入口上下文 / T-L2 interpolate 原子性（既有锁定）/
+T-L3 目标 realm 服务（隔离组读本地 svc） / T-L4 entry.inject 合并。
+
+**红验证（stash 回退 F1-F4）**：T-L1/T-L3/T-L4 FAIL、T-L2 ok → 恢复全绿（三个缺口各由测试驱动）。
+
+**阶段 4 验证**：`cargo test --workspace` EXIT=0（210 ok 块）；`cargo clippy ... -D warnings` 0；
+`verify-diff.mjs` **26/26**（golden 无 `!!js` → 零回归）；serve 冒烟 HTTP 200/13270。
+
+**预期影响与回滚点**：行为修正：① disabled 引用可见服务不再误禁用（此前 fail-closed 误禁）；
+② entry 声明 inject 现参与门控（fork 行为；无 inject 声明者不受影响）。回滚 = `git revert` 本提交
+（F1-F4 整体）；m29 锁点随撤；m21/m3/26 golden 与修复前基线不受影响。
+
+## D-173（A2 收口复查 验收过闸：复核报告 + 全回归闭环）
+
+**日期**：2026-08-27
+
+**阶段结论**：A2 收口复查**闭环**。D-171（需求+设计，用户确认任务与 A 口径）→ D-172（编码 F1-F4 +
+m29 红→绿）→ D-173（本验收）。复核报告（acceptance.md）：V1 语义保真（scope 键集/原子性）✓ ；
+V2 两缺口修复（disabled 入口上下文、目标视图）✓；V3' 缺口③（entry.inject 合并）✓；V4 全回归零
+破坏。证据：m29 4/4（红→绿 3 项 + 既有锁定 1）、workspace 0 失败、clippy 0、verify-diff 26/26、
+serve 200/13270。
+
+**诚实边界**：disabled/插值值解析不经 internal/get 拦截（决策/插值快照，DIV 记录）；非 Value 服务
+仍不暴露（DIV-6-1）；未重评 agent-presets/standing/combo 的 row_disabled（非 loader A2 面）。
+
+**下一步候选（beyond 目标剩余项）**：harness FIXME（插件文件→name 解析，顶层装配，独立立项）。
+
 
 
 
