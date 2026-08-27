@@ -918,6 +918,12 @@ impl Loader {
             loader: self.clone(),
             entry_id: id.to_string(),
         });
+        // A4：group 入口自身的 isolate/intercept 应用到 Group fiber（与 load_plugin 同径）
+        // ——否则嵌套组/顶层组的隔离边界不生效，注入 walk 越过边界解析到祖先 realm。
+        let isolate_map = self.entry_isolate_map(id);
+        if !isolate_map.is_empty() {
+            self.ctx.with(|rt| rt.pending_isolate = isolate_map);
+        }
         self.ctx.with(|rt| rt.pending_entry = Some(id.to_string()));
         let fid = self.ctx.plugin_arc(plugin, config)?;
         {
@@ -961,6 +967,39 @@ impl Loader {
             }
         }
         None
+    }
+
+    /// 解析 entry 的 isolate 选项为作用域映射（本地 realm `{entry}:{svc}` / 全局 realm
+    /// `label → {svc: scope}`）。与 `load_plugin` 的挂载前隔离逻辑一致；A4 供 group 入口复用。
+    fn entry_isolate_map(&self, id: &str) -> HashMap<String, ScopeId> {
+        let isolate_opts = {
+            let st = self.state.borrow();
+            st.entries
+                .get(id)
+                .map(|e| e.options.isolate.clone())
+                .unwrap_or_default()
+        };
+        let mut st = self.state.borrow_mut();
+        let mut iso = HashMap::new();
+        for (sname, spec) in &isolate_opts {
+            let scope = match spec {
+                Value::Bool(true) => {
+                    let key = format!("{id}:{sname}");
+                    *st.local_realms.entry(key).or_insert_with(|| {
+                        self.ctx.with(|rt| rt.alloc_scope())
+                    })
+                }
+                Value::String(label) => {
+                    let realms = st.global_realms.entry(label.clone()).or_default();
+                    *realms.entry(sname.clone()).or_insert_with(|| {
+                        self.ctx.with(|rt| rt.alloc_scope())
+                    })
+                }
+                _ => continue,
+            };
+            iso.insert(sname.clone(), scope);
+        }
+        iso
     }
 
     /// 加载插件：pending_entry/isolate/intercept → plugin_arc → 关联 fiber。
@@ -1592,6 +1631,11 @@ impl Loader {
             loader: self.clone(),
             entry_id: id.to_string(),
         });
+        // A4：group 入口 isolate 应用到 Group fiber（async 同径）
+        let isolate_map = self.entry_isolate_map(id);
+        if !isolate_map.is_empty() {
+            self.ctx.with(|rt| rt.pending_isolate = isolate_map);
+        }
         self.ctx.with(|rt| rt.pending_entry = Some(id.to_string()));
         let fid = self.ctx.plugin_arc_async(plugin, config).await?;
         {

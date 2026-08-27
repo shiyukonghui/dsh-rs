@@ -1,0 +1,19 @@
+{
+  "name": "loader-24-reload-store-snapshot",
+  "plugins": {
+    "provider": {
+      "name": "provider",
+      "apply": [
+        { "op": "log-config" },
+        { "op": "dispose-check", "service": "svc" },
+        { "op": "provide", "service": "svc", "value": "v1" }
+      ]
+    }
+  },
+  "steps": [
+    { "op": "loader-sync", "entries": [
+      { "id": "p1", "name": "provider", "config": { "v": 1 } }
+    ] },
+    { "op": "loader-update", "id": "p1", "options": { "id": "p1", "name": "provider", "config": { "v": 2 } } }
+  ]
+}

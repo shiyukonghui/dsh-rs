@@ -1,0 +1,17 @@
+loader-sync:[{"config":{"v":1},"id":"p1","name":"provider"}]
+plugin:provider
+status:provider:Pending:Loading
+apply:provider
+log-config:{"v":1}
+dispose-check-reg:svc
+provide:svc:"v1"
+status:provider:Loading:Active
+loader-update:p1:{"config":{"v":2},"id":"p1","name":"provider"}
+status:provider:Active:Unloading
+dispose-check:svc:null
+status:provider:Unloading:Loading
+apply:provider
+log-config:{"v":2}
+dispose-check-reg:svc
+provide:svc:"v1"
+status:provider:Loading:Active

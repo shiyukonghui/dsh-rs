@@ -42,6 +42,15 @@ function buildPlugin(desc, trace) {
           trace.push(`provide:${op.service}:${JSON.stringify(op.value)}`)
           ctx.provide(op.service, op.value)
           break
+        case 'dispose-check':
+          // A4：卸载期自访问探针——op 位置注册 disposer；卸载逆序时读服务（非 strict）。
+          trace.push(`dispose-check-reg:${op.service}`)
+          ctx.fiber.effect(() => () => {
+            let v = null
+            try { v = ctx.reflect.get(op.service, false) ?? null } catch { v = null }
+            trace.push(`dispose-check:${op.service}:${JSON.stringify(v)}`)
+          })
+          break
         default:
           throw new Error(`unknown apply op ${op.op}`)
       }

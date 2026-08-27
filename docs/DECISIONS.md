@@ -7177,6 +7177,36 @@ DIV-HMR-1..3（retained 策略 / 无文件 watch / 薄封装）。
 **阶段结论**：需求/设计工件 `.spec/plugin-hmr/{requirements,design}.md` 定稿 → 编码。
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
 
+## D-163（A4 编码实现：DSL dispose-check + golden 22/24 + 组 isolate 修复 + m27 三断言）
+
+**日期**：2026-08-27
+
+**触发问题**：A4 设计（D-161）实施；TDD 红→绿。
+
+**关键实现与发现**：
+- `dispose-check` op 双侧（loader-host.mjs / dsh-diff ApplyOp::DisposeCheck）：**非 strict** 读取
+  （TS `ctx.reflect.get(svc,false)` ↔ Rust `ctx.get`）判别「disposer 运行在 provide-remove 前/后」；
+  经 `ctx.effect`/`fiber.effect` 在 op 位置注册、卸载逆序运行。
+- **loader-22 unprovide-self-access**（11 行）与 **loader-24 reload-store-snapshot**（17 行）golden
+  字节一致（25/25 PASS）。loader-24 修正两处：update options 须带 id/name（dsh-diff 归一化为全量
+  的既有约定，loader-12 亦然）；provider 单独 reload 以剔除依赖方完成与自清的交错。
+- **发现并修复真实偏差**：Rust loader 从未应用 group 入口的 `isolate`（load_group_plugin 不设
+  pending_isolate）——m3_isolate / loader-15 的兄弟节点无自身 isolate 致两路皆 Active、无法分辨；
+  新 golden 探针（嵌套 gIso 边界 b1）首次暴露。修复：新增 `entry_isolate_map` helper，
+  sync+async load_group_plugin 应用组 isolate（DIV-A4-4 记录）。m27 T2 锁定。
+- **异步交错边界**（DIV-A4-5）：cordis `_unload` 走 `Promise.all`**并发** disposers（每 disposer 先
+  `await Promise.resolve()`），Rust 顺序逆序（依赖方完整 settle 后才自清）。语义上 Rust ⊇ cordis
+  （notify 先于自清、端态一致均成立），但 `consumer Unloading:Pending` 与 `dispose-check` 的相对
+  行序不可字节对齐。**决策**：不改全局 disposer 调度（危及 20+ goldens）；golden 收窄剔除该窗口；
+  唤醒顺序改由 m27 T1（确定性：consumer-unloading 先于 provider-later）承担。
+- **m27_a4**（3 断言全绿）：T1 唤醒顺序+自访问 absent；T2 组 isolate 边界+3 层 walk；T3 就地
+  reload 身份不变+新配置可见+依赖方重解析。
+
+**验证**：cargo test --workspace 209 目标 0 失败；clippy 0；verify-diff 25/25。
+**阶段结论**：A4 编码完成 → 验收（阶段 4→5）。
+**预期影响与回滚点**：`entry_isolate_map` 使 group 入口 isolate 真正生效（行为修正；既有
+goldens 不受影响——loader-15 路径两路等价已验证）；回滚 = revert 本提交（连同 loader.rs 修复）。
+
 
 
 

@@ -107,6 +107,11 @@ pub enum ApplyOp {
         #[serde(default)]
         check: Option<bool>,
     },
+    /// A4：卸载期自访问探针——在 apply 序列**该 op 位置**注册一个 disposer；卸载时（逆序）
+    /// 读取服务并记录 `dispose-check:{service}:{json(value) ?? null}`。读取**非 strict**
+    /// （AS 侧某 `reflect.get(service, false)`）：提供者状态不影响，仅按 impl 在场与否判别
+    /// 「dispose-check 运行在 provide-disposer（remove）前/后」。注册时 `dispose-check-reg:{service}`。
+    DisposeCheck { service: String },
     /// 注册 intercept：`intercept:{service}:{json(config)}`。
     Intercept {
         service: String,
@@ -694,6 +699,31 @@ impl ScenarioPlugin {
                     ctx.provide(&service, Arc::new(value))?
                 };
                 // 提供 disposer 可被 `dispose-effect` 定向（A4a：unprovide 而 fiber 不卸载）。
+                disposers.push(disposer);
+            }
+            ApplyOp::DisposeCheck { service } => {
+                let svc = service.clone();
+                self.push(ctx, &format!("dispose-check-reg:{svc}"));
+                // AS：卸载逆序——本 op 位置决定 dispose-check disposer 相对 provide-disposer
+                // 的运行先后。读取非 strict（`ctx.get`）：仅按 impl 在场与否出值。
+                let disposer = ctx.effect(
+                    "scenario-dispose-check",
+                    Box::new(move |_ctx| {
+                        let svc = svc.clone();
+                        Ok(EffectOutcome::One(Rc::new(move |ctx| {
+                            let value_str = ctx
+                                .get(&svc)
+                                .and_then(|v| {
+                                    v.downcast::<serde_json::Value>()
+                                        .ok()
+                                        .map(|x| (*x).clone())
+                                })
+                                .and_then(|v| serde_json::to_string(&v).ok())
+                                .unwrap_or_else(|| "null".to_string());
+                            ctx.with(|rt| rt.trace.push(format!("dispose-check:{svc}:{value_str}")));
+                        })))
+                    }),
+                )?;
                 disposers.push(disposer);
             }
             ApplyOp::Intercept { service, config } => {
