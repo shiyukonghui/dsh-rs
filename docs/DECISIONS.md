@@ -7137,6 +7137,46 @@ case-7）。对照 T2 复锁站部语义。DIV-A1-1..3（多实现宿主层 / m-
 **预期影响与回滚点**：beyond 目标 A1 验收完成。回滚 = `git revert e169ef3` + 撤 D-158/160 工件提交。
 下一步候选：A4（注入快照/unprovide 顺序/父链 walk）/ A6 已闭环 / B4 已闭环——由用户指派优先级。
 
+## D-161（beyond 目标 Phase A4 需求+设计定稿：注入快照 / unprovide 唤醒顺序 / 父链 walk 收口）
+
+**日期**：2026-08-27
+
+**触发问题**：目标「分别完成A4和更完整 HMR」→ A4 需求分析（方法论二）。
+
+**自下而上核对（源码实证）**：① unprovide 顺序——cordis provide disposer = 删 impl → notify
+（await 依赖方）→ **最后**删自身 fiber.store（reflect.ts:297-303）；Rust provide_with disposer =
+remove_impl + notify + transitions（context.rs:1436-1445）。「stale 自访问窗口」仅存于 provide disposer
+异步体内、后续 disposer 串行运行在其后 → observable 契约 = notify 先于后续 disposer + 端态
+ctx.get→None。② 父链 walk——Rust resolve_scope 沿父链查 isolate（runtime.rs:307-321），loader-15
+已锁跨 realm。③ reload 快照——cordis fiber.ts:647 `store={..._store}`。
+
+**用户确认 Q1=B：m27 + TS golden**。收敛：A4 = 扩 loader-host/dsh-diff DSL 新 op `dispose-check`
+（op 位置注册 disposer、卸载 trace `dispose-check:svc:{JSON(get)}`，双侧同构，收集逆序 fiber.rs:132-164）
+→ 3 新 golden（G1 unprovide 唤醒排序 / G2 walk 3 层边界 / G3 reload 快照）+ m27 三断言；仅实测偏差
+才对齐（DIV-A4-1 sta 窗口不可达，不做 per-fiber store 回退）。
+
+**阶段结论**：需求/设计工件 `.spec/service-assembly-a4/{requirements,design}.md` 定稿 → 编码
+（DSL→goldens→m27）。
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
+
+## D-162（beyond 目标 Phase HMR 需求+设计定稿：宿主侧插件模块热更 + 删除后 entry 处置）
+
+**日期**：2026-08-27
+
+**触发问题**：目标「更完整 HMR」——replace/remove_plugin 仅测试调用（无生产调用者）。
+
+**需求收敛（用户确认 Q2=A）**：host 插件模块 HMR 接入 + entry 处置策略 + 集成测试。删除后策略选
+**保留但 inert**（cordis delete 同径：不动 entry.options、不自禁用；可再注册 revive 或显式 remove）。
+非目标：插件文件 watcher / specifier→Arc 解析（harness 层 FIXME）。
+
+**设计收敛（阶段 2）**：`Loader::sync_plugin(name, PluginEvent{Register|Replace|Delete}) ->
+PluginSyncOutcome{reloaded, disposed, retained}`（薄封装委托 register_plugin / replace_plugin /
+remove_plugin）；e2e 测试 m27_hmr_host 序列（Register/Replace/Delete/Revive）；文档化契约 +
+DIV-HMR-1..3（retained 策略 / 无文件 watch / 薄封装）。
+
+**阶段结论**：需求/设计工件 `.spec/plugin-hmr/{requirements,design}.md` 定稿 → 编码。
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
+
 
 
 
