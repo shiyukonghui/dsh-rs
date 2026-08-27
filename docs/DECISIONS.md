@@ -7411,6 +7411,69 @@ serve 200/13270。
 
 **下一步候选（beyond 目标剩余项）**：harness FIXME（插件文件→name 解析，顶层装配，独立立项）。
 
+## D-174（harness FIXME 需求+设计过闸：插件包=文件夹 模型重构 + Q1-Q4 用户确认）
+
+**日期**：2026-08-27
+
+**触发问题**：beyond 目标最后一项 harness FIXME（插件文件→注册名解析）。用户先要源码对照
+（真实 deepseek-harness 如何加载/区分插件）再决策；经研究真实 `Tree.import(name)`
+（cordis/packages/loader/src/config/tree.ts:103-120：`cordis:`→builtins 表，否则 Node 原生
+import——`./rel` 相对 baseUrl、包名走 node_modules）+ 真实 examples/headless-agent/cordis.yml
+（`name: '@deepseek-ai/dsh-...'` 或 `./file.mjs`；有 `!!js` disabled/config——即我们 A2 eval_scope
+镜像），结论：真实 harness **name 即模块 specifier，无 wasm/world/类型判别**，插件凭服务自我
+描述运行。
+
+**用户重构**：否决 A/B/C 三选一，定向「插件=一个文件夹，内含 wasm 组件 + 前端组件；文件夹名=
+插件注册名」；随后确认四项决策（全部推荐项）：
+- D1 布局：`plugin.json` 清单声明（wasm/web/caps/world 可选）+ 构建目录约定回退；
+- D2 前端：静态资源目录挂接（`/plugins/<name>/**`，包 web 目录）；
+- D3 范围：Rust 侧（folder→wasm 注册 + serve 挂接 + 测试）；web GUI 消费侧留后续；
+- D4 loop：name=folder + **world 判别**（预检组件导出接口：`plugin-api`→Component、
+  `agent-loop`→Loop）为唯一路径，**移除 config.wasm 特判**，web-cordis.yml 迁移。
+
+**设计要点**：world 判别 = wasmtime 34 `types::Component::exports()` 遍历导出名（ABI 事实）；
+registry（内置/host）优先于包解析；turn loop = 首个 dsh-loop 包（config 序）；boot 与 HMR
+refresh 共用 `assemble_plugin_packages` helper（换 loop = 换 `name` 指向另一包）。
+
+**预期影响与回滚点**：见 D-175。工件 `.spec/plugin-file-resolve/{requirements,design}.md`。
+
+## D-175（harness FIXME 编码落定：文件夹包装配 + world 判别 + web 挂接，TDD 红→绿）
+
+**日期**：2026-08-27
+
+**关键实现**：wasmrt `detect_component_kind`/`ComponentKind`（lib/component.rs 导出名预检；
+m30_plugin_kind 3/3：echo-loop→Loop、hello-component→Plugin、非法→Unknown）；loader
+`has_plugin`；cli `plugin_pkg.rs`（`resolve_package` 清单+回退、`effective_caps` 优先级）
++ 5 单元测试；lib.rs `assemble_plugin_packages`（boot/refresh 共用；移除 load_component 死代码）
++ `Boot.packages`；web.rs `/plugins/<name>/**` 静态分支（`serve_package_asset`）；迁移
+web-cordis.yml/web-smoke*.yml 与 m9_boot/m9_yaml_assemble 的 config.wasm 形态
+（manifest 测试 → plugin.json 显式 wasm；swap 测试 → name 换包）。
+
+**TDD**：红验证（stash 实现）——`boot_assembles_wasm_component_package_sibling_to_loop`
+0/1 FAILED；恢复后全绿。锁点：m9_boot 23/23（含组件包装配+未知插件 fail-loud）、plugin_pkg 5/5、
+m30 3/3、web serve_package_asset 1/1。
+
+**预期影响与回滚点**：行为修正——① 插件从文件夹包按名解析（wasm+前端），`config.wasm` 键
+废除（死键，name=folder 优先生效）；② world 判别替代「config.wasm=loop」；③ `/plugins/<name>/**`
+前端静态挂接。回滚 = `git revert` 本提交（特征级）；旧 config.wasm 配置仍能被 name=folder 解析
+（兼容降级）。
+
+## D-176（harness FIXME 验收过闸：复核报告 + 全回归闭环，beyond 目标全部闭环）
+
+**日期**：2026-08-27
+
+**阶段结论**：harness FIXME **闭环** → beyond 目标 **全部完成**。D-174（需求+设计，源码对照 +
+Q1-Q4 用户确认）→ D-175（编码 TDD）→ D-176（本验收）。S1 文件夹解析 / S2 loop 统一 / S3 前端
+挂接 / S4 回归全绿，工件 `.spec/plugin-file-resolve/acceptance.md`。
+
+**证据**：workspace 0 失败；clippy 0；verify-diff 26/26（golden 数据面未触）；serve 冒烟
+200/13270（web-cordis.yml 纯 folder 形态）。
+
+**诚实边界**：前端组件以静态目录挂接（D2=a），GUI 消费侧留后续（D3）；不做插件文件 watch
+（HMR 显式 refresh 重解析）；`plugin.json` 为包级清单非 loader 全局 schema。
+
+**目标收尾**：objective 的 M27/M28、A2 收口复查、harness FIXME 三项全部完成。
+
 
 
 
