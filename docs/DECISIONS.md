@@ -7092,6 +7092,29 @@ DECISIONS 补文档化偏差（DIV-A1-1 一名一实现顺序换代/同名多实
 （m26 红→remove_plugin 绿）。
 **预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；编码各自独立可回。
 
+## D-159（beyond 目标 Phase A1 编码落定：remove_plugin + m26 红→绿 + 文档化偏差）
+
+**日期**：2026-08-27
+
+**触发问题**：D-158 关闸通过 → 阶段 3（TDD 编码）。
+
+**关键实现（红→绿）**：
+- **S1**：`Loader::remove_plugin(name) -> Result<usize, CordisError>`——先 `rt.registry.remove(name)`
+  取该名存活 fibers + `st.plugins.remove(name)`，**后**逐 fid `ctx.unload`（顺序不变量：先删记录后
+  unload，fiber dispose 的 `internal/plugin(dispose)` 经 seven_case case-4 `registry.contains_key`
+  =假 → 合法 Continue，entry 不自禁用、无 `disable:` 写回）。未注册名 → Ok(0) 幂等。
+- **S2（m26，3 测 / 红→绿）**：T1 `remove_plugin("p")` → 返回 1（一存活 fiber）、entry 不 disabled、
+  无 `disable:a` 写回、`plugin_identity("p")` None；T2（对照）插件仍注册时 `ctx.unload` →
+  case-7 entry disabled + `disable:a` 写回（既有语义复锁）；T3 ghost → Ok(0) 无副作用。
+  红 = `no method named remove_plugin`；绿 = 3/3。
+- **S3**：identity.rs 模块 doc 补 A1 文档化偏差声明（DIV-A1-1：平名单记录 + 宿主层多实现消解；
+  case-4 经 remove_plugin 触发，m26 锁定）。
+
+**阶段 4 验证**：`cargo test --workspace` EXIT=0（**206 目标 0 失败**，205 + m26）；clippy -D warnings
+0；verify-diff **23/23**（replace/HMR/m16/m18 零回归）。
+
+**预期影响与回滚点**：回滚 = `git revert` 本提交。待阶段 5（serve 冒烟 + acceptance + D-160）。
+
 
 
 

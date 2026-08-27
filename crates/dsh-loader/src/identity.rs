@@ -4,6 +4,14 @@
 //! HMR/case-4 依赖此判定）。Rust 等价物 = 每注册铸一个 `Arc<()>` token（指针身份，同
 //! dsh-scope `ScopeKey` 的 Arc 身份纪律）：`register_plugin` 以 Arc 指针相等判定
 //! 「同名同实现 = 同身份（幂等）/ 同名新实现 = 新身份（换代）」。
+//!
+//! # A1 文档化偏差（DIV-A1-1，用户确认 2026-08-27）
+//!
+//! 注册表保持「名字 → 当前实现」的**平名单记录**形态（顺序换代），而非 (来源, name)+版本 多实现
+//! 键——dsh-rs 是**宿主-owned 注册表**：同名多实现**同时共存**由宿主在 import/装配层消解（一名一
+//! 当前实现）。case-4（模块消失 → self-dispose 合法、entry 不自禁用）经
+//! [`Loader::remove_plugin`]（cordis `registry.delete` 同径：先删记录后 dispose 存活 fiber）触发
+//! 并已由 m26 锁定。
 
 use std::sync::Arc;
 

@@ -482,6 +482,26 @@ impl Loader {
         }
     }
 
+    /// A1 收口：删除插件实现（cordis `registry.delete(plugin)`）。
+    ///
+    /// 顺序不变量：**先**从 core registry 与 loader 记录移除、**后** dispose 该名所有存活
+    /// fiber——fiber dispose 触发的 `internal/plugin(dispose)` 经 seven_case case-4
+    /// （`registry.contains_key(name)` 已假）判为**模块消失 → 合法**：entry 不自禁用、
+    /// 无 `disable:` 写回。未注册 name → `Ok(0)`（幂等）。
+    pub fn remove_plugin(&self, name: &str) -> Result<usize, CordisError> {
+        let fibers: Vec<FiberId> = self.ctx.with(|rt| {
+            match rt.registry.remove(name) {
+                Some(rec) => rec.fibers.clone(),
+                None => Vec::new(),
+            }
+        });
+        self.state.borrow_mut().plugins.remove(name);
+        for fid in fibers.clone() {
+            let _ = self.ctx.unload(fid);
+        }
+        Ok(fibers.len())
+    }
+
     // ---- 热更（B3：插件实现级 replace/reload） ----
 
     /// B3 HMR 模块热更：把 name 的实现换成新实现（A1 身份换代）→ 以**旧身份**加载的
