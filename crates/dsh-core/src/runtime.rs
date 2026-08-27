@@ -141,6 +141,9 @@ pub struct Runtime {
     pub current: Vec<FiberId>,
     /// 挂载入口时待赋给下一个新 fiber 的 loader entry id（M2）。
     pub pending_entry: Option<String>,
+    /// A2 收口（D-171）：挂载入口时待并入下个 fiber 的 entry 声明注入服务名
+    /// （`entry.options.inject`；fork `internal/plugin` 的 `Inject.resolve(...)` 同径）。
+    pub pending_entry_inject: Vec<String>,
     /// 挂载入口时待注入新 fiber 的服务隔离映射（M3 isolate）。
     pub pending_isolate: HashMap<String, ScopeId>,
     /// K1/C：待取用的挂载作用域队列（FIFO）。`mount_scope` 压入一个新 agent
@@ -193,6 +196,7 @@ impl Runtime {
             registry: HashMap::new(),
             current: Vec::new(),
             pending_entry: None,
+            pending_entry_inject: Vec::new(),
             pending_isolate: HashMap::new(),
             pending_scope: std::collections::VecDeque::new(),
             pending_intercept: Vec::new(),
@@ -541,6 +545,14 @@ impl Runtime {
         for (n, _) in &own_cfgs {
             if !inject.iter().any(|x| x == n) {
                 inject.push(n.clone());
+            }
+        }
+        // A2 收口（D-171）：entry 声明注入服务并入 fiber inject（fork `internal/plugin` 的
+        // `Inject.resolve(fiber.entry.options.inject, fiber.inject)` 同径）——entry 级依赖
+        // 参与服务门控与 `!!js` 绑定。
+        for n in std::mem::take(&mut self.pending_entry_inject) {
+            if !inject.contains(&n) {
+                inject.push(n);
             }
         }
         let entry = self.pending_entry.take().or_else(|| {

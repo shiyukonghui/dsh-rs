@@ -1642,6 +1642,17 @@ impl Cordis {
         })
     }
 
+    /// A2 收口（D-171）：按**指定上下文**（而非 current_fiber）解析 Value 服务——
+    /// 目标视图解析（父链 + isolate），供 loader 绑目标纤维 / 入口决策上下文。
+    /// 与 `get_value` 同款 Value 暴露面（DIV-6-1，Value 服务才可读）；不经
+    /// `internal/get` 拦截（决策期取决策时刻快照，文档化为边界）。
+    pub fn get_value_from(&self, ctx_fiber: Option<FiberId>, name: &str) -> Option<Value> {
+        let impl_arc = self.with(|rt| rt.resolve_impl(name, ctx_fiber).map(|i| i.value.clone()));
+        impl_arc
+            .and_then(|a| a.downcast::<Value>().ok())
+            .map(|v| (*v).clone())
+    }
+
     /// 原始查表（不经拦截）：accessor 或 Value 服务（M43 inner）。
     fn get_raw_value(&self, name: &str) -> Option<Value> {
         // accessor 优先（clone 闭包，无借用调用——get 内可重入）

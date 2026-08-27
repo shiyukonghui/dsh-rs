@@ -103,7 +103,18 @@ fn entry_disabled(st: &LoaderState, id: &str, ctx: &Cordis) -> bool {
         }
         // `!!js` disabled 表达式（fail-closed：求值失败视为禁用）
         if let Some(expr) = expr {
-            let services = fiber_service_ctx(ctx, ctx.current_fiber());
+            // A2 收口（D-171）：disabled 绑**入口上下文**（fork `Entry.evaluate` 在 loader
+            // ctx 根化的扩展 Context 求值）——顶层 create 无 current fiber 时仍有根作用域
+            // 可见的注入服务可读（否则服务引用 fail-closed 误禁用）；值按 loader（根）realm
+            // 解析。显式键 config/process/env 优先；未知标识符仍 fail-closed（m3 语义保持）。
+            let loader_fid = st.loader_fiber;
+            let mut services = serde_json::Map::new();
+            for n in entry_inject_names(st, id) {
+                if let Some(v) = ctx.get_value_from(loader_fid, &n) {
+                    services.insert(n, v);
+                }
+            }
+            let services = Value::Object(services);
             let scope = eval_scope_with_services(&config, &dsh_eval::process_facade(), &services);
             let truthy = dsh_eval::evaluate(&scope, &expr)
                 .map(|v| dsh_eval::truthy(&v))
@@ -162,6 +173,9 @@ pub fn eval_scope_with_services(
 
 /// 取某纤维的注入服务上下文 `{ 注入名 → Value }`（A2；仅 Value 型服务，DIV-6-1）。
 /// `fid: None` = 空上下文（无纤维）。
+/// A2 收口（D-171）：名字与值都按**同一 fid 的目标视图**解析（`get_value_from(fid, …)`，
+/// 替代 current_fiber）——消除「名字取目标 inject、值按调用方 current 解析」的不一致
+/// （DIV-6-2 错位：调用方可见 ≠ 目标可见的隔离 realm 场景）。
 pub(crate) fn fiber_service_ctx(ctx: &Cordis, fid: Option<FiberId>) -> Value {
     let names: Vec<String> = ctx
         .with(|rt| {
@@ -171,11 +185,26 @@ pub(crate) fn fiber_service_ctx(ctx: &Cordis, fid: Option<FiberId>) -> Value {
         });
     let mut map = serde_json::Map::new();
     for n in &names {
-        if let Some(v) = ctx.get_value(n) {
+        if let Some(v) = ctx.get_value_from(fid, n) {
             map.insert(n.clone(), v);
         }
     }
     Value::Object(map)
+}
+
+/// A2 收口（D-171）：入口声明注入服务名单 = `entry.options.inject` ∪ 插件 `inject()`。
+/// disabled 决策期无 fiber 可用，据此绑定入口上下文（fork `Entry.evaluate` 同径）。
+fn entry_inject_names(st: &LoaderState, id: &str) -> Vec<String> {
+    let entry = st.entries.get(id);
+    let mut names: Vec<String> = entry
+        .map(|e| e.options.inject.clone())
+        .unwrap_or_default();
+    if let Some(rec) = entry.and_then(|e| st.plugins.get(&e.options.name)) {
+        names.extend(rec.plugin.inject().iter().map(|s| s.to_string()));
+    }
+    names.sort();
+    names.dedup();
+    names
 }
 
 impl Plugin for LoaderPlugin {
@@ -991,6 +1020,15 @@ impl Loader {
         if !isolate_map.is_empty() {
             self.ctx.with(|rt| rt.pending_isolate = isolate_map);
         }
+        // A2 收口（D-171）：group 入口声明注入服务并入 fiber inject（fork 同径）。
+        let entry_inject = {
+            let st = self.state.borrow();
+            st.entries
+                .get(id)
+                .map(|e| e.options.inject.clone())
+                .unwrap_or_default()
+        };
+        self.ctx.with(|rt| rt.pending_entry_inject = entry_inject);
         self.ctx.with(|rt| rt.pending_entry = Some(id.to_string()));
         let fid = self.ctx.plugin_arc(plugin, config)?;
         {
@@ -1129,6 +1167,17 @@ impl Loader {
         if !intercept_vec.is_empty() {
             self.ctx.with(|rt| rt.pending_intercept = intercept_vec);
         }
+
+        // A2 收口（D-171）：entry 声明注入服务并入 fiber inject（fork `internal/plugin`
+        // 的 `Inject.resolve(fiber.entry.options.inject, fiber.inject)` 同径）。
+        let entry_inject = {
+            let st = self.state.borrow();
+            st.entries
+                .get(id)
+                .map(|e| e.options.inject.clone())
+                .unwrap_or_default()
+        };
+        self.ctx.with(|rt| rt.pending_entry_inject = entry_inject);
 
         self.ctx.with(|rt| rt.pending_entry = Some(id.to_string()));
         let fid = self.ctx.plugin_arc(plugin, config)?;
@@ -1703,6 +1752,15 @@ impl Loader {
         if !isolate_map.is_empty() {
             self.ctx.with(|rt| rt.pending_isolate = isolate_map);
         }
+        // A2 收口（D-171）：group 入口声明注入并入 fiber inject（async 同径）。
+        let entry_inject = {
+            let st = self.state.borrow();
+            st.entries
+                .get(id)
+                .map(|e| e.options.inject.clone())
+                .unwrap_or_default()
+        };
+        self.ctx.with(|rt| rt.pending_entry_inject = entry_inject);
         self.ctx.with(|rt| rt.pending_entry = Some(id.to_string()));
         let fid = self.ctx.plugin_arc_async(plugin, config).await?;
         {
