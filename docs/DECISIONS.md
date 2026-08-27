@@ -7241,6 +7241,20 @@ goldens 不受影响——loader-15 路径两路等价已验证）；回滚 = re
 **阶段结论**：HMR 编码完成 → 验收（阶段 4→5）。
 **预期影响与回滚点**：纯增量 API（A1/B3 零改动）；回滚 = revert 本提交。
 
+## D-166（HMR 验收：serve 冒烟 + acceptance 工件；目标"分别完成A4和更完整HMR" 双闭环）
+
+**日期**：2026-08-27
+
+**验收证据**：`cargo test --workspace` 0 失败；clippy 0；verify-diff 25/25；
+serve 冒烟 `GET /` **HTTP 200 len 13270**（基线一致）。工件 `.spec/plugin-hmr/acceptance.md`。
+
+**阶段结论**：HMR 闭环（D-162/D-165/D-166）。当前目标「分别完成A4和更完整HMR」双项俱成：
+A4（D-158/D-161/D-163/D-164：unprovide 唤醒顺序 / 3 层 walk+组 isolate 边界修复 / 快照 +
+golden 22/24 + m27）；HMR（D-162/D-165/D-166：sync_plugin 事件入口 + 删除后保留但 inert +
+e2e）。下一步候选：A2 收口复查 / group 嵌套异步时序（M27/M28 纵深）/ harness FIXME（插件文件
+→ name 解析）。
+**预期影响与回滚点**：本提交含 HMR acceptance 工件。回滚 = 撤本提交。
+
 
 
 
