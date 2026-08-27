@@ -7207,6 +7207,18 @@ DIV-HMR-1..3（retained 策略 / 无文件 watch / 薄封装）。
 **预期影响与回滚点**：`entry_isolate_map` 使 group 入口 isolate 真正生效（行为修正；既有
 goldens 不受影响——loader-15 路径两路等价已验证）；回滚 = revert 本提交（连同 loader.rs 修复）。
 
+## D-164（A4 验收：serve 冒烟 + acceptance 工件；HMR 进入编码）
+
+**日期**：2026-08-27
+
+**验收证据**：`cargo test --workspace` 209 目标 0 失败；clippy 0；verify-diff 25/25
+（含 loader-22/24 新 golden）；serve 冒烟 `GET /` **HTTP 200 len 13270**（与基线一致，
+经 dsh-cli 重建；cwd 必须为仓库根，Start-Job 默认 cwd 会使 wasm 相对路径解析失败——环境说明）。
+工件 `.spec/service-assembly-a4/acceptance.md`。
+
+**阶段结论**：A4 闭环（D-158/D-161/D-163/D-164）。下一步：HMR 编码（D-162 设计已闸）。
+**预期影响与回滚点**：本提交含 acceptance 工件 + 决策日志。回滚 = 撤本提交。
+
 
 
 
