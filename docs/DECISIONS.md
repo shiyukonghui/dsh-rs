@@ -7063,6 +7063,35 @@ golden（DIV-10-1），m-series 锁定。
 **预期影响与回滚点**：Phase 10（A3）验收完成——**目标全部缺口（A5/A2/B1/B2/B4/A3）闭环**。回滚 =
 各阶段 git revert 特征级。目标可标 complete。
 
+## D-158（beyond 目标 Phase A1 需求+设计定稿：插件身份键模型收口——remove_plugin + case-4 + 文档化偏差）
+
+**日期**：2026-08-27
+
+**触发问题**：用户指示按流程规划 beyond 目标 → 需求分析（方法论二）落 A1。
+
+**自下而上核对（源码实证）**：
+- **A1 已形核**：身份 = `Arc<()>` token（identity.rs:14-41，Arc::ptr_eq）+ `generation`；`register_plugin`
+  同 Arc 幂等/新 Arc 换代（loader.rs:467-483）；`replace_plugin`（B3/HMR）换代 → stale entry reload
+  （loader.rs:492-512）；m16（T1-T5）+ m18（T1-T4）已绿。
+- **真实剩余 = 三件**：① 无 `remove_plugin`（cordis `registry.delete`，registry.ts:258-267）→ case-4
+  「模块消失→self-dispose 合法」路径不可达（无 API、无测试；seven_case case-4 loader.rs:220-227
+  存在但从未触发）；② case-4 无测试；③ A1 偏差未显式文档化。
+
+**需求收敛（阶段 1，用户确认 3 问）**：Q1=A 文档化偏差收口（注册表键结构不动，同名多实现=宿主层责任——
+HANDOFF「或显式声明为文档化偏差」分支）；Q2=case-4 用 m-series（DSL 无 delete-plugin）；Q3=remove_plugin
+语义 = **先删 core registry + st.plugins 记录，再 dispose 该名所有存活 fiber**（顺序不变量：先删后
+unload，否则 case-4 误落 case-7 disabled）。
+
+**设计收敛（阶段 2）**：S1 `Loader::remove_plugin(name)->Result<usize>`（rt.registry.remove 取 fibers +
+st.plugins.remove + 逐 fid `ctx.unload`）；S2 m26 T1（remove 后 entry 不自禁用、无 disable 写回）/
+T2（对照：插件仍注册时 self-dispose → disabled，case-7 复锁）/T3（ghost → Ok(0)）；S3 identity.rs +
+DECISIONS 补文档化偏差（DIV-A1-1 一名一实现顺序换代/同名多实现宿主层；DIV-A1-2 m-series；DIV-A1-3
+不写持久化，cordis delete 不动 entry.options）。
+
+**阶段结论**：需求/设计工件 `.spec/service-assembly-a1/{requirements,design}.md` 定稿 → 编码
+（m26 红→remove_plugin 绿）。
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交；编码各自独立可回。
+
 
 
 
