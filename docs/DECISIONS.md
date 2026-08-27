@@ -7474,6 +7474,34 @@ Q1-Q4 用户确认）→ D-175（编码 TDD）→ D-176（本验收）。S1 文�
 
 **目标收尾**：objective 的 M27/M28、A2 收口复查、harness FIXME 三项全部完成。
 
+## D-178（服务装配单元前端 UI 方向决策：P2 声明式数据驱动）
+
+**日期**：2026-08-27
+
+**触发问题**：beyond 目标完成后，用户追问「服务装配单元插件若含前端 UI 如何加载渲染？Rust vs
+TS 差距 + 网络类似方案？」——讲解 + 网络调研 + 方向决策任务（纯调研，不写实现代码）。
+
+**调研结论**（真实源码 + 网络）：
+- 差距本质：TS 前端插件=可执行 JS（`lib/client.js`，浏览器直接跑 + React 生态）；Rust wasm 插件=
+  后端逻辑（进不了浏览器）。前端只能四选一：JS bundle 镜像标准链 / 声明式数据驱动（服务端定义
+  UI、客户端通用渲染）/ 独立前端 iframe / 浏览器内 wasm（重）。
+- 网络锚点：MCP Apps / A2UI（服务端定义 UI 客户端渲染，2026 趋势）、Adaptive Cards（声明式 UI
+  成熟落地）、微前端/Module Federation（动态载入独立前端包；真实 harness 因 Vite 不支持 remote
+  bundle 而否）、Cordis/Koishi webui + vscode-web-wasm-rust（同生态 + 浏览器内 Rust-wasm 先例）。
+
+**用户确认（四问全答）**：① 路径 = **P2 声明式数据驱动**（否决 P1 镜像标准链 / P3 iframe /
+P4 浏览器 wasm）；② GUI 边界 = **允许改/自建 GUI 壳**（含通用渲染器）——P2 因此成立；③ 不定试点
+（后续立项再定）；④ 只确认方向，不写实现代码。
+
+**关键决策与预期影响**：插件前端 = 声明（静态 `plugin.json` / 动态 RPC `describe-UI`），GUI 壳以
+**单一通用渲染器**消费 JSON 描述（元素/布局/绑定/动作），动作回宿主 RPC 到 wasm 插件。天然沙箱
+（渲染器只读 JSON，无任意 JS）。影响：新增插件 UI 不需改壳；代价 = 需 GUI 壳改动 + 声明 schema
+子集设计 + 渲染表现力受 schema 限制。回滚点：方向未实现（纯决策，无代码）；后续立项时可在实现
+前再校准 schema 形态。工件 `.spec/service-assembly-ui/requirements.md`（v2 正式）。
+
+**下一步（建议）**：单独立项走完整瀑布流——定试点 → 设计（schema 子集 + 渲染器契约 + 发现面 +
+RPC 动作面）→ TDD 实现 → 验收 demo。
+
 
 
 
