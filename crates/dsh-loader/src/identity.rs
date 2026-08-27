@@ -11,7 +11,9 @@
 //! 键——dsh-rs 是**宿主-owned 注册表**：同名多实现**同时共存**由宿主在 import/装配层消解（一名一
 //! 当前实现）。case-4（模块消失 → self-dispose 合法、entry 不自禁用）经
 //! [`Loader::remove_plugin`]（cordis `registry.delete` 同径：先删记录后 dispose 存活 fiber）触发
-//! 并已由 m26 锁定。
+//! 并已由 m26 锁定。HMR 宿主入口 [`Loader::sync_plugin`]（D-162）复用本条语义：
+//! Register/Replace 换代、Delete 后 entry 保留但 inert，再 Register = **全新记录/全新 lineage**
+//! （generation 重置为 1、新身份 token；m27_hmr_host 锁定）。
 
 use std::sync::Arc;
 

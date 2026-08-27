@@ -26,4 +26,4 @@ pub use group::EntryGroup;
 pub use hmr::Hmr;
 pub use identity::{PluginIdentity, PluginRecord};
 pub use include::{apply_entry_patches, apply_entry_patches_with_warn, Include, Patch};
-pub use loader::{EntrySnapshot, Loader, LoaderPlugin, LoaderState, PersistSink};
+pub use loader::{EntrySnapshot, Loader, LoaderPlugin, LoaderState, PersistSink, PluginEvent, PluginSyncOutcome};

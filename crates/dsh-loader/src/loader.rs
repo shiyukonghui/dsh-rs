@@ -352,6 +352,28 @@ pub struct Loader {
     pub persist: RefCell<Option<PersistSink>>,
 }
 
+/// 插件模块事件（host-facing：`Sync 插件热更入口 = Loader::sync_plugin`）。
+pub enum PluginEvent {
+    /// 注册/（重新）导入实现：同名同 Arc 幂等（无 reload）；同名新 Arc → 换代并 reload 受影响 entry。
+    Register(Arc<dyn Plugin>),
+    /// 热替换实现（同 Register 换代语义；概念上为显式 hot-swap）。
+    Replace(Arc<dyn Plugin>),
+    /// 删除实现（模块消失）：先删 registry/记录、后 dispose 存活 fiber；
+    /// 受影响 entry **保留但 inert**（不自禁用、可再 Register 复活或显式 remove）。
+    Delete,
+}
+
+/// `Loader::sync_plugin` 的结果：宿主可据此观测/决策（reload 集 / dispose 数 / 保留集）。
+#[derive(Debug, Clone, Default)]
+pub struct PluginSyncOutcome {
+    /// Register/Replace：受影响（已 reload 新实现）的 entry id。
+    pub reloaded: Vec<String>,
+    /// Delete：被 dispose 的 fiber 数。
+    pub disposed: usize,
+    /// Delete：受影响但保留的 entry id（保留但 inert）。
+    pub retained: Vec<String>,
+}
+
 /// Group 插件（M22：对应 Cordis `Group extends EntryGroup`）。
 ///
 /// group 入口经本插件注册为真实 fiber（`plugin:Group`/`status:Group`），
@@ -556,6 +578,51 @@ impl Loader {
         self.dispose_entry(id)?;
         self.start_entry(id)
     }
+
+    // ---- 宿主插件模块热更（beyond：事件入口） ----
+
+    /// 宿主插件模块事件入口（D-162）：`Register/Replace/Delete` 各自复用
+    /// register/replace/remove_plugin（A1/B3 已完备），并返回结构化观测结果供宿主决策。
+    pub fn sync_plugin(&self, name: &str, event: PluginEvent) -> Result<PluginSyncOutcome, CordisError> {
+        match event {
+            PluginEvent::Register(p) | PluginEvent::Replace(p) => {
+                // 受影响集 = 该名下、曾以（旧）身份加载的 entry（新身份后皆 stale → 将被 reload）。
+                // 不含从未加载（无身份）的 entry——它们仅在下一次 start 时取到当前实现。
+                let affected: Vec<String> = {
+                    let st = self.state.borrow();
+                    st.entries
+                        .iter()
+                        .filter(|(_, e)| e.options.name == name && e.identity.is_some())
+                        .map(|(id, _)| id.clone())
+                        .collect()
+                };
+                let n = self.replace_plugin(name, p)?;
+                let reloaded = if n > 0 { affected } else { Vec::new() };
+                Ok(PluginSyncOutcome {
+                    reloaded,
+                    disposed: 0,
+                    retained: Vec::new(),
+                })
+            }
+            PluginEvent::Delete => {
+                let retained: Vec<String> = {
+                    let st = self.state.borrow();
+                    st.entries
+                        .iter()
+                        .filter(|(_, e)| e.options.name == name)
+                        .map(|(id, _)| id.clone())
+                        .collect()
+                };
+                let disposed = self.remove_plugin(name)?;
+                Ok(PluginSyncOutcome {
+                    reloaded: Vec::new(),
+                    disposed,
+                    retained,
+                })
+            }
+        }
+    }
+
 
     // ---- 查询 ----
 

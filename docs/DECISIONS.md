@@ -7219,6 +7219,28 @@ goldens 不受影响——loader-15 路径两路等价已验证）；回滚 = re
 **阶段结论**：A4 闭环（D-158/D-161/D-163/D-164）。下一步：HMR 编码（D-162 设计已闸）。
 **预期影响与回滚点**：本提交含 acceptance 工件 + 决策日志。回滚 = 撤本提交。
 
+## D-165（HMR 编码实现：sync_plugin 事件入口 + 删除后保留但 inert + e2e）
+
+**日期**：2026-08-27
+
+**触发问题**：D-162 设计实施（TDD 红→绿）。
+
+**关键实现**：
+- `Loader::sync_plugin(name, PluginEvent) -> PluginSyncOutcome`（模块级 `PluginEvent` 三变体 +
+  `PluginSyncOutcome{reloaded, disposed, retained}`，lib.rs 导出）：Register/Replace 委托
+  `replace_plugin`（同 Arc 幂等→reloaded=[]；新 Arc→换代+reload，reloaded=受影响集 =
+  该名、e.identity 已设的 entry——含 inert 待复活者）；Delete 委托 `remove_plugin`
+  （retained=该名全部 entry、disposed=fiber 数）。
+- **e2e m27_hmr_host**（TDD 红→绿，红线修正两处）：Delete 后 `fiber()` 仍指 Disposed fiber
+  （不变量：Disposed 状态而非字段清空）；Delete 后 re-register = **全新 lineage**（记录被清、
+  generation 重置 1、新身份 token）——诚实语义非 Bug。e2e 锁定：Register 幂等 / Replace
+  reload+换代 / Delete 保留但 inert（不 disabled、无 disable 写）/ Revive（新 fiber+新实现）。
+- identity.rs 文档补充：HMR 契约 + Delete+re-register 全新 lineage（DIV-HMR-2 关联）。
+
+**验证**：cargo test --workspace 0 失败；clippy 0；verify-diff 25/25。
+**阶段结论**：HMR 编码完成 → 验收（阶段 4→5）。
+**预期影响与回滚点**：纯增量 API（A1/B3 零改动）；回滚 = revert 本提交。
+
 
 
 
