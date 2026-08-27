@@ -7255,6 +7255,24 @@ e2e）。下一步候选：A2 收口复查 / group 嵌套异步时序（M27/M28 
 → name 解析）。
 **预期影响与回滚点**：本提交含 HMR acceptance 工件。回滚 = 撤本提交。
 
+## D-167（新目标需求分析过闸：group 嵌套异步时序 M27/M28，聚焦 Finish 时序）
+
+**日期**：2026-08-27
+
+**触发问题**：用户新目标「继续任务：A2 收口复查 / group 嵌套异步时序（M27/M28）/ harness
+FIXME（插件文件→name 解析），从更底层的任务做起」（goal-68b94531）。
+
+**方法论二复盘（自下而上核对）**：三候选层级——M27/M28（核心运行时 finish/驱动序，依赖最底层）
+> A2 收口复查（对已闭环 `!!js` eval_scope 绑定，D-141..144/`.spec/service-assembly-p6` 的复核）
+> harness FIXME（DIV-HMR-2 推迟的「插件文件→注册名」装配胶水，顶层依赖 loader API）。
+
+**用户确认（ask_user_question）**：order=A（从 M27/M28 做起）；target=A（**聚焦 Finish 时序**：
+修复嵌套组「Group 提前/不聚末尾 Active」+「Group Active 先于子入口」两类；**不动 disposer 并发**
+=DIV-A4-5 类保持文档化另行立项；全量字节级 B 与仅语义级 C 均被否）。
+
+**阶段结论**：需求工件 `.spec/group-nested-async/requirements.md` 定稿 → 阶段 2（系统设计）。
+**预期影响与回滚点**：本提交纯文档。回滚 = 撤本提交。
+
 
 
 

@@ -1,0 +1,19 @@
+{
+  "name": "probe-multitop-boundary",
+  "plugins": {
+    "provider": { "name": "provider", "apply": [{ "op": "provide", "service": "svc", "value": "root" }] },
+    "consumer": { "name": "consumer", "inject": ["svc"], "apply": [{ "op": "log", "text": "consumer-applied" }] },
+    "blocked": { "name": "blocked", "inject": ["svc"], "apply": [{ "op": "log", "text": "blocked-applied" }] }
+  },
+  "steps": [
+    { "op": "loader-sync", "entries": [
+      { "id": "gA", "name": "group", "group": true, "config": [
+        { "id": "p", "name": "provider" },
+        { "id": "c1", "name": "consumer" }
+      ] },
+      { "id": "gIso", "name": "group", "group": true, "isolate": { "svc": true }, "config": [
+        { "id": "b1", "name": "blocked" }
+      ] }
+    ] }
+  ]
+}
