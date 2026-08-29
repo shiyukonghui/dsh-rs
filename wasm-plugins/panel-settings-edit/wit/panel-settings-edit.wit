@@ -1,0 +1,10 @@
+// panel-settings-edit 服务装配单元（面板改写 #8 / S4，D-194）：设置编辑声明单元。
+package dsh:panel-settings-edit;
+
+use dsh:host-remote/remote;
+use dsh:host-remote/host-services;
+
+world panel-settings-edit {
+  export remote;
+  import host-services;
+}

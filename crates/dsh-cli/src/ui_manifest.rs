@@ -672,5 +672,13 @@ mod tests {
             .unwrap_or_else(|| panic!("聊天卡应在清单里，得 {:?}", m.cards));
         assert_eq!(chat["type"], "session");
         assert_eq!(chat["cardId"], "panel-chat.chat");
+        // S4（D-194）：设置编辑声明单元（第九卡，动态 fields 投影）。
+        let se = m
+            .cards
+            .iter()
+            .find(|c| c["pluginName"] == "panel-settings-edit")
+            .unwrap_or_else(|| panic!("设置编辑卡应在清单里，得 {:?}", m.cards));
+        assert_eq!(se["type"], "config");
+        assert_eq!(se["cardId"], "panel-settings-edit.edit");
     }
 }

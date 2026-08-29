@@ -8067,6 +8067,15 @@ hello/keepalive/plan/approval 帧按 method 过滤忽略。诚实台账更新：
 **回滚点**：纯设计轮——撤 `.spec/service-assembly-ui-settings-edit/` + 本条即回到
 `664051c`。
 
+**实现切片实测 S1..S4（2026-09-05，S 系列收口）**：S1 `schemaFields` + form XOR
+fieldsFrom 校验（桩红 3→node 30/30，`f642496`）；S2 `canonical_rpc_method` 入口规范化
+（免疫共享臂陷阱，256/0，`37717ca`；锚点侦查 `1cb6534` 先行）；S3 renderForm fieldsFrom
+预载 + `{ns,patch,expectedRevision}` 乐观锁保存 + 冲突/重启文案 + checkbox（node 30/30，
+`876675c`）；S4 `panel-settings-edit` 声明单元（describeUI 只拥有声明、零自有数据端点、
+ui.json 一份契约；清单第九卡断言）。dsh-cli **256/0**、dsh-wasmrt 全绿（m32–m40 齐）、
+clippy **0**。诚实注记：S4 未单独跑包不存在红（context 预算裁决；m33–m39 该红型已七次
+实证，m40 行为断言全绿即契约钉死）。settings 面板读写两端自此服务单元化。
+
 
 
 

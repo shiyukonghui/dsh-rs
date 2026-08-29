@@ -1,0 +1,25 @@
+[package]
+name = "panel-settings-edit-plugin"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[dependencies]
+serde_json = "1"
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+# 面板改写 #8（S4/D-194）：设置编辑声明单元（复用 dsh:host-remote 接口身份）。
+[package.metadata.component]
+package = "dsh:panel-settings-edit"
+
+[package.metadata.component.target]
+path = "wit"
+
+[package.metadata.component.target.dependencies]
+"dsh:host-remote" = { path = "../../crates/dsh-wasmrt/wit-host-remote" }
+
+[workspace]
