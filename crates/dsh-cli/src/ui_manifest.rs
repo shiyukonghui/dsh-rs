@@ -623,5 +623,14 @@ mod tests {
         assert_eq!(inv["size"], json!({"w": 4, "h": 4}));
         assert_eq!(inv["declPath"], "/plugins/panel-plugin-inventory/ui.json");
         assert!(m.cards.iter().any(|c| c["pluginName"] == "llm-deepseek"), "试点卡同在");
+        // 面板改写 #2（D-187）：运行时状态卡同样自动上桌布（宿主清单层零改动）。
+        let st = m
+            .cards
+            .iter()
+            .find(|c| c["pluginName"] == "panel-runtime-status")
+            .unwrap_or_else(|| panic!("运行时状态卡应在清单里，得 {:?}", m.cards));
+        assert_eq!(st["type"], "runtime");
+        assert_eq!(st["cardId"], "panel-runtime-status.status");
+        assert_eq!(st["size"], json!({"w": 2, "h": 2}));
     }
 }

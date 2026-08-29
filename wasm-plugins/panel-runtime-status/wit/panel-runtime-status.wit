@@ -1,0 +1,13 @@
+// panel-runtime-status 服务装配单元（面板改写 #2，D-187）：运行时状态卡。
+//
+// 复用 `dsh:host-remote/remote` 与 `dsh:host-remote/host-services` 同一接口身份：
+// 宿主 `WasmRemoteEndpointPlugin` 零改动即可加载（namespace = panel-runtime-status）。
+package dsh:panel-runtime-status;
+
+use dsh:host-remote/remote;
+use dsh:host-remote/host-services;
+
+world panel-runtime-status {
+  export remote;
+  import host-services;
+}
