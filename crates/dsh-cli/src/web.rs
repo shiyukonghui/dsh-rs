@@ -271,26 +271,26 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
     boot.remote_plugin = Some(std::rc::Rc::new(std::cell::RefCell::new(remote_plugin)));
     boot.remote_projector = Some(remote_projector);
 
-    // P2 试点（服务装配单元）：装配 `llm-deepseek` wasm remote 载体（describeUI/save/
-    // discoverModels，复用 host-remote world 接口身份）+ 其插件包静态面（web/ui.json 经
-    // `/plugins/llm-deepseek/**` 分发，D-175 serve_package_asset）。缺组件/包 → 静态面
-    // 仍可访问，`llm-deepseek.*` RPC 回落 not-implemented（诚实，不伪装可用）。
-    let llm_deepseek_bytes = llm_deepseek_component_bytes();
-    if !llm_deepseek_bytes.is_empty() {
-        let llm_deepseek_plugin = dsh_wasmrt::WasmRemoteEndpointPlugin::new(
-            "llm-deepseek",
-            &llm_deepseek_bytes,
+    // P2/D-185（服务装配单元）：发现挂载——扫描 wasm_base 下 plugin.json
+    // world:"remote" 的包（每装配单元一载体 + `/plugins/<name>/**` 静态面，D-175）。
+    // 缺构建物 → 尝试构建一次；仍缺 → 跳过 + 诚实提示（不炸 serve）；构件存在但
+    // 加载失败 → fail-loud（坏构件比缺失更严重，不静默）。热插拔：新单元 = 放文件夹。
+    for pkg in scan_remote_units(&cfg.wasm_base) {
+        let bytes = remote_unit_component_bytes(&pkg);
+        if bytes.is_empty() {
+            eprintln!("dsh web: remote unit {} skipped (component unavailable)", pkg.name);
+            continue;
+        }
+        let unit_plugin = dsh_wasmrt::WasmRemoteEndpointPlugin::new(
+            Box::leak(pkg.name.clone().into_boxed_str()),
+            &bytes,
             dsh_wasmrt::Capabilities::default(),
             None,
         )
-        .map_err(|e| CordisError::Internal(format!("llm-deepseek plugin: {e}")))?;
-        boot.llm_deepseek_remote =
-            Some(std::rc::Rc::new(std::cell::RefCell::new(llm_deepseek_plugin)));
-    }
-    if let Some(pkg) = crate::plugin_pkg::resolve_package(&cfg.wasm_base, "llm-deepseek")
-        .map_err(|e| CordisError::Internal(format!("llm-deepseek package: {e}")))?
-    {
-        if !boot.packages.iter().any(|p| p.name == "llm-deepseek") {
+        .map_err(|e| CordisError::Internal(format!("{} plugin: {e}", pkg.name)))?;
+        boot.remote_carriers
+            .push((pkg.name.clone(), std::rc::Rc::new(std::cell::RefCell::new(unit_plugin))));
+        if !boot.packages.iter().any(|p| p.name == pkg.name) {
             boot.packages.push(pkg);
         }
     }
@@ -1260,24 +1260,73 @@ pub fn host_remote_component_bytes() -> Vec<u8> {
     std::fs::read(&wasm).unwrap_or_default()
 }
 
-/// P2 试点：读取（如缺构建）`llm-deepseek` 服务装配单元组件字节（复用 host-remote
-/// world 接口身份；组件模型专，禁 C ABI）。缺构建 → 空字节（路由回落 not-implemented，
-/// 诚实——不伪装可用）。
-pub fn llm_deepseek_component_bytes() -> Vec<u8> {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../wasm-plugins/llm-deepseek");
-    let wasm = dir.join("target/wasm32-wasip1/debug/llm_deepseek_plugin.wasm");
-    if !wasm.exists() {
-        let status = std::process::Command::new("cargo")
-            .env("CARGO_NET_OFFLINE", "true")
-            .args(["component", "build", "--manifest-path"])
-            .arg(dir.join("Cargo.toml"))
-            .status()
-            .expect("run cargo component build for llm-deepseek");
-        if !status.success() {
-            eprintln!("llm-deepseek component build failed; llm-deepseek.* endpoints unavailable");
+/// D-185：发现 `wasm_base` 下的服务装配单元（`plugin.json` 的 `world:"remote"`；
+/// `host-remote` 是宿主桥，不是装配单元，按名排除）。序 = 目录名升序（稳定挂载序）。
+/// 坏 plugin.json / 缺构建物 → `eprintln` 跳过（**不炸 serve**，也不上死卡）。
+pub fn scan_remote_units(wasm_base: &std::path::Path) -> Vec<crate::plugin_pkg::PluginPackage> {
+    let mut units = Vec::new();
+    let Ok(rd) = std::fs::read_dir(wasm_base) else {
+        return units;
+    };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .filter(|de| de.path().is_dir())
+        .map(|de| de.file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    for name in names {
+        if name == "host-remote" {
+            continue;
+        }
+        let dir = wasm_base.join(&name);
+        let manifest = dir.join("plugin.json");
+        if !manifest.is_file() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            eprintln!("dsh web: skip remote unit {name}: unreadable plugin.json");
+            continue;
+        };
+        match serde_json::from_str::<Value>(&text) {
+            Ok(j) if j.get("world").and_then(|w| w.as_str()) == Some("remote") => {}
+            Ok(_) => continue,
+            Err(e) => {
+                eprintln!("dsh web: skip remote unit {name}: bad plugin.json: {e}");
+                continue;
+            }
+        }
+        // 开发体验承袭：无构建物 → 按需构建一次（有 Cargo.toml 才试；仍缺 → resolve Err 跳过）。
+        let wasm = dir
+            .join("target")
+            .join("wasm32-wasip1")
+            .join("debug")
+            .join(format!("{}_plugin.wasm", name.replace('-', "_")));
+        if !wasm.exists() && dir.join("Cargo.toml").is_file() {
+            let _ = std::process::Command::new("cargo")
+                .env("CARGO_NET_OFFLINE", "true")
+                .args(["component", "build", "--manifest-path"])
+                .arg(dir.join("Cargo.toml"))
+                .status();
+        }
+        match crate::plugin_pkg::resolve_package(wasm_base, &name) {
+            Ok(Some(pkg)) => units.push(pkg),
+            Ok(None) => {}
+            Err(e) => eprintln!("dsh web: skip remote unit {name}: {e}"),
         }
     }
-    std::fs::read(&wasm).unwrap_or_default()
+    units
+}
+
+/// 装配单元组件字节（缺构建 → 尝试构建一次；仍缺 → 空字节，调用方跳过 + 提示）。
+pub fn remote_unit_component_bytes(pkg: &crate::plugin_pkg::PluginPackage) -> Vec<u8> {
+    if !pkg.wasm.exists() {
+        let _ = std::process::Command::new("cargo")
+            .env("CARGO_NET_OFFLINE", "true")
+            .args(["component", "build", "--manifest-path"])
+            .arg(pkg.dir.join("Cargo.toml"))
+            .status();
+    }
+    std::fs::read(&pkg.wasm).unwrap_or_default()
 }
 
 /// 组装 `__DSH_BOOT__`（单 root）：委托多 root 版本（`[plugin_root]`）。
@@ -4477,33 +4526,22 @@ fn dispatch_wasm_remote(boot: &Boot, method: &str, payload: &Value) -> Value {
             "message": format!("method \"{method}\" not implemented by dsh web"),
         }});
     };
-    // P2 试点：`llm-deepseek` 服务装配单元的 UI/动作端点由它自己的 wasm 载体承载；
-    // 其余 namespace 沿用 host-remote 单一载体（既有路由不动；未装配 → 诚实回落）。
+    // D-185：namespace 分流——发现的装配单元走自己的载体（每单元一载体）；
+    // 未命中 → host-remote 单一载体（既有路由零变）；两者皆无 → 诚实 internal
+    // （未装配 = 本 boot 不提供该面，不伪造；D-185 统一原 llm-deepseek 特判文案）。
     let plugin: &Rc<std::cell::RefCell<dsh_wasmrt::WasmRemoteEndpointPlugin>> =
-        if namespace == "llm-deepseek" {
-            match boot.llm_deepseek_remote.as_ref() {
-                Some(p) => p,
-                None => {
-                    return serde_json::json!({"ok": false, "error": {
-                        "code": "not-implemented",
-                        "message": format!(
-                            "remote endpoint {method} (llm-deepseek wasm carrier not assembled)"
-                        ),
-                        "details": {},
-                    }});
-                }
-            }
-        } else {
-            match boot.remote_plugin.as_ref() {
+        match boot.remote_carriers.iter().find(|(ns, _)| ns == namespace) {
+            Some((_, p)) => p,
+            None => match boot.remote_plugin.as_ref() {
                 Some(p) => p,
                 None => {
                     return serde_json::json!({"ok": false, "error": {
                         "code": "internal",
-                        "message": format!("remote endpoint {method} (no wasm remote host assembled)"),
+                        "message": format!("remote endpoint {method} (no remote carrier assembled)"),
                         "details": {},
                     }});
                 }
-            }
+            },
         };
     // 组件 body：前端 gateway 把端点参数包在 `payload.args`（`rpc.call('/api', e, {args})`）——
     // 解包后透传组件（组件读平铺字段）；无 args 壳（curl/直接调用）→ 透传 payload 本身。
@@ -4617,7 +4655,7 @@ mod tests {
             plan_session: None,
             approval_wire: None,
             remote_plugin: None,
-            llm_deepseek_remote: None,
+            remote_carriers: Vec::new(),
             remote_projector: None,
             loader: None,
             packages: Vec::new(),
@@ -4805,14 +4843,21 @@ mod tests {
         assert!(v2["error"]["details"].is_object(), "error details present: {v2}");
     }
 
-    /// P2 试点（服务装配单元）：`llm-deepseek` 路由到自己的 wasm 载体（describeUI/save），
-    /// 静态面 `/plugins/llm-deepseek/ui.json` 由 serve_package_asset 真实分发。
+    /// P2/D-185（服务装配单元）：`llm-deepseek` 经 `remote_carriers` 分流到自己的 wasm
+    /// 载体（describeUI/save），静态面 `/plugins/llm-deepseek/ui.json` 由
+    /// serve_package_asset 真实分发；未装配 → 诚实 fail-loud（D-185 统一为 internal）。
     #[test]
     fn llm_deepseek_remote_routes_and_serves_static() {
         use std::path::Path;
-        // 1. 装配试点载体到 boot（复用 host-remote world 接口身份）。
+        // 1. 发现挂载路径取组件（scan 即 serve 的挂载前奏），装配载体到 boot。
         let mut boot = boot_with_sessions();
-        let bytes = llm_deepseek_component_bytes();
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../wasm-plugins");
+        let units = scan_remote_units(&base);
+        let pkg = units
+            .iter()
+            .find(|p| p.name == "llm-deepseek")
+            .expect("llm-deepseek discovered by scan (world:remote)");
+        let bytes = remote_unit_component_bytes(pkg);
         assert!(!bytes.is_empty(), "llm-deepseek component bytes present");
         let plugin = dsh_wasmrt::WasmRemoteEndpointPlugin::new(
             "llm-deepseek",
@@ -4821,7 +4866,8 @@ mod tests {
             None,
         )
         .unwrap();
-        boot.llm_deepseek_remote = Some(std::rc::Rc::new(std::cell::RefCell::new(plugin)));
+        boot.remote_carriers
+            .push(("llm-deepseek".to_string(), std::rc::Rc::new(std::cell::RefCell::new(plugin))));
 
         // 2. describeUI 路由到试点载体 → 有效声明。
         let v = dispatch_wasm_remote(&boot, "llm-deepseek/describeUI", &serde_json::json!({}));
@@ -4842,11 +4888,12 @@ mod tests {
         assert_eq!(sv["ok"], false, "no projector -> fail-loud: {sv}");
         assert_ne!(sv["error"]["code"], "not-implemented");
 
-        // 4. 未装配载体 → not-implemented（诚实回落）。
+        // 4. 未装配（无载体且无 host-remote）→ 诚实 fail-loud（D-185：统一 remote 回落，
+        //    原 llm-deepseek 特判的 not-implemented 文案随泛化并入 internal 通路）。
         let bare = boot_with_sessions();
         let unmounted = dispatch_wasm_remote(&bare, "llm-deepseek/describeUI", &serde_json::json!({}));
         assert_eq!(unmounted["ok"], false);
-        assert_eq!(unmounted["error"]["code"], "not-implemented");
+        assert_eq!(unmounted["error"]["code"], "internal");
 
         // 5. 静态面：/plugins/llm-deepseek/ui.json 经 serve_package_asset 分发。
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../wasm-plugins");
@@ -4862,6 +4909,38 @@ mod tests {
         assert_eq!(served["kind"], "card");
         assert_eq!(served["type"], "model");
         assert_eq!(served["view"]["kind"], "form");
+    }
+
+    /// D-185：发现挂载的判据——只收 `world:"remote"` 且有构建物的包；
+    /// 非 remote / 坏 plugin.json / 无 plugin.json / 缺构建物 / host-remote 桥 → 全部跳过。
+    #[test]
+    fn scan_remote_units_discovers_world_remote_and_skips_broken() {
+        let base = std::env::temp_dir().join(format!("dsh-scan-remote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mk = |name: &str, manifest: &str| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(dir.join("web")).unwrap();
+            if !manifest.is_empty() {
+                std::fs::write(dir.join("plugin.json"), manifest).unwrap();
+            }
+            dir
+        };
+        // 合格：world:remote + 约定路径构建物
+        let good = mk("unit-good", r#"{"world":"remote","web":"web"}"#);
+        let wasm = good.join("target/wasm32-wasip1/debug/unit_good_plugin.wasm");
+        std::fs::create_dir_all(wasm.parent().unwrap()).unwrap();
+        std::fs::write(&wasm, b"wasm").unwrap();
+        // 干扰项（各走一条跳过路径）
+        mk("unit-loop", r#"{"world":"loop"}"#); // 非 remote
+        mk("unit-broken", "not json{"); // 坏 manifest
+        mk("unit-plain", ""); // 无 plugin.json
+        mk("unit-nowasm", r#"{"world":"remote","web":"web"}"#); // 缺构建物（无 Cargo.toml → 不试构建）
+        mk("host-remote", r#"{"world":"remote"}"#); // 宿主桥按名排除
+
+        let units = scan_remote_units(&base);
+        let names: Vec<&str> = units.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["unit-good"], "只挂载合格的 remote 装配单元，得 {names:?}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
 

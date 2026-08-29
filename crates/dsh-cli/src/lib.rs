@@ -137,10 +137,12 @@ pub struct Boot {
     /// dispatch 回落 not-implemented（诚实）。`Rc<RefCell>`：web RPC 只持 `&Boot`，
     /// 组件懒实例化入 `RefCell`（单线程 accept，与 loop_plugin 同纪律）。
     pub remote_plugin: Option<Rc<std::cell::RefCell<dsh_wasmrt::WasmRemoteEndpointPlugin>>>,
-    /// P2 试点（服务装配单元）：`llm-deepseek` wasm 远程载体（describeUI/save/
-    /// discoverModels；复用 host-remote world 接口身份）。serve 装配 Some；None
-    /// （测试口/未装配）→ `llm-deepseek.*` 路由回落 not-implemented（诚实）。
-    pub llm_deepseek_remote: Option<Rc<std::cell::RefCell<dsh_wasmrt::WasmRemoteEndpointPlugin>>>,
+    /// D-185：服务装配单元远程载体注册表（namespace → 载体；每装配单元一载体，
+    /// `dispatch_wasm_remote` 按 namespace 分流）。serve 发现挂载（`scan_remote_units`：
+    /// `wasm_base` 下 `plugin.json world:"remote"` 的包）；未命中的 namespace →
+    /// host-remote（`remote_plugin`）既有语义零变。热插拔：新单元 = 放包文件夹，零宿主改动。
+    pub remote_carriers:
+        Vec<(String, Rc<std::cell::RefCell<dsh_wasmrt::WasmRemoteEndpointPlugin>>)>,
     /// D2：真实宿主投影器（`RemoteServiceProjector`——loader/session/settings/持久 KV
     /// 等真实数据源面）。serve 装配 Some；None（测试口）→ wasm 端点反查宿主时诚实报错。
     pub remote_projector: Option<Rc<dyn dsh_wasmrt::RemoteServiceProjector>>,
@@ -352,7 +354,7 @@ pub fn boot_with_host_plugins(
         plan_session: None,
         approval_wire: None,
         remote_plugin: None,
-        llm_deepseek_remote: None,
+        remote_carriers: Vec::new(),
         remote_projector: None,
         loader: Some(loader.clone()),
         packages,

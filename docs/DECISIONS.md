@@ -7765,6 +7765,16 @@ serve 进程冒烟无自动化执行（无浏览器基建/需 boot fixture），
 （撤目录即消失）；C `Boot.remote_carriers` 替换 `llm_deepseek_remote` 字段 + serve 扫描块
 （撤 C 提交回 C3 完成态 `1b0708a`）。三块各自独立可回退。
 
+**验收实测（2026-09-05 编码落地）**：A 桩红（validate 新档 + listRows「伪造行」探针被抓）
+→ node **16/16**；B m33 先红（包不存在）→ **5/5**（含 `static_ui_json_matches_describe_ui`
+一份契约 + `list_service_failure_is_fail_loud` 不伪造空表；m32 双模型防线自动覆盖新声明）；
+C `scan_remote_units` 判据测试（五类跳过路径）+ `scan_mounted_units_appear_in_manifest`
+（发现→清单出第二卡，宿主清单层零改动）+ llm 试点测试迁移 carriers 分流（断言主体不动）。
+dsh-cli **246/0**、dsh-wasmrt 全绿、clippy **0**。
+**一处 wire 语义随泛化统一（已验证零宿主回归）**：未装配 boot 下 `llm-deepseek/*` 回落
+从特判 `not-implemented` 并入 remote 家族统一 `internal`（"(no remote carrier assembled)"）
+——D-115 既有的 pluginInventory/dynamicCordisRunner 回落文案与 code 全数不变。
+
 
 
 

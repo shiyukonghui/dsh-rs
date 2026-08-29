@@ -281,7 +281,7 @@
 | **C1** v2 契约 + 试点迁移 | ✅ **已落地**（2026-08-28，D-182） | `web/ui.json` + wasm `ui_declaration()` 均升 `card→view.form`（`type:"model"`、`size 2×3`、`cardId`、`view.dataRpc`）；m32 **8/8 绿**，含 `declaration_satisfies_v2_card_contract` 与双模型防线 `no_legacy_v1_top_level_declaration_anywhere`；dsh-cli `llm_deepseek_remote_routes_and_serves_static` 绿；clippy `-D warnings` 0；全量 225 通过 / 5 失败均为**基线既有** M5 bash 环境性失败（与 C1 无关，git stash 已验证） |
 | **C2** `uiManifest/list` | ✅ **已落地**（2026-09-04，D-183） | `crates/dsh-cli/src/ui_manifest.rs`（实时聚合纯函数 + sha256 内容哈希 rev + 坏声明 error 条目 + type/size/title 归一 + disabled 交叉）+ `dispatch()` 原生臂；11 新测试（桩红 10/11 + **缓存探针红验证**：注入 OnceLock 快照缓存 → 实时性测试必红）；dsh-cli **241/0**（基线 230 + 11 新增），m32 8/8，clippy **0**，verify-diff **26/26**；详见 `.spec/service-assembly-ui-c2/acceptance.md` |
 | **C3** 桌布壳最小集 | ✅ **已落地**（2026-09-05，D-184） | `/canvas` 独立视图（资产编译进 dsh-cli，SPA 前拦截，miss→404）；`core.js` 纯函数（buildModel/layoutGrid 可证无重叠/validateDeclaration §7 九行/rpcEnvelope/pollDecision）12 测试 + canvas.rs 3 测试；侧栏分类 + 10px 瀑布工作台 + form 渲染器 + dataRpc + 4s rev 轮询；附带修复 demo renderer 裸 `{args}` 信封缺陷；dsh-cli **244/0**、clippy **0**、`node --test` **12/12**；`status/list` 落回落待 C4；详见 `.spec/service-assembly-ui-c3/acceptance.md` |
-| **C4** `status` / `list` 渲染器 | ⬜ 未开始 | — |
+| **C4** `status`/`list` 渲染器 + 首个面板改写 | ✅ **已落地**（2026-09-05，D-185） | 渲染器实现档齐（form/status/list；list 加 rowsPath 必备校验）；首个 harness 面板改写 = `wasm-plugins/panel-plugin-inventory`（list 卡，wasm 自持 loader 行投影，服务失败不伪造空表）；宿主泛化 `Boot.remote_carriers` + serve `scan_remote_units` 发现挂载（关死「每面板一次宿主提交」）；node 16/16、m33 5/5、dsh-cli **246/0**、clippy **0**；详见 `.spec/service-assembly-ui-c4/acceptance.md` |
 | **C5** 热插拔 SSE | ⬜ 未开始 | — |
 
 **C1 的三点诚实交代**：

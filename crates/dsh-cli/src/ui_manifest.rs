@@ -489,8 +489,7 @@ mod tests {
     }
 
     /// 测试 8：disabled 交叉——同名 entry **全部**禁用才排除；任一 enabled 出卡；
-    /// 无同名 entry（试点现状）出卡；group 条目不参与匹配。
-    #[test]
+    /// 无同名 entry（试点现状）出卡；group 条目不参与匹配。    #[test]
     fn disabled_entry_excludes_card() {
         let (base, a) = tmp_pkg("dis", "pkg-dis");
         write_ui(&a, &v2_card("dis.card", "Dis").to_string());
@@ -511,5 +510,24 @@ mod tests {
         let m = build_manifest(std::slice::from_ref(&a), &[group_snapshot("pkg-dis", true)]);
         assert_eq!(m.cards.len(), 1, "group 条目不参与名字匹配");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// S6（D-185）：发现挂载 → 清单联动——真实 wasm_base 经 `scan_remote_units` 发现
+    /// 装配单元后，清单出「插件清单」卡（type runtime）与试点卡；宿主清单层零改动。
+    #[test]
+    fn scan_mounted_units_appear_in_manifest() {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../wasm-plugins");
+        let units = crate::web::scan_remote_units(&base);
+        let m = build_manifest(&units, &[]);
+        let inv = m
+            .cards
+            .iter()
+            .find(|c| c["pluginName"] == "panel-plugin-inventory")
+            .unwrap_or_else(|| panic!("插件清单卡应在清单里，得 {:?}", m.cards));
+        assert_eq!(inv["type"], "runtime");
+        assert_eq!(inv["cardId"], "panel-plugin-inventory.list");
+        assert_eq!(inv["size"], json!({"w": 4, "h": 4}));
+        assert_eq!(inv["declPath"], "/plugins/panel-plugin-inventory/ui.json");
+        assert!(m.cards.iter().any(|c| c["pluginName"] == "llm-deepseek"), "试点卡同在");
     }
 }
