@@ -664,5 +664,13 @@ mod tests {
             .unwrap_or_else(|| panic!("设置概览卡应在清单里，得 {:?}", m.cards));
         assert_eq!(cfg_card["type"], "config");
         assert_eq!(cfg_card["cardId"], "panel-settings.list");
+        // C8-4（D-193）：聊天声明单元（第八卡——声明归单元、数据面在宿主原生臂）。
+        let chat = m
+            .cards
+            .iter()
+            .find(|c| c["pluginName"] == "panel-chat")
+            .unwrap_or_else(|| panic!("聊天卡应在清单里，得 {:?}", m.cards));
+        assert_eq!(chat["type"], "session");
+        assert_eq!(chat["cardId"], "panel-chat.chat");
     }
 }

@@ -1,0 +1,16 @@
+{
+  "$schema": "dsh/plugin-ui/v2",
+  "kind": "card",
+  "cardId": "panel-chat.chat",
+  "type": "session",
+  "title": "聊天",
+  "description": "会话聊天（选择/历史/发送；会话协议在宿主，C8-4 声明单元）",
+  "size": { "w": 4, "h": 6 },
+  "view": {
+    "kind": "chat",
+    "sessionSource": ["session", "list"],
+    "historyRpc": ["session", "history"],
+    "sendRpc": ["session", "prompt"],
+    "stream": "session-events"
+  }
+}

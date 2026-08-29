@@ -8021,7 +8021,16 @@ SSE 帧形状未取证（grep 无 session-event 字面量），`stream:"session-
 core 折叠契约保持单一 `{text}`。core 档位：RESERVED 摘 chat → IMPLEMENTED（四档）；
 C8-1 的「齐形 chat → renderer-unimplemented」测试按 C8-3 语义迁移为直通 null。
 node **26/26**、dsh-cli **255/0**、clippy **0**。浏览器端到端手测仍缺（无基建；
-DOM 层为已钉死纯函数的接线）。C8-4（panel-chat 声明单元）排期——落地即第八卡上桌布。
+DOM 层为已钉死纯函数的接线）。
+
+**实现切片实测 C8-4（2026-09-05，C8 收口）**：`panel-chat` 声明单元落地——
+describeUI 返回 v2 chat 声明（三数据面指宿主既表面 session·list/history/prompt），
+**零自有数据端点**（`no_proprietary_data_endpoints_fail_loud` 断言 list/send/history/
+status 全 fail-loud——单元不伪装能力）；ui.json == describeUI 一份契约；scan 自动
+挂载 → 清单第八卡（type session）断言入 `scan_mounted_units_appear_in_manifest`。
+m39 先红 → **3/3**。**C8 全链路验收**：`.spec/service-assembly-ui-c8-chat/acceptance.md`
+——聊天主视图以服务单元形态运行，与旧前端同一事实源；「替代 deepseek 前端」的最后
+一个主视图打通。
 
 
 

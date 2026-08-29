@@ -1,0 +1,13 @@
+// panel-chat 服务装配单元（面板改写 #7 / C8-4，D-193）：聊天卡的声明单元。
+//
+// 架构裁决（D-193-B）：会话协议归宿主原生臂（session·list/history/prompt 既表面），
+// 单元只拥有 v2 chat 声明（describeUI），**无自有数据端点**（数据面调用 fail-loud）。
+package dsh:panel-chat;
+
+use dsh:host-remote/remote;
+use dsh:host-remote/host-services;
+
+world panel-chat {
+  export remote;
+  import host-services;
+}
