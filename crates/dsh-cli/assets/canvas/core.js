@@ -114,8 +114,24 @@ export function validateDeclaration(d) {
   if (IMPLEMENTED.indexOf(k) < 0) {
     return { code: "view-kind-unknown", message: "未定义的 view.kind=\"" + k + "\"" };
   }
-  if (k === "form" && (!Array.isArray(d.view.fields) || !Array.isArray(d.view.actions))) {
-    return { code: "view-malformed", message: "form 视图缺 fields/actions 数组" };
+  if (k === "form") {
+    // S1（D-194）：fields（声明期静态）与 fieldsFrom（运行时投影）**二选一**；
+    // fieldsFrom 形 = {rpc:[ns,method], pick:string}。
+    const hasFields = Array.isArray(d.view.fields);
+    const ff = d.view.fieldsFrom;
+    const hasFF =
+      !!ff &&
+      typeof ff === "object" &&
+      Array.isArray(ff.rpc) &&
+      ff.rpc.length === 2 &&
+      ff.rpc.every((x) => typeof x === "string") &&
+      typeof ff.pick === "string";
+    if (hasFields === hasFF) {
+      return { code: "view-malformed", message: "form 视图须有 fields 或形正的 fieldsFrom（二选一）" };
+    }
+    if (!Array.isArray(d.view.actions)) {
+      return { code: "view-malformed", message: "form 视图缺 actions 数组" };
+    }
   }
   if (k === "list" && typeof d.view.rowsPath !== "string") {
     return { code: "view-malformed", message: "list 视图缺 rowsPath（数据面位置必须显式）" };
@@ -280,4 +296,46 @@ export function chatOptions(rows) {
     out.push({ value: r.sessionId, label: r.sessionId + (r.running ? "·忙" : "·闲") });
   }
   return out;
+}
+
+// ---- S1（D-194）：schemaFields 动态投影（settings namespace 视图 → 表单） ----
+
+/** settings namespace 视图（settings.describe 形状）→ 表单投影。
+ *  规则（D-194 决策回执 #4/#5）：顶层标量 → 输入控件（enum → select）；
+ *  嵌套对象/数组/未知形态 → readonly 只读行（不伪造控件）；缺值 → 诚实空初值
+ *  （"" / 0 / false——**不虚构默认**）；secrets 只带存在性；revision/applies 透出。 */
+export function schemaFields(nsView) {
+  const v = nsView && typeof nsView === "object" ? nsView : {};
+  const props =
+    v.schema && v.schema.properties && typeof v.schema.properties === "object"
+      ? v.schema.properties
+      : {};
+  const value = v.value && typeof v.value === "object" && !Array.isArray(v.value) ? v.value : {};
+  const fields = [];
+  const readonly = [];
+  for (const key of Object.keys(props)) {
+    const p = props[key] && typeof props[key] === "object" ? props[key] : {};
+    const cur = value[key];
+    if (Array.isArray(p.enum) && p.enum.length > 0) {
+      fields.push({
+        key, label: key, type: "select", options: p.enum.slice(),
+        value: typeof cur === "string" ? cur : "",
+      });
+    } else if (p.type === "number" || p.type === "integer") {
+      fields.push({ key, label: key, type: "number", value: typeof cur === "number" ? cur : 0 });
+    } else if (p.type === "boolean") {
+      fields.push({ key, label: key, type: "checkbox", value: cur === true });
+    } else if (p.type === "string") {
+      fields.push({ key, label: key, type: "text", value: typeof cur === "string" ? cur : "" });
+    } else {
+      readonly.push({ key, note: p.type === "object" || p.type === "array" ? "嵌套结构 v1 只读" : "未知形态 v1 只读" });
+    }
+  }
+  return {
+    fields,
+    readonly,
+    secrets: Array.isArray(v.secrets) ? v.secrets.slice() : [],
+    revision: Number.isInteger(v.revision) ? v.revision : null,
+    applies: v.applies === "live" || v.applies === "restart" ? v.applies : null,
+  };
 }

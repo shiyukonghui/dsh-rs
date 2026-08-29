@@ -20,6 +20,7 @@ import {
   needsConfirm,
   chatFoldFrame,
   chatOptions,
+  schemaFields,
 } from "../core.js";
 
 function card(pluginName, cardId, type, w, h) {
@@ -436,4 +437,90 @@ test("chatOptions: rows to selector options, junk rows skipped", () => {
     { value: "b", label: "b·闲" },
   ]);
   assert.deepEqual(chatOptions(null), []);
+});
+
+// ---- S1（D-194）：schemaFields 动态投影 + form 校验扩展（fieldsFrom） ----
+
+const themeNsView = () => ({
+  ns: "ui-theme",
+  applies: "live",
+  revision: 7,
+  schema: {
+    type: "object",
+    properties: {
+      mode: { type: "string", enum: ["dark", "light"] },
+      fontSize: { type: "number" },
+      showTips: { type: "boolean" },
+      nested: { type: "object", properties: {} },
+    },
+  },
+  value: { mode: "dark", fontSize: 14, showTips: true, nested: { a: 1 } },
+  secrets: [{ path: "apiKey", set: true }],
+});
+
+test("schemaFields: scalars to inputs, enum to select, nested readonly, secrets presence", () => {
+  const r = schemaFields(themeNsView());
+  const byKey = {};
+  for (const f of r.fields) byKey[f.key] = f;
+  assert.equal(byKey.mode.type, "select", "enum → select");
+  assert.deepEqual(byKey.mode.options, ["dark", "light"]);
+  assert.equal(byKey.mode.value, "dark", "现值来自 resolved value");
+  assert.equal(byKey.fontSize.type, "number");
+  assert.equal(byKey.fontSize.value, 14);
+  assert.equal(byKey.showTips.type, "checkbox");
+  assert.equal(byKey.nested, undefined, "嵌套对象不进可编辑 fields（不伪造控件）");
+  assert.equal(r.readonly.length, 1);
+  assert.equal(r.readonly[0].key, "nested");
+  assert.deepEqual(r.secrets, [{ path: "apiKey", set: true }]);
+  assert.equal(r.revision, 7, "乐观锁 revision 随投影带出");
+  assert.equal(r.applies, "live");
+});
+
+test("schemaFields: missing value keys fall to honest empty inits, no fabricated defaults", () => {
+  const v = themeNsView();
+  v.value = {};
+  const r = schemaFields(v);
+  const byKey = {};
+  for (const f of r.fields) byKey[f.key] = f;
+  assert.equal(byKey.mode.value, "");
+  assert.equal(byKey.fontSize.value, 0);
+  assert.equal(byKey.showTips.value, false);
+});
+
+test("schemaFields: junk nsView degrades to empty projection (no throw)", () => {
+  const r = schemaFields({});
+  assert.deepEqual(r.fields, []);
+  assert.deepEqual(r.readonly, []);
+  assert.equal(r.revision, null);
+});
+
+const formCard = (view) => {
+  const d = goodForm();
+  d.view = view;
+  return d;
+};
+
+test("validateDeclaration: form accepts fields XOR fieldsFrom, rejects both/neither", () => {
+  const ff = { rpc: ["settings", "describe"], pick: "ui-theme" };
+  // fieldsFrom 形（无 fields）→ 直通。
+  assert.equal(validateDeclaration(formCard({ kind: "form", fieldsFrom: ff, actions: [] })), null);
+  // 静态 fields 形（无 fieldsFrom）→ 直通（既有行为）。
+  const dStatic = goodForm();
+  assert.equal(validateDeclaration(dStatic), null);
+  // 两者皆有 → view-malformed（二选一）。
+  assert.equal(
+    validateDeclaration(formCard({ kind: "form", fields: [], fieldsFrom: ff, actions: [] })).code,
+    "view-malformed",
+  );
+  // 两者皆无 → view-malformed（既有）。
+  assert.equal(validateDeclaration(formCard({ kind: "form", actions: [] })).code, "view-malformed");
+  // fieldsFrom 形不正 → view-malformed。
+  assert.equal(
+    validateDeclaration(formCard({ kind: "form", fieldsFrom: { pick: "x" }, actions: [] })).code,
+    "view-malformed",
+  );
+  assert.equal(
+    validateDeclaration(formCard({ kind: "form", fieldsFrom: { rpc: ["a", "b", "c"], pick: "x" }, actions: [] })).code,
+    "view-malformed",
+  );
 });
