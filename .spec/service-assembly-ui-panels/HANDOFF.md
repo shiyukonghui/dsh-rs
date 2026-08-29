@@ -10,7 +10,7 @@ harness 全部核心前端能力已由 **13 张服务单元卡**在 `/canvas` �
 | 维度 | 数字 | 权威出处 |
 |---|---|---|
 | 装配单元 / 桌面卡 | **13 / 13**（11 面板单元 + 2 表单/编辑补充） | `wasm-plugins/` 目录 + `ui_manifest.rs` scan 测试逐卡断言 |
-| 决策日志 | D-180 … **D-200** 每片一条（选项/否决/实测/回滚点） | `docs/DECISIONS.md` |
+| 决策日志 | D-180 … **D-201** 每片一条（选项/否决/实测/回滚点） | `docs/DECISIONS.md` |
 | 面板台账 | 逐卡状态表 | `.spec/service-assembly-ui-panels/progress.md` |
 | 测试基线（本轮实测） | node **31/31**、verify-diff **ALL PASS**、dsh-cli **259/0**、wasmrt m32–m44、clippy **0** | 2026-09-05 交接认证 |
 
@@ -25,8 +25,9 @@ harness 全部核心前端能力已由 **13 张服务单元卡**在 `/canvas` �
 ## 4. §2 缺口速览（判定材料）
 - **不可机械化**（已取证）：动态插件 define/activate（vendored 面无源码 + 线形不兼容，
   D-200 重分级）；secrets 编辑（redact 在源）；聊天中断/附件（D-193 边界）。
-- **点单式机械**：其余 ns 设置编辑卡（llm[Restart]/shell/agent-loop/…）——照
-  panel-locale-edit 复制即可，说一声就补。
+- **已终结（D-201）**：其余 ns 设置编辑——设置编辑卡自带 **nsSelect 命名空间下拉**，
+  一卡通用编辑全部 ns（含 llm[Restart]/shell/agent-loop/…），**不再需要点单复制**；
+  panel-locale-edit 固定卡自此冗余，E2E 后可裁撤（你拍板）。
 - 审批策略编辑（approval/policy）属设置域，同上。
 
 ## 5. 诚实账（不代宣的三件事）
@@ -36,5 +37,6 @@ harness 全部核心前端能力已由 **13 张服务单元卡**在 `/canvas` �
 3. 新单元包自 m38 后未跑独立「包不存在红」（红型已九次实证，逐条注记在 D-19x/D-200）。
 
 ## 6. 若要继续自主开发（优先级建议）
-① 点单 ns 编辑卡（机械）→ ② 激活面原生臂 + 声明单元（define/activate 的正解，独立
-需求轮）→ ③ E2E 反馈修复。全部按瀑布关卡：需求文档 → 设计 → TDD → 验收 → D-201+。
+① E2E 反馈修复（照单打勾中发现的卡级 bug，回对应切片）→ ② 激活面原生臂 + 声明单元
+（define/activate 的正解，独立需求轮）→ ③ locale 固定卡裁撤拍板。~~点单 ns 编辑卡~~
+已被 D-201 nsSelect 通用卡终结。全部按瀑布关卡：需求文档 → 设计 → TDD → 验收 → D-202+。

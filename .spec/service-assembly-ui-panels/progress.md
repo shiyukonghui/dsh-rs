@@ -17,7 +17,7 @@ kv / sessionMessages / workspaceFiles / time / …），避免宿主扩张。
 | — | 会话打开/切换 | — | chat（预留） | 需「卡级选择/跳转」交互形态 + chat 渲染器点亮（远景关键路径，独立契约流程） | ⬜ 契约演进 |
 | 6 | 设置概览 | `wasm-plugins/panel-settings` | list | 宿主新投影 arm `settingsDescribe`（与原生 describe 同形状共用 namespace_view，redact 在源头）；行拍平 {ns,field,value}；**config 分类首卡** | ✅ D-192（m38 + 宿主 2 测） |
 | C8 | 聊天 | `wasm-plugins/panel-chat`（声明单元） | chat（**全链路落地**） | 三 RPC 面复用宿主既表面；折叠同源；**SSE 直订已接（C8-3b，仅订 events.mux）** | ✅ D-193 C8-1..4+3b（m39 3/3，清单第八卡） |
-| S | 设置编辑 | `wasm-plugins/panel-settings-edit`（声明单元） | form + `fieldsFrom` 动态投影 | describe/update 经 canonical 别名复用宿主既表面；expectedRevision 乐观锁；secrets 仅存在性；嵌套只读 | ✅ D-194 S1..S4（m40 3/3，清单第九卡） |
+| S | 设置编辑 | `wasm-plugins/panel-settings-edit`（声明单元） | form + `fieldsFrom` 动态投影 + **nsSelect 下拉** | describe/update 经 canonical 别名复用宿主既表面；expectedRevision 乐观锁；secrets 仅存在性；嵌套只读；**D-201 一卡通用全部 ns** | ✅ D-194 S1..S4 + **D-201**（m40 3/3） |
 | 10 | 调度任务 | `wasm-plugins/panel-schedule`（声明单元） | list | 宿主薄臂 `schedule/list`（Boot 挂载与 M4 工具同一 ScheduleHost，fold 事件日志权威；缺宿主诚实报错）；写端另立切片 | ✅ D-195（m41 3/3 + 宿主测） |
 | 11 | 创建调度 | `wasm-plugins/panel-schedule-create`（声明单元） | form | 保存走 `schedule/create` 臂（D-196 wire 形钉死）；rowActions 删除带 confirm | ✅ D-197（m42 3/3，调度建/看/删闭环） |
 | 12 | 待审批 | `wasm-plugins/panel-approval`（声明单元） | list + rowActions | `approval/pending` 臂（wire.pending_requests 单权威）；允许/拒绝同臂 args.decision 区分（D-198 扩展），拒绝 confirm | ✅ D-199（m43 3/3，**技术队列清零**） |
