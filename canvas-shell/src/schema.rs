@@ -132,9 +132,42 @@ fn by_key<'a>(proj: &'a Value, key: &str) -> Option<&'a Value> {
     proj["fields"].as_array()?.iter().find(|f| f["key"] == json!(key))
 }
 
+/// D-201 nsSelect 模型：describe value → {options, current}。current = pick 命中，
+/// 否则首项回退；空/坏 → 空模型（core.js 341–346 行移植）。
+pub fn ns_select_model(value: &Value, selected: &str) -> Value {
+    let options: Vec<Value> = value
+        .get("namespaces")
+        .and_then(Value::as_array)
+        .map(|ns| {
+            ns.iter()
+                .filter_map(|n| n.get("ns").and_then(Value::as_str).map(|s| json!(s)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let hit = options.iter().any(|o| o.as_str() == Some(selected));
+    let current = if hit {
+        json!(selected)
+    } else {
+        options.first().cloned().unwrap_or(json!(""))
+    };
+    json!({"options": options, "current": current})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ns_select_model_pick_hit_then_first_then_empty() {
+        let v = json!({"namespaces":[{"ns":"ui-theme"},{"ns":"llm"},{"ns":"locale"}]});
+        assert_eq!(ns_select_model(&v, "llm")["current"], "llm");
+        assert_eq!(ns_select_model(&v, "nope")["current"], "ui-theme", "回退首项");
+        assert_eq!(ns_select_model(&v, "nope")["options"].as_array().unwrap().len(), 3);
+        let junk = ns_select_model(&json!(null), "");
+        assert_eq!(junk["options"].as_array().unwrap().len(), 0);
+        assert_eq!(junk["current"], "");
+        assert_eq!(ns_select_model(&json!({"namespaces":[{"x":1},{"ns":"ok"}]}), "ok")["options"], json!(["ok"]), "脏条目跳过");
+    }
 
     #[test]
     fn projects_scalars_enum_readonly_secrets() {
