@@ -315,7 +315,14 @@ test("statusItems: dataRpc items > static view.items > honest empty", () => {
 // D-204（secrets-recon）：write-only 秘密字段 + 防误清闸。
 test("schemaFields projects top-level secrets as write-only fields (D-204)", () => {
   const proj = schemaFields({
-    schema: { properties: { token: { type: "string" }, lang: { type: "string" } } },
+    schema: {
+      refs: {
+        0: { type: "object", dict: { token: 1, lang: 2 }, meta: {} },
+        1: { type: "string", meta: {} },
+        2: { type: "string", meta: {} },
+      },
+      uid: 0,
+    },
     value: { lang: "zh" },
     secrets: [{ path: ["token"], set: true }, { path: ["deep", "pw"], set: false }],
   });
@@ -498,21 +505,27 @@ test("chatOptions: rows to selector options, junk rows skipped", () => {
 
 // ---- S1（D-194）：schemaFields 动态投影 + form 校验扩展（fieldsFrom） ----
 
+// 真实 wire 形（2026-09-05 live settings/describe 抓样：dsh-schema refs 表序列化，
+// 非臆造 JSON-Schema——S1 夹具曾臆造 {properties} 形，浏览器实证后纠正）。
 const themeNsView = () => ({
   ns: "ui-theme",
   applies: "live",
   revision: 7,
   schema: {
-    type: "object",
-    properties: {
-      mode: { type: "string", enum: ["dark", "light"] },
-      fontSize: { type: "number" },
-      showTips: { type: "boolean" },
-      nested: { type: "object", properties: {} },
+    refs: {
+      0: { type: "object", dict: { mode: 1, fontSize: 2, showTips: 3, nested: 4 }, meta: {} },
+      1: { type: "union", list: [5, 6], meta: { default: "light" } },
+      2: { type: "number", meta: {} },
+      3: { type: "boolean", meta: {} },
+      4: { type: "object", dict: { a: 7 }, meta: {} },
+      5: { type: "const", value: "dark", meta: {} },
+      6: { type: "const", value: "light", meta: {} },
+      7: { type: "string", meta: {} },
     },
+    uid: 0,
   },
   value: { mode: "dark", fontSize: 14, showTips: true, nested: { a: 1 } },
-  secrets: [{ path: "apiKey", set: true }],
+  secrets: [{ path: ["apiKey"], set: true }],
 });
 
 test("schemaFields: scalars to inputs, enum to select, nested readonly, secrets presence", () => {
@@ -528,7 +541,7 @@ test("schemaFields: scalars to inputs, enum to select, nested readonly, secrets 
   assert.equal(byKey.nested, undefined, "嵌套对象不进可编辑 fields（不伪造控件）");
   assert.equal(r.readonly.length, 1);
   assert.equal(r.readonly[0].key, "nested");
-  assert.deepEqual(r.secrets, [{ path: "apiKey", set: true }]);
+  assert.deepEqual(r.secrets, [{ path: ["apiKey"], set: true }]);
   assert.equal(r.revision, 7, "乐观锁 revision 随投影带出");
   assert.equal(r.applies, "live");
 });

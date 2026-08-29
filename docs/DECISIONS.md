@@ -8372,7 +8372,29 @@ settings/describe×2）、Console/Log 零错误、forms=1/selects=5（聊天与 
 
 **诚实账更新**：「DOM 渲染层从未被真实执行」自此**解除**——自主 CDP E2E 可跑；用户
 浏览器逐卡目检降级为推荐而非必需（交互细节如动画/输入法类仍以人眼为准）。
-**回滚点**：撤本提交（app.js 两编辑 + 探针脚本）回到 `bf635ca`。E2E 清单已同步（13 卡基线 + §1 行）。
+**回滚点**：撤本提交（app.js 两编辑 + 探针脚本）回到 `bf635ca`。
+
+## D-208（schemaFields 对齐真实 wire：refs 表形——夹具臆造形的最后一个大雷清除）
+
+**日期**：2026-09-05
+
+**触发**：交互级 E2E T1（nsSelect 切换）显示设置编辑卡**零字段**——投影层读
+`schema.properties`，但 live 抓样证实 dsh-schema 序列化为 **refs 表形**
+`{refs:{id:node},uid}`（object=dict{key:refId}、union(const)=枚举、const/string/number/
+boolean 标量）。S1 测试夹具当时按 JSON-Schema 惯例**臆造**（D-206/207 同族教训第三次：
+夹具形状 ≠ wire 形状）。
+
+**裁定**：schemaFields 重写为 refs 表投影（deref 一层、transform 等未知形 → 诚实只读
+注记类型名）；夹具**全部换成 live 抓样形**（themeNsView 注释标注抓样来源）；D-204
+secrets 夹具同步。**否决**后端加 JSON-Schema 兼容层（wire 是 dsh-schema 的权威形，
+渲染器就该贴它）。
+
+**验收实测（活体浏览器）**：T1 nsSelect 12 ns 选项、ui-theme→shell 切换字段重投影
+（preference→timeoutMs）；locale 卡 lang 枚举 select（zh/en）= union-const 投影实证；
+T2 表单保存→诚实 no-schedule-host；T3 侧栏过滤 13→5→13；Console 零错误。
+node **34/34**（先红后绿）、dsh-cli **259/0**、clippy **0**。
+
+**回滚点**：撤本提交回 `0f6516a`。教训固化：**新契约字段必须先 live 抓样再造夹具**。E2E 清单已同步（13 卡基线 + §1 行）。
 
 
 

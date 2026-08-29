@@ -23,6 +23,7 @@
 | 设置概览（list） | ns/字段/值与 settings.describe 一致；secret 仅存在性 | 设置面板（只读子集） |
 | **聊天（chat）** | 选会话→历史气泡与旧前端一致；发送→乐观气泡→SSE 真回复；切会话不串线；**停止**→turn 中止（aborted 事件）不删历史 | **聊天主视图（关键路径）** |
 | 设置编辑（form+fieldsFrom+**nsSelect**） | 下拉列出全部 ns；切换重投影；保存成功；改并发→SETTINGS_CONFLICT 显式；Restart 类 ns 保存后显示「需重启生效」；**秘密字段**=password 框（设→存在性转「已设」；留空保存不改写） | 设置面板（写端**全 ns**，D-201/204） |
+| ↳ 自主 E2E 进度（CDP） | ✅ 13 卡渲染+37 行真数据（D-207）；✅ nsSelect 切换重投影、表单诚实错误、侧栏过滤、Console 零错误（D-208）；⬜ 保存成功类写路径（SETTINGS_CONFLICT/重启文案/password 框）待你或下轮交互 | — |
 | 设置编辑 · locale（form，固定 ns） | 同契约换 ns=locale（D-201 后与上卡重叠，可合并裁撤） | 设置面板（冗余保留，待拍板） |
 | 调度任务（list+删） | after/at/every 行与实况一致；**删除弹确认**；删后行消失（fold 回读） | 调度面板（读+删） |
 | 创建调度（form） | kind/prompt/afterSeconds 保存 → 调度任务卡出现该行 | 调度面板（建端） |

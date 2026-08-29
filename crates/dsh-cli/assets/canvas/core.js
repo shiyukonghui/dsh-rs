@@ -324,10 +324,17 @@ export function nsSelectModel(value, selected) {
 
 export function schemaFields(nsView) {
   const v = nsView && typeof nsView === "object" ? nsView : {};
-  const props =
-    v.schema && v.schema.properties && typeof v.schema.properties === "object"
-      ? v.schema.properties
-      : {};
+  // 真实 wire 形（live settings/describe 抓样，dsh-schema refs 表序列化）：
+  // `schema = {refs: {id: node}, uid}`；object 节点的字段面是 dict {key: refId}；
+  // union(const…) = 枚举。D-208：纠正 S1 臆造的 JSON-Schema {properties} 形。
+  const refs = v.schema && v.schema.refs && typeof v.schema.refs === "object" ? v.schema.refs : null;
+  const root = refs ? refs[String(v.schema.uid != null ? v.schema.uid : 0)] : null;
+  const dict =
+    root && root.type === "object" && root.dict && typeof root.dict === "object" ? root.dict : {};
+  const deref = (id) => {
+    const n = refs ? refs[String(id)] : null;
+    return n && typeof n === "object" ? n : {};
+  };
   const value = v.value && typeof v.value === "object" && !Array.isArray(v.value) ? v.value : {};
   const fields = [];
   const readonly = [];
@@ -337,27 +344,37 @@ export function schemaFields(nsView) {
     (s) => s && Array.isArray(s.path) && s.path.length === 1,
   );
   const secretOf = (key) => secretSlots.find((s) => s.path[0] === key);
-  for (const key of Object.keys(props)) {
-    const p = props[key] && typeof props[key] === "object" ? props[key] : {};
+  for (const key of Object.keys(dict)) {
+    const p = deref(dict[key]);
     const cur = value[key];
     const sec = secretOf(key);
+    const consts =
+      p.type === "union" && Array.isArray(p.list) && p.list.length > 0
+        ? p.list.map(deref)
+        : null;
+    const isEnum = consts && consts.every((c) => c.type === "const");
     if (sec) {
       fields.push({
         key, label: key, type: "text", secretWriteOnly: true, value: "", exists: sec.set === true,
       });
-    } else if (Array.isArray(p.enum) && p.enum.length > 0) {
+    } else if (isEnum) {
       fields.push({
-        key, label: key, type: "select", options: p.enum.slice(),
+        key, label: key, type: "select", options: consts.map((c) => c.value),
         value: typeof cur === "string" ? cur : "",
       });
-    } else if (p.type === "number" || p.type === "integer") {
+    } else if (p.type === "number") {
       fields.push({ key, label: key, type: "number", value: typeof cur === "number" ? cur : 0 });
     } else if (p.type === "boolean") {
       fields.push({ key, label: key, type: "checkbox", value: cur === true });
-    } else if (p.type === "string") {
+    } else if (p.type === "string" || p.type === "const") {
       fields.push({ key, label: key, type: "text", value: typeof cur === "string" ? cur : "" });
     } else {
-      readonly.push({ key, note: p.type === "object" || p.type === "array" ? "嵌套结构 v1 只读" : "未知形态 v1 只读" });
+      readonly.push({
+        key,
+        note: p.type === "object" || p.type === "array" || p.type === "dict" || p.type === "list" || p.type === "tuple"
+          ? "嵌套结构 v1 只读"
+          : "未知形态（" + String(p.type) + "）v1 只读",
+      });
     }
   }
   return {
