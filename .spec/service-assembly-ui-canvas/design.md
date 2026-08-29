@@ -125,6 +125,9 @@
 
 ```jsonc
 "view": { "kind": "chat",  "sessionIdRef"?: string, "actions":[...] }   // 消息流 + 输入
+    // ↑ C8 契约已定稿（D-193，实现排期 C8-1..4）：sessionSource/historyRpc/sendRpc
+    //   三个 [ns,method] 面 + stream:"session-events"（闭集）；详见
+    //   .spec/service-assembly-ui-c8-chat/design.md（会话协议归宿主原生臂，单元只拥有声明）
 "view": { "kind": "chart", "seriesPath": string, "xKey": string, "actions":[...] }
 "view": { "kind": "table", "columnsPath"?: string, "rowsPath": string }
 ```
@@ -284,6 +287,8 @@
 | **C4** `status`/`list` 渲染器 + 首个面板改写 | ✅ **已落地**（2026-09-05，D-185） | 渲染器实现档齐（form/status/list；list 加 rowsPath 必备校验）；首个 harness 面板改写 = `wasm-plugins/panel-plugin-inventory`（list 卡，wasm 自持 loader 行投影，服务失败不伪造空表）；宿主泛化 `Boot.remote_carriers` + serve `scan_remote_units` 发现挂载（关死「每面板一次宿主提交」）；node 16/16、m33 5/5、dsh-cli **246/0**、clippy **0**；详见 `.spec/service-assembly-ui-c4/acceptance.md` |
 | **C5** 热插拔 SSE | ✅ **已落地**（2026-09-05，D-186） | serve 主循环 tick（2s 节流）同步 scan 挂载的单元装/卸（运行时**不构建**、失败不炸、只卸 mounted 登记）→ rev 变经 `/plugins/events` 广播 `ui-manifest-changed {rev}`；桌布 EventSource 消费 + 10s 轮询兜底；watch 4 测 + 帧形状测（桩红→绿；clippy 复活一条被吞 `#[test]`）；dsh-cli **251/0**、clippy **0**；详见 `.spec/service-assembly-ui-c5/acceptance.md` |
 | **C6** 行动作 + 确认 | ✅ **已落地**（2026-09-05，D-189） | §4.1 rowActions 渲染 + `confirm` 契约字段（只认严格 true；v1 = window.confirm）；线形状 `args={row}` 单元自校验；首张写能力卡 = panel-dynamic-plugins stop/undefine（宿主 dynamicStop/Undefine 透传）；node 19/19 + m35 10/10（探针红×3 生效）；详见 `.spec/service-assembly-ui-c6-row-actions/acceptance.md` |
+| **C7** 面板改写 ×N | ✅ **持续进行**（D-187–D-192，6/N） | 改写型六卡批量落地（inventory/runtime-status/dynamic-plugins(+写动作)/workspace-files/sessions/settings 概览）；D-181 五语义位全有真实卡；台账 `.spec/service-assembly-ui-panels/progress.md` |
+| **C8** chat 视图 | 📐 **契约已定稿**（2026-09-05，D-193） | 三 RPC 面 + `stream:"session-events"` 闭集；会话协议归宿主原生臂（单元只拥有声明）；实现切片 C8-1..4 排期中；`.spec/service-assembly-ui-c8-chat/` |
 
 **C1 的三点诚实交代**：
 

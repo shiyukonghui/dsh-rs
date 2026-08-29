@@ -7968,6 +7968,30 @@ dsh-cli **253/0**（+2 宿主测）、dsh-wasmrt 全绿（m32–m38 齐）、cli
 **预期影响与回滚点**：remote_host 三处 + 单元目录 + m38 + 清单一行断言；
 撤本提交即回到 `36fa730`。写端（settings.update 表单）留动态 fields 契约演进。
 
+## D-193（桌布 C8：chat 视图契约定稿——三 RPC 面 + `stream:"session-events"` 闭集；会话协议归宿主，单元只拥有声明）
+
+**日期**：2026-09-05（设计工件；实现切片 C8-1..4 排期）
+
+**触发问题**：「前端全部由服务单元组成」的最后一个主视图 = 聊天。流式事件不能经
+wasm 单元（请求/响应模型无订阅原语）；发送长 RPC `session.prompt` 需 `&mut Boot`
+而单元回调只拿 `&self`。
+
+**考虑过的选项与裁定**：
+- **(A) wasm chat 单元代理全部**（set "sessionPrompt"）：需 Arc/Box<dyn Fn> 反向钩子
+  注入 turn-driver——**装配倒挂**（RemoteHost 先于 agent loop 构造），且会话域本是
+  宿主概念，「单元优先」不应演变成「一切套 wasm 中转」。否决。
+- **(B) 声明单元 + 宿主协议面**：`panel-chat` 单元只拥有声明（describeUI v2 chat 卡），
+  三数据面（sessionSource/session·list、historyRpc/session·history 新薄臂、
+  sendRpc/session·prompt slash 别名）全指宿主原生臂；流 = 渲染器直订宿主既有 SSE
+  （`stream:"session-events"` **闭集单值**，契约不写 SSE 路径——宿主基建细节）。
+  三条不变量不动（声明=数据、渲染=浏览器、Rust 不渲染）。选定。
+- **卡内会话选择器**：sessionSource list 形状驱动 `<select>`；无源/失败 → 诚实错误态
+  （不猜会话）。折叠逻辑归 core 纯函数 `chatFoldFrame`（可 node 钉死，DOM 只做接线）。
+- **中断 v1 不做**：宿主中断面未实证——诚实缺省优于假按钮。
+
+**影响**：canvas design §4.1 chat 块标注定稿 + §13 加 C7（面板 ×N 台账行）/C8 行。
+**回滚点**：纯设计轮——撤本文档 + 三处标注即回到 `f8a5d68`；实现片 C8-1..4 各自独立可撤。
+
 
 
 
