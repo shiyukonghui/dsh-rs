@@ -1,0 +1,13 @@
+// panel-settings 服务装配单元（面板改写 #6，D-192）：设置概览卡（config 分类首卡）。
+//
+// 复用 `dsh:host-remote/remote` 与 `dsh:host-remote/host-services` 同一接口身份：
+// 宿主 `WasmRemoteEndpointPlugin` 零改动即可加载（namespace = panel-settings）。
+package dsh:panel-settings;
+
+use dsh:host-remote/remote;
+use dsh:host-remote/host-services;
+
+world panel-settings {
+  export remote;
+  import host-services;
+}

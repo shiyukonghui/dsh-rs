@@ -656,5 +656,13 @@ mod tests {
             .unwrap_or_else(|| panic!("会话清单卡应在清单里，得 {:?}", m.cards));
         assert_eq!(sess["type"], "session");
         assert_eq!(sess["cardId"], "panel-sessions.list");
+        // 面板改写 #6（D-192）：设置概览卡（第七卡，config 分类首卡）。
+        let cfg_card = m
+            .cards
+            .iter()
+            .find(|c| c["pluginName"] == "panel-settings")
+            .unwrap_or_else(|| panic!("设置概览卡应在清单里，得 {:?}", m.cards));
+        assert_eq!(cfg_card["type"], "config");
+        assert_eq!(cfg_card["cardId"], "panel-settings.list");
     }
 }

@@ -15,7 +15,8 @@ kv / sessionMessages / workspaceFiles / time / …），避免宿主扩张。
 | 4 | 工作区文件 | `wasm-plugins/panel-workspace-files` | list | 两段式：agentWorkspace 解析→workspaceFiles 列举（失败零枚举，不猜目录）；**resource 分类首卡** | ✅ D-190（m36） |
 | 5 | 会话清单 | `wasm-plugins/panel-sessions` | list | sessionCandidates 行零加工（epoch 原样）；**session 分类首卡**，发现端先行（打开/切换与 chat 同题留契约演进） | ✅ D-191（m37） |
 | — | 会话打开/切换 | — | chat（预留） | 需「卡级选择/跳转」交互形态 + chat 渲染器点亮（远景关键路径，独立契约流程） | ⬜ 契约演进 |
-| … | 设置/调度/任务/聊天… | — | form/list/chat（chat 渲染器属契约预留，点亮前无法迁移聊天面板） | — | ⬜ 路线图 |
+| 6 | 设置概览 | `wasm-plugins/panel-settings` | list | 宿主新投影 arm `settingsDescribe`（与原生 describe 同形状共用 namespace_view，redact 在源头）；行拍平 {ns,field,value}；**config 分类首卡** | ✅ D-192（m38 + 宿主 2 测） |
+| … | 设置编辑/调度/任务/聊天… | form（动态 fields）/chat | 契约演进：async schema、卡级选择、chat 渲染器点亮 | — | ⬜ 契约演进后迁移 |
 
 ## 迁移完成的判定（远景）
 「前端全部由服务单元组成」= harness 面板逐块迁移到桌布卡片直至旧前端可下线；

@@ -252,6 +252,7 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
         Some(host.sink.clone()),
         boot.loader.clone(),
         Some(boot.workspaces.clone()),
+        Some(boot.settings.clone()),
     ));
     // D-115-Web（阶段 C）：动态插件目录 → 注册真实可装配包（面板 list + runHostHalf 源）。
     if let Some(dir) = cfg.dynamic_plugins_dir.as_deref() {
@@ -2201,7 +2202,8 @@ fn now_ms() -> u64 {
 }
 
 /// M3b：namespace 描述 → wire `SettingsNamespaceView`（对齐 settingsNamespaceViewSchema）。
-fn namespace_view(view: dsh_settings::NamespaceDescriptor) -> Value {
+/// D-192：`pub(crate)`——原生 RPC 臂与 RemoteHost `settingsDescribe` 投影**共用**（杜绝双源）。
+pub(crate) fn namespace_view(view: dsh_settings::NamespaceDescriptor) -> Value {
     let mut v = serde_json::Map::new();
     v.insert("ns".to_string(), serde_json::json!(view.ns));
     let mut secrets = Vec::new();
@@ -4721,7 +4723,7 @@ mod tests {
         use dsh_loader::Loader;
         let cordis = dsh_core::Cordis::new();
         let loader = Loader::new(&cordis).unwrap();
-        let host = crate::remote_host::RemoteHost::new(None, Some(loader.clone()), None);
+        let host = crate::remote_host::RemoteHost::new(None, Some(loader.clone()), None, None);
         host.register_dynamic_package(crate::remote_host::DynamicPackage {
             plugin_id: "hello".to_string(),
             package_id: "pkg-v1".to_string(),
@@ -4754,7 +4756,12 @@ mod tests {
         use dsh_loader::Loader;
         let cordis = dsh_core::Cordis::new();
         let loader = Loader::new(&cordis).unwrap();
-        let host = std::rc::Rc::new(crate::remote_host::RemoteHost::new(None, Some(loader.clone()), None));
+        let host = std::rc::Rc::new(crate::remote_host::RemoteHost::new(
+            None,
+            Some(loader.clone()),
+            None,
+            None,
+        ));
         host.register_dynamic_package(crate::remote_host::DynamicPackage {
             plugin_id: "hello".to_string(),
             package_id: "pkg-v1".to_string(),
@@ -4841,7 +4848,12 @@ mod tests {
         use dsh_loader::Loader;
         let cordis = dsh_core::Cordis::new();
         let loader = Loader::new(&cordis).unwrap();
-        let host = std::rc::Rc::new(crate::remote_host::RemoteHost::new(None, Some(loader.clone()), None));
+        let host = std::rc::Rc::new(crate::remote_host::RemoteHost::new(
+            None,
+            Some(loader.clone()),
+            None,
+            None,
+        ));
         let plugin = dsh_wasmrt::WasmRemoteEndpointPlugin::new(
             "host-remote",
             &host_remote_component_bytes(),

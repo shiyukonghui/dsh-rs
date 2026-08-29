@@ -7939,6 +7939,35 @@ chat）。工作区文件面板对应 D-181 分类表的 `resource` 语义位（
 
 **预期影响与回滚点**：新包目录 + m37 + 清单断言行；撤包目录即回到 `cdcaf21`。
 
+## D-192（面板改写 #6：panel-settings 设置概览卡——宿主投影器首个受测扩展，「一个视图函数两处用」）
+
+**日期**：2026-09-05
+
+**触发问题**：设置面板是 harness 核心面板，但写端（编辑表单）依赖「动态 fields」契约
+演进（async schema，D-187 裁定独立决策）。读端今天可做：宿主 settings 域已完整
+（describe_all + redact 在源头），只是 RemoteHost 投影器没接它。
+
+**考虑过的选项与裁定**：
+- **投影 vs 转发**：单元直连原生 RPC（需扩 host-services 语义到任意 RPC——面太大）vs
+  **投影器加只读 arm `settingsDescribe`**。选后者：投影器就是「单元可见世界」的边界，
+  新数据面在边界上显式开窗，每个 arm 可测。
+- **杜绝双源漂移**：投影复用 web.rs 的 `namespace_view`（改 `pub(crate)`）——原生 RPC
+  与投影**共用一个视图函数**；宿主测试断言形状（ns/applies/revision/value），并做
+  **伪造空表探针**（空 namespaces 必红）验证断言非空转。
+- **redact 不重做也不解除**：provider 源头已脱敏（secrets[].set 仅存在性），单元不展开
+  secrets 路径、不自行脱敏、不解除脱敏——敏感面单一权威。
+- **行拍平归单元**：`{ns,field,value}` 概览行是展示投影（单元语义，双权威禁令）；
+  字段序不作断言（value 键序非契约，测试按 (ns,field) 查找——红之前修掉的顺序假设）。
+- **装配面**：RemoteHost::new 第 4 参 `settings: Option<…>`，None → `no-settings` 诚实
+  报错（不伪造空表）。
+
+**验收实测（2026-09-05）**：宿主 2/2（形状一致 + 缺依赖诚实）+ **伪造空表探针被抓红**；
+m38 先红（包不存在）→ **5/5**（拍平含非对象 value 占位行、失败透传）；清单联动扩第七卡。
+dsh-cli **253/0**（+2 宿主测）、dsh-wasmrt 全绿（m32–m38 齐）、clippy **0**。
+
+**预期影响与回滚点**：remote_host 三处 + 单元目录 + m38 + 清单一行断言；
+撤本提交即回到 `36fa730`。写端（settings.update 表单）留动态 fields 契约演进。
+
 
 
 

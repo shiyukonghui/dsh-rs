@@ -35,6 +35,8 @@ pub struct RemoteHost {
     pub dynamic_packages: Rc<RefCell<HashMap<String, DynamicPackage>>>,
     /// 每次 handle 调用通过 host-services 反查的记账（诊断）。
     pub calls: Rc<RefCell<Vec<String>>>,
+    /// D-192：真实 settings 提供者（panel-settings 只读投影数据源；None → 诚实报错）。
+    pub settings: Option<Rc<RefCell<dsh_settings::SettingsProvider>>>,
 }
 
 /// 一个动态 wasm 组件包（阶段 B/C）：真实装配单位。
@@ -61,6 +63,7 @@ impl RemoteHost {
         events: Option<crate::session_host::EventSink>,
         loader: Option<dsh_loader::Loader>,
         workspaces: Option<Rc<RefCell<crate::workspace_host::WorkspaceRegistry>>>,
+        settings: Option<Rc<RefCell<dsh_settings::SettingsProvider>>>,
     ) -> Self {
         RemoteHost {
             events,
@@ -69,6 +72,7 @@ impl RemoteHost {
             kv: Rc::new(RefCell::new(HashMap::new())),
             dynamic_packages: Rc::new(RefCell::new(HashMap::new())),
             calls: Rc::new(RefCell::new(Vec::new())),
+            settings,
         }
     }
 
@@ -391,6 +395,29 @@ impl RemoteServiceProjector for RemoteHost {
                 "plugins": self.dynamic_registry_json(),
             }))
             .unwrap_or_default(),
+            // D-192（panel-settings 只读投影）：与原生 settings.describe **同形状**——
+            // 复用 namespace_view（一个视图函数两处用，杜绝双源漂移）。
+            "settingsDescribe" => match &self.settings {
+                None => Self::err_json("no-settings", "no settings provider assembled"),
+                Some(sp) => {
+                    let mut sp = sp.borrow_mut();
+                    let namespaces: Vec<serde_json::Value> = sp
+                        .describe_all()
+                        .into_iter()
+                        .map(crate::web::namespace_view)
+                        .collect();
+                    let has_document = sp.has_document();
+                    serde_json::to_vec(&serde_json::json!({
+                        "ok": true,
+                        "value": {
+                            "writable": true,
+                            "hasDocument": has_document,
+                            "namespaces": namespaces,
+                        }
+                    }))
+                    .unwrap_or_default()
+                }
+            },
             _ => Self::err_json("unknown-service", &format!("no service {service}")),
         }
     }
@@ -445,5 +472,41 @@ impl RemoteServiceProjector for RemoteHost {
             }
             _ => Self::err_json("read-only", &format!("service {service} is read-only")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D-192（panel-settings）：`settingsDescribe` 投影与原生 settings.describe 同形状
+    /// （复用 namespace_view 的字段面：ns/applies/revision…）。
+    #[test]
+    fn settings_describe_projection_matches_native_shape() {
+        let settings = Rc::new(RefCell::new(dsh_settings::SettingsProvider::memory()));
+        crate::register_host_settings(&mut settings.borrow_mut());
+        let host = RemoteHost::new(None, None, None, Some(settings));
+        let out: serde_json::Value =
+            serde_json::from_slice(&host.get("settingsDescribe", b"{}")).unwrap();
+        assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(out["value"]["writable"], true);
+        let namespaces = out["value"]["namespaces"].as_array().expect("namespaces");
+        assert!(!namespaces.is_empty(), "注册过产品偏好命名空间必有投影");
+        let theme = namespaces
+            .iter()
+            .find(|n| n["ns"] == "ui-theme")
+            .unwrap_or_else(|| panic!("ui-theme 应在投影里: {namespaces:?}"));
+        assert_eq!(theme["applies"], "live");
+        assert!(theme["revision"].is_number(), "revision 齐（乐观锁面）");
+    }
+
+    /// 缺依赖诚实报错——不伪造空命名空间表。
+    #[test]
+    fn settings_describe_without_reference_is_honest() {
+        let host = RemoteHost::new(None, None, None, None);
+        let out: serde_json::Value =
+            serde_json::from_slice(&host.get("settingsDescribe", b"{}")).unwrap();
+        assert_eq!(out["ok"], false, "缺 settings 引用不得报成功: {out}");
+        assert_eq!(out["error"]["code"], "no-settings");
     }
 }
