@@ -16,7 +16,7 @@ kv / sessionMessages / workspaceFiles / time / …），避免宿主扩张。
 | 5 | 会话清单 | `wasm-plugins/panel-sessions` | list | sessionCandidates 行零加工（epoch 原样）；**session 分类首卡**，发现端先行（打开/切换与 chat 同题留契约演进） | ✅ D-191（m37） |
 | — | 会话打开/切换 | — | chat（预留） | 需「卡级选择/跳转」交互形态 + chat 渲染器点亮（远景关键路径，独立契约流程） | ⬜ 契约演进 |
 | 6 | 设置概览 | `wasm-plugins/panel-settings` | list | 宿主新投影 arm `settingsDescribe`（与原生 describe 同形状共用 namespace_view，redact 在源头）；行拍平 {ns,field,value}；**config 分类首卡** | ✅ D-192（m38 + 宿主 2 测） |
-| C8 | 聊天 | `panel-chat`（只拥有声明） | chat（**契约已定稿**） | 三 RPC 面指宿主原生臂（session·list/history/prompt）+ `stream:"session-events"` 闭集（渲染器直订宿主 SSE，折叠归 core `chatFoldFrame`）；实现切片 C8-1..4 | 🟨 C8-1 ✅（core 校验+折叠纯函数，node 26/26）；C8-2..4 排期 |
+| C8 | 聊天 | `panel-chat`（只拥有声明） | chat（**契约已定稿**） | 三 RPC 面指宿主原生臂（**复用既有 session.history 面**+list/prompt slash 别名，C8-2 遮蔽教训回正）+ `stream:"session-events"` 闭集；折叠归 core `chatFoldFrame` | 🟨 C8-1/C8-2 ✅（node 26/26；255/0）；C8-3 渲染器/C8-4 声明单元排期 |
 | … | 设置编辑/调度/任务… | form（动态 fields）/list+写动作 | 契约演进：async schema、调度投影 arm（照 D-192 受测扩展型） | — | ⬜ 契约演进后迁移 |
 
 ## 迁移完成的判定（远景）

@@ -8000,6 +8000,18 @@ turn/start|end、command/run|done；引用差 = 重绘信号；纯函数零改�
 （→ chart/table 两员，齐形 chat 归 C8 专测）；canvas.rs 导出守卫补 chatFoldFrame/
 chatOptions（顺手补齐 C6 漏登的 rowActionBody/needsConfirm）。C8-2..4 排期不变。
 
+**实现切片实测 C8-2（2026-09-05）+ 一处设计回正（越级处理纪律的实证）**：原设计
+「historyRpc = 新宿主薄臂 session/history（宿主折叠）」——实现后被**两条旧测红暴露**：
+`session.history` 面**早已存在**（M 期：`{hasMore, events:[{event:{type,data,time,seq}}],
+projections}`），自造臂遮蔽了既有臂。回正：**撤自造臂、复用既有面 + slash 别名**
+（`"session.history" | "session/history"`）——旧前端与桌布卡共用同一事实源（杜绝双源
+折叠漂移，同 namespace_view 纪律）；历史折叠由渲染器把 events[].event 映射成 core
+`chatFoldFrame` 帧（kind=event.type 规范串本就同源）。附带：`session/list` 别名、
+`session/prompt` 别名 + 简化线形状 `{sessionId,text}` 臂内映射 content 块、长 RPC
+名单同步。dsh-cli **255/0**（+2）、clippy **0**。教训入册：动手前对既有方法名全表面
+取证不足（只查了 sessions.list 变体未查 history）——设计文档「新薄臂」据实修正为
+「复用既表面 + 别名」。
+
 
 
 

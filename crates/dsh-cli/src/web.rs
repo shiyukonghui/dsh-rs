@@ -809,7 +809,7 @@ pub fn dispatch_long_rpc(
 pub fn is_long_rpc_method(method: &str) -> bool {
     matches!(
         method,
-        "session.prompt" | "agent-loop" | "agent.turn" | "agent.run" | "commands/execute" | "session.approval.decide"
+        "session.prompt" | "session/prompt" | "agent-loop" | "agent.turn" | "agent.run" | "commands/execute" | "session.approval.decide"
     )
 }
 
@@ -3627,7 +3627,7 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
                 serde_json::json!({"ok": true, "value": {"opened": true}})
             }
         }
-        "sessions" | "session.list" => {
+        "sessions" | "session.list" | "session/list" => {
             // M1e：SessionStore 提供权威列表（创建顺序、失活/空判定）。
             let updated_at = now_ms();
             let items = {
@@ -3695,7 +3695,9 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
             }
             serde_json::json!({"ok": true, "value": {"sessionId": id}})
         }
-        "session.history" => {
+        // C8-2（D-193）：slash 别名——桌布 rpc 面 `[ns,method]` join 出的方法名直连
+        // 既有 history 面（**复用不另造**：旧前端同事实源，杜绝双源折叠漂移）。
+        "session.history" | "session/history" => {
             // M1e：SessionStore 的历史（strict-envelope 事件直接 wire）。
             let sid = payload
                 .get("sessionId")
@@ -3795,13 +3797,24 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
                 }})
             }
         }
-        "session.prompt" => {
+        "session.prompt" | "session/prompt" => {
             // 前端经 prompt 发消息：提取 content → 驱动 turn。
             // M2g：boot 装配了 Rust AgentLoopHost 时改驱真实 agent-loop（事件直接
             // 落共享 store；前端历史/下链同一事实源）；否则 M1 WASM loop 路径
             // （run_turn 的 SessionLog 新事件 adopt 进目标会话）。
             let sid = payload.get("sessionId").and_then(|v| v.as_str()).unwrap_or("default").to_string();
-            let content = payload.get("content").cloned().unwrap_or(Value::Null);
+            let content = payload
+                .get("content")
+                .cloned()
+                // C8-2（D-193）：chat 卡简化线形状 `{sessionId,text}` → 映射 content
+                // 块（臂内协议适配，传输细节归宿主）。
+                .or_else(|| {
+                    payload
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|t| serde_json::json!([{"type": "text", "text": t}]))
+                })
+                .unwrap_or(Value::Null);
             if boot.agent_loop.is_some() {
                 // 取首个 text 块为 prompt 文本（M1 回显 loop 的输入形状）。
                 let text = content
@@ -5516,10 +5529,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// C8-2（D-193）：session/history slash 别名 = 既有 session.history 面
+    /// （复用不另造——曾自造薄臂被两条旧测红暴露遮蔽，退回复用，单源纪律）。
+    #[test]
+    fn rpc_session_history_slash_alias_matches_dot() {
+        let boot = boot_with_sessions();
+        let call = |method: &str| -> Value {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "rh", "method": method, "payload": {},
+            }))
+            .unwrap();
+            handle_rpc(&boot, method, &body).1
+        };
+        let dot = call("session.history");
+        let slash = call("session/history");
+        assert_eq!(dot["result"]["ok"], true, "既有面基线：{dot}");
+        assert_eq!(slash["result"]["ok"], dot["result"]["ok"], "别名同臂：{slash}");
+        assert!(
+            slash["result"]["value"]["events"].is_array(),
+            "events 面直供 chatFoldFrame 消费：{slash}"
+        );
+    }
+
+    /// C8-2（D-193）：slash 别名路由（桌布 rpc 面 `[ns,method]` join 出的方法名）——
+    /// session/list 与 session.list 同形；session/prompt slash + 简化 text args 与
+    /// 点号 content 形同为可接受响应（不 panic、信封完整）。
+    #[test]
+    fn rpc_session_slash_aliases_route() {
+        let boot = boot_with_sessions();
+        let call = |method: &str, payload: Value| -> Value {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "ra", "method": method, "payload": payload,
+            }))
+            .unwrap();
+            handle_rpc(&boot, method, &body).1
+        };
+        let v = call("session/list", serde_json::json!({}));
+        assert_eq!(v["result"]["ok"], true, "slash 别名出列表：{v}");
+        assert!(v["result"]["value"]["items"].is_array());
+        let v1 = call("session/prompt", serde_json::json!({"sessionId": "default", "text": "你好"}));
+        assert!(v1["result"].get("ok").is_some(), "prompt slash+text 信封完整：{v1}");
+        let v2 = call(
+            "session.prompt",
+            serde_json::json!({"sessionId": "default", "content": [{"type": "text", "text": "你好"}]}),
+        );
+        assert_eq!(
+            v2["result"]["ok"], v1["result"]["ok"],
+            "两形状路由同一臂，ok 一致：{v1} vs {v2}"
+        );
+    }
+
     /// M3a：host.createDirectory 真实创建；重复 → directory-exists 错误链路。
     #[test]
-    fn rpc_host_create_directory_real_fs() {
-        let boot = boot_with_sessions();
+    fn rpc_host_create_directory_real_fs() {        let boot = boot_with_sessions();
         let dir = std::env::temp_dir().join(format!(
             "dsh-web-create-{}",
             std::process::id()
