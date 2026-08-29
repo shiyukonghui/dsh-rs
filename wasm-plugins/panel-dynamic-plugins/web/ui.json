@@ -1,0 +1,21 @@
+{
+  "$schema": "dsh/plugin-ui/v2",
+  "kind": "card",
+  "cardId": "panel-dynamic-plugins.list",
+  "type": "runtime",
+  "title": "动态插件",
+  "description": "dynamicCordisRunner 定义与运行态（只读）",
+  "size": { "w": 4, "h": 4 },
+  "view": {
+    "kind": "list",
+    "dataRpc": ["panel-dynamic-plugins", "list"],
+    "columns": [
+      { "key": "pluginId", "label": "插件 ID" },
+      { "key": "name", "label": "包名" },
+      { "key": "state", "label": "状态" }
+    ],
+    "rowsPath": "items",
+    "actions": [],
+    "emptyText": "没有已定义的动态插件"
+  }
+}

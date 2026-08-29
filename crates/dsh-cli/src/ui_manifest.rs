@@ -632,5 +632,13 @@ mod tests {
         assert_eq!(st["type"], "runtime");
         assert_eq!(st["cardId"], "panel-runtime-status.status");
         assert_eq!(st["size"], json!({"w": 2, "h": 2}));
+        // 面板改写 #3（D-188）：动态插件清单卡（第四卡，同样零宿主改动）。
+        let dyn_card = m
+            .cards
+            .iter()
+            .find(|c| c["pluginName"] == "panel-dynamic-plugins")
+            .unwrap_or_else(|| panic!("动态插件卡应在清单里，得 {:?}", m.cards));
+        assert_eq!(dyn_card["type"], "runtime");
+        assert_eq!(dyn_card["cardId"], "panel-dynamic-plugins.list");
     }
 }
