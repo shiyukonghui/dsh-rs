@@ -14,6 +14,8 @@ import {
   statusItems,
   rowActionBody,
   needsConfirm,
+  chatFoldFrame,
+  chatOptions,
   GRID,
 } from "./core.js";
 
@@ -207,6 +209,8 @@ async function loadBody(el, card) {
   }
   if (decl.view.kind === "form") {
     renderForm(el, decl);
+  } else if (decl.view.kind === "chat") {
+    renderChat(el, decl); // C8-3（D-193）
   } else {
     renderDataBody(el, decl); // status / list（C4）
   }
@@ -490,6 +494,144 @@ setInterval(() => {
   loadManifest().finally(() => { state.polling = false; });
 }, POLL_MS);
 window.addEventListener("resize", () => { if (state.model) renderWorkbench(); });
+
+// C8-3（D-193）：chat 渲染器——会话选择器 + 历史折叠（复用 session.history 事件面，
+// 喂 core chatFoldFrame）+ 发送（乐观气泡，失败标注）+ 轮询刷新（stream SSE 直订
+// 待宿主帧形状取证，轮询与 SSE 同一折叠事实源，无第二权威）。
+function renderChat(el, decl) {
+  const view = decl.view;
+  const stat = statLine(el);
+  const bar = document.createElement("div");
+  bar.className = "chat-bar";
+  const sel = document.createElement("select");
+  bar.appendChild(sel);
+  bar.appendChild(button("↻", "", () => loadHistory()));
+  el.appendChild(bar);
+  const msgs = document.createElement("div");
+  msgs.className = "chat-msgs";
+  el.appendChild(msgs);
+  const form = document.createElement("form");
+  form.className = "chat-send";
+  const input = document.createElement("input");
+  input.placeholder = "发消息…";
+  input.autocomplete = "off";
+  const go = button("发送", "primary", null);
+  go.type = "submit";
+  form.appendChild(input);
+  form.appendChild(go);
+  el.appendChild(form);
+
+  let sid = null;
+  let chat = { sessionId: null, busy: false, messages: [] };
+
+  const paint = () => {
+    msgs.innerHTML = "";
+    for (const m of chat.messages) {
+      const d = document.createElement("div");
+      d.className = "chat-bubble " + m.role;
+      const who = m.role === "user" ? "我: " : m.role === "assistant" ? "助手: " : "· ";
+      d.textContent = who + m.text + (m.pending ? " …" : "");
+      msgs.appendChild(d);
+    }
+    msgs.scrollTop = msgs.scrollHeight;
+  };
+
+  const loadHistory = () => {
+    if (!sid) return;
+    // 历史事件 data 形状（user `{content}`、assistant 或嵌 `message.content`，
+    // content 为串或 text 块数组）→ 归一成 core 折叠契约的 `{text}`（传输适配在
+    // DOM 层，core 契约单一：SSE 直订接入时复用同一归一）。
+    const frameText = (d) => {
+      if (!d) return "";
+      const c = d.content !== undefined
+        ? d.content
+        : d.message && d.message.content !== undefined ? d.message.content : d.text;
+      if (typeof c === "string") return c;
+      if (Array.isArray(c)) {
+        return c.filter((b) => b && b.type === "text").map((b) => b.text || "").join("");
+      }
+      return "";
+    };
+    rpc(view.historyRpc.join("/"), { sessionId: sid })
+      .then((res) => {
+        if (!res || res.ok === false) {
+          report(stat, res);
+          return;
+        }
+        let s = { sessionId: sid, busy: false, messages: [] };
+        for (const wrap of (res.value && res.value.events) || []) {
+          const ev = wrap && wrap.event;
+          if (!ev) continue;
+          s = chatFoldFrame(s, {
+            sessionId: sid,
+            kind: ev.type,
+            data: { text: frameText(ev.data) },
+            time: ev.time,
+          });
+        }
+        chat = s;
+        paint();
+      })
+      .catch((e) => stat("✗ 历史拉取：" + e.message, "err"));
+  };
+
+  sel.onchange = () => {
+    sid = sel.value;
+    loadHistory();
+  };
+
+  form.onsubmit = (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!sid || !text) return;
+    chat = {
+      sessionId: sid,
+      busy: chat.busy,
+      messages: chat.messages.concat([{ role: "user", text, pending: true, ts: Date.now() }]),
+    };
+    paint();
+    input.value = "";
+    rpc(view.sendRpc.join("/"), { sessionId: sid, text })
+      .then((res) => {
+        report(stat, res);
+        if (res && res.ok === false) {
+          const copy = chat.messages.slice();
+          const last = copy.length - 1;
+          if (copy[last] && copy[last].pending) {
+            copy[last] = { ...copy[last], text: copy[last].text + "（发送失败）" };
+          }
+          chat = { ...chat, messages: copy };
+          paint();
+        }
+      })
+      .catch((e) => stat("✗ 发送：" + e.message, "err"));
+  };
+
+  rpc(view.sessionSource.join("/"), {})
+    .then((res) => {
+      if (!res || res.ok === false) {
+        stat("✗ 会话列表：" + ((res && res.error && res.error.message) || "?"), "err");
+        return;
+      }
+      const opts = chatOptions((res.value && res.value.items) || []);
+      if (opts.length === 0) {
+        stat("没有可选会话", "warn");
+        return;
+      }
+      for (const o of opts) {
+        const op = document.createElement("option");
+        op.value = o.value;
+        op.textContent = o.label;
+        sel.appendChild(op);
+      }
+      sid = opts.some((o) => o.value === "default") ? "default" : opts[0].value;
+      sel.value = sid;
+      loadHistory();
+    })
+    .catch((e) => stat("✗ 会话列表拉取：" + e.message, "err"));
+
+  setInterval(() => loadHistory(), 5000);
+}
 
 // D-186：热插拔主通道——`/plugins/events` SSE 收 ui-manifest-changed 即重取清单
 // （pollDecision 的 keep/replace 语义对重复/乱序帧天然安全）。graph/rebuilt 帧属

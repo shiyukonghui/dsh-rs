@@ -8012,6 +8012,17 @@ projections}`），自造臂遮蔽了既有臂。回正：**撤自造臂、复�
 取证不足（只查了 sessions.list 变体未查 history）——设计文档「新薄臂」据实修正为
 「复用既表面 + 别名」。
 
+**实现切片实测 C8-3（2026-09-05）**：chat 渲染器落地（`renderChat`：会话选择器
+`chatOptions(session.list.items)` + 历史 `session.history events → 归一{text} →
+chatFoldFrame` + 发送乐观气泡失败标注 + 5s 轮询刷新）。**v1 诚实降级一处**：宿主
+SSE 帧形状未取证（grep 无 session-event 字面量），`stream:"session-events"` SSE
+直订暂缓——轮询用**同一折叠事实源**（无第二权威），取证后接入仅换驱动不改语义；
+渲染器输入归一（data.content/嵌入 message.content/blocks→text）放 DOM 层传输适配，
+core 折叠契约保持单一 `{text}`。core 档位：RESERVED 摘 chat → IMPLEMENTED（四档）；
+C8-1 的「齐形 chat → renderer-unimplemented」测试按 C8-3 语义迁移为直通 null。
+node **26/26**、dsh-cli **255/0**、clippy **0**。浏览器端到端手测仍缺（无基建；
+DOM 层为已钉死纯函数的接线）。C8-4（panel-chat 声明单元）排期——落地即第八卡上桌布。
+
 
 
 

@@ -361,8 +361,8 @@ const goodChat = () => {
 };
 
 test("chat shape validated ahead of renderer reservation", () => {
-  // 形状齐 → 仍 renderer-unimplemented（C8-3 前渲染器保留档，语义如实）。
-  assert.equal(validateDeclaration(goodChat()).code, "renderer-unimplemented");
+  // C8-3（D-193）迁移注记：chat 渲染器已点亮——形状齐 → 直通（null）。
+  assert.equal(validateDeclaration(goodChat()), null);
   // 形状缺 → view-malformed 抢在保留档之前（声明缺陷优先于渲染器进度）。
   const noHist = goodChat();
   delete noHist.view.historyRpc;

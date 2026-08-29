@@ -9,9 +9,9 @@ export const TYPE_ORDER = ["model", "config", "capability", "runtime", "resource
 
 const SCHEMA = "dsh/plugin-ui/v2";
 const REJECTED = ["board"]; // 画布本身；卡内嵌画布 = 递归陷阱
-const RESERVED = ["chat", "chart", "table"]; // 契约预留：签名已定，渲染器未建
+const RESERVED = ["chart", "table"]; // 契约预留（chat 由 C8-3/D-193 点亮升入实现档）
 // C4 点亮 form/status/list（§4.1 三档「实现档」齐）；预留档落 renderer-unimplemented。
-const IMPLEMENTED = ["form", "status", "list"];
+const IMPLEMENTED = ["form", "status", "list", "chat"];
 const UNIMPLEMENTED = RESERVED;
 
 /** 默认网格几何（CSS 变量可覆写；格距 10px 是契约值，非打印 pt）。 */

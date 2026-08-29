@@ -78,3 +78,16 @@ header h1 { font-size: 16px; margin: 0; }
 .srow .svalue.tone-ok { color: var(--ok); }
 .srow .svalue.tone-warn { color: #d9a94b; }
 .srow .svalue.tone-err { color: var(--err); }
+.chat-bar { display: flex; gap: 6px; margin-bottom: 6px; }
+.chat-bar select { flex: 1; background: var(--bg); color: var(--text);
+  border: 1px solid var(--line); border-radius: 3px; font: inherit; }
+.chat-msgs { overflow-y: auto; max-height: 260px; display: flex;
+  flex-direction: column; gap: 4px; }
+.chat-bubble { padding: 3px 8px; border-radius: 6px; font-size: 12px;
+  white-space: pre-wrap; word-break: break-word; }
+.chat-bubble.user { background: var(--line); align-self: flex-end; }
+.chat-bubble.assistant { background: #23303f; align-self: flex-start; }
+.chat-bubble.system { color: var(--dim); font-size: 11px; align-self: center; }
+.chat-send { display: flex; gap: 6px; margin-top: 6px; }
+.chat-send input { flex: 1; background: var(--bg); color: var(--text);
+  border: 1px solid var(--line); border-radius: 3px; font: inherit; padding: 3px 6px; }
