@@ -320,6 +320,7 @@ function renderForm(el, decl) {
       const proj = schemaFields(nsView);
       view.fields = proj.fields.map((f) => ({
         name: f.key, label: f.label, type: f.type, options: f.options, default: f.value,
+        secretWriteOnly: f.secretWriteOnly, exists: f.exists,
       }));
       if (ff.nsSelect === true) {
         const m = nsSelectModel(allValue, nsName);
@@ -382,6 +383,14 @@ function fieldInput(f, value) {
       sel.appendChild(o);
     });
     return sel;
+  }
+  if (f.secretWriteOnly === true) {
+    // D-204：密码型写入框——值恒空起步，永不明文回显。
+    const pw = document.createElement("input");
+    pw.type = "password";
+    pw.value = "";
+    pw.placeholder = f.exists === true ? "改写（留空=不改动）" : "首次设置";
+    return pw;
   }
   if (f.type === "checkbox") {
     const cb = document.createElement("input");

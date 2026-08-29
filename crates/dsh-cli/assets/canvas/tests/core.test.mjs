@@ -312,6 +312,40 @@ test("statusItems: dataRpc items > static view.items > honest empty", () => {
 
 // ---- C6（D-189）：行动作线形状 + confirm 语义 ----
 
+// D-204（secrets-recon）：write-only 秘密字段 + 防误清闸。
+test("schemaFields projects top-level secrets as write-only fields (D-204)", () => {
+  const proj = schemaFields({
+    schema: { properties: { token: { type: "string" }, lang: { type: "string" } } },
+    value: { lang: "zh" },
+    secrets: [{ path: ["token"], set: true }, { path: ["deep", "pw"], set: false }],
+  });
+  const tok = proj.fields.find((f) => f.key === "token");
+  assert.equal(tok.secretWriteOnly, true, "顶层 secret → write-only 控件");
+  assert.equal(tok.value, "", "永不明文回显");
+  assert.equal(tok.exists, true, "set 侧信息透出（改写/首次设置文案用）");
+  assert.equal(proj.fields.find((f) => f.key === "lang").secretWriteOnly, undefined);
+  // 嵌套 secret（path 多点）不提升为控件——其容器维持 v1 只读纪律。
+  assert.ok(!proj.fields.some((f) => f.key === "deep" && f.secretWriteOnly));
+});
+
+test("collectValues omits empty write-only secret values (D-204 wipe gate)", () => {
+  const view = {
+    fields: [
+      { name: "token", type: "text", secretWriteOnly: true },
+      { name: "lang", type: "text" },
+    ],
+  };
+  assert.deepEqual(
+    collectValues(view, (n) => (n === "token" ? "" : "en")),
+    { lang: "en" },
+    "空值必须剔出 patch（否则覆盖已存秘密=事故）",
+  );
+  assert.deepEqual(
+    collectValues(view, (n) => (n === "token" ? "s3cr3t" : "en")),
+    { token: "s3cr3t", lang: "en" },
+  );
+});
+
 test("nsSelectModel projects namespaces into a selector model (D-201)", () => {
   const value = { namespaces: [{ ns: "ui-theme" }, { ns: "locale" }, { ns: "shell" }] };
   assert.deepEqual(nsSelectModel(value, "locale"), {

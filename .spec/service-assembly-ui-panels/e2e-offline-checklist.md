@@ -21,7 +21,7 @@
 | 会话清单（list） | sessionId/epoch 与实况一致（只读） | 会话面板（列举子集） |
 | 设置概览（list） | ns/字段/值与 settings.describe 一致；secret 仅存在性 | 设置面板（只读子集） |
 | **聊天（chat）** | 选会话→历史气泡与旧前端一致；发送→乐观气泡→SSE 真回复；切会话不串线；**停止**→turn 中止（aborted 事件）不删历史 | **聊天主视图（关键路径）** |
-| 设置编辑（form+fieldsFrom+**nsSelect**） | 下拉列出全部 ns；切换重投影；保存成功；改并发→SETTINGS_CONFLICT 显式；Restart 类 ns 保存后显示「需重启生效」 | 设置面板（写端**全 ns**，D-201） |
+| 设置编辑（form+fieldsFrom+**nsSelect**） | 下拉列出全部 ns；切换重投影；保存成功；改并发→SETTINGS_CONFLICT 显式；Restart 类 ns 保存后显示「需重启生效」；**秘密字段**=password 框（设→存在性转「已设」；留空保存不改写） | 设置面板（写端**全 ns**，D-201/204） |
 | 设置编辑 · locale（form，固定 ns） | 同契约换 ns=locale（D-201 后与上卡重叠，可合并裁撤） | 设置面板（冗余保留，待拍板） |
 | 调度任务（list+删） | after/at/every 行与实况一致；**删除弹确认**；删后行消失（fold 回读） | 调度面板（读+删） |
 | 创建调度（form） | kind/prompt/afterSeconds 保存 → 调度任务卡出现该行 | 调度面板（建端） |
@@ -31,8 +31,8 @@
 - ~~审批交互~~ → **已落地（D-198/199 第十二卡：pending 列表 + 允许/拒绝(confirm)）**；
   审批策略编辑（approval/policy）未做（属设置域）。
 - 动态插件 **define/activate**（表单参数写）未做。
-- 设置编辑已 2 ns（ui-theme + **locale**，D-200 机械复制已兑现）；其余 ns（llm/shell/
-  agent-loop/…）同法待点单；secrets 编辑不支持。
+- 设置编辑已 2 ns（ui-theme + **locale**，D-200 机械复制已兑现）；~~其余 ns 待点单~~
+  （D-201 nsSelect 通用卡终结）；~~secrets 编辑不支持~~ → **已落地（D-204 write-only）**。
 - 动态插件 define（新定义写 cordis.yml）：宿主 loader.create 无 RPC 面，真需设计轮；
   ~~activate~~ → **已落地（D-202 启用动作 = dynamicActivate 同后端）**。
 - 聊天：审批线、附件未做（D-193 边界）；~~中断按钮~~ → **已落地（D-203 停止按钮）**。

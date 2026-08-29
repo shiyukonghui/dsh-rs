@@ -171,6 +171,9 @@ export function collectValues(view, read) {
       }
     } else if (f.type === "number") {
       data[f.name] = Number(raw);
+    } else if (f.secretWriteOnly === true) {
+      // D-204 防误清闸：write-only 秘密字段空值 = 不改动（绝不以 "" 覆盖已存秘密）。
+      if (raw !== "" && raw != null) data[f.name] = raw;
     } else {
       data[f.name] = raw;
     }
@@ -328,10 +331,21 @@ export function schemaFields(nsView) {
   const value = v.value && typeof v.value === "object" && !Array.isArray(v.value) ? v.value : {};
   const fields = [];
   const readonly = [];
+  // D-204：顶层 secret（path 单段）→ write-only 字段（永不明文回显；空值=不改由
+  // collectValues 闸保证）。嵌套 secret（path 多点）不提升——容器维持 v1 只读。
+  const secretSlots = (Array.isArray(v.secrets) ? v.secrets : []).filter(
+    (s) => s && Array.isArray(s.path) && s.path.length === 1,
+  );
+  const secretOf = (key) => secretSlots.find((s) => s.path[0] === key);
   for (const key of Object.keys(props)) {
     const p = props[key] && typeof props[key] === "object" ? props[key] : {};
     const cur = value[key];
-    if (Array.isArray(p.enum) && p.enum.length > 0) {
+    const sec = secretOf(key);
+    if (sec) {
+      fields.push({
+        key, label: key, type: "text", secretWriteOnly: true, value: "", exists: sec.set === true,
+      });
+    } else if (Array.isArray(p.enum) && p.enum.length > 0) {
       fields.push({
         key, label: key, type: "select", options: p.enum.slice(),
         value: typeof cur === "string" ? cur : "",
