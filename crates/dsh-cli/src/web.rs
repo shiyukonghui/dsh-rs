@@ -382,6 +382,8 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
         // M6 step8（D-087）：真实 provider catalog 视图注入 Boot（llm.models caps）。
         boot.agent_catalog = Some(crate::m6_llm::server_catalog_view(&base_url, &model));
         tick_schedule = Some(bundle.schedule.clone());
+        // D-195：桌布 `schedule/list` RPC 面的挂载点（与 tick/M4 工具同一实例）。
+        boot.schedule = Some(bundle.schedule.clone());
         tick_bridge = bundle.bash_jobs.clone();
     }
 
@@ -3640,6 +3642,21 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
                 serde_json::json!({"ok": true, "value": {"opened": true}})
             }
         }
+        // D-195（panel-schedule 读端薄臂）：与 M4 工具 ScheduleHost 同一实例
+        // （fold 事件日志为权威，零第二状态源）；未装配 → 诚实报错不伪造空表。
+        "schedule/list" => match &boot.schedule {
+            None => serde_json::json!({"ok": false, "error": {
+                "code": "no-schedule-host",
+                "message": "schedule host not assembled (agent loop disabled?)",
+            }}),
+            Some(s) => match s.list() {
+                Ok(rows) => serde_json::json!({"ok": true, "value": {"items": rows}}),
+                Err(e) => serde_json::json!({"ok": false, "error": {
+                    "code": "schedule-list-failed",
+                    "message": e,
+                }}),
+            },
+        },
         "sessions" | "session.list" | "session/list" => {
             // M1e：SessionStore 提供权威列表（创建顺序、失活/空判定）。
             let updated_at = now_ms();
@@ -4686,6 +4703,7 @@ mod tests {
             settings: std::rc::Rc::new(std::cell::RefCell::new(
                 dsh_settings::SettingsProvider::memory(),
             )),
+            schedule: None,
             credentials: std::rc::Rc::new(std::cell::RefCell::new(
                 dsh_credentials::CredentialProvider::memory(),
             )),
@@ -5575,6 +5593,38 @@ mod tests {
         assert_eq!(canonical_rpc_method("settings/update"), "settings.update");
         assert_eq!(canonical_rpc_method("session/history"), "session/history");
         assert_eq!(canonical_rpc_method("uiManifest/list"), "uiManifest/list");
+    }
+
+    /// D-195：schedule/list 诚实两面——无宿主 = no-schedule-host（不伪造空表）；
+    /// 挂载后 create 一条即回读 {id,kind,prompt,scheduledAt}（fold 权威）。
+    #[test]
+    fn rpc_schedule_list_honest_shapes() {
+        let mut boot = boot_with_sessions();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "rs", "method": "schedule/list", "payload": {},
+        }))
+        .unwrap();
+        let v = handle_rpc(&boot, "schedule/list", &body).1;
+        assert_eq!(v["result"]["ok"], false, "缺调度宿主必须诚实: {v}");
+        assert_eq!(v["result"]["error"]["code"], "no-schedule-host");
+        let store = SessionHost::in_memory();
+        let sess = store.session("default").expect("default live");
+        let sched = std::sync::Arc::new(dsh_cli_host::ScheduleHost::new(sess));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        sched
+            .create("after", "提醒喝水", Some(60), None, None, now)
+            .expect("create ok");
+        boot.schedule = Some(sched);
+        let v = handle_rpc(&boot, "schedule/list", &body).1;
+        assert_eq!(v["result"]["ok"], true, "{v}");
+        let items = v["result"]["value"]["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kind"], "after");
+        assert_eq!(items[0]["prompt"], "提醒喝水");
+        assert!(items[0]["id"].as_str().unwrap().starts_with("schedule-"));
     }
 
     #[test]

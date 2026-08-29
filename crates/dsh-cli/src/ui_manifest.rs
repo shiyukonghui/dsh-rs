@@ -680,5 +680,13 @@ mod tests {
             .unwrap_or_else(|| panic!("设置编辑卡应在清单里，得 {:?}", m.cards));
         assert_eq!(se["type"], "config");
         assert_eq!(se["cardId"], "panel-settings-edit.edit");
+        // D-195：调度清单声明单元（第十卡；E2E 清单最大缺口划账）。
+        let sch = m
+            .cards
+            .iter()
+            .find(|c| c["pluginName"] == "panel-schedule")
+            .unwrap_or_else(|| panic!("调度卡应在清单里，得 {:?}", m.cards));
+        assert_eq!(sch["type"], "runtime");
+        assert_eq!(sch["cardId"], "panel-schedule.list");
     }
 }

@@ -1,0 +1,10 @@
+// panel-schedule 服务装配单元（面板改写 #9 / D-195）：调度清单声明单元。
+package dsh:panel-schedule;
+
+use dsh:host-remote/remote;
+use dsh:host-remote/host-services;
+
+world panel-schedule {
+  export remote;
+  import host-services;
+}

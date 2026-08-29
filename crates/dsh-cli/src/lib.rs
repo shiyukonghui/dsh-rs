@@ -99,6 +99,9 @@ pub struct Boot {
     /// M3b：settings 能力缝（namespace 注册 + describe/update/replace/mutate + 文件）。
     /// `Rc<RefCell>`——web RPC 只持 `&Boot`，跨请求共享可变状态。
     pub settings: Rc<std::cell::RefCell<dsh_settings::SettingsProvider>>,
+    /// D-195：调度宿主（`schedule/list` 桌布读端的单一权威——与 M4 工具执行器同一
+    /// Arc；agent-loop 装配时由 serve 挂载，未启用 = None → 端点诚实报错）。
+    pub schedule: Option<std::sync::Arc<crate::web::dsh_cli_host::ScheduleHost>>,
     /// M3c：credentials 能力缝（env/file 分层 + set/unset + 文件）。
     pub credentials: Rc<std::cell::RefCell<dsh_credentials::CredentialProvider>>,
     /// M4h：goal 服务（goal.* RPC 的真实状态机；`Rc<RefCell>` 跨请求共享）。
@@ -337,6 +340,7 @@ pub fn boot_with_host_plugins(
         agent_loop: None,
         agent_catalog: None,
         settings,
+        schedule: None,
         credentials: Rc::new(std::cell::RefCell::new(
             dsh_credentials::CredentialProvider::memory(),
         )),

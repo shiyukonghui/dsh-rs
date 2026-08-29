@@ -18,7 +18,8 @@ kv / sessionMessages / workspaceFiles / time / …），避免宿主扩张。
 | 6 | 设置概览 | `wasm-plugins/panel-settings` | list | 宿主新投影 arm `settingsDescribe`（与原生 describe 同形状共用 namespace_view，redact 在源头）；行拍平 {ns,field,value}；**config 分类首卡** | ✅ D-192（m38 + 宿主 2 测） |
 | C8 | 聊天 | `wasm-plugins/panel-chat`（声明单元） | chat（**全链路落地**） | 三 RPC 面复用宿主既表面；折叠同源；**SSE 直订已接（C8-3b，仅订 events.mux）** | ✅ D-193 C8-1..4+3b（m39 3/3，清单第八卡） |
 | S | 设置编辑 | `wasm-plugins/panel-settings-edit`（声明单元） | form + `fieldsFrom` 动态投影 | describe/update 经 canonical 别名复用宿主既表面；expectedRevision 乐观锁；secrets 仅存在性；嵌套只读 | ✅ D-194 S1..S4（m40 3/3，清单第九卡） |
-| … | 调度/任务… | list+写动作 | 契约演进：调度投影 arm（照 D-192 受测扩展型） | — | ⬜ 契约演进后迁移 |
+| 10 | 调度任务 | `wasm-plugins/panel-schedule`（声明单元） | list | 宿主薄臂 `schedule/list`（Boot 挂载与 M4 工具同一 ScheduleHost，fold 事件日志权威；缺宿主诚实报错）；写端另立切片 | ✅ D-195（m41 3/3 + 宿主测） |
+| … | 审批… | — | 契约演进：审批交互形态 | — | ⬜ 契约演进后迁移 |
 
 ## 迁移完成的判定（远景）
 「前端全部由服务单元组成」= harness 面板逐块迁移到桌布卡片直至旧前端可下线；

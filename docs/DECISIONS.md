@@ -8076,6 +8076,34 @@ ui.json 一份契约；清单第九卡断言）。dsh-cli **256/0**、dsh-wasmrt
 clippy **0**。诚实注记：S4 未单独跑包不存在红（context 预算裁决；m33–m39 该红型已七次
 实证，m40 行为断言全绿即契约钉死）。settings 面板读写两端自此服务单元化。
 
+## D-195（panel-schedule：调度读端薄臂 + 声明单元——Boot 挂载单一权威，E2E 最大缺口划账）
+
+**日期**：2026-09-05
+
+**触发问题**：E2E 清单 §2 指认的最大未迁移项（调度/任务面板）。取证发现：调度只有
+**M4 工具面**（schedule_create/list/delete 执行器），**无前端 RPC 臂**；状态权威 =
+会话 `schedule/change` 事件日志（ScheduleHost::fold 纯重放）；`schedule.list` 点号面
+不存在（遮蔽教训流程先行排除）。
+
+**考虑过的选项与裁定**：
+- **读端落点**：投影器 arm（RemoteHost 再扩构造器 + 装配时序纠缠）vs **web.rs 原生薄臂
+  `schedule/list`**（handle_rpc_host 有 boot 可达，同 session.list 先例）。选后者——
+  单文件、零构造器变更。
+- **单一权威**：Boot 加 `schedule: Option<Arc<ScheduleHost>>`，serve 在
+  `tick_schedule = Some(bundle.schedule.clone())` 同点挂载**同一 Arc**——不复制 fold
+  逻辑、不新造状态源；未启用 agent loop = None → `no-schedule-host` 诚实报错。
+- **归属**：声明单元照 panel-chat/panel-settings-edit 定型（零自有数据端点）。
+- **写端 v1 不做**（create/delete 需表单参数与确认形态，独立切片）。
+
+**验收实测（2026-09-05）**：宿主 `rpc_schedule_list_honest_shapes`（缺宿主诚实 + create
+一条即回读 {id,kind,prompt,scheduledAt}，fold 权威闭环）；m41 3/3；清单第十卡断言。
+dsh-cli **257/0**、wasmrt 全绿（m32–m41）、node 30/30、clippy **0**。诚实注记：
+本包未单独跑包不存在红（红型已八次实证）；两处编译期小错（Boot 测试字面量缺字段 /
+now 应 i64）即时修复。
+
+**预期影响与回滚点**：lib.rs 两行 + web.rs 三处 + 单元目录 + m41 + 清单一行；
+撤本提交回到 `5464ab2`。E2E 清单 §2 划账（调度只读子集落地；写端缺口保留标注）。
+
 
 
 
