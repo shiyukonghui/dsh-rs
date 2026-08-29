@@ -1,0 +1,30 @@
+{
+  "$schema": "dsh/plugin-ui/v2",
+  "kind": "card",
+  "cardId": "llm-deepseek.settings",
+  "type": "model",
+  "title": "DeepSeek Provider",
+  "description": "DeepSeek provider 连接与模型目录设置",
+  "size": { "w": 2, "h": 3 },
+  "view": {
+    "kind": "form",
+    "dataRpc": ["llm-deepseek", "currentValues"],
+    "fields": [
+      { "name": "apiKeyEnv", "label": "API Key 环境变量", "type": "text", "role": "credential-ref", "default": "DEEPSEEK_API_KEY", "required": true },
+      { "name": "baseURL", "label": "Base URL", "type": "text", "default": "https://api.deepseek.com" },
+      { "name": "thinking", "label": "Thinking", "type": "select", "options": ["enabled", "disabled"], "default": "enabled" },
+      { "name": "reasoningEffort", "label": "Reasoning Effort", "type": "select", "options": ["off", "low", "high", "max"], "default": "high" },
+      { "name": "maxTokens", "label": "Max Tokens", "type": "number", "default": 256000, "min": 1 },
+      { "name": "defaultContextWindow", "label": "Default Context Window", "type": "number", "default": 1000000, "min": 1 },
+      { "name": "models", "label": "Models（目录）", "type": "list", "item": { "type": "object", "fields": [
+          { "name": "id", "label": "Model ID", "type": "text", "required": true },
+          { "name": "name", "label": "显示名", "type": "text" },
+          { "name": "contextWindow", "label": "Context Window", "type": "number", "min": 1 }
+      ] } }
+    ],
+    "actions": [
+      { "name": "save", "label": "保存", "rpc": ["llm-deepseek", "save"], "primary": true },
+      { "name": "discoverModels", "label": "发现模型", "rpc": ["llm-deepseek", "discoverModels"] }
+    ]
+  }
+}

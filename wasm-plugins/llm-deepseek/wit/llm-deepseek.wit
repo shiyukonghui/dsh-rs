@@ -1,0 +1,14 @@
+// llm-deepseek 服务装配单元试点（P2：rust + ui 声明 + wasm）。
+//
+// 复用 `dsh:host-remote/remote` 与 `dsh:host-remote/host-services` 同一接口身份：
+// 宿主 `WasmRemoteEndpointPlugin`（已绑定 host-remote world）零改动即可加载本组件，
+// 组件携带自己的 UI 声明面 + 动作面（namespace = llm-deepseek）。
+package dsh:llm-deepseek;
+
+use dsh:host-remote/remote;
+use dsh:host-remote/host-services;
+
+world llm-deepseek {
+  export remote;
+  import host-services;
+}

@@ -130,6 +130,10 @@ pub struct Boot {
     /// dispatch 回落 not-implemented（诚实）。`Rc<RefCell>`：web RPC 只持 `&Boot`，
     /// 组件懒实例化入 `RefCell`（单线程 accept，与 loop_plugin 同纪律）。
     pub remote_plugin: Option<Rc<std::cell::RefCell<dsh_wasmrt::WasmRemoteEndpointPlugin>>>,
+    /// P2 试点（服务装配单元）：`llm-deepseek` wasm 远程载体（describeUI/save/
+    /// discoverModels；复用 host-remote world 接口身份）。serve 装配 Some；None
+    /// （测试口/未装配）→ `llm-deepseek.*` 路由回落 not-implemented（诚实）。
+    pub llm_deepseek_remote: Option<Rc<std::cell::RefCell<dsh_wasmrt::WasmRemoteEndpointPlugin>>>,
     /// D2：真实宿主投影器（`RemoteServiceProjector`——loader/session/settings/持久 KV
     /// 等真实数据源面）。serve 装配 Some；None（测试口）→ wasm 端点反查宿主时诚实报错。
     pub remote_projector: Option<Rc<dyn dsh_wasmrt::RemoteServiceProjector>>,
@@ -341,6 +345,7 @@ pub fn boot_with_host_plugins(
         plan_session: None,
         approval_wire: None,
         remote_plugin: None,
+        llm_deepseek_remote: None,
         remote_projector: None,
         loader: Some(loader.clone()),
         packages,

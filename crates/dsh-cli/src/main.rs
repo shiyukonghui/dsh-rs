@@ -374,6 +374,7 @@ fn web_main(args: &[String]) {
         env_file,
         dynamic_plugins_dir,
         config_path,
+        wasm_base: wasm_base.clone(),
     };
     match dsh_cli::web::serve(&mut boot, cfg) {
         Ok(server) => {

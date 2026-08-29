@@ -142,6 +142,9 @@ pub struct WebConfig {
     /// 服务装配单元 Phase 1（E3/A7）：主 cordis.yml 配置路径——serve 在 boot 完成后
     /// 给 loader 挂持久化 seam（运行时 create/update/remove 真实原子写回该文件）。
     pub config_path: PathBuf,
+    /// P2 试点：插件包文件夹根（`wasm-plugins`）。serve 据此解析 `llm-deepseek` 服务
+    /// 装配单元包，把其 `web/` 挂到 `/plugins/llm-deepseek/**` 静态面。
+    pub wasm_base: PathBuf,
 }
 
 /// 一个已运行的 Web 服务器（持有实际监听地址）。
@@ -267,6 +270,30 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
     .map_err(|e| CordisError::Internal(format!("host-remote plugin: {e}")))?;
     boot.remote_plugin = Some(std::rc::Rc::new(std::cell::RefCell::new(remote_plugin)));
     boot.remote_projector = Some(remote_projector);
+
+    // P2 试点（服务装配单元）：装配 `llm-deepseek` wasm remote 载体（describeUI/save/
+    // discoverModels，复用 host-remote world 接口身份）+ 其插件包静态面（web/ui.json 经
+    // `/plugins/llm-deepseek/**` 分发，D-175 serve_package_asset）。缺组件/包 → 静态面
+    // 仍可访问，`llm-deepseek.*` RPC 回落 not-implemented（诚实，不伪装可用）。
+    let llm_deepseek_bytes = llm_deepseek_component_bytes();
+    if !llm_deepseek_bytes.is_empty() {
+        let llm_deepseek_plugin = dsh_wasmrt::WasmRemoteEndpointPlugin::new(
+            "llm-deepseek",
+            &llm_deepseek_bytes,
+            dsh_wasmrt::Capabilities::default(),
+            None,
+        )
+        .map_err(|e| CordisError::Internal(format!("llm-deepseek plugin: {e}")))?;
+        boot.llm_deepseek_remote =
+            Some(std::rc::Rc::new(std::cell::RefCell::new(llm_deepseek_plugin)));
+    }
+    if let Some(pkg) = crate::plugin_pkg::resolve_package(&cfg.wasm_base, "llm-deepseek")
+        .map_err(|e| CordisError::Internal(format!("llm-deepseek package: {e}")))?
+    {
+        if !boot.packages.iter().any(|p| p.name == "llm-deepseek") {
+            boot.packages.push(pkg);
+        }
+    }
 
     // M3a+（D-098）：装配进程内原生目录选择器（`host.pickDirectory`）。Windows 桌面经
     // IFileDialog/COM（零子进程）弹系统目录框；无桌面/失败 → wire `directory-picker-unavailable`
@@ -1211,6 +1238,26 @@ pub fn host_remote_component_bytes() -> Vec<u8> {
             .expect("run cargo component build for host-remote");
         if !status.success() {
             eprintln!("host-remote component build failed; remote endpoints unavailable");
+        }
+    }
+    std::fs::read(&wasm).unwrap_or_default()
+}
+
+/// P2 试点：读取（如缺构建）`llm-deepseek` 服务装配单元组件字节（复用 host-remote
+/// world 接口身份；组件模型专，禁 C ABI）。缺构建 → 空字节（路由回落 not-implemented，
+/// 诚实——不伪装可用）。
+pub fn llm_deepseek_component_bytes() -> Vec<u8> {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../wasm-plugins/llm-deepseek");
+    let wasm = dir.join("target/wasm32-wasip1/debug/llm_deepseek_plugin.wasm");
+    if !wasm.exists() {
+        let status = std::process::Command::new("cargo")
+            .env("CARGO_NET_OFFLINE", "true")
+            .args(["component", "build", "--manifest-path"])
+            .arg(dir.join("Cargo.toml"))
+            .status()
+            .expect("run cargo component build for llm-deepseek");
+        if !status.success() {
+            eprintln!("llm-deepseek component build failed; llm-deepseek.* endpoints unavailable");
         }
     }
     std::fs::read(&wasm).unwrap_or_default()
@@ -4410,13 +4457,34 @@ fn dispatch_wasm_remote(boot: &Boot, method: &str, payload: &Value) -> Value {
             "message": format!("method \"{method}\" not implemented by dsh web"),
         }});
     };
-    let Some(plugin) = boot.remote_plugin.as_ref() else {
-        return serde_json::json!({"ok": false, "error": {
-            "code": "internal",
-            "message": format!("remote endpoint {method} (no wasm remote host assembled)"),
-            "details": {},
-        }});
-    };
+    // P2 试点：`llm-deepseek` 服务装配单元的 UI/动作端点由它自己的 wasm 载体承载；
+    // 其余 namespace 沿用 host-remote 单一载体（既有路由不动；未装配 → 诚实回落）。
+    let plugin: &Rc<std::cell::RefCell<dsh_wasmrt::WasmRemoteEndpointPlugin>> =
+        if namespace == "llm-deepseek" {
+            match boot.llm_deepseek_remote.as_ref() {
+                Some(p) => p,
+                None => {
+                    return serde_json::json!({"ok": false, "error": {
+                        "code": "not-implemented",
+                        "message": format!(
+                            "remote endpoint {method} (llm-deepseek wasm carrier not assembled)"
+                        ),
+                        "details": {},
+                    }});
+                }
+            }
+        } else {
+            match boot.remote_plugin.as_ref() {
+                Some(p) => p,
+                None => {
+                    return serde_json::json!({"ok": false, "error": {
+                        "code": "internal",
+                        "message": format!("remote endpoint {method} (no wasm remote host assembled)"),
+                        "details": {},
+                    }});
+                }
+            }
+        };
     // 组件 body：前端 gateway 把端点参数包在 `payload.args`（`rpc.call('/api', e, {args})`）——
     // 解包后透传组件（组件读平铺字段）；无 args 壳（curl/直接调用）→ 透传 payload 本身。
     let body_payload = payload.get("args").unwrap_or(payload);
@@ -4529,6 +4597,7 @@ mod tests {
             plan_session: None,
             approval_wire: None,
             remote_plugin: None,
+            llm_deepseek_remote: None,
             remote_projector: None,
             loader: None,
             packages: Vec::new(),
@@ -4715,6 +4784,66 @@ mod tests {
         assert_eq!(v2["error"]["code"], "internal");
         assert!(v2["error"]["details"].is_object(), "error details present: {v2}");
     }
+
+    /// P2 试点（服务装配单元）：`llm-deepseek` 路由到自己的 wasm 载体（describeUI/save），
+    /// 静态面 `/plugins/llm-deepseek/ui.json` 由 serve_package_asset 真实分发。
+    #[test]
+    fn llm_deepseek_remote_routes_and_serves_static() {
+        use std::path::Path;
+        // 1. 装配试点载体到 boot（复用 host-remote world 接口身份）。
+        let mut boot = boot_with_sessions();
+        let bytes = llm_deepseek_component_bytes();
+        assert!(!bytes.is_empty(), "llm-deepseek component bytes present");
+        let plugin = dsh_wasmrt::WasmRemoteEndpointPlugin::new(
+            "llm-deepseek",
+            &bytes,
+            dsh_wasmrt::Capabilities::default(),
+            None,
+        )
+        .unwrap();
+        boot.llm_deepseek_remote = Some(std::rc::Rc::new(std::cell::RefCell::new(plugin)));
+
+        // 2. describeUI 路由到试点载体 → 有效声明。
+        let v = dispatch_wasm_remote(&boot, "llm-deepseek/describeUI", &serde_json::json!({}));
+        assert_eq!(v["ok"], true, "describeUI routed: {v}");
+        // v2（D-181）：顶层 card；分类轴 type；内容视图在 view。
+        assert_eq!(v["value"]["kind"], "card");
+        assert_eq!(v["value"]["type"], "model");
+        assert_eq!(v["value"]["view"]["kind"], "form");
+
+        // 3. save 经 args 壳 → 落宿主 kv（projector 为空则 honest 报错；此处用 args 透传）。
+        //    （真实 kv 后端在 serve 时经 remote_projector；本测试只验证路由与 args 解包。）
+        let sv = dispatch_wasm_remote(
+            &boot,
+            "llm-deepseek/save",
+            &serde_json::json!({"args": {"values": {"maxTokens": 12345}}}),
+        );
+        // 无 remote_projector → 组件反查 host-services 失败 → fail-loud（诚实，不伪造成功）。
+        assert_eq!(sv["ok"], false, "no projector -> fail-loud: {sv}");
+        assert_ne!(sv["error"]["code"], "not-implemented");
+
+        // 4. 未装配载体 → not-implemented（诚实回落）。
+        let bare = boot_with_sessions();
+        let unmounted = dispatch_wasm_remote(&bare, "llm-deepseek/describeUI", &serde_json::json!({}));
+        assert_eq!(unmounted["ok"], false);
+        assert_eq!(unmounted["error"]["code"], "not-implemented");
+
+        // 5. 静态面：/plugins/llm-deepseek/ui.json 经 serve_package_asset 分发。
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../wasm-plugins");
+        let pkg = crate::plugin_pkg::resolve_package(&base, "llm-deepseek")
+            .expect("resolve llm-deepseek package")
+            .expect("package exists");
+        let (status, ct, body) = serve_package_asset(std::slice::from_ref(&pkg), "/plugins/llm-deepseek/ui.json")
+            .expect("ui.json served");
+        assert_eq!(status, 200);
+        assert!(ct.contains("json"), "content-type json: {ct}");
+        let served: serde_json::Value = serde_json::from_slice(&body).expect("ui.json parses");
+        // v2（D-181）静态面与 describeUI 同契约：card + type + view.form。
+        assert_eq!(served["kind"], "card");
+        assert_eq!(served["type"], "model");
+        assert_eq!(served["view"]["kind"], "form");
+    }
+
 
     /// D-106/S1：`session.plan.mode` 宿主入口/出口——落 `plan/mode`（含 message）+
     /// `approval/policy` 诚实宣告；离开无 heading 前置；折叠源即时可见。

@@ -7532,6 +7532,119 @@ RPC 动作面）→ TDD 实现 → 验收 demo。
 无运行时影响。回滚：撤本提交即可回到 D-178 后的状态；架构模型尚未实现（无代码可回滚），真正
 实现代码留到试点立项后的 TDD 阶段。
 
+## D-180（试点落地：llm-deepseek 服务装配单元——rust + ui 声明 + wasm 垂直切片）
+
+**日期**：2026-08-28
+
+**触发问题**：D-178/D-179 定稿 P2 架构模型后，用户要求「选一个 deepseek harness 插件作试点，
+转换为定下的 rust + ui 声明 + wasm 模式」——首个服务装配单元含 UI 的可验收 demo。
+
+**试点选择（llm-deepseek）**：HANDOFF 点名的 canonical「cordis.yml 一行插件」；Config 是纯声明
+式表单（apiKeyEnv/baseURL/thinking/reasoningEffort/maxTokens/defaultContextWindow/models[]），
+天然可表达为 P2 声明（数据）；与 dsh-settings/credentials/kv 契约平行；验收可做 demo（渲染 +
+保存 + 发现模型，不需真实 LLM 网络）。
+
+**关键决策**：
+- **wasm world 复用 host-remote 接口身份**（`export remote` + `import host-services`）：
+  宿主 `WasmRemoteEndpointPlugin` **零改动**即可加载试点组件——每服务装配单元 = 一个远程载体
+  （namespace=插件名），describeUI/save/discoverModels/currentValues 动作面。
+- **声明=数据，一份契约**：静态 `web/ui.json` 与 wasm `describeUI` **逐字段一致**（m32 断言），
+  渲染器只读声明（无插件 JS 进浏览器 → 天然沙箱）。
+- **静态声明起步 + 动态 RPC 增强**（requirements.md P2 §2 倾向）：`/plugins/llm-deepseek/ui.json`
+  静态分发（D-175 serve_package_asset）+ `/api/llm-deepseek/describeUI` 动态。
+- **持久化走既有 kv 后端**（key `llm-deepseek/settings`），save 白名单校验 + fail-loud，不伪造成功。
+- **试点边界**：不做真实 LLM 调用 / 不做 loader entry 依赖激活（inject）——「服务插件 entry 化」
+  下一阶段；不做 SSR（D-179 可选加速，非验收）。
+
+**验收（详见 `.spec/service-assembly-ui-pilot/acceptance.md`）**：m32（wasmrt）6 断言全绿 +
+dsh-cli 集成测试 `llm_deepseek_remote_routes_and_serves_static` 绿（路由 + 未装配回落
+not-implemented + ui.json 静态 200）；`cargo test -p dsh-cli -p dsh-wasmrt` 225 通过（5 个
+M5 bash/schedule/job 失败为基线既有环境性失败，git stash 验证与本改动无关）；clippy `-D warnings`
+零告警。
+
+**预期影响与回滚点**：新增 `wasm-plugins/llm-deepseek/`（组件 + web 声明/渲染器 demo）+ `Boot.
+llm_deepseek_remote` 字段（默认 None）+ WebConfig.wasm_base 字段 + dispatch 路由（仅 namespace=
+llm-deepseek 分流，既有 host-remote 路由不动）+ m32/集成测试 + 本 spec 目录。回滚：撤本提交即去
+试点载体装配与路由（字段默认 None，路由回落 not-implemented），既有行为零回归。
+
+## D-181（桌布架构定稿：双正交枚举 / 卡片壳 / 网格自适排布 / 热插拔清单口子）
+
+**日期**：2026-08-28
+
+**触发问题**：D-180 试点跑通「wasm 生声明 + 通用渲染器」后，用户提出把前端从「绑定 harness
+现有前端」改为**桌布（Canvas）**——每个插件 UI 是一张卡片、按类型分类、左侧固定边栏、右侧网格
+容器自适应排布。用户明确**非专业 UI 设计**，要求逐轮反问确认真实需求、**不要盲从其设计**。
+
+**协商结论（六轮问答，用户逐条确认）**：
+1. **桌布定位 = 独立视图**：不推翻 harness 前端（聊天/会话等成熟资产保留）；现有前端 UI 资产
+   按「UI + 逻辑」**增量拆成服务装配单元**（迁一块、验一块，未迁部分继续用原前端）。
+2. **右侧 = 工作台**（多卡片平铺），非单卡查看器；点左侧类型=切分类，点左侧插件名=聚焦/滚动该卡。
+3. **坐标不外泄给插件**：插件只声明 `size{w,h}` + 排布顺序；**10px 网格格距**（非打印 pt），
+   列数随容器宽度自适应；「插件写死坐标」被否决（重叠/空档/出界，不成立自适应）。
+4. **双正交枚举强制分离**（本条核心，防架构崩塌）：`type`=侧边栏**分类**（面向用户，加值近乎
+   免费）；`view.kind`=**渲染契约**（加值必须实写渲染器）。合并成单一枚举被否决——那会让
+   侧栏显示 `form/list` 这种用户看不懂的值，且「加一个分类就得配一个渲染器」两条轴互相锁死。
+5. **v1 单卡 + `cardId` 预留**：一个装配单元出一张卡；将来出多卡是**发现清单层面**做加法。
+6. **`size` 封顶**：`w≤4`、`h≤8`，**超出由宿主裁剪 + 记录**（契约违规降级，不是渲染失败）。
+7. **热插拔口子**：`/api/ui-manifest` 从**实时状态**算（非启动快照）+ `rev` 代数 + 复用既有
+   `/plugins/events` SSE（D-175/D-177）广播变更；卡身份 = `(插件名, cardId)`。
+
+**概念纠偏（防走回三条弯路，与 D-179 同性质）**：
+- **`board` 否决**：「board」就是桌布/画布本身；卡片里再嵌画布 = 无限递归，v1 是纯陷阱。
+  若本意是「一卡里显示一行行条目」，那已是 `list`。
+- **三档制防「契约吹牛」**：写进契约的每个 `view.kind` 都等于「渲染器必须画得出」。故
+  **v1 实现** `form`/`status`/`list`；**契约预留** `chat`/`chart`/`table`（渲染器待建，落
+  fail-loud 元数据回落，不白屏）；**否决** `board`。「契约一次定全 + 实现逐档点亮」既满足
+  用户「一步到位、不要两套并行 schema」，又不虚报能力。
+- **v1 顶层只一种容器 `kind:"card"`**，D-180 的 `kind:"form"` **降级为 `view.kind:"form"`**
+  并**废止旧顶层形态**——不是新旧并列（并列才是崩塌根源），只维护一棵树。
+
+**下一步（不含本轮代码）**：新建 `.spec/service-assembly-ui-canvas/`（需求 + 设计）；试点
+`service-assembly-ui-pilot` 声明形态迁移 `form → card.view.form` 列为下一编码阶段第一件事。
+
+**预期影响与回滚点**：纯文档——本条 + `.spec/service-assembly-ui-canvas/{requirements,design}.md`
++ 试点 design 修订指针。**零代码、零运行时影响**（桌布尚未实现，无可回滚代码）。回滚：撤本提交
+即回到 D-180 后状态；试点现有代码仍按 D-180 的 `kind:"form"` 运行，迁移在下一轮以 TDD 红→绿进行。
+
+## D-182（桌布 C1 编码落定：试点声明迁移 form → card.view.form + 双模型防线）
+
+**日期**：2026-08-28
+
+**触发问题**：D-181 把 v2 契约定稿并声明「v1 顶层形态废止、不并存」。并存不会自己消失——
+必须真把唯一的 v1 产物（llm-deepseek 试点）迁过去，并用机制护栏证明没有第二套模型残留。
+
+**关键决策**：
+- **迁移只动形态，机制零改动**：`web/ui.json` 与 wasm `ui_declaration()` 的
+  `fields`/`actions` 原样搬进 `view`，外套 card 壳并加 `cardId`/`type:"model"`/`size 2×3`。
+  wasm world、四端点、kv 落盘、白名单校验、`/plugins/**` 静态挂接、`dispatch` 路由**全部不动**
+  ——这验证了「卡片化只影响声明形态与呈现，不影响 RPC 面」的判断。
+- **新增 `view.dataRpc`（契约内字段，非扩造）**：设计 §4.1 已预留「渲染器启动时调 `view.dataRpc`
+  拉宿主真实数据」。迁移时启用它显式表达 `["llm-deepseek","currentValues"]`，替掉 v1 里
+  顶层 `namespace` 的隐式推导——数据面不再靠猜。
+- **双模型防线 = 解析后看顶层，不 grep 文本**：新测试
+  `no_legacy_v1_top_level_declaration_anywhere` 遍历全仓 `wasm-plugins/*/web/ui.json`，断言凡含
+  `$schema` 者必须 v2 + 顶层 `kind:"card"`。**必须解析**：`view.kind:"form"` 是合法内容视图，
+  文本 grep 会假阳性。
+- **红验证**：临时放入 `kind:"form" + $schema:v1` 探针 → 防线 **FAILED** 并精确报出违规路径；
+  移除后复绿。（避免「恒真断言」自欺。）
+- **契约补一行 `card-kind-unknown`**：`$schema` 对但顶层容器写错时，只报
+  `schema-version-unsupported` 会把诊断引向错误方向，故区分「版本错」与「容器种类错」。
+  属契约正常收敛，不改「v1 已废止」的结论。
+
+**验收**：m32 **8/8 绿**（新增 `declaration_satisfies_v2_card_contract`：cardId 非空 / type 落
+闭集 / size 封顶且**声明无坐标** / dataRpc 显式；`static_ui_json_matches_describe_ui` 继续守护
+「静态与 describeUI 逐字段一致」一份契约）；dsh-cli 集成测试升 v2 后绿；
+`cargo clippy -p dsh-cli -p dsh-wasmrt --all-targets -- -D warnings` **0**；
+dsh-wasmrt 全套 14 个测试目标全绿（含 m31 host-remote）；dsh-cli **225 通过 / 5 失败**，
+5 个为**基线既有** M5 bash/schedule 环境性失败（git stash 已验证与本改动无关），计数与 C1 前一致。
+
+**诚实交代**：`web/renderer.js` 是**包内 demo，不是桌布壳**——C1 只让它正确消费 v2 单卡并按
+§7 fail-loud 表分派；侧栏分类 + 网格工作台在 C3。故 `status`/`list` 在当前 demo 落
+`renderer-unimplemented` 回落（三档制回落语义正是为此设计，不虚报实现进度）。
+
+**回滚点**：C1 集中在「声明形态 + 测试断言」——撤销本提交即回到 D-180 的 v1 形态；
+`dispatch` 路由 / 载体装配 / kv 后端不受影响（未改动）。
+
 
 
 
