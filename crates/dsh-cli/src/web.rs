@@ -1091,6 +1091,23 @@ fn dispatch_request(
         return;
     }
 
+    // 桌布 C3（D-184）：`/canvas` 独立视图（资产编译进二进制，零依赖 harness dist）。
+    // 未识别的 /canvas/* → 404——**绝不回落 SPA**（防「桌布失踪变前端」的诡异现场）。
+    if path == "/canvas" || path.starts_with("/canvas/") {
+        match crate::canvas::canvas_response(&path) {
+            Some((status, ct, body)) => {
+                let resp = Response::from_data(body.to_vec())
+                    .with_status_code(status)
+                    .with_header(Header::from_bytes(&b"Content-Type"[..], ct.as_bytes()).unwrap());
+                let _ = request.respond(resp);
+            }
+            None => {
+                let _ = request.respond(Response::empty(404));
+            }
+        }
+        return;
+    }
+
     // 静态文件：`/` 注入 `__DSH_BOOT__`，其余 SPA fallback。
     if path == "/" || path.is_empty() {
         if let Some(html) = render_index_with_boot(web_root, manifest) {

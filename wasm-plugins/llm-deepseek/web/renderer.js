@@ -148,10 +148,17 @@
   }
 
   function callRpc(ns, method, args) {
+    // client-request 信封（rpc_envelope_ok 纪律）：裸 {args} 经真实 HTTP 必 400（D-184 修复）。
+    var rid = "demo-" + Date.now() + "-" + Math.floor(Math.random() * 1e6);
     return fetch("/api/" + ns + "/" + method, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ args: args || {} }),
+      body: JSON.stringify({
+        type: "client-request",
+        rpcId: rid,
+        method: ns + "/" + method,
+        payload: { args: args || {} },
+      }),
     }).then(function (r) { return r.json(); });
   }
 

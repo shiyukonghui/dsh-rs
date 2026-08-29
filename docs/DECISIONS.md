@@ -7725,6 +7725,12 @@ clippy `-D warnings` **0**、verify-diff **26/26**。逐条验收与诚实台账
 **预期影响与回滚点**：新增 `crates/dsh-cli/assets/canvas/` + `canvas.rs` + serve 闭包一插 +
 demo renderer 一行修复；既有 wire/路由/前端零改动。回滚 = 撤销 C3 提交即回到 C2 完成态。
 
+**验收实测（2026-09-05 编码落地）**：桩红 **12/12**（`node --test`，含 rpcEnvelope 桩刻意
+复刻 demo 裸 `{args}` 缺陷被测试抓住——信封探针生效）→ 实现转绿 **12/12**；canvas.rs 3 测
+（壳引用齐 + 资产 mime + 零 eval 哨兵 + miss→None）。dsh-cli **244/0**（241 + 3）、
+dsh-wasmrt 全绿、clippy **0**。已知边界（诚实台账 acceptance §5）：app.js 粘合层与真实
+serve 进程冒烟无自动化执行（无浏览器基建/需 boot fixture），DOM 行为待人工浏览器验证。
+
 
 
 
