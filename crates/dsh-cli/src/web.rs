@@ -4406,6 +4406,9 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
         }
         // D-115-Web（D3）：wasm 组件承载的 remote 端点（含 dynamicCordisRunner.*——
         // 从组件真实实现不再是占位；未装配组件 → not-implemented 诚实回落）。
+        // 桌布 C2（D-183）：装配单元卡片发现面——原生臂（与 pluginInventory/list 同形；
+        // 实时聚合清单，禁缓存；坏声明带 error 条目）。
+        "uiManifest/list" => crate::ui_manifest::ui_manifest_result(boot, payload),
         m if m.starts_with("dynamicCordisRunner/") || m.starts_with("pluginInventory/")
             || m.starts_with("messageFeedback/") || m.starts_with("fileReferences/")
             || m.starts_with("sessionReferenceResolver/") => {
@@ -5802,6 +5805,155 @@ mod tests {
         let val = &v["result"]["value"];
         assert!(val.is_array());
         assert!(val[0]["name"].as_str().is_some());
+    }
+
+    // ---- 桌布 C2（D-183）：uiManifest/list 清单端点集成 ----
+
+    /// 临时插件包骨架：`base/<name>/{dummy.wasm, web/}`（清单只读 web/ui.json）。
+    fn ui_manifest_fixture(tag: &str, name: &str) -> (std::path::PathBuf, crate::plugin_pkg::PluginPackage) {
+        let base = std::env::temp_dir().join(format!(
+            "dsh-ui-manifest-rpc-{tag}-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join(name);
+        std::fs::create_dir_all(dir.join("web")).unwrap();
+        std::fs::write(dir.join("dummy.wasm"), b"wasm").unwrap();
+        let pkg = crate::plugin_pkg::PluginPackage {
+            name: name.to_string(),
+            dir: dir.clone(),
+            wasm: dir.join("dummy.wasm"),
+            web: Some(dir.join("web")),
+            caps: None,
+            world: None,
+        };
+        (base, pkg)
+    }
+
+    fn ui_manifest_rpc_body(client_rev: Option<&str>) -> Vec<u8> {
+        let args = match client_rev {
+            Some(r) => serde_json::json!({"rev": r}),
+            None => serde_json::json!({}),
+        };
+        serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "r-ui",
+            "method": "uiManifest/list", "payload": {"args": args}
+        }))
+        .unwrap()
+    }
+
+    fn ui_manifest_v2(card_id: &str, title: &str) -> String {
+        serde_json::json!({
+            "$schema": "dsh/plugin-ui/v2", "kind": "card",
+            "cardId": card_id, "type": "model", "title": title,
+            "size": { "w": 2, "h": 3 },
+            "view": { "kind": "form", "fields": [], "actions": [] }
+        })
+        .to_string()
+    }
+
+    /// wire 形状：空 packages → ok + 空 cards + 64-hex rev；好卡 + 坏卡聚合正确。
+    #[test]
+    fn rpc_ui_manifest_list_shape() {
+        let mut boot = boot_with_sessions();
+        let (_, v) = handle_rpc(&boot, "uiManifest/list", &ui_manifest_rpc_body(None));
+        assert_eq!(v["result"]["ok"], true, "空清单也必须 ok（诚实空态）");
+        let val = &v["result"]["value"];
+        assert_eq!(val["cards"].as_array().map(|c| c.len()), Some(0));
+        assert_eq!(val["rev"].as_str().map(|s| s.len()), Some(64), "sha256 全量 hex");
+
+        let (base, good) = ui_manifest_fixture("shape", "rpc-good");
+        let (_, broken) = ui_manifest_fixture("shape", "rpc-broken");
+        std::fs::write(
+            good.web.as_ref().unwrap().join("ui.json"),
+            ui_manifest_v2("rpc-good.settings", "RPC Good"),
+        )
+        .unwrap();
+        std::fs::write(broken.web.as_ref().unwrap().join("ui.json"), "not json{").unwrap();
+        boot.packages.push(good);
+        boot.packages.push(broken);
+
+        let (_, v) = handle_rpc(&boot, "uiManifest/list", &ui_manifest_rpc_body(None));
+        let cards = v["result"]["value"]["cards"].as_array().unwrap();
+        assert_eq!(cards.len(), 2, "坏包不静默丢：得 {cards:?}");
+        let g = &cards[0];
+        assert_eq!(g["pluginName"], "rpc-good");
+        assert_eq!(g["cardId"], "rpc-good.settings");
+        assert_eq!(g["type"], "model");
+        assert_eq!(g["title"], "RPC Good");
+        assert_eq!(g["size"], serde_json::json!({"w": 2, "h": 3}));
+        assert_eq!(g["declPath"], "/plugins/rpc-good/ui.json");
+        assert_eq!(cards[1]["error"]["code"], "declaration-unparseable");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 实时性（禁缓存的核心防线）：同一 boot 两请求之间改 ui.json 文件 → 条目与 rev 变。
+    /// 若谁日后加了启动快照缓存，本测试必红。
+    #[test]
+    fn rpc_ui_manifest_is_live_no_cache() {
+        let mut boot = boot_with_sessions();
+        let (base, pkg) = ui_manifest_fixture("live", "rpc-live");
+        std::fs::write(
+            pkg.web.as_ref().unwrap().join("ui.json"),
+            serde_json::json!({"$schema": "dsh/plugin-ui/v1", "kind": "form"}).to_string(),
+        )
+        .unwrap();
+        boot.packages.push(pkg.clone());
+
+        let (_, v1) = handle_rpc(&boot, "uiManifest/list", &ui_manifest_rpc_body(None));
+        let cards1 = v1["result"]["value"]["cards"].as_array().unwrap();
+        assert_eq!(cards1[0]["error"]["code"], "schema-version-unsupported");
+        let rev1 = v1["result"]["value"]["rev"].as_str().unwrap().to_string();
+
+        // 不重启、不重装配——只改磁盘上的 ui.json → 修好声明 + 改 title 都应反映
+        std::fs::write(
+            pkg.web.as_ref().unwrap().join("ui.json"),
+            ui_manifest_v2("rpc-live.settings", "Live v2"),
+        )
+        .unwrap();
+        let (_, v2) = handle_rpc(&boot, "uiManifest/list", &ui_manifest_rpc_body(None));
+        let cards2 = v2["result"]["value"]["cards"].as_array().unwrap();
+        assert_eq!(cards2.len(), 1);
+        assert!(cards2[0].get("error").is_none(), "修好后应出正常卡，得 {:?}", cards2[0]);
+        assert_eq!(cards2[0]["title"], "Live v2");
+        let rev2 = v2["result"]["value"]["rev"].as_str().unwrap().to_string();
+        assert_ne!(rev1, rev2, "内容变 → rev 必变（无缓存的可见证据）");
+
+        // 再请求一次（内容未变）→ rev 稳定
+        let (_, v3) = handle_rpc(&boot, "uiManifest/list", &ui_manifest_rpc_body(None));
+        assert_eq!(v3["result"]["value"]["rev"].as_str().unwrap(), rev2);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `args.rev` 协商：与当前一致 → `{rev, unchanged:true}`（无 cards，省带宽）。
+    #[test]
+    fn rpc_ui_manifest_unchanged_short_circuit() {
+        let mut boot = boot_with_sessions();
+        let (base, pkg) = ui_manifest_fixture("unch", "rpc-unch");
+        std::fs::write(
+            pkg.web.as_ref().unwrap().join("ui.json"),
+            ui_manifest_v2("rpc-unch.settings", "Unch"),
+        )
+        .unwrap();
+        boot.packages.push(pkg);
+
+        let (_, first) = handle_rpc(&boot, "uiManifest/list", &ui_manifest_rpc_body(None));
+        let rev = first["result"]["value"]["rev"].as_str().unwrap().to_string();
+
+        let (_, v) = handle_rpc(&boot, "uiManifest/list", &ui_manifest_rpc_body(Some(&rev)));
+        assert_eq!(v["result"]["ok"], true);
+        assert_eq!(v["result"]["value"]["unchanged"], true);
+        assert_eq!(v["result"]["value"]["rev"], rev.as_str());
+        assert!(
+            v["result"]["value"].get("cards").is_none(),
+            "unchanged 响应不得携带 cards（省带宽是短路的目的）"
+        );
+
+        // 客户端 rev 过期 → 正常全量
+        let (_, v) = handle_rpc(&boot, "uiManifest/list", &ui_manifest_rpc_body(Some("stale")));
+        assert!(v["result"]["value"].get("unchanged").is_none());
+        assert!(v["result"]["value"]["cards"].is_array());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 阶段3：dynamicCordisRunner inventory → []、syncInspectManifest → null

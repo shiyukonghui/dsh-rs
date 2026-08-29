@@ -7683,7 +7683,13 @@ disabled 交叉语义（试点未 entry 化）也须在编码前定死，否则�
 
 **预期影响与回滚点**：全增量——新模块 + dispatch 一臂 + Cargo.toml sha2 一行 + 测试；
 既有 wire 面零改动、wasm 侧零改动。回滚 = 撤销本工作流提交即回到 `44f9618` 后状态。
-验收实测见 `.spec/service-assembly-ui-c2/acceptance.md`。
+
+**验收实测（2026-09-04 编码落地）**：TDD 桩红 **10/11**（唯一 pass 为负向断言被空输出平凡满足）
+→ 实现转绿；**缓存探针红验证**（注入 `OnceLock` 快照缓存 → `rpc_ui_manifest_is_live_no_cache`
+FAILED，证明实时性护栏非恒真）后移除复绿；11 新测试全绿（8 单元 + 3 集成）。
+dsh-cli **241 通过 / 0 失败**（基线 230 + 新增 11，零劣化）、m32 8/8、dsh-wasmrt 全绿、
+clippy `-D warnings` **0**、verify-diff **26/26**。逐条验收与诚实台账见
+`.spec/service-assembly-ui-c2/acceptance.md`。
 
 
 

@@ -279,7 +279,7 @@
 | 切分 | 状态 | 证据 / 备注 |
 |---|---|---|
 | **C1** v2 契约 + 试点迁移 | ✅ **已落地**（2026-08-28，D-182） | `web/ui.json` + wasm `ui_declaration()` 均升 `card→view.form`（`type:"model"`、`size 2×3`、`cardId`、`view.dataRpc`）；m32 **8/8 绿**，含 `declaration_satisfies_v2_card_contract` 与双模型防线 `no_legacy_v1_top_level_declaration_anywhere`；dsh-cli `llm_deepseek_remote_routes_and_serves_static` 绿；clippy `-D warnings` 0；全量 225 通过 / 5 失败均为**基线既有** M5 bash 环境性失败（与 C1 无关，git stash 已验证） |
-| **C2** `/api/ui-manifest` | ⬜ 未开始 | — |
+| **C2** `uiManifest/list` | ✅ **已落地**（2026-09-04，D-183） | `crates/dsh-cli/src/ui_manifest.rs`（实时聚合纯函数 + sha256 内容哈希 rev + 坏声明 error 条目 + type/size/title 归一 + disabled 交叉）+ `dispatch()` 原生臂；11 新测试（桩红 10/11 + **缓存探针红验证**：注入 OnceLock 快照缓存 → 实时性测试必红）；dsh-cli **241/0**（基线 230 + 11 新增），m32 8/8，clippy **0**，verify-diff **26/26**；详见 `.spec/service-assembly-ui-c2/acceptance.md` |
 | **C3** 桌布壳最小集 | ⬜ 未开始 | — |
 | **C4** `status` / `list` 渲染器 | ⬜ 未开始 | — |
 | **C5** 热插拔 SSE | ⬜ 未开始 | — |

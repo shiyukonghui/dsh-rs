@@ -58,6 +58,10 @@ pub mod remote_host;
 /// 插件包（文件夹）解析：插件 = 文件夹（wasm 组件 + 前端组件），文件夹名 = 注册名。
 pub mod plugin_pkg;
 
+/// D-183：桌布 C2——宿主实时清单聚合（`uiManifest/list`）：包扫描 + 校验归一 + 坏包 error
+/// 条目 + sha256 内容哈希 rev。**每请求实时计算，禁缓存**（热插拔第一等要求）。
+pub mod ui_manifest;
+
 /// M6 step5b：真实 LLM 装配（deepseek 适配器 + dsh-core 流式 HTTP 桥 + 诚实 no-key
 /// fail-loud；key 仅 `DEEPSEEK_API_KEY` 环境变量）。
 pub mod m6_llm;
