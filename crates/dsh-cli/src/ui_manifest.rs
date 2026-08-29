@@ -648,5 +648,13 @@ mod tests {
             .unwrap_or_else(|| panic!("工作区文件卡应在清单里，得 {:?}", m.cards));
         assert_eq!(ws["type"], "resource");
         assert_eq!(ws["cardId"], "panel-workspace-files.list");
+        // 面板改写 #5（D-191）：会话清单卡（第六卡，session 分类首卡）。
+        let sess = m
+            .cards
+            .iter()
+            .find(|c| c["pluginName"] == "panel-sessions")
+            .unwrap_or_else(|| panic!("会话清单卡应在清单里，得 {:?}", m.cards));
+        assert_eq!(sess["type"], "session");
+        assert_eq!(sess["cardId"], "panel-sessions.list");
     }
 }

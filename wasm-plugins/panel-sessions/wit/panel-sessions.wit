@@ -1,0 +1,13 @@
+// panel-sessions 服务装配单元（面板改写 #5，D-191）：会话清单卡（session 分类首卡）。
+//
+// 复用 `dsh:host-remote/remote` 与 `dsh:host-remote/host-services` 同一接口身份：
+// 宿主 `WasmRemoteEndpointPlugin` 零改动即可加载（namespace = panel-sessions）。
+package dsh:panel-sessions;
+
+use dsh:host-remote/remote;
+use dsh:host-remote/host-services;
+
+world panel-sessions {
+  export remote;
+  import host-services;
+}

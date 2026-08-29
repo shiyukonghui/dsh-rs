@@ -1,0 +1,20 @@
+{
+  "$schema": "dsh/plugin-ui/v2",
+  "kind": "card",
+  "cardId": "panel-sessions.list",
+  "type": "session",
+  "title": "会话清单",
+  "description": "宿主真实会话候选（只读；打开/切换属未来交互形态）",
+  "size": { "w": 4, "h": 4 },
+  "view": {
+    "kind": "list",
+    "dataRpc": ["panel-sessions", "list"],
+    "columns": [
+      { "key": "sessionId", "label": "会话" },
+      { "key": "createdAt", "label": "创建 (epoch ms)" }
+    ],
+    "rowsPath": "items",
+    "actions": [],
+    "emptyText": "还没有会话"
+  }
+}

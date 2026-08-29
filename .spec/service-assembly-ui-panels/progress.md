@@ -13,7 +13,8 @@ kv / sessionMessages / workspaceFiles / time / …），避免宿主扩张。
 | 2 | 运行时状态 | `wasm-plugins/panel-runtime-status` | status | loader+dynamicPlugins 聚合 | ✅ D-187（m34） |
 | 3 | 动态插件 | `wasm-plugins/panel-dynamic-plugins` | list + **rowActions(stop/undefine, confirm)** | dynamicPlugins 投影行（running/defined）；**首张写能力卡（C6/D-189）** | ✅ D-188/D-189（m35 10 测） |
 | 4 | 工作区文件 | `wasm-plugins/panel-workspace-files` | list | 两段式：agentWorkspace 解析→workspaceFiles 列举（失败零枚举，不猜目录）；**resource 分类首卡** | ✅ D-190（m36） |
-| — | 会话概览 | `panel-sessions` | list | sessionMessages/sessionIdentity（payload 需 sessionId，需评估卡级选择形态） | ⬜ 候选 |
+| 5 | 会话清单 | `wasm-plugins/panel-sessions` | list | sessionCandidates 行零加工（epoch 原样）；**session 分类首卡**，发现端先行（打开/切换与 chat 同题留契约演进） | ✅ D-191（m37） |
+| — | 会话打开/切换 | — | chat（预留） | 需「卡级选择/跳转」交互形态 + chat 渲染器点亮（远景关键路径，独立契约流程） | ⬜ 契约演进 |
 | … | 设置/调度/任务/聊天… | — | form/list/chat（chat 渲染器属契约预留，点亮前无法迁移聊天面板） | — | ⬜ 路线图 |
 
 ## 迁移完成的判定（远景）
