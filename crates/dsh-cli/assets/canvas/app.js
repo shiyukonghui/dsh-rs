@@ -15,7 +15,7 @@ import {
   GRID,
 } from "./core.js";
 
-const POLL_MS = 4000; // rev 轮询（C5 SSE 落地前的实时通道）
+const POLL_MS = 10000; // rev 轮询兜底（D-186 起 SSE 为主通道；unchanged 协商让兜底几乎免费）
 const state = { model: null, selectedType: null, rid: 0, polling: false };
 
 const $ = (id) => document.getElementById(id);
@@ -462,3 +462,16 @@ setInterval(() => {
   loadManifest().finally(() => { state.polling = false; });
 }, POLL_MS);
 window.addEventListener("resize", () => { if (state.model) renderWorkbench(); });
+
+// D-186：热插拔主通道——`/plugins/events` SSE 收 ui-manifest-changed 即重取清单
+// （pollDecision 的 keep/replace 语义对重复/乱序帧天然安全）。graph/rebuilt 帧属
+// harness HMR 链路，本壳忽略。
+try {
+  const es = new EventSource("/plugins/events");
+  es.onmessage = (ev) => {
+    let frame;
+    try { frame = JSON.parse(ev.data); } catch { return; }
+    if (frame && frame.type === "ui-manifest-changed") loadManifest();
+  };
+  es.onerror = () => { /* 断线静默——轮询兜底在跑，浏览器会自动重连 */ };
+} catch { /* EventSource 不可用环境：轮询兜底即主通道 */ }

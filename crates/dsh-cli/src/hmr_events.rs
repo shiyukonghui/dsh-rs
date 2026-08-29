@@ -67,6 +67,12 @@ fn rebuilt_line(id: &str, rev: &str) -> String {
     format!("data: {json}\n\n")
 }
 
+/// D-186：序列化 `ui-manifest-changed` SSE 帧（canvas design §6.2）。
+fn ui_manifest_changed_line(rev: &str) -> String {
+    let json = serde_json::json!({ "type": "ui-manifest-changed", "rev": rev }).to_string();
+    format!("data: {json}\n\n")
+}
+
 /// 一条被 watch 的 bundle（对齐 TS `WatchedBundle`）。
 struct WatchedRow {
     id: String,
@@ -199,6 +205,14 @@ impl HmrChannel {
             let line = rebuilt_line(id, rev);
             inner.clients.retain(|_, tx| tx.send(line.clone()).is_ok());
         }
+    }
+
+    /// D-186：广播 `ui-manifest-changed {rev}`（桌布 C5——清单代数变更推送）。
+    /// 与 rebuilt 同一 mpsc 广播面（对端关闭即移除，防连接表泄漏）。
+    pub fn broadcast_ui_manifest(&self, rev: &str) {
+        let line = ui_manifest_changed_line(rev);
+        let mut inner = self.inner.lock().unwrap();
+        inner.clients.retain(|_, tx| tx.send(line.clone()).is_ok());
     }
 
     /// watcher 循环：每 `interval_ms` 扫描一次并广播（TS 默认 500，`HMR_POLL_INTERVAL_MS`）。
@@ -335,6 +349,18 @@ mod tests {
         assert_eq!(v["type"], "rebuilt");
         assert_eq!(v["id"], "@deepseek-ai/dsh-client-demo");
         assert_eq!(v["rev"], "abc123");
+    }
+
+    /// D-186：`ui-manifest-changed` 帧形状（data 行 + type/rev 字段，按名解析）。
+    #[test]
+    fn ui_manifest_changed_line_wire_format() {
+        let line = ui_manifest_changed_line("deadbeef");
+        assert!(line.starts_with("data: "), "SSE data line: {line}");
+        assert!(line.ends_with("\n\n"), "SSE terminator: {line}");
+        let payload = line.strip_prefix("data: ").unwrap().trim_end_matches('\n');
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(v["type"], "ui-manifest-changed");
+        assert_eq!(v["rev"], "deadbeef");
     }
 
     /// 初次扫描建立基线后，无变化 → poll_once 返回空（通道空闲）。

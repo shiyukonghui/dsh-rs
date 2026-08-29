@@ -219,6 +219,99 @@ fn content_rev(cards: &[Value]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+// ---- C5（D-186）：运行时热插拔 watch（serve 主循环 tick 挂钩，2s 节流） ----
+
+/// watch 节流窗口（毫秒）——tick 每 250ms 跑，重扫只按此窗口。
+pub const UI_MANIFEST_WATCH_INTERVAL_MS: u64 = 2000;
+
+/// 热插拔 watch 状态（serve 主循环私有；单线程纪律，无锁）。
+pub struct UiManifestWatchState {
+    pub last_check_ms: u64,
+    pub last_rev: String,
+    /// **只含 scan 挂载的**包名（卸载绝不碰 boot manifest 装配的其它 packages）。
+    pub mounted: Vec<String>,
+}
+
+/// 启动基线：rev 现算（不广播——此刻无客户端）。
+pub fn init_watch_state(boot: &crate::Boot) -> UiManifestWatchState {
+    let entries = boot.loader.as_ref().map(|l| l.entries()).unwrap_or_default();
+    UiManifestWatchState {
+        last_check_ms: 0,
+        last_rev: build_manifest(&boot.packages, &entries).rev,
+        mounted: Vec::new(),
+    }
+}
+
+/// 主循环 tick：节流重扫（**不构建**）→ 同步 boot（装/卸 scan 挂载的单元）→
+/// rev 变则返回 Some(new_rev)（调用方经 `/plugins/events` 广播）。
+/// 运行时装载体失败 → eprintln 跳过（不炸 serve、不上死卡；与启动 fail-loud 区分：
+/// 启动是装配决策，运行时是热插事件）。卸载**只动 scan 挂载的包**（state.mounted）。
+pub fn ui_manifest_watch_tick(
+    boot: &mut crate::Boot,
+    wasm_base: &std::path::Path,
+    now_ms: u64,
+    st: &mut UiManifestWatchState,
+) -> Option<String> {
+    if st.last_check_ms != 0
+        && now_ms.saturating_sub(st.last_check_ms) < UI_MANIFEST_WATCH_INTERVAL_MS
+    {
+        return None;
+    }
+    st.last_check_ms = now_ms;
+    let desired = crate::web::scan_remote_units_opts(wasm_base, false);
+    let desired_names: Vec<&str> = desired.iter().map(|p| p.name.as_str()).collect();
+
+    // 装：新出现的合格单元（启动 scan 已挂载的只登记，不重复）。
+    for pkg in &desired {
+        if st.mounted.contains(&pkg.name) {
+            continue;
+        }
+        if boot.packages.iter().any(|p| p.name == pkg.name) {
+            st.mounted.push(pkg.name.clone());
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&pkg.wasm) else {
+            continue; // scan 已保证存在；竞态缺文件 = 下轮再看
+        };
+        match dsh_wasmrt::WasmRemoteEndpointPlugin::new(
+            Box::leak(pkg.name.clone().into_boxed_str()),
+            &bytes,
+            dsh_wasmrt::Capabilities::default(),
+            None,
+        ) {
+            Ok(carrier) => {
+                boot.remote_carriers
+                    .push((pkg.name.clone(), std::rc::Rc::new(std::cell::RefCell::new(carrier))));
+                boot.packages.push(pkg.clone());
+                st.mounted.push(pkg.name.clone());
+            }
+            Err(e) => eprintln!("dsh web: hot-plug unit {} skipped (carrier load: {e})", pkg.name),
+        }
+    }
+
+    // 卸：mounted 中已消失的（只动 scan 挂载的——boot manifest 装配的包绝不碰）。
+    let gone: Vec<String> = st
+        .mounted
+        .iter()
+        .filter(|n| !desired_names.contains(&n.as_str()))
+        .cloned()
+        .collect();
+    for name in gone {
+        boot.packages.retain(|p| p.name != name);
+        boot.remote_carriers.retain(|(ns, _)| ns != &name);
+        st.mounted.retain(|m| m != &name);
+    }
+
+    let entries = boot.loader.as_ref().map(|l| l.entries()).unwrap_or_default();
+    let rev = build_manifest(&boot.packages, &entries).rev;
+    if rev != st.last_rev {
+        st.last_rev = rev.clone();
+        Some(rev)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,7 +582,8 @@ mod tests {
     }
 
     /// 测试 8：disabled 交叉——同名 entry **全部**禁用才排除；任一 enabled 出卡；
-    /// 无同名 entry（试点现状）出卡；group 条目不参与匹配。    #[test]
+    /// 无同名 entry（试点现状）出卡；group 条目不参与匹配。
+    #[test]
     fn disabled_entry_excludes_card() {
         let (base, a) = tmp_pkg("dis", "pkg-dis");
         write_ui(&a, &v2_card("dis.card", "Dis").to_string());

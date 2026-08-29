@@ -7775,6 +7775,40 @@ dsh-cli **246/0**、dsh-wasmrt 全绿、clippy **0**。
 从特判 `not-implemented` 并入 remote 家族统一 `internal`（"(no remote carrier assembled)"）
 ——D-115 既有的 pluginInventory/dynamicCordisRunner 回落文案与 code 全数不变。
 
+## D-186（桌布 C5 落地：热插拔 watch（tick 同步 + 2s 节流）+ `ui-manifest-changed` SSE 推送）
+
+**日期**：2026-09-05
+
+**触发问题**：热插拔是第一等要求，但运行时没有任何包增删通路（scan 只在启动跑一次），
+桌布实时性 = 纯轮询。canvas design §6.2 预留的 `ui-manifest-changed` 需要一个能感知
+「装/卸/改」的宿主侧机制。
+
+**考虑过的选项与裁定**：
+- **变更感知**：(a) 独立 watcher 线程 + fs watcher 依赖 vs (b) **serve 主循环 tick 挂钩
+  + 2s 节流重扫**。选 (b)——boot 非 Send（单线程宿主纪律），watch 在 accept 线程内
+  零同步原语；重扫 = 目录扫描 + 小包读取，2s 窗口成本可忽略；无新依赖。（a) 需要把
+  载体装配搬回主线程的消息泵，复杂度全花在省 2 秒延迟上。
+- **运行时构建**：watch 重扫**绝不**触发 `cargo component build`（会阻塞 accept 分钟级）
+  ——`scan_remote_units_opts(base, build_missing)`：启动 true（开发体验）、运行时 false。
+- **运行时装配失败语义**：载体加载失败 → eprintln 跳过（不炸 serve、不上死卡）——与
+  启动 fail-loud 区分：启动是装配决策，运行时是热插事件。
+- **卸载边界**：watch 只卸 `state.mounted` 登记过的 scan 挂载包，绝不碰 boot manifest
+  装配的其它 packages（测试 `unmount_only_touches_scan_mounted` 钉死）。
+- **广播通道**：复用 D-099 `/plugins/events` 的 mpsc 广播面新增
+  `{type:"ui-manifest-changed", rev}` 帧——不新建端点；rev 是内容哈希，天然去抖
+  （改回原样 = rev 不变 = 不广播）。桌布 `EventSource` 消费即重取清单；轮询放宽 10s
+  作 SSE 断线兜底（`unchanged` 协商让兜底几乎免费）。
+
+**验收实测（2026-09-05）**：桩红（3 watch 流程 + S1 帧形状）→ 全绿；
+dsh-cli **251/0**（watch 4 + hmr 帧 1；**clippy 顺手抓出一条被吞的 `#[test]`**——C2 的
+`disabled_entry_excludes_card` 此前因编辑事故退化为普通函数，已复活并计入）、dsh-wasmrt
+全绿、clippy **0**、node **16/16**、verify-diff ALL PASS。
+**诚实台账**：真实「装/卸目录 → 浏览器卡片增删」的端到端手测未执行（无浏览器基建）；
+同步/广播/挂载面已全测，EventSource 消费属 DOM 边界层。
+
+**预期影响与回滚点**：ui_manifest 两个函数 + hmr 两个函数 + serve 一钩 + app.js 十余行；
+撤提交回 `11021e8`。
+
 
 
 

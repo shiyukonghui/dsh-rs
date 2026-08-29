@@ -295,6 +295,11 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
         }
     }
 
+    // C5（D-186）：热插拔 watch 基线（rev 现算、启动不广播——此刻无客户端）。
+    // 主循环 tick 同步挂载状态并经 `/plugins/events` 推送清单 rev 变化。
+    let mut ui_watch = crate::ui_manifest::init_watch_state(boot);
+    let ui_watch_base = cfg.wasm_base.clone();
+
     // M3a+（D-098）：装配进程内原生目录选择器（`host.pickDirectory`）。Windows 桌面经
     // IFileDialog/COM（零子进程）弹系统目录框；无桌面/失败 → wire `directory-picker-unavailable`
     // （诚实，不冒充取消）。测试 Boot 不装配（None）→ 同一错误路径，由 stub 测试覆盖。
@@ -416,6 +421,16 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
             if let Err(e) = web_m5::m5g_tick_once(sched, Some(bridge), now) {
                 eprintln!("dsh web: tick advance failed: {e}");
             }
+        }
+        // D-186：热插拔 watch（2s 节流）——装配单元装/卸同步 + 清单 rev 变化经
+        // `/plugins/events` 广播 `ui-manifest-changed`（桌布即时增删卡片）。
+        if let Some(rev) = crate::ui_manifest::ui_manifest_watch_tick(
+            &mut *boot,
+            &ui_watch_base,
+            system_now_ms() as u64,
+            &mut ui_watch,
+        ) {
+            hmr.broadcast_ui_manifest(&rev);
         }
     }
     Ok(WebServer { addr })
@@ -1264,6 +1279,15 @@ pub fn host_remote_component_bytes() -> Vec<u8> {
 /// `host-remote` 是宿主桥，不是装配单元，按名排除）。序 = 目录名升序（稳定挂载序）。
 /// 坏 plugin.json / 缺构建物 → `eprintln` 跳过（**不炸 serve**，也不上死卡）。
 pub fn scan_remote_units(wasm_base: &std::path::Path) -> Vec<crate::plugin_pkg::PluginPackage> {
+    scan_remote_units_opts(wasm_base, true)
+}
+
+/// D-186：`build_missing` = 缺构建物时是否尝试 `cargo component build`（**启动装配 =
+/// true 的开发体验；运行时 watch = false**——构建会阻塞 accept 循环分钟级，绝不允许）。
+pub fn scan_remote_units_opts(
+    wasm_base: &std::path::Path,
+    build_missing: bool,
+) -> Vec<crate::plugin_pkg::PluginPackage> {
     let mut units = Vec::new();
     let Ok(rd) = std::fs::read_dir(wasm_base) else {
         return units;
@@ -1301,7 +1325,7 @@ pub fn scan_remote_units(wasm_base: &std::path::Path) -> Vec<crate::plugin_pkg::
             .join("wasm32-wasip1")
             .join("debug")
             .join(format!("{}_plugin.wasm", name.replace('-', "_")));
-        if !wasm.exists() && dir.join("Cargo.toml").is_file() {
+        if !wasm.exists() && build_missing && dir.join("Cargo.toml").is_file() {
             let _ = std::process::Command::new("cargo")
                 .env("CARGO_NET_OFFLINE", "true")
                 .args(["component", "build", "--manifest-path"])
@@ -4940,6 +4964,150 @@ mod tests {
         let units = scan_remote_units(&base);
         let names: Vec<&str> = units.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["unit-good"], "只挂载合格的 remote 装配单元，得 {names:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- C5（D-186）：热插拔 watch（装/改/卸/节流/缺构件） ----
+
+    fn ui_watch_base(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!("dsh-ui-watch-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    /// 造一个合格 remote 单元目录；`with_component=false` → 缺构建物（无 Cargo.toml，
+    /// watch 也不可能触发构建）。ui.json 为合法 v2 卡（title 可版本化以便内容变更）。
+    fn ui_watch_make_unit(base: &std::path::Path, name: &str, with_component: bool, title: &str) {
+        let dir = base.join(name);
+        std::fs::create_dir_all(dir.join("web")).unwrap();
+        std::fs::write(dir.join("plugin.json"), r#"{"world":"remote","web":"web"}"#).unwrap();
+        std::fs::write(
+            dir.join("web/ui.json"),
+            format!(
+                r#"{{"$schema":"dsh/plugin-ui/v2","kind":"card","cardId":"{name}.c","type":"misc","title":"{title}","size":{{"w":2,"h":2}},"view":{{"kind":"form","fields":[],"actions":[]}}}}"#
+            ),
+        )
+        .unwrap();
+        if with_component {
+            let bytes = host_remote_component_bytes();
+            let wasm = dir
+                .join("target/wasm32-wasip1/debug")
+                .join(format!("{}_plugin.wasm", name.replace('-', "_")));
+            std::fs::create_dir_all(wasm.parent().unwrap()).unwrap();
+            std::fs::write(&wasm, bytes).unwrap();
+        }
+    }
+
+    fn ui_watch_channel() -> (std::sync::Arc<crate::hmr_events::HmrChannel>, std::sync::mpsc::Receiver<String>) {
+        let hmr = std::sync::Arc::new(crate::hmr_events::HmrChannel::new(&BootManifest {
+            rev: "g".to_string(),
+            entries: vec![],
+        }));
+        let (_id, rx, _initial) = hmr.connect();
+        (hmr, rx)
+    }
+
+    /// S2/S3/S4 主流程：装 → 广播；静默；改 → 广播；卸 → 广播（合成时钟，零等待）。
+    #[test]
+    fn ui_manifest_watch_mount_edit_unmount_flow() {
+        use crate::ui_manifest;
+        let mut boot = boot_with_sessions();
+        let base = ui_watch_base("flow");
+        let (hmr, rx) = ui_watch_channel();
+        let mut st = ui_manifest::init_watch_state(&boot);
+        let t0: u64 = 1_000_000_000_000;
+
+        // 空 base → 空闲
+        assert!(ui_manifest::ui_manifest_watch_tick(&mut boot, &base, t0, &mut st).is_none());
+
+        // 装：新单元出现 → 挂载 + rev 变 + 帧可达
+        ui_watch_make_unit(&base, "unit-live", true, "v1");
+        let rev1 = ui_manifest::ui_manifest_watch_tick(&mut boot, &base, t0 + 5_000, &mut st)
+            .expect("新单元必须改变清单 rev");
+        hmr.broadcast_ui_manifest(&rev1);
+        let frame = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("SSE 帧送达");
+        assert!(frame.contains("ui-manifest-changed") && frame.contains(&rev1), "{frame}");
+        assert!(boot.packages.iter().any(|p| p.name == "unit-live"), "packages 挂载");
+        assert!(boot.remote_carriers.iter().any(|(ns, _)| ns == "unit-live"), "载体挂载");
+
+        // 再 tick → 静默（无变化不重复广播）
+        assert!(ui_manifest::ui_manifest_watch_tick(&mut boot, &base, t0 + 10_000, &mut st).is_none());
+
+        // 改：ui.json 内容变 → rev 变
+        ui_watch_make_unit(&base, "unit-live", true, "v2-edited");
+        let rev2 = ui_manifest::ui_manifest_watch_tick(&mut boot, &base, t0 + 15_000, &mut st)
+            .expect("ui.json 内容变必须改 rev");
+        assert_ne!(rev2, rev1);
+
+        // 卸：删除目录 → 卸载 + rev 变
+        std::fs::remove_dir_all(base.join("unit-live")).unwrap();
+        let rev3 = ui_manifest::ui_manifest_watch_tick(&mut boot, &base, t0 + 20_000, &mut st)
+            .expect("卸装必须改 rev");
+        assert_ne!(rev3, rev2);
+        assert!(!boot.packages.iter().any(|p| p.name == "unit-live"), "packages 卸载");
+        assert!(!boot.remote_carriers.iter().any(|(ns, _)| ns == "unit-live"), "载体卸载");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// S4 隔离：卸载只动 scan 挂载的包，绝不碰其它 packages。
+    #[test]
+    fn ui_manifest_watch_unmount_only_touches_scan_mounted() {
+        use crate::ui_manifest;
+        let mut boot = boot_with_sessions();
+        boot.packages.push(crate::plugin_pkg::PluginPackage {
+            name: "boot-manifest-pkg".to_string(),
+            dir: std::path::PathBuf::from("."),
+            wasm: std::path::PathBuf::from("x.wasm"),
+            web: None,
+            caps: None,
+            world: None,
+        });
+        let base = ui_watch_base("isolate");
+        let mut st = ui_manifest::init_watch_state(&boot);
+        let t0: u64 = 2_000_000_000_000;
+        ui_watch_make_unit(&base, "unit-guest", true, "v1");
+        assert!(ui_manifest::ui_manifest_watch_tick(&mut boot, &base, t0, &mut st).is_some());
+        std::fs::remove_dir_all(base.join("unit-guest")).unwrap();
+        assert!(ui_manifest::ui_manifest_watch_tick(&mut boot, &base, t0 + 5_000, &mut st).is_some());
+        assert!(boot.packages.iter().any(|p| p.name == "boot-manifest-pkg"), "非 scan 包不动");
+        assert!(!boot.packages.iter().any(|p| p.name == "unit-guest"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// S5：节流窗口内不重扫（有变更也等窗口）。
+    #[test]
+    fn ui_manifest_watch_throttles_within_window() {
+        use crate::ui_manifest;
+        let mut boot = boot_with_sessions();
+        let base = ui_watch_base("throttle");
+        let mut st = ui_manifest::init_watch_state(&boot);
+        let t0: u64 = 3_000_000_000_000;
+        assert!(ui_manifest::ui_manifest_watch_tick(&mut boot, &base, t0, &mut st).is_none());
+        ui_watch_make_unit(&base, "unit-late", true, "v1");
+        // 窗口内：不重扫（单元不可见）
+        assert!(ui_manifest::ui_manifest_watch_tick(&mut boot, &base, t0 + 500, &mut st).is_none());
+        assert!(
+            !boot.packages.iter().any(|p| p.name == "unit-late"),
+            "节流窗口内不得重扫挂载"
+        );
+        // 出窗口：可见
+        assert!(ui_manifest::ui_manifest_watch_tick(&mut boot, &base, t0 + 2_500, &mut st).is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// S6：缺构建物的单元 → 不挂载、不 panic（watch 也不可能构建——无 Cargo.toml）。
+    #[test]
+    fn ui_manifest_watch_skips_unit_without_component() {
+        use crate::ui_manifest;
+        let mut boot = boot_with_sessions();
+        let base = ui_watch_base("nowebuild");
+        let mut st = ui_manifest::init_watch_state(&boot);
+        let t0: u64 = 4_000_000_000_000;
+        ui_watch_make_unit(&base, "unit-half", false, "v1");
+        assert!(ui_manifest::ui_manifest_watch_tick(&mut boot, &base, t0, &mut st).is_none());
+        assert!(st.mounted.is_empty(), "缺构件不得挂载");
+        assert!(!boot.packages.iter().any(|p| p.name == "unit-half"));
         let _ = std::fs::remove_dir_all(&base);
     }
 
