@@ -8225,7 +8225,34 @@ canvas 导出守卫 17 名全列；全套 0 失败、clippy **0**、app.js 语�
 **预期影响与回滚点**：core.js/app.js 通用面 + 单元声明两文件 + m40 + 导出守卫。
 panel-locale-edit（第十三卡）自此**冗余**——保留可运行（固定 ns 版仍合法），建议 E2E
 后合并裁撤（用户拍板项）。撤本提交回到 `53e5cc6`。E2E 清单同步（§1 设置编辑行改
-「下拉选 ns」）。剩余 ns 编辑需求**一次性清零**——点单复制不再需要。E2E 清单已同步（13 卡基线 + §1 行）。
+「下拉选 ns」）。剩余 ns 编辑需求**一次性清零**——点单复制不再需要。
+
+## D-202（启用动作：panel-dynamic-plugins 激活端点——「激活面原生臂」被取证证伪，零新后端）
+
+**日期**：2026-09-05
+
+**触发问题**：HANDOFF 优先级 ②「激活面原生臂 + 声明单元（define/activate 正解）」
+开工取证发现：D-200 的分级**过于悲观**——`RemoteHost::dynamic_activate(plugin_id,
+package_id)` + set 臂 `dynamicActivate`（runHostHalf 同一后端，真实装配 loader）**早已
+存在且被 m31/web 测覆盖**；panel-dynamic-plugins 的 stop/undefine 本就经 host.set 走
+set 臂。激活 = 同型第三复制，**不需要任何原生臂**。
+
+**裁定**：
+- **activate 端点**（单元内）：行自校验（pluginId + packageId 非空才触宿主，纪律同
+  row_identity）→ host.set dynamicActivate → 透传（含 pluginRunId）。
+- **行携带 packageId**：row_for 注入隐藏列（列不显示；rowAction 整行转发的既有语义
+  ——零契约改动）。
+- **confirm 分级**：启用=非破坏**无确认**；停止/卸载维持 confirm:true——m35 断言从
+  「全 confirm」升级为**按动作分级**（这是契约语义的精化不是放宽）。
+- **define（新定义写 cordis.yml）仍缺**：loader.create/update 是宿主内部面，无 RPC 面
+  ——维持 §2 缺口（真正的「需设计」项，非本轮范围）。
+
+**验收实测**：m35 **11/11**（声明三动作分级断言 + activate 缺 packageId fail-loud 不触
+宿主 + 既有 stop/undefine 全绿）；一份契约（ui.json==describeUI，wasm 重建实证）；
+全套 0 失败、clippy **0**。诚实注记：activate 成功路径未单测（set stub 基建只覆盖
+fail-loud 型），代码与 stop 同构共享 row_action——注记入册。
+
+**回滚点**：撤本提交回到 `d258e51`。E2E 清单同步（动态插件行 + 启用；§2 只剩 define）。E2E 清单已同步（13 卡基线 + §1 行）。
 
 
 

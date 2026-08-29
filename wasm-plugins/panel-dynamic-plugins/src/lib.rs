@@ -20,7 +20,7 @@ fn ui_declaration() -> Value {
         "cardId": "panel-dynamic-plugins.list",
         "type": "runtime",
         "title": "动态插件",
-        "description": "dynamicCordisRunner 定义与运行态（只读）",
+        "description": "dynamicCordisRunner 定义与运行态（启用/停止/卸载）",
         "size": { "w": 4, "h": 4 },
         "view": {
             "kind": "list",
@@ -33,6 +33,8 @@ fn ui_declaration() -> Value {
             "rowsPath": "items",
             "actions": [],
             "rowActions": [
+                { "name": "activate", "label": "启用", "rpc": ["panel-dynamic-plugins", "activate"],
+                  "scope": "row" },
                 { "name": "stop", "label": "停止", "rpc": ["panel-dynamic-plugins", "stop"],
                   "scope": "row", "confirm": true },
                 { "name": "undefine", "label": "卸载", "rpc": ["panel-dynamic-plugins", "undefine"],
@@ -55,8 +57,8 @@ fn describe_ui(_body: &Value) -> Vec<u8> {
     serde_json::to_vec(&json!({ "ok": true, "value": ui_declaration() })).unwrap_or_default()
 }
 
-/// 行投影：name = currentPackageId 对应包名（缺配回落首包/null）；
-/// state = activeRun 存在 → running，否则 defined。
+/// 行投影：name = currentPackageId 对应包名（缺配回落首包/null）；state = activeRun
+/// 存在 → running，否则 defined。行内携带 packageId（activate 动作的行身份；列不显示）。
 fn row_for(plugin_row: &Value) -> Value {
     let current_id = plugin_row.get("currentPackageId").and_then(Value::as_str);
     let packages = plugin_row
@@ -64,14 +66,18 @@ fn row_for(plugin_row: &Value) -> Value {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let name = current_id
+    let pkg = current_id
         .and_then(|cid| {
-            packages.iter().find(|p| {
-                p.get("packageId").and_then(Value::as_str) == Some(cid)
-            })
+            packages
+                .iter()
+                .find(|p| p.get("packageId").and_then(Value::as_str) == Some(cid))
         })
-        .or_else(|| packages.first())
+        .or_else(|| packages.first());
+    let name = pkg
         .and_then(|p| p.get("name").cloned())
+        .unwrap_or(Value::Null);
+    let package_id = pkg
+        .and_then(|p| p.get("packageId").cloned())
         .unwrap_or(Value::Null);
     let state = if plugin_row.get("activeRun").map(|v| !v.is_null()).unwrap_or(false) {
         "running"
@@ -80,6 +86,7 @@ fn row_for(plugin_row: &Value) -> Value {
     };
     json!({
         "pluginId": plugin_row.get("pluginId").cloned().unwrap_or(Value::Null),
+        "packageId": package_id,
         "name": name,
         "state": state,
     })
@@ -121,20 +128,29 @@ fn row_identity(body: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// 行写动作（stop/undefine 同型）：校验身份 → `host_services.set` → 透传。
-fn row_action(body: &Value, endpoint: &str, set_service: &str, done_key: &str) -> Vec<u8> {
+/// 行写动作（activate/stop/undefine 同型）：校验身份 → `host_services.set` → 透传。
+/// `extra` 并入宿主载荷（activate 带 packageId；stop/undefine 空）。
+fn row_action(body: &Value, endpoint: &str, set_service: &str, done_key: &str, extra: &Value) -> Vec<u8> {
     let Some(plugin_id) = row_identity(body) else {
         return error(
             "internal",
             &format!("panel-dynamic-plugins/{endpoint}: body.row.pluginId must be a non-empty string"),
         );
     };
-    let payload = json!({ "pluginId": plugin_id });
+    let mut payload = json!({ "pluginId": plugin_id });
+    if let (Some(obj), Some(map)) = (extra.as_object(), payload.as_object_mut()) {
+        for (k, v) in obj {
+            map.insert(k.clone(), v.clone());
+        }
+    }
     let bytes = host_services::set(set_service, &serde_json::to_vec(&payload).unwrap_or_default());
     match serde_json::from_slice::<Value>(&bytes) {
         Ok(v) if v.get("ok").and_then(|o| o.as_bool()) == Some(true) => {
             let mut value = json!({ "pluginId": plugin_id });
             value[done_key] = json!(true);
+            if let Some(rid) = v.get("pluginRunId") {
+                value["pluginRunId"] = rid.clone();
+            }
             serde_json::to_vec(&json!({ "ok": true, "value": value })).unwrap_or_default()
         }
         Ok(v) => passthrough_error(&v),
@@ -143,11 +159,28 @@ fn row_action(body: &Value, endpoint: &str, set_service: &str, done_key: &str) -
 }
 
 fn stop(body: &Value) -> Vec<u8> {
-    row_action(body, "stop", "dynamicStop", "stopped")
+    row_action(body, "stop", "dynamicStop", "stopped", &json!({}))
 }
 
 fn undefine(body: &Value) -> Vec<u8> {
-    row_action(body, "undefine", "dynamicUndefine", "undefined")
+    row_action(body, "undefine", "dynamicUndefine", "undefined", &json!({}))
+}
+
+/// 启用（D-202）：行须带 packageId（row_for 注入）——**先自校验再触宿主**（纪律同
+/// row_identity）；宿主 set dynamicActivate = runHostHalf 同一后端（真实装配 loader）。
+fn activate(body: &Value) -> Vec<u8> {
+    let pkg = body
+        .get("row")
+        .and_then(|r| r.get("packageId"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let Some(pkg) = pkg else {
+        return error(
+            "internal",
+            "panel-dynamic-plugins/activate: body.row.packageId must be a non-empty string",
+        );
+    };
+    row_action(body, "activate", "dynamicActivate", "activated", &json!({ "packageId": pkg }))
 }
 
 struct PanelDynamicPlugins;
@@ -159,6 +192,7 @@ impl Guest for PanelDynamicPlugins {
             ("panel-dynamic-plugins", "describeUI") => describe_ui(&body_value),
             ("panel-dynamic-plugins", "list") => list(&body_value),
             ("panel-dynamic-plugins", "stop") => stop(&body_value),
+            ("panel-dynamic-plugins", "activate") => activate(&body_value),
             ("panel-dynamic-plugins", "undefine") => undefine(&body_value),
             _ => error(
                 "internal",

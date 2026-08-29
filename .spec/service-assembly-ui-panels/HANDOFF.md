@@ -23,8 +23,9 @@ harness 全部核心前端能力已由 **13 张服务单元卡**在 `/canvas` �
    （独立小提交，撤之即回滚）；任一 ❌ 把现象记在对应行，回对应切片修。
 
 ## 4. §2 缺口速览（判定材料）
-- **不可机械化**（已取证）：动态插件 define/activate（vendored 面无源码 + 线形不兼容，
-  D-200 重分级）；secrets 编辑（redact 在源）；聊天中断/附件（D-193 边界）。
+- **已落地（D-202）**：动态插件**启用**（= dynamicActivate 同后端，行动作非破坏无确认）。
+- **不可机械化**（已取证）：动态插件 **define**（新定义写 cordis.yml，loader 无 RPC 面，
+  真需设计轮）；secrets 编辑（redact 在源）；聊天中断/附件（D-193 边界）。
 - **已终结（D-201）**：其余 ns 设置编辑——设置编辑卡自带 **nsSelect 命名空间下拉**，
   一卡通用编辑全部 ns（含 llm[Restart]/shell/agent-loop/…），**不再需要点单复制**；
   panel-locale-edit 固定卡自此冗余，E2E 后可裁撤（你拍板）。

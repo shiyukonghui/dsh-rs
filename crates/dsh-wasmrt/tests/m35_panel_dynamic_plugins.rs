@@ -281,7 +281,7 @@ fn undefine_passthrough_and_validation() {
     assert_eq!(calls.set_calls.borrow().len(), 1, "坏 body 不再触达服务");
 }
 
-/// 声明层：rowActions 齐（stop/undefine，均 confirm:true）——一份契约由 static 测试继续守。
+/// 声明层：rowActions 齐（启用无确认=非破坏；停止/卸载 confirm:true=破坏必确认）。
 #[test]
 fn declaration_carries_confirm_row_actions() {
     let p = plugin(json!({"ok": true, "plugins": []}));
@@ -289,11 +289,29 @@ fn declaration_carries_confirm_row_actions() {
         .handle("panel-dynamic-plugins", "describeUI", br#"{}"#, None)
         .unwrap();
     let actions = r["value"]["view"]["rowActions"].as_array().expect("rowActions");
-    assert_eq!(actions.len(), 2, "{actions:?}");
+    assert_eq!(actions.len(), 3, "{actions:?}");
     for a in actions {
         assert_eq!(a["scope"], "row");
-        assert_eq!(a["confirm"], true, "破坏性动作必须声明确认");
         let rpc = a["rpc"].as_array().unwrap();
         assert_eq!(rpc[0], "panel-dynamic-plugins");
+        if a["name"] == "activate" {
+            assert!(a.get("confirm").is_none(), "启用非破坏，无需确认");
+        } else {
+            assert_eq!(a["confirm"], true, "破坏性动作必须声明确认");
+        }
     }
+}
+
+/// D-202：启用端点自校验——缺 packageId 必须 fail-loud 且绝不触达宿主服务。
+#[test]
+fn activate_requires_package_id_fail_loud() {
+    let p = plugin(json!({"ok": true, "plugins": []}));
+    let r = p
+        .handle("panel-dynamic-plugins", "activate", br#"{"row":{"pluginId":"x"}}"#, None)
+        .unwrap();
+    assert_eq!(r["ok"], false, "缺 packageId 必须红: {r}");
+    assert!(r["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("packageId"));
 }

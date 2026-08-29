@@ -16,7 +16,7 @@
 | Provider 设置（llm-deepseek, form） | 字段预填自 kv；保存回读一致 | Provider 配置 |
 | 插件清单（list） | loader 行齐；禁用条目不出现 | 插件清单 |
 | 运行时状态（status） | 计数与 loader/动态包实况一致 | 概览状态 |
-| 动态插件（list+写） | 定义/在跑状态；**停止/卸载弹确认**；取消不发 RPC；成功后行刷新 | dynamicCordisRunner 面板（除 define/activate 表单） |
+| 动态插件（list+写） | 定义/在跑状态；**启用**→running（真实装配 loader）；**停止/卸载弹确认**；取消不发 RPC；成功后行刷新 | dynamicCordisRunner 面板（除 define 表单） |
 | 工作区文件（list） | 与默认工作区顶层实况一致；未配置工作区=错误态非空表 | 文件面板（只读子集） |
 | 会话清单（list） | sessionId/epoch 与实况一致（只读） | 会话面板（列举子集） |
 | 设置概览（list） | ns/字段/值与 settings.describe 一致；secret 仅存在性 | 设置面板（只读子集） |
@@ -33,7 +33,8 @@
 - 动态插件 **define/activate**（表单参数写）未做。
 - 设置编辑已 2 ns（ui-theme + **locale**，D-200 机械复制已兑现）；其余 ns（llm/shell/
   agent-loop/…）同法待点单；secrets 编辑不支持。
-- 动态插件 define/activate：vendored 组件面无源码 + 线形不兼容，**重分级非机械**（D-200）。
+- 动态插件 define（新定义写 cordis.yml）：宿主 loader.create 无 RPC 面，真需设计轮；
+  ~~activate~~ → **已落地（D-202 启用动作 = dynamicActivate 同后端）**。
 - 聊天：中断按钮、审批线、附件未做（D-193 边界）。
 - 全部卡片浏览器手测此前**未执行过**（无基建）——本清单即首次执行。
 

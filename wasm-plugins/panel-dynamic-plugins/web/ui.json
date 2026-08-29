@@ -4,7 +4,7 @@
   "cardId": "panel-dynamic-plugins.list",
   "type": "runtime",
   "title": "动态插件",
-  "description": "dynamicCordisRunner 定义与运行态（只读）",
+  "description": "dynamicCordisRunner 定义与运行态（启用/停止/卸载）",
   "size": { "w": 4, "h": 4 },
   "view": {
     "kind": "list",
@@ -17,6 +17,8 @@
     "rowsPath": "items",
     "actions": [],
     "rowActions": [
+      { "name": "activate", "label": "启用", "rpc": ["panel-dynamic-plugins", "activate"],
+        "scope": "row" },
       { "name": "stop", "label": "停止", "rpc": ["panel-dynamic-plugins", "stop"],
         "scope": "row", "confirm": true },
       { "name": "undefine", "label": "卸载", "rpc": ["panel-dynamic-plugins", "undefine"],
