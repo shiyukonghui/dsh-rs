@@ -7645,6 +7645,46 @@ dsh-wasmrt 全套 14 个测试目标全绿（含 m31 host-remote）；dsh-cli **
 **回滚点**：C1 集中在「声明形态 + 测试断言」——撤销本提交即回到 D-180 的 v1 形态；
 `dispatch` 路由 / 载体装配 / kv 后端不受影响（未改动）。
 
+## D-183（桌布 C2 设计定稿：uiManifest/list 原生臂 + sha256 内容哈希 rev + 清单层归一权威）
+
+**日期**：2026-09-04
+
+**触发问题**：接手文档 §3-A 明确「开工前必须先决策端点形状」；`rev` 语义、坏包错误码集、
+disabled 交叉语义（试点未 entry 化）也须在编码前定死，否则清单层会各自发明规则。
+
+**考虑过的选项与裁定**：
+- **端点形状**：(a) 原生臂 `uiManifest/list` vs (b) 裸 `/api/ui-manifest` 路由特判。
+  **选 (a)**——`/api` 路由 `trim_start_matches("/api/")` 后无 `/` 的 method 会被
+  `dispatch_wasm_remote` 判 `not-implemented`（web.rs:971/4454 实证），(b) 必须为单端点
+  开路由例外，破坏 `/api` 网关 `namespace/method` 约定（trust fence / RPC 信封 / 前端 rpc
+  通道复用全打折）。(a) 与 `commands/list`、`settings/describe` 同形，零例外。
+  **已同步回写** canvas design §6.1 + §1 架构图（原文 `/api/ui-manifest?rev=` 属 wire 表述
+  纠偏，非契约变更）。
+- **rev = 内容哈希而非单调计数**：单调计数重启后漂移，客户端缓存 rev 作废，违背热更前提。
+  `rev = SHA-256(canonical cards[])` 全量小写 hex；**error 条目计入 rev**（坏声明修好=内容变）。
+- **哈希依赖**：手写 FNV-1a vs `sha2`。**选 sha2 0.10**——已在 Cargo.lock 与本地 registry
+  缓存（离线可解析，零新增供应链），成熟通用；hex 手写不拉 hex crate。「自己造轮子」的
+  条件（不满足/成本过高/核心竞争力）一条都不成立。
+- **清单层 = 归一单一权威**（承接手文档 §3-A 建议）：type 未知→misc+declaredType、
+  size 裁剪 w∈[1,4]/h∈[1,8]+declaredSize、title 缺失回落 cardId、坐标键零输出。渲染器只
+  信清单，规则不复制到 C3。
+- **坏包错误码集**：`declaration-unparseable` / `schema-version-unsupported` /
+  `card-kind-unknown`（复用 §7 表）+ 新增 `card-id-missing`（身份不完整无法去重/聚焦，
+  fail-loud 而非静默补造；承 D-182 `card-kind-unknown` 的收敛方式）。
+- **size 默认档位语义裁定**：canvas design §5.1 原文「按 type 的默认尺寸（model/config→2×3，
+  status→2×2，list→4×4）」把 type 与 view.kind 混写（status/list 是 view.kind）。按语义
+  裁定为**按 view.kind**：status→2×2、list→4×4、其余→2×3。契约收敛，不改已锁决策。
+- **disabled 交叉（用户确认）**：loader entries 过滤 group 后按 `entry.name == pkg.name`
+  匹配；**全部同名 entry 禁用才排除**，无同名 entry 出卡（兼容试点「serve 直接 push、
+  未 entry 化」现状；entry 化属装配引擎侧后续）。
+- **模块切分**：纯函数核心 `ui_manifest.rs::build_manifest(packages, entries)`（每请求实时
+  计算，禁任何快照缓存）+ web.rs `dispatch()` 一臂。C3（桌布壳）/C5（SSE rev 广播）复用
+  同一核心，规则不复制。
+
+**预期影响与回滚点**：全增量——新模块 + dispatch 一臂 + Cargo.toml sha2 一行 + 测试；
+既有 wire 面零改动、wasm 侧零改动。回滚 = 撤销本工作流提交即回到 `44f9618` 后状态。
+验收实测见 `.spec/service-assembly-ui-c2/acceptance.md`。
+
 
 
 

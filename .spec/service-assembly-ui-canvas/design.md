@@ -19,7 +19,7 @@
                 │ ①清单（元数据）      ②声明（内容）        ③动作
                 ▼                      ▼                    ▼
 ┌─ 桌布 GUI 壳（浏览器，单一通用渲染器）────────────────────────┐
-│ /api/ui-manifest?rev  →  GET /plugins/<n>/ui.json             │
+│ /api/uiManifest/list (args.rev)  →  GET /plugins/<n>/ui.json │
 │   ├─ 左栏：按 type 分组 + 计数 + 插件名                        │
 │   ├─ 右栏：分类内卡片按 size 自动流式排布（10px 网格）          │
 │   ├─ 渲染器分派：view.kind → form / status / list / 回落       │
@@ -162,10 +162,12 @@
 
 ## 6. 发现面与热插拔口子
 
-### 6.1 `/api/ui-manifest`
+### 6.1 `uiManifest/list`（D-183 wire 形状修订：与 `pluginInventory/list` 同形，不开裸路由特判）
+
+`POST /api/uiManifest/list`（client-request 信封；`args.rev?` = 客户端已持有的清单哈希）：
 ```jsonc
 { "ok": true, "value": {
-  "rev": 7,
+  "rev": "3f9a…64-hex sha256",          // 内容哈希（D-183：非单调计数，重启后仍稳定）
   "cards": [ {
     "pluginName": "llm-deepseek",
     "cardId": "llm-deepseek.settings",
@@ -175,6 +177,7 @@
     "declPath": "/plugins/llm-deepseek/ui.json"   // 或 describeUI 标记
   } ] } }
 ```
+`args.rev` == 当前值 → `{ "rev": …, "unchanged": true }`（省带宽，无 cards）。
 
 **硬约束（热插拔的关键）**：
 - 清单**每次请求从实时状态计算**（`boot.packages` + loader 生效 entries + 各包 `ui.json` 元数据），
@@ -218,7 +221,7 @@
 | 组件 | 归属端 | 职责 |
 |---|---|---|
 | 卡片声明生产者 | Rust 插件（wasm） | 出 `kind:"card"` 声明（含 type/size/view）；产物=数据 |
-| 卡片元数据聚合 | **Rust 宿主** | `/api/ui-manifest`（实时计算 + rev）；坏声明带 error |
+| 卡片元数据聚合 | **Rust 宿主** | `uiManifest/list`（实时计算 + rev）；坏声明带 error |
 | 变更广播 | Rust 宿主 | `/plugins/events` 加 `ui-manifest-changed` |
 | 静态分发 | Rust 宿主 | `/plugins/<name>/**`（复用 `serve_package_asset`，D-175） |
 | 动作执行 / 权限 | Rust 插件（wasm） | 白名单校验 + `host-services` 落盘；fail-loud |
@@ -246,7 +249,7 @@
 1. **契约层**（Rust）：v2 声明解析/校验单测——type 枚举 + 未知落 misc；size 裁剪；
    `$schema` v1 显式拒绝（红→绿）。
 2. **迁移层**（Rust）：llm-deepseek 迁移后 m32 全绿 + 新增断言：全仓无顶层 `kind:"form"` 残留。
-3. **清单层**（Rust）：`/api/ui-manifest` 集成测试——多包聚合、`rev` 随增删变化、
+3. **清单层**（Rust）：`uiManifest/list` 集成测试——多包聚合、`rev` 随增删变化、
    坏包以 error 条目出现不静默丢。
 4. **桌布壳**（前端）：fail-loud 表逐行断言（含 `renderer-unimplemented` /
    `view-kind-rejected` / `schema-version-unsupported`）；排布无重叠/无出界（窄 + 宽两档视口）。
@@ -257,7 +260,7 @@
 ## 11. 编码切分建议（下一轮起，走 TDD）
 
 - **C1**：v2 契约 + llm-deepseek 迁移（`form` → `card.view.form`）+ m32 红→绿 ← *最小可验证第一步*
-- **C2**：`/api/ui-manifest`（实时 + rev）+ 坏声明 error 条目
+- **C2**：`uiManifest/list`（实时 + rev）+ 坏声明 error 条目
 - **C3**：桌布壳最小集（侧栏分类 + 网格排布 + `form` 渲染器 + fail-loud 表）
 - **C4**：`status` / `list` 渲染器 + 真实数据面（首个 `list` 试点建议 = 插件清单）
 - **C5**：`ui-manifest-changed` SSE 接热插拔（最小验证：装/卸一包，卡片增删可见）
