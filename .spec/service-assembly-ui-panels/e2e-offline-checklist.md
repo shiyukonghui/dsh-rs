@@ -24,9 +24,9 @@
 | 设置编辑（form+fieldsFrom） | ui-theme 字段投影自 schema；保存成功；改并发→SETTINGS_CONFLICT 显式 | 设置面板（写端，ui-theme 子集） |
 
 ## 2. 已知缺口（判定=不通过项，如实列）
-- ~~调度/任务面板未迁移~~ → **读端已落地（D-195 第十卡，只读）**；写端（create/delete
-  表单与确认）仍是缺口。
-- 动态插件 **define/activate**（表单参数写）未做；审批交互（approval asked/decide）未做。
+- ~~审批交互~~ → **已落地（D-198/199 第十二卡：pending 列表 + 允许/拒绝(confirm)）**；
+  审批策略编辑（approval/policy）未做（属设置域）。
+- 动态插件 **define/activate**（表单参数写）未做。
 - 设置编辑 v1 仅 `ui-theme` 一卡（其余 ns = 复制声明单元，机械工作）；secrets 编辑不支持。
 - 聊天：中断按钮、审批线、附件未做（D-193 边界）。
 - 全部卡片浏览器手测此前**未执行过**（无基建）——本清单即首次执行。

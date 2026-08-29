@@ -1,0 +1,27 @@
+{
+  "$schema": "dsh/plugin-ui/v2",
+  "kind": "card",
+  "cardId": "panel-approval.pending",
+  "type": "session",
+  "title": "待审批",
+  "description": "未决工具审批（决定走宿主 session.approval.decide；拒绝需确认）",
+  "size": { "w": 4, "h": 4 },
+  "view": {
+    "kind": "list",
+    "dataRpc": ["approval", "pending"],
+    "columns": [
+      { "key": "toolName", "label": "工具" },
+      { "key": "sessionId", "label": "会话" },
+      { "key": "reason", "label": "原因" }
+    ],
+    "rowsPath": "items",
+    "actions": [],
+    "rowActions": [
+      { "name": "allow", "label": "允许", "rpc": ["session.approval", "decide"],
+        "scope": "row", "args": { "decision": "allowedOnce" } },
+      { "name": "reject", "label": "拒绝", "rpc": ["session.approval", "decide"],
+        "scope": "row", "args": { "decision": "rejected" }, "confirm": true }
+    ],
+    "emptyText": "没有待审批项"
+  }
+}

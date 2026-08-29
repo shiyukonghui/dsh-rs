@@ -1,0 +1,10 @@
+// panel-approval 服务装配单元（面板改写 #11 / D-199）：待审批清单声明单元。
+package dsh:panel-approval;
+
+use dsh:host-remote/remote;
+use dsh:host-remote/host-services;
+
+world panel-approval {
+  export remote;
+  import host-services;
+}

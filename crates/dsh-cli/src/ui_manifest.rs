@@ -696,5 +696,13 @@ mod tests {
             .unwrap_or_else(|| panic!("创建调度卡应在清单里，得 {:?}", m.cards));
         assert_eq!(sc["type"], "runtime");
         assert_eq!(sc["cardId"], "panel-schedule-create.form");
+        // D-199：待审批卡（第十二卡——技术队列清零）。
+        let ap = m
+            .cards
+            .iter()
+            .find(|c| c["pluginName"] == "panel-approval")
+            .unwrap_or_else(|| panic!("审批卡应在清单里，得 {:?}", m.cards));
+        assert_eq!(ap["type"], "session");
+        assert_eq!(ap["cardId"], "panel-approval.pending");
     }
 }
