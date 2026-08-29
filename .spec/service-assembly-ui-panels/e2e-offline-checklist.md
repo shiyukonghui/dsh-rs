@@ -5,7 +5,7 @@
 
 ## 0. 准备
 1. `cargo run -- serve`（确保 wasm_base=wasm-plugins/ 存在已构建组件；首次启动 scan 会自动构建缺失单元）。
-2. 打开 `http://127.0.0.1:<port>/canvas`。验收基线：清单应含 **9 卡**、侧栏五分类齐
+2. 打开 `http://127.0.0.1:<port>/canvas`。验收基线：清单应含 **12 卡**、侧栏五分类齐
    （model/runtime/resource/session/config）、无「渲染器未实现/校验失败」红卡。
 3. 热插拔抽查：运行中把 `wasm-plugins/panel-dynamic-plugins` 改名 → ≤2s 卡片消失、分类收缩；
    改回 → 卡片恢复（C5 watch 链路）。
@@ -22,6 +22,9 @@
 | 设置概览（list） | ns/字段/值与 settings.describe 一致；secret 仅存在性 | 设置面板（只读子集） |
 | **聊天（chat）** | 选会话→历史气泡与旧前端一致；发送→乐观气泡→SSE 真回复；切会话不串线 | **聊天主视图（关键路径）** |
 | 设置编辑（form+fieldsFrom） | ui-theme 字段投影自 schema；保存成功；改并发→SETTINGS_CONFLICT 显式 | 设置面板（写端，ui-theme 子集） |
+| 调度任务（list+删） | after/at/every 行与实况一致；**删除弹确认**；删后行消失（fold 回读） | 调度面板（读+删） |
+| 创建调度（form） | kind/prompt/afterSeconds 保存 → 调度任务卡出现该行 | 调度面板（建端） |
+| **待审批（list+决定）** | agent loop 触发 ask→行出现（工具/会话/原因）；允许→工具续跑；**拒绝弹确认**→行消失且工具拒执 | **审批弹窗主路径（关键路径）** |
 
 ## 2. 已知缺口（判定=不通过项，如实列）
 - ~~审批交互~~ → **已落地（D-198/199 第十二卡：pending 列表 + 允许/拒绝(confirm)）**；
@@ -37,4 +40,5 @@
 - 下线动作本身 = 后续独立决策轮（保留 `serve` 旧前端路由至判定通过，回滚点=撤那一个提交）。
 
 ## 4. 回归基线（E2E 前先绿）
-cargo test 全套（dsh-cli 256/0，wasmrt m32–m40）、clippy 0、node 30/30、verify-diff ALL PASS。
+cargo test 全套（dsh-cli **259/0**，wasmrt m32–m43）、clippy 0、node **31/31**、
+verify-diff ALL PASS。（D-195..199 后基线；对应提交 `851d17c`。）
