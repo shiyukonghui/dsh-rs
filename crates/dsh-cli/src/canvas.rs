@@ -75,6 +75,10 @@ mod tests {
             "extractPath",
             "listRows",
             "statusItems",
+            "rowActionBody",
+            "needsConfirm",
+            "chatFoldFrame",
+            "chatOptions",
         ] {
             assert!(CANVAS_CORE_JS.contains(&format!("export function {name}")), "core 导出 {name}");
         }

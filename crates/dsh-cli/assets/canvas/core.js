@@ -93,6 +93,21 @@ export function validateDeclaration(d) {
   if (REJECTED.indexOf(k) >= 0) {
     return { code: "view-kind-rejected", message: "view.kind=\"" + k + "\" 被契约否决（画布本身，卡内嵌画布为递归陷阱）" };
   }
+  if (k === "chat") {
+    // C8-1（D-193）：chat 体校验**先于**渲染器保留档——声明缺陷优先于渲染器进度。
+    const pair = (v) =>
+      Array.isArray(v) && v.length === 2 && v.every((x) => typeof x === "string");
+    const v = d.view;
+    if (!pair(v.sessionSource) || !pair(v.historyRpc) || !pair(v.sendRpc)) {
+      return {
+        code: "view-malformed",
+        message: "chat 视图须有 sessionSource/historyRpc/sendRpc 三个 [ns,method] 面",
+      };
+    }
+    if (v.stream !== "session-events") {
+      return { code: "view-malformed", message: 'chat.stream 必须恰为 "session-events"（闭集）' };
+    }
+  }
   if (UNIMPLEMENTED.indexOf(k) >= 0) {
     return { code: "renderer-unimplemented", message: "view.kind=\"" + k + "\" 渲染器尚未实现（契约已定档）" };
   }
@@ -211,4 +226,58 @@ export function rowActionBody(row) {
 /** `confirm` 语义：只认严格 true（缺省/其他值 = 直接执行，向后兼容，无静默强制）。 */
 export function needsConfirm(action) {
   return !!action && action.confirm === true;
+}
+
+// ---- C8-1（D-193）：chat 折叠/选择器（纯函数，DOM 只做接线） ----
+
+/** EventKind 帧折叠进会话视图状态。
+ *  state = {sessionId, busy:boolean, messages:[{role:"user"|"assistant"|"system", text, ts, pending?}]}
+ *  frame = {sessionId, kind, data, time}（kind = dsh-session EventKind 规范串）。
+ *  规则：非所选会话/未列举 kind → **原样返回同一引用**（渲染器以引用差决定是否重绘）；
+ *  user/message 对齐 pending 乐观气泡；assistant/message|chunk 合并进当前 assistant 气泡；
+ *  turn/start|end → busy；command/run|done → 系统行。绝不改动传入 state。 */
+export function chatFoldFrame(state, frame) {
+  if (!frame || frame.sessionId !== state.sessionId) return state;
+  const kind = frame.kind;
+  const msgs = state.messages;
+  const last = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+  const next = (arr, busy) => ({
+    sessionId: state.sessionId,
+    busy: busy === undefined ? state.busy : busy,
+    messages: arr,
+  });
+  const textOf = (f) =>
+    f.data && f.data.text != null ? String(f.data.text) : "";
+  if (kind === "user/message") {
+    if (last && last.role === "user" && last.pending) {
+      const merged = Object.assign({}, last, { text: textOf(frame), pending: false, ts: frame.time != null ? frame.time : last.ts });
+      return next(msgs.slice(0, -1).concat([merged]));
+    }
+    return next(msgs.concat([{ role: "user", text: textOf(frame), ts: frame.time }]));
+  }
+  if (kind === "assistant/message" || kind === "assistant/chunk") {
+    if (last && last.role === "assistant") {
+      const merged = Object.assign({}, last, { text: last.text + textOf(frame) });
+      return next(msgs.slice(0, -1).concat([merged]));
+    }
+    return next(msgs.concat([{ role: "assistant", text: textOf(frame), ts: frame.time }]));
+  }
+  if (kind === "turn/start") return next(msgs, true);
+  if (kind === "turn/end") return next(msgs, false);
+  if (kind === "command/run" || kind === "command/done") {
+    const verb = kind === "command/run" ? "命令运行" : "命令完成";
+    const name = frame.data && frame.data.name != null ? " " + String(frame.data.name) : "";
+    return next(msgs.concat([{ role: "system", text: verb + name, ts: frame.time }]));
+  }
+  return state;
+}
+
+/** 会话选择器选项：list 行 → [{value,label}]（脏行跳过；running → 忙/闲 标记）。 */
+export function chatOptions(rows) {
+  const out = [];
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (!r || typeof r.sessionId !== "string") continue;
+    out.push({ value: r.sessionId, label: r.sessionId + (r.running ? "·忙" : "·闲") });
+  }
+  return out;
 }

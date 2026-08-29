@@ -18,6 +18,8 @@ import {
   statusItems,
   rowActionBody,
   needsConfirm,
+  chatFoldFrame,
+  chatOptions,
 } from "../core.js";
 
 function card(pluginName, cardId, type, w, h) {
@@ -174,8 +176,10 @@ test("validateDeclaration covers all nine fail-loud rows", () => {
   const board = goodForm();
   board.view = { kind: "board" };
   assert.equal(validateDeclaration(board).code, "view-kind-rejected");
-  // 6 契约预留 → renderer-unimplemented（C4 起 status/list **已实现**，只剩三员预留）
-  for (const k of ["chat", "chart", "table"]) {
+  // 6 契约预留 → renderer-unimplemented（C4 起 status/list **已实现**，只剩三员预留）。
+  // C8-1（D-193）迁移注记：chat 有形状要求——裸 chat 体先落 view-malformed（形状校验
+  // 先于保留档）；齐形 chat → renderer-unimplemented 由 C8 专测覆盖。此处留无要求两员。
+  for (const k of ["chart", "table"]) {
     const d = goodForm();
     d.view = { kind: k };
     assert.equal(validateDeclaration(d).code, "renderer-unimplemented", k);
@@ -340,4 +344,96 @@ test("validateDeclaration rejects malformed rowActions", () => {
   const badRpc = listView();
   badRpc.view.rowActions = [{ name: "x", rpc: ["ns", "a", "b"] }];
   assert.equal(validateDeclaration(badRpc).code, "view-malformed");
+});
+
+// ---- C8-1（D-193）：chat 契约校验 + 折叠/选择器纯函数 ----
+
+const goodChat = () => {
+  const d = goodForm();
+  d.view = {
+    kind: "chat",
+    sessionSource: ["session", "list"],
+    historyRpc: ["session", "history"],
+    sendRpc: ["session", "prompt"],
+    stream: "session-events",
+  };
+  return d;
+};
+
+test("chat shape validated ahead of renderer reservation", () => {
+  // 形状齐 → 仍 renderer-unimplemented（C8-3 前渲染器保留档，语义如实）。
+  assert.equal(validateDeclaration(goodChat()).code, "renderer-unimplemented");
+  // 形状缺 → view-malformed 抢在保留档之前（声明缺陷优先于渲染器进度）。
+  const noHist = goodChat();
+  delete noHist.view.historyRpc;
+  assert.equal(validateDeclaration(noHist).code, "view-malformed");
+  const badSend = goodChat();
+  badSend.view.sendRpc = ["session", "a", "b"];
+  assert.equal(validateDeclaration(badSend).code, "view-malformed");
+  const badStream = goodChat();
+  badStream.view.stream = "sse";
+  assert.equal(validateDeclaration(badStream).code, "view-malformed");
+  const noStream = goodChat();
+  delete noStream.view.stream;
+  assert.equal(validateDeclaration(noStream).code, "view-malformed");
+});
+
+const chatState = () => ({ sessionId: "s-1", busy: false, messages: [] });
+
+test("chatFoldFrame: foreign session ignored by reference identity", () => {
+  const s = chatState();
+  const out = chatFoldFrame(s, { sessionId: "other", kind: "user/message", data: { text: "x" }, time: 1 });
+  assert.strictEqual(out, s, "非所选会话帧必须原样返回（同一引用）");
+});
+
+test("chatFoldFrame: optimistic user bubble aligned by real event", () => {
+  const s = { sessionId: "s-1", busy: false, messages: [{ role: "user", text: "echo", pending: true }] };
+  const out = chatFoldFrame(s, { sessionId: "s-1", kind: "user/message", data: { text: "echo" }, time: 7 });
+  assert.equal(out.messages.length, 1, "对齐而非重复追加");
+  assert.equal(out.messages[0].pending, false);
+  assert.equal(out.messages[0].ts, 7);
+  assert.equal(s.messages[0].pending, true, "原 state 不得被改动（纯函数）");
+});
+
+test("chatFoldFrame: user push when no pending bubble; assistant merge and push", () => {
+  let s = chatState();
+  s = chatFoldFrame(s, { sessionId: "s-1", kind: "user/message", data: { text: "hi" }, time: 1 });
+  assert.equal(s.messages.length, 1);
+  s = chatFoldFrame(s, { sessionId: "s-1", kind: "assistant/message", data: { text: "Hel" }, time: 2 });
+  s = chatFoldFrame(s, { sessionId: "s-1", kind: "assistant/chunk", data: { text: "lo" }, time: 3 });
+  assert.equal(s.messages.length, 2, "chunk 延续 assistant 气泡不新开");
+  assert.equal(s.messages[1].text, "Hello");
+});
+
+test("chatFoldFrame: turn busy flags and system line for command kinds", () => {
+  let s = chatState();
+  s = chatFoldFrame(s, { sessionId: "s-1", kind: "turn/start", data: {}, time: 1 });
+  assert.equal(s.busy, true);
+  s = chatFoldFrame(s, { sessionId: "s-1", kind: "command/run", data: { name: "plan" }, time: 2 });
+  const sys = s.messages[s.messages.length - 1];
+  assert.equal(sys.role, "system");
+  assert.ok(String(sys.text).includes("plan"), "系统行带命令名");
+  s = chatFoldFrame(s, { sessionId: "s-1", kind: "turn/end", data: {}, time: 3 });
+  assert.equal(s.busy, false);
+});
+
+test("chatFoldFrame: unknown kinds ignored by reference identity", () => {
+  const s = chatState();
+  const out = chatFoldFrame(s, { sessionId: "s-1", kind: "hook/invoked", data: {}, time: 1 });
+  assert.strictEqual(out, s, "未列举 kind 原样返回（不产生系统噪音）");
+});
+
+test("chatOptions: rows to selector options, junk rows skipped", () => {
+  const opts = chatOptions([
+    { sessionId: "a", running: true },
+    { sessionId: "b", running: false },
+    { running: true },
+    { sessionId: 5 },
+    null,
+  ]);
+  assert.deepEqual(opts, [
+    { value: "a", label: "a·忙" },
+    { value: "b", label: "b·闲" },
+  ]);
+  assert.deepEqual(chatOptions(null), []);
 });

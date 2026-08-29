@@ -7992,6 +7992,14 @@ wasm 单元（请求/响应模型无订阅原语）；发送长 RPC `session.pro
 **影响**：canvas design §4.1 chat 块标注定稿 + §13 加 C7（面板 ×N 台账行）/C8 行。
 **回滚点**：纯设计轮——撤本文档 + 三处标注即回到 `f8a5d68`；实现片 C8-1..4 各自独立可撤。
 
+**实现切片实测 C8-1（2026-09-05）**：core.js chat 校验（三 `[ns,method]` 面 + `stream`
+闭集，**形状校验先于渲染器保留档**——声明缺陷优先于渲染器进度）+ `chatFoldFrame`
+（EventKind 规范串实证自 dsh-session types.rs：user/message、assistant/message|chunk、
+turn/start|end、command/run|done；引用差 = 重绘信号；纯函数零改动入参）+ `chatOptions`。
+桩红 5 → **node 26/26**；旧「九行 fail-loud」测试的裸 chat 预留行按新语义迁移
+（→ chart/table 两员，齐形 chat 归 C8 专测）；canvas.rs 导出守卫补 chatFoldFrame/
+chatOptions（顺手补齐 C6 漏登的 rowActionBody/needsConfirm）。C8-2..4 排期不变。
+
 
 
 
