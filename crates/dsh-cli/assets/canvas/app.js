@@ -38,24 +38,30 @@ function rpc(method, args) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(rpcEnvelope(method, args, "canvas-" + state.rid)),
-  }).then((r) => r.json());
+  }).then((r) => r.json())
+    // D-207（live E2E 首跑白屏根因）：HTTP 返回 server-response 信封
+    // `{type,rpcId,result:{ok,value|error}}`——消费者契约是 arm 层 {ok,value}，
+    // 信封解包收敛在**这里单点**（既往测试口直喂 arm 层，信封层从未被真实执行）。
+    .then((j) => (j && j.result !== undefined ? j.result : j));
 }
 
 // ---------- 清单：首次加载 + rev 轮询 ----------
 
 async function loadManifest() {
   const args = state.model ? { rev: state.model.rev } : {};
-  let value;
+  let res;
   try {
-    value = await rpc("uiManifest/list", args);
+    res = await rpc("uiManifest/list", args);
   } catch (e) {
     status("✗ 清单拉取失败：" + e.message + "（保留现状）", "err");
     return;
   }
-  if (value && value.ok === false) {
-    status("✗ 清单错误：" + ((value.error && value.error.message) || "?"), "err");
+  if (res && res.ok === false) {
+    status("✗ 清单错误：" + ((res.error && res.error.message) || "?"), "err");
     return;
   }
+  // pollDecision 契约 = 内层 {rev, cards|unchanged}（D-207：信封与 ok 闸都在 rpc/此处剥净）。
+  const value = res && res.value !== undefined ? res.value : res;
   const decision = pollDecision(state.model, value);
   if (decision.action === "keep") return;
   render({ rev: decision.rev, cards: decision.cards });

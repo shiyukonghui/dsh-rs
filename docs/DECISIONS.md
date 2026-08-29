@@ -8346,7 +8346,33 @@ dsh-cli **259/0**、clippy **0**。教训入册：**自主冒烟必须走渲染�
 **活体重冒烟补记（修复后新二进制，渲染器真实 slash 信封）**：`settings/describe`
 ok=true/12 ns；`settings/update` 过闸**打到真实乐观锁域**（SETTINGS_CONFLICT=乱猜
 revision 被正确拒——信封修复与锁语义活体双重自证）；`session.approval/decide`
-invalid-args（非 bad-request）=过闸。三别名活体全绿，HANDOFF/E2E 起服配方同步实证版。E2E 清单已同步（13 卡基线 + §1 行）。
+invalid-args（非 bad-request）=过闸。三别名活体全绿，HANDOFF/E2E 起服配方同步实证版。
+
+## D-207（真实浏览器 E2E 基建落地 + 首跑抓出白屏级 bug：rpc() 信封解包缺失）
+
+**日期**：2026-09-05
+
+**触发**：用户提供 Chrome DevTools MCP 配置欲补 E2E 基建。取证：宿主 harness **不支持
+MCP**（vendored TS acp/index.ts:544 显式 throw "mcpServers is not supported"；运行中
+npx 检出 `mcpServers` 仅见于无关库 @google/genai；`.mcp.json` 零匹配）→ 字面路线不通。
+**等效自建**：Node v24 内置 WebSocket + 本机 Edge(Chromium) → 零依赖裸 CDP 驱动
+（`.spec/service-assembly-ui-panels/e2e-cdp.mjs`：起 headless → 导航 → DOM 探针 →
+Console/Log/Network 三域监听 → 截图）。
+
+**首跑战果（价值即证明）**：真实浏览器第一次执行 app.js 即白屏——NET 显示清单 200 但
+cards=0 且零报错。根因：`rpc()` 返回 **server-response 信封** `{type,rpcId,result:{ok,
+value}}`，而全渲染器契约是 arm 层 `{ok,value}`——信封解包**从未存在**（既往测试口直喂
+arm 层，信封层从未被执行；D-206 同族教训第 N 次应验）。修复=rpc() 单点解包
+`.result` + loadManifest 剥内层 value（pollDecision 契约不变）。
+
+**修复后活体全绿**：cards=13、rows=37（列表真数据）、errEls=2（= 调度/审批诚实未装配，
+与设计预期一致）、14 个数据端点全 200（含 session/history、events.mux SSE、
+settings/describe×2）、Console/Log 零错误、forms=1/selects=5（聊天与 nsSelect 就位）。
+截图 20KB→75KB。
+
+**诚实账更新**：「DOM 渲染层从未被真实执行」自此**解除**——自主 CDP E2E 可跑；用户
+浏览器逐卡目检降级为推荐而非必需（交互细节如动画/输入法类仍以人眼为准）。
+**回滚点**：撤本提交（app.js 两编辑 + 探针脚本）回到 `bf635ca`。E2E 清单已同步（13 卡基线 + §1 行）。
 
 
 
