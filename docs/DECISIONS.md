@@ -7731,6 +7731,40 @@ demo renderer 一行修复；既有 wire/路由/前端零改动。回滚 = 撤�
 dsh-wasmrt 全绿、clippy **0**。已知边界（诚实台账 acceptance §5）：app.js 粘合层与真实
 serve 进程冒烟无自动化执行（无浏览器基建/需 boot fixture），DOM 行为待人工浏览器验证。
 
+## D-185（桌布 C4 设计定稿：status/list 渲染器点亮 + 首个 harness 面板改写「插件清单」+ 载体泛化 remote_carriers）
+
+**日期**：2026-09-05
+
+**触发问题**：用户目标「完成C3后，继续将其他的 deepseek harness 插件改写为服务单元」。
+改写需要：① list/status 渲染器（大量面板本质是列表）；② 新单元接入通路——若继续
+`web.rs` 硬编码 namespace + 特判载体，每改一个面板都要改宿主，**违背热插拔第一等**
+与「装配单元自持 UI+逻辑」的基石判断。
+
+**考虑过的选项与裁定**：
+- **接入通路**：(a) 每面板一次宿主提交（硬编码复制）vs (b) `Boot.remote_carriers`
+  （namespace→载体 map）+ serve **扫描 wasm_base 发现 world:"remote" 包**挂载。
+  **选 (b)**——「每装配单元一载体、namespace 分流」是接手文档 §2.2 预告的既定扩展向；
+  选 (a) 等于把「改写插件」变成「改宿主」，生态命题死亡。未命中 map → host-remote
+  既有语义零变（llm-deepseek 既有测试即回归锚）。
+- **改写首个试点**：设置卡（form，与试点重复）vs **插件清单（list，canvas design §11
+  既定建议）**——list 点亮 + 新数据面（loader 投影只读）+ 只读无副作用，风险最低收益最高。
+- **数据面**：壳内直连 `pluginInventory/list`（壳变宿主 RPC 的搬运工，单元无逻辑=JSON 壳）
+  vs 新单元 wasm `list` 端点内 `host_services.get("loader")` 行投影。**选后者**——
+  服务装配单元=「UI+逻辑同包」本义；行语义（disabled/fiber→state 映射、group 过滤）
+  归属单元自己；宿主数据面零新后端。
+- **失败面纪律**：loader 服务失败 → `{ok:false}` 透传，**绝不伪造空表**（诚实空态与
+  错误态在渲染器分列）。
+- **扫描器坏包语义**：缺构建物/坏 plugin.json → eprintln 跳过（不炸 serve、不上死卡）；
+  `host-remote` 本身（宿主桥）按名排除。
+- **清单卡 type**：`runtime`（loader 装配态=运行时编排）；`capability` 留给工具/技能
+  语义位。可回退一行。
+- **刷新 affordance**：list/status 卡的「刷新」= 渲染器重放 dataRpc（渲染 affordance），
+  不塞进契约 actions——契约不为渲染器便利扩张。
+
+**预期影响与回滚点**：A（assets/canvas 渲染器）纯增量；B 新目录 `wasm-plugins/panel-plugin-inventory/`
+（撤目录即消失）；C `Boot.remote_carriers` 替换 `llm_deepseek_remote` 字段 + serve 扫描块
+（撤 C 提交回 C3 完成态 `1b0708a`）。三块各自独立可回退。
+
 
 
 
