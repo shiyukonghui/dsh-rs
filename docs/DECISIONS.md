@@ -8042,6 +8042,31 @@ hello/keepalive/plan/approval 帧按 method 过滤忽略。诚实台账更新：
 仍缺（无基建），但帧映射两侧（宿主 `mux_session_event_frame_shape` 测 / core 折叠测）
 均已钉死，渲染器为形状匹配的接线。验证：node 语法门 + dsh-cli **255/0**、clippy **0**。
 
+## D-194（S 系列：设置编辑卡契约定稿——form 档 `fieldsFrom` 动态投影，声明单元 + 宿主既表面复用；实现切片 S1..4 排期）
+
+**日期**：2026-09-05（契约设计轮；无代码变更）
+
+**触发问题**：设置面板写半边。障碍 = v2 form 的 fields 是声明期静态数据，而设置字段是
+运行时 schema（宿主注册表）。写协议宿主全现成（settings.update + expectedRevision 乐观锁
++ SETTINGS_CONFLICT），缺的只是渲染侧「schema+value → 表单」投影这一步。
+
+**考虑过的选项与裁定**：
+- **契约扩展形态**：新 view.kind "settingsForm"（第二套表单实现——双源漂移否决）vs
+  **form 档可选 `fieldsFrom {rpc,pick}`**（fields 渲染时投影，与静态 fields 二选一，
+  一个表单实现）。选后者。
+- **数据面**：宿主既表面 + slash 别名（describe/update），复用不另造（D-192/193 纪律）。
+- **归属**：设置域是宿主域——`panel-settings-edit` 只拥有声明（D-193-B 复制，零自有
+  数据端点）。
+- **诚实缺省三条**：secrets 仅显示存在性（redact 源头 set-only，写密钥需专门形态）；
+  嵌套对象/数组 → 只读行不伪造输入控件；applies=restart 成功文案显式「需重启生效」。
+- **并发**：describe.revision → update.expectedRevision；冲突显式呈现 + 引导重读
+  （乐观锁语义原样透出，不静默重试）。
+
+**影响**：canvas design §4.1 form 块将回写 fieldsFrom/saveRpc 形；切片 S1(core 纯函数)
+/S2(宿主别名)/S3(renderForm 扩展)/S4(声明单元+第九卡) 各自红→绿独立可撤。
+**回滚点**：纯设计轮——撤 `.spec/service-assembly-ui-settings-edit/` + 本条即回到
+`664051c`。
+
 
 
 

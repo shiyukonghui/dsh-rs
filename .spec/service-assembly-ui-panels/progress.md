@@ -17,7 +17,8 @@ kv / sessionMessages / workspaceFiles / time / …），避免宿主扩张。
 | — | 会话打开/切换 | — | chat（预留） | 需「卡级选择/跳转」交互形态 + chat 渲染器点亮（远景关键路径，独立契约流程） | ⬜ 契约演进 |
 | 6 | 设置概览 | `wasm-plugins/panel-settings` | list | 宿主新投影 arm `settingsDescribe`（与原生 describe 同形状共用 namespace_view，redact 在源头）；行拍平 {ns,field,value}；**config 分类首卡** | ✅ D-192（m38 + 宿主 2 测） |
 | C8 | 聊天 | `wasm-plugins/panel-chat`（声明单元） | chat（**全链路落地**） | 三 RPC 面复用宿主既表面；折叠同源；**SSE 直订已接（C8-3b，仅订 events.mux）** | ✅ D-193 C8-1..4+3b（m39 3/3，清单第八卡） |
-| … | 设置编辑/调度/任务… | form（动态 fields）/list+写动作 | 契约演进：async schema、调度投影 arm（照 D-192 受测扩展型） | — | ⬜ 契约演进后迁移 |
+| S | 设置编辑 | `panel-settings-edit`（声明单元，排期） | form + `fieldsFrom` 动态投影 | describe/update 宿主既表面别名 + expectedRevision 乐观锁；secrets 仅存在性；嵌套只读 | 📐 D-194 契约定稿；S1..4 排期 |
+| … | 调度/任务… | list+写动作 | 契约演进：调度投影 arm（照 D-192 受测扩展型） | — | ⬜ 契约演进后迁移 |
 
 ## 迁移完成的判定（远景）
 「前端全部由服务单元组成」= harness 面板逐块迁移到桌布卡片直至旧前端可下线；
