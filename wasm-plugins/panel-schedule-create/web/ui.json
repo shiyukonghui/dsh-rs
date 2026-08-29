@@ -1,0 +1,21 @@
+{
+  "$schema": "dsh/plugin-ui/v2",
+  "kind": "card",
+  "cardId": "panel-schedule-create.form",
+  "type": "runtime",
+  "title": "创建调度",
+  "description": "after/at/every 调度创建（写端；动作走宿主 schedule/create 臂）",
+  "size": { "w": 2, "h": 4 },
+  "view": {
+    "kind": "form",
+    "fields": [
+      { "name": "kind", "label": "类型", "type": "select",
+        "options": ["after", "at", "every"], "default": "after", "required": true },
+      { "name": "prompt", "label": "提示", "type": "text", "required": true },
+      { "name": "afterSeconds", "label": "延迟秒（after）", "type": "number", "default": 60 }
+    ],
+    "actions": [
+      { "name": "create", "label": "创建", "rpc": ["schedule", "create"], "primary": true }
+    ]
+  }
+}

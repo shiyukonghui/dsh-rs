@@ -8126,6 +8126,18 @@ m41 补 rowActions(confirm) 断言；dsh-cli **258/0**、m41 3/3、clippy **0**�
 教训入册：**跨线形状（envelope）必须与每个消费臂逐一核对**，E2E 前 wire 审计是必要
 关口（调度面板自此读+删可用；create 表单卡 panel-schedule-create 与审批交互仍排队）。
 
+## D-197（panel-schedule-create：调度创建表单声明单元——静态 form × 声明单元两型合体，调度写端闭环）
+
+**日期**：2026-09-05
+
+**内容**：第十一个装配单元 = 静态 form 卡（kind select [after/at/every] + prompt +
+afterSeconds；保存动作 `schedule/create`）+ 声明单元纪律（零自有数据端点）。保存链
+`renderActions {values}` → 画布 `{args:{values}}` 信封 → create 臂（D-196 已按该形
+测试钉死）→ ScheduleHost append `schedule/change` 事件 → 列表卡刷新可见——调度面板
+**建/看/删** 全部以服务单元形态运行。**回滚点**：撤包目录 + m42 + 清单三行断言。
+**验收**：m42 3/3（form 契约 + 一份契约 + 无自有端点）、清单第十一卡断言、全套 0 失败、
+clippy **0**。审批交互为最后排队的技术项；E2E + 下线判定仍待用户。
+
 
 
 

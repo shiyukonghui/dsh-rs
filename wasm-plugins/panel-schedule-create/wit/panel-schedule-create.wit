@@ -1,0 +1,10 @@
+// panel-schedule-create 服务装配单元（面板改写 #10 / D-197）：调度创建表单声明单元。
+package dsh:panel-schedule-create;
+
+use dsh:host-remote/remote;
+use dsh:host-remote/host-services;
+
+world panel-schedule-create {
+  export remote;
+  import host-services;
+}

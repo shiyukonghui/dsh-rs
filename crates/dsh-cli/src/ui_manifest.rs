@@ -688,5 +688,13 @@ mod tests {
             .unwrap_or_else(|| panic!("调度卡应在清单里，得 {:?}", m.cards));
         assert_eq!(sch["type"], "runtime");
         assert_eq!(sch["cardId"], "panel-schedule.list");
+        // D-197：调度创建表单卡（第十一卡，写端闭环）。
+        let sc = m
+            .cards
+            .iter()
+            .find(|c| c["pluginName"] == "panel-schedule-create")
+            .unwrap_or_else(|| panic!("创建调度卡应在清单里，得 {:?}", m.cards));
+        assert_eq!(sc["type"], "runtime");
+        assert_eq!(sc["cardId"], "panel-schedule-create.form");
     }
 }
