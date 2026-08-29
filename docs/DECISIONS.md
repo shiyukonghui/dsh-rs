@@ -8104,6 +8104,28 @@ now 应 i64）即时修复。
 **预期影响与回滚点**：lib.rs 两行 + web.rs 三处 + 单元目录 + m41 + 清单一行；
 撤本提交回到 `5464ab2`。E2E 清单 §2 划账（调度只读子集落地；写端缺口保留标注）。
 
+## D-196（调度写切片 A + wire 审计热修：直读字段的原生臂必须解包画布 `{args}` 信封）
+
+**日期**：2026-09-05
+
+**触发问题**：写切片 A（schedule/create + schedule/delete 薄臂 + 卡 rowActions delete
+confirm）实现时做 wire 形状自查，发现系统性隐患：画布 `rpcEnvelope` 一律发
+`payload:{args:{…}}`，而 `dispatch` 内**直读字段的原生臂**（settings/update、
+session/history、session/prompt）读的是 `payload.get("ns"/"sessionId"/…)`——参数会
+**静默丢失**（E2E 未跑故未暴露；wasm remote 路径早已解包、uiManifest 臂自读 args，
+两者幸免）。
+
+**裁定**：臂内一行遮蔽解包 `let payload = payload.get("args").unwrap_or(payload);`
+×3——旧前端直发形 unwrap_or 原样返回 = **零回归**；否决入口全局解包（uiManifest 等
+自读 args 的臂会被双解破坏，回归面大）。新臂（schedule/*）直接按画布形编写并以
+`{args}` 形测试钉死。
+
+**验收实测**：宿主 `rpc_schedule_write_roundtrip`（未挂载诚实 → create 画布形 ok →
+fold 回读 1 行 → row 形 delete deleted:true → 回读空——**建一删一 fold 权威闭环**）；
+m41 补 rowActions(confirm) 断言；dsh-cli **258/0**、m41 3/3、clippy **0**。
+教训入册：**跨线形状（envelope）必须与每个消费臂逐一核对**，E2E 前 wire 审计是必要
+关口（调度面板自此读+删可用；create 表单卡 panel-schedule-create 与审批交互仍排队）。
+
 
 
 

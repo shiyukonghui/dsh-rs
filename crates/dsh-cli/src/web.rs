@@ -3657,6 +3657,69 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
                 }}),
             },
         },
+        // D-195 写切片 A：create/delete 薄臂——同一 ScheduleHost 权威（事件日志 append，
+        // 绝不落坏事件由 ScheduleHost 自身保证）。create 兼容双形（表单 {values:{…}} /
+        // 直发 {…}）；delete 吃 C6 行形状 `args.row.id`（确认在渲染器，单元/宿主自校验）。
+        "schedule/create" => match &boot.schedule {
+            None => serde_json::json!({"ok": false, "error": {
+                "code": "no-schedule-host",
+                "message": "schedule host not assembled (agent loop disabled?)",
+            }}),
+            Some(s) => {
+                let args = payload.get("args").cloned().unwrap_or(Value::Null);
+                let v = args.get("values").cloned().unwrap_or(args.clone());
+                let kind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("");
+                let prompt = v.get("prompt").and_then(|x| x.as_str()).unwrap_or("");
+                if kind.is_empty() || prompt.is_empty() {
+                    return serde_json::json!({"ok": false, "error": {
+                        "code": "bad-request",
+                        "message": "schedule/create requires kind & prompt",
+                    }});
+                }
+                let now = system_now_ms();
+                match s.create(
+                    kind,
+                    prompt,
+                    v.get("afterSeconds").and_then(|x| x.as_u64()),
+                    v.get("at").and_then(|x| x.as_str()),
+                    v.get("everySeconds").and_then(|x| x.as_u64()),
+                    now,
+                ) {
+                    Ok(id) => serde_json::json!({"ok": true, "value": {"id": id}}),
+                    Err(e) => serde_json::json!({"ok": false, "error": {
+                        "code": "schedule-create-failed", "message": e,
+                    }}),
+                }
+            }
+        },
+        "schedule/delete" => match &boot.schedule {
+            None => serde_json::json!({"ok": false, "error": {
+                "code": "no-schedule-host",
+                "message": "schedule host not assembled (agent loop disabled?)",
+            }}),
+            Some(s) => {
+                let id = payload
+                    .get("args")
+                    .and_then(|a| a.get("row"))
+                    .and_then(|r| r.get("id"))
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("");
+                if id.is_empty() {
+                    return serde_json::json!({"ok": false, "error": {
+                        "code": "bad-request",
+                        "message": "schedule/delete requires args.row.id",
+                    }});
+                }
+                match s.delete(id) {
+                    Ok(deleted) => {
+                        serde_json::json!({"ok": true, "value": {"deleted": deleted}})
+                    }
+                    Err(e) => serde_json::json!({"ok": false, "error": {
+                        "code": "schedule-delete-failed", "message": e,
+                    }}),
+                }
+            }
+        },
         "sessions" | "session.list" | "session/list" => {
             // M1e：SessionStore 提供权威列表（创建顺序、失活/空判定）。
             let updated_at = now_ms();
@@ -3728,6 +3791,8 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
         // C8-2（D-193）：slash 别名——桌布 rpc 面 `[ns,method]` join 出的方法名直连
         // 既有 history 面（**复用不另造**：旧前端同事实源，杜绝双源折叠漂移）。
         "session.history" | "session/history" => {
+            // D-196 wire 审计：解包画布 {args} 形（sessionId 等）。
+            let payload = payload.get("args").unwrap_or(payload);
             // M1e：SessionStore 的历史（strict-envelope 事件直接 wire）。
             let sid = payload
                 .get("sessionId")
@@ -3828,6 +3893,8 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
             }
         }
         "session.prompt" | "session/prompt" => {
+            // D-196 wire 审计：解包画布 {args} 形（sessionId/content/text）。
+            let payload = payload.get("args").unwrap_or(payload);
             // 前端经 prompt 发消息：提取 content → 驱动 turn。
             // M2g：boot 装配了 Rust AgentLoopHost 时改驱真实 agent-loop（事件直接
             // 落共享 store；前端历史/下链同一事实源）；否则 M1 WASM loop 路径
@@ -4355,6 +4422,9 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
             serde_json::json!({"ok": true, "value": {"opened": true}})
         }
         "settings.update" | "settings.replace" | "settings.mutate" => {
+            // wire 审计（D-196）：画布 rpcEnvelope 包 {args}，直读字段的臂必须先行解包
+            // （旧前端直发形 unwrap_or 原样 = 零影响）。
+            let payload = payload.get("args").unwrap_or(payload);
             let ns = payload.get("ns").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let expected = payload.get("expectedRevision").and_then(|v| v.as_u64());
             let mut sp = boot.settings.borrow_mut();
@@ -5625,6 +5695,48 @@ mod tests {
         assert_eq!(items[0]["kind"], "after");
         assert_eq!(items[0]["prompt"], "提醒喝水");
         assert!(items[0]["id"].as_str().unwrap().starts_with("schedule-"));
+    }
+
+    /// D-195 写切片 A：schedule/create + schedule/delete 闭环——create 走表单形
+    /// {values}，delete 走 C6 行形 args.row.id；fold 权威回读闭环（建一删一空）。
+    #[test]
+    fn rpc_schedule_write_roundtrip() {
+        let mut boot = boot_with_sessions();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "rw0", "method": "schedule/create",
+            "payload": {"args": {"values": {"kind": "after", "prompt": "p1", "afterSeconds": 120}}},
+        }))
+        .unwrap();
+        let v = handle_rpc(&boot, "schedule/create", &body).1;
+        assert_eq!(v["result"]["ok"], false, "未挂宿主写必须诚实: {v}");
+        assert_eq!(v["result"]["error"]["code"], "no-schedule-host");
+        let store = SessionHost::in_memory();
+        let sess = store.session("default").expect("default live");
+        let sched = std::sync::Arc::new(dsh_cli_host::ScheduleHost::new(sess));
+        boot.schedule = Some(sched);
+        let call = |method: &str, payload: Value| -> Value {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "client-request", "rpcId": "rw", "method": method, "payload": payload,
+            }))
+            .unwrap();
+            handle_rpc(&boot, method, &body).1
+        };
+        let v = call(
+            "schedule/create",
+            serde_json::json!({"args": {"values": {"kind": "after", "prompt": "p1", "afterSeconds": 120}}}),
+        );
+        assert_eq!(v["result"]["ok"], true, "create: {v}");
+        let id = v["result"]["value"]["id"].as_str().unwrap().to_string();
+        let v = call("schedule/list", serde_json::json!({}));
+        assert_eq!(v["result"]["value"]["items"].as_array().unwrap().len(), 1);
+        let v = call("schedule/delete", serde_json::json!({"args": {"row": {"id": id}}}));
+        assert_eq!(v["result"]["ok"], true, "delete: {v}");
+        assert_eq!(v["result"]["value"]["deleted"], true);
+        let v = call("schedule/list", serde_json::json!({}));
+        assert!(
+            v["result"]["value"]["items"].as_array().unwrap().is_empty(),
+            "删除后 fold 回读应为空: {v}"
+        );
     }
 
     #[test]

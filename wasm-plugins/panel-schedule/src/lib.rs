@@ -29,6 +29,10 @@ fn ui_declaration() -> Value {
             ],
             "rowsPath": "items",
             "actions": [],
+            "rowActions": [
+                { "name": "delete", "label": "删除", "rpc": ["schedule", "delete"],
+                  "scope": "row", "confirm": true }
+            ],
             "emptyText": "没有调度记录"
         }
     })

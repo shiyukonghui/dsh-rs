@@ -46,6 +46,12 @@ fn describe_ui_returns_valid_list_declaration() {
     assert_eq!(view["rowsPath"], "items");
     let cols = view["columns"].as_array().expect("columns");
     assert_eq!(cols.len(), 4, "{cols:?}");
+    // D-195 写切片 A：删除行动作（C6 confirm 形——破坏性动作必须声明确认）。
+    let ra = view["rowActions"].as_array().expect("rowActions");
+    assert_eq!(ra.len(), 1);
+    assert_eq!(ra[0]["rpc"], json!(["schedule", "delete"]));
+    assert_eq!(ra[0]["scope"], "row");
+    assert_eq!(ra[0]["confirm"], true);
 }
 
 #[test]
