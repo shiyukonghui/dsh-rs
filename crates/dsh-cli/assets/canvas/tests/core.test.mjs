@@ -21,6 +21,7 @@ import {
   chatFoldFrame,
   chatOptions,
   schemaFields,
+  nsSelectModel,
 } from "../core.js";
 
 function card(pluginName, cardId, type, w, h) {
@@ -310,6 +311,19 @@ test("statusItems: dataRpc items > static view.items > honest empty", () => {
 });
 
 // ---- C6（D-189）：行动作线形状 + confirm 语义 ----
+
+test("nsSelectModel projects namespaces into a selector model (D-201)", () => {
+  const value = { namespaces: [{ ns: "ui-theme" }, { ns: "locale" }, { ns: "shell" }] };
+  assert.deepEqual(nsSelectModel(value, "locale"), {
+    options: ["ui-theme", "locale", "shell"],
+    current: "locale",
+  });
+  // 初始 pick 不在场 → 回退首项（诚实显示可选面，不空转）。
+  assert.equal(nsSelectModel(value, "ghost").current, "ui-theme");
+  // 空/坏数据 → 空模型（渲染器据此显示错误态）。
+  assert.deepEqual(nsSelectModel({}, "x"), { options: [], current: "" });
+  assert.deepEqual(nsSelectModel(null, "x"), { options: [], current: "" });
+});
 
 test("rowActionBody wraps the full row untouched (wire contract)", () => {
   const row = { pluginId: "hello", name: "Hello v2", state: "running" };

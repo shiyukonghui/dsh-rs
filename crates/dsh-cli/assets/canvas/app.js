@@ -17,6 +17,7 @@ import {
   chatFoldFrame,
   chatOptions,
   schemaFields,
+  nsSelectModel,
   GRID,
 } from "./core.js";
 
@@ -270,7 +271,8 @@ function renderForm(el, decl) {
   const inputs = {};
   const stat = statLine(el);
 
-  const finish = (prefill, meta) => {
+  const finish = (prefill, meta, host) => {
+    const boxHost = host || el;
     view.fields.forEach((f) => {
       const label = document.createElement("label");
       const span = document.createElement("span");
@@ -279,7 +281,7 @@ function renderForm(el, decl) {
       const input = fieldInput(f, prefill[f.name] !== undefined ? prefill[f.name] : f.default);
       inputs[f.name] = input;
       label.appendChild(input);
-      el.appendChild(label);
+      boxHost.appendChild(label);
     });
     if (meta) {
       // S3（D-194）：不可编辑面如实列出（嵌套只读 / secrets 仅存在性——不伪造控件）。
@@ -287,21 +289,62 @@ function renderForm(el, decl) {
         const d = document.createElement("div");
         d.className = "note";
         d.textContent = "· " + r.key + "：" + r.note;
-        el.appendChild(d);
+        boxHost.appendChild(d);
       });
       (meta.secrets || []).forEach((s) => {
         const d = document.createElement("div");
         d.className = "note";
         d.textContent = "· " + s.path + "：" + (s.set ? "已设" : "未设") + "（secrets 不可在桌布编辑）";
-        el.appendChild(d);
+        boxHost.appendChild(d);
       });
     }
-    renderActions(el, decl, inputs, stat, meta);
+    renderActions(boxHost, decl, inputs, stat, meta);
   };
 
   // fieldsFrom（D-194/S3）：fields 运行时从数据面投影（设置域 = 宿主既表面，S2 别名面）。
+  // nsSelect（D-201）：带命名空间下拉——一卡通用编辑全部 ns（终结每 ns 一卡的机械复制）。
   const ff = view.fieldsFrom;
   if (ff && Array.isArray(ff.rpc) && ff.rpc.length === 2 && typeof ff.pick === "string") {
+    const body = document.createElement("div");
+    el.appendChild(body);
+    let allValue = null;
+    const paint = (nsName) => {
+      Object.keys(inputs).forEach((k) => delete inputs[k]);
+      body.innerHTML = "";
+      const nss = (allValue && allValue.namespaces) || [];
+      const nsView = nss.find((n) => n && n.ns === nsName);
+      if (!nsView) {
+        stat("✗ 命名空间不存在：" + nsName + "（不猜字段）", "err");
+        return;
+      }
+      const proj = schemaFields(nsView);
+      view.fields = proj.fields.map((f) => ({
+        name: f.key, label: f.label, type: f.type, options: f.options, default: f.value,
+      }));
+      if (ff.nsSelect === true) {
+        const m = nsSelectModel(allValue, nsName);
+        const bar = document.createElement("div");
+        bar.className = "note";
+        const cap = document.createElement("span");
+        cap.textContent = "命名空间 ";
+        const picker = document.createElement("select");
+        m.options.forEach((o) => {
+          const op = document.createElement("option");
+          op.value = o;
+          op.textContent = o;
+          op.selected = o === m.current;
+          picker.appendChild(op);
+        });
+        picker.addEventListener("change", () => paint(picker.value));
+        bar.appendChild(cap);
+        bar.appendChild(picker);
+        body.appendChild(bar);
+      }
+      finish({}, {
+        ns: nsName, revision: proj.revision, applies: proj.applies,
+        readonly: proj.readonly, secrets: proj.secrets,
+      }, body);
+    };
     stat("载入设置面…", "");
     rpc(ff.rpc.join("/"), {})
       .then((res) => {
@@ -309,20 +352,8 @@ function renderForm(el, decl) {
           stat("✗ 设置面：" + ((res && res.error && res.error.message) || "?"), "err");
           return;
         }
-        const nss = (res.value && res.value.namespaces) || [];
-        const nsView = nss.find((n) => n && n.ns === ff.pick);
-        if (!nsView) {
-          stat("✗ 命名空间不存在：" + ff.pick + "（不猜字段）", "err");
-          return;
-        }
-        const proj = schemaFields(nsView);
-        view.fields = proj.fields.map((f) => ({
-          name: f.key, label: f.label, type: f.type, options: f.options, default: f.value,
-        }));
-        finish({}, {
-          ns: ff.pick, revision: proj.revision, applies: proj.applies,
-          readonly: proj.readonly, secrets: proj.secrets,
-        });
+        allValue = res.value || {};
+        paint(nsSelectModel(allValue, ff.pick).current);
       })
       .catch((e) => stat("✗ 设置面载入失败：" + e.message, "err"));
     return;

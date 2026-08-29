@@ -310,6 +310,15 @@ export function chatOptions(rows) {
  *  规则（D-194 决策回执 #4/#5）：顶层标量 → 输入控件（enum → select）；
  *  嵌套对象/数组/未知形态 → readonly 只读行（不伪造控件）；缺值 → 诚实空初值
  *  （"" / 0 / false——**不虚构默认**）；secrets 只带存在性；revision/applies 透出。 */
+/** D-201 nsSelect 模型：describe value → {options:[ns…], current}。current = pick 命中，
+ *  否则回退首项（诚实显示可选面）；空/坏数据 → 空模型（渲染器据此显示错误态）。 */
+export function nsSelectModel(value, selected) {
+  const nss = value && Array.isArray(value.namespaces) ? value.namespaces : [];
+  const options = nss.filter((n) => n && typeof n.ns === "string").map((n) => n.ns);
+  const current = options.indexOf(selected) >= 0 ? selected : options[0] || "";
+  return { options: options, current: current };
+}
+
 export function schemaFields(nsView) {
   const v = nsView && typeof nsView === "object" ? nsView : {};
   const props =

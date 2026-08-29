@@ -21,8 +21,8 @@
 | 会话清单（list） | sessionId/epoch 与实况一致（只读） | 会话面板（列举子集） |
 | 设置概览（list） | ns/字段/值与 settings.describe 一致；secret 仅存在性 | 设置面板（只读子集） |
 | **聊天（chat）** | 选会话→历史气泡与旧前端一致；发送→乐观气泡→SSE 真回复；切会话不串线 | **聊天主视图（关键路径）** |
-| 设置编辑（form+fieldsFrom） | ui-theme 字段投影自 schema；保存成功；改并发→SETTINGS_CONFLICT 显式 | 设置面板（写端，ui-theme 子集） |
-| 设置编辑 · locale（form） | 同上契约换 ns=locale；两编辑卡并存互不串线 | 设置面板（写端，多 ns 首卡 D-200） |
+| 设置编辑（form+fieldsFrom+**nsSelect**） | 下拉列出全部 ns；切换重投影；保存成功；改并发→SETTINGS_CONFLICT 显式；Restart 类 ns 保存后显示「需重启生效」 | 设置面板（写端**全 ns**，D-201） |
+| 设置编辑 · locale（form，固定 ns） | 同契约换 ns=locale（D-201 后与上卡重叠，可合并裁撤） | 设置面板（冗余保留，待拍板） |
 | 调度任务（list+删） | after/at/every 行与实况一致；**删除弹确认**；删后行消失（fold 回读） | 调度面板（读+删） |
 | 创建调度（form） | kind/prompt/afterSeconds 保存 → 调度任务卡出现该行 | 调度面板（建端） |
 | **待审批（list+决定）** | agent loop 触发 ask→行出现（工具/会话/原因）；允许→工具续跑；**拒绝弹确认**→行消失且工具拒执 | **审批弹窗主路径（关键路径）** |

@@ -16,12 +16,12 @@ fn ui_declaration() -> Value {
         "kind": "card",
         "cardId": "panel-settings-edit.edit",
         "type": "config",
-        "title": "设置编辑 · ui-theme",
-        "description": "动态 fields 投影（D-194；保存带乐观锁；secrets 不可编辑）",
+        "title": "设置编辑",
+        "description": "命名空间下拉 + 动态 fields 投影（D-201 一卡通用；保存带乐观锁；secrets 不可编辑）",
         "size": { "w": 4, "h": 6 },
         "view": {
             "kind": "form",
-            "fieldsFrom": { "rpc": ["settings", "describe"], "pick": "ui-theme" },
+            "fieldsFrom": { "rpc": ["settings", "describe"], "pick": "ui-theme", "nsSelect": true },
             "actions": [
                 { "name": "save", "label": "保存", "rpc": ["settings", "update"], "primary": true }
             ]

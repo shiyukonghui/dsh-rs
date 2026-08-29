@@ -45,8 +45,8 @@ fn describe_ui_returns_valid_dynamic_form_declaration() {
     assert_eq!(view["kind"], "form");
     assert_eq!(
         view["fieldsFrom"],
-        json!({ "rpc": ["settings", "describe"], "pick": "ui-theme" }),
-        "动态 fields 投影面（D-194 契约）"
+        json!({ "rpc": ["settings", "describe"], "pick": "ui-theme", "nsSelect": true }),
+        "动态 fields 投影面 + D-201 nsSelect（一卡通用编辑全部 ns）"
     );
     assert!(
         view.get("fields").is_none(),
