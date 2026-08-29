@@ -16,6 +16,7 @@ import {
   needsConfirm,
   chatFoldFrame,
   chatOptions,
+  schemaFields,
   GRID,
 } from "./core.js";
 
@@ -269,7 +270,7 @@ function renderForm(el, decl) {
   const inputs = {};
   const stat = statLine(el);
 
-  const finish = (prefill) => {
+  const finish = (prefill, meta) => {
     view.fields.forEach((f) => {
       const label = document.createElement("label");
       const span = document.createElement("span");
@@ -280,8 +281,52 @@ function renderForm(el, decl) {
       label.appendChild(input);
       el.appendChild(label);
     });
-    renderActions(el, decl, inputs, stat);
+    if (meta) {
+      // S3（D-194）：不可编辑面如实列出（嵌套只读 / secrets 仅存在性——不伪造控件）。
+      (meta.readonly || []).forEach((r) => {
+        const d = document.createElement("div");
+        d.className = "note";
+        d.textContent = "· " + r.key + "：" + r.note;
+        el.appendChild(d);
+      });
+      (meta.secrets || []).forEach((s) => {
+        const d = document.createElement("div");
+        d.className = "note";
+        d.textContent = "· " + s.path + "：" + (s.set ? "已设" : "未设") + "（secrets 不可在桌布编辑）";
+        el.appendChild(d);
+      });
+    }
+    renderActions(el, decl, inputs, stat, meta);
   };
+
+  // fieldsFrom（D-194/S3）：fields 运行时从数据面投影（设置域 = 宿主既表面，S2 别名面）。
+  const ff = view.fieldsFrom;
+  if (ff && Array.isArray(ff.rpc) && ff.rpc.length === 2 && typeof ff.pick === "string") {
+    stat("载入设置面…", "");
+    rpc(ff.rpc.join("/"), {})
+      .then((res) => {
+        if (!res || res.ok === false) {
+          stat("✗ 设置面：" + ((res && res.error && res.error.message) || "?"), "err");
+          return;
+        }
+        const nss = (res.value && res.value.namespaces) || [];
+        const nsView = nss.find((n) => n && n.ns === ff.pick);
+        if (!nsView) {
+          stat("✗ 命名空间不存在：" + ff.pick + "（不猜字段）", "err");
+          return;
+        }
+        const proj = schemaFields(nsView);
+        view.fields = proj.fields.map((f) => ({
+          name: f.key, label: f.label, type: f.type, options: f.options, default: f.value,
+        }));
+        finish({}, {
+          ns: ff.pick, revision: proj.revision, applies: proj.applies,
+          readonly: proj.readonly, secrets: proj.secrets,
+        });
+      })
+      .catch((e) => stat("✗ 设置面载入失败：" + e.message, "err"));
+    return;
+  }
 
   // dataRpc 预填；拉不到用声明默认值（诚实，不伪造）
   const rpc2 = view.dataRpc;
@@ -307,6 +352,12 @@ function fieldInput(f, value) {
     });
     return sel;
   }
+  if (f.type === "checkbox") {
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = value === true;
+    return cb;
+  }
   const input = document.createElement(f.type === "list" ? "textarea" : "input");
   if (f.type === "number") {
     input.type = "number";
@@ -323,7 +374,7 @@ function fieldInput(f, value) {
   return input;
 }
 
-function renderActions(el, decl, inputs, stat) {
+function renderActions(el, decl, inputs, stat, meta) {
   const box = document.createElement("div");
   box.className = "actions";
   (decl.view.actions || []).forEach((a) => {
@@ -331,13 +382,25 @@ function renderActions(el, decl, inputs, stat) {
     box.appendChild(button(a.label, a.primary ? "primary" : "", () => {
       let values;
       try {
-        values = collectValues(decl.view, (name) => inputs[name].value);
+        values = collectValues(decl.view, (name) => {
+          const i = inputs[name];
+          return i && i.type === "checkbox" ? i.checked : i.value;
+        });
       } catch (e) {
         stat("✗ " + e.message, "err");
         return; // fail-loud：动作不发
       }
       stat("→ " + a.rpc.join("/") + " …", "");
-      rpc(a.rpc.join("/"), { values: values }).then((res) => report(stat, res));
+      // fieldsFrom（D-194）：保存体 = 乐观锁形 {ns, patch, expectedRevision}。
+      const body = meta
+        ? { ns: meta.ns, patch: values, expectedRevision: meta.revision }
+        : { values: values };
+      rpc(a.rpc.join("/"), body).then((res) => {
+        report(stat, res);
+        if (meta && res && res.ok !== false && meta.applies === "restart") {
+          stat("✓ 已保存——需重启生效", "ok");
+        }
+      });
     }));
   });
   el.appendChild(box);
