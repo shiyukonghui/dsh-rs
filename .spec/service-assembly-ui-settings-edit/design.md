@@ -49,3 +49,17 @@ app.js renderForm（**扩展而非另造**——一个表单实现，杜绝双�
 
 ## 4. 回滚点
 纯设计轮：撤本两文档 + D-194 即回到 `664051c`；实现片 S1..4 各自独立可撤。
+
+## 5. S2 实现落点（锚点侦查，2026-09-05 实证自源码）
+
+- **首选做法 = 入口处规范化而非逐臂加别名**：`handle_rpc_host` 大 match 之前把
+  `settings/describe → settings.describe`、`settings/update → settings.update` 做一次性
+  方法名映射（单点、覆盖全臂）。
+- **已证实的陷阱（勿逐臂加）**：`"settings.update" | "settings.replace" | "settings.mutate"`
+  是**共享臂**，体内再 `match method { "settings.update" => …, "settings.replace" => … }`
+  二次分派——若只在外层模式串加 `"settings/update"`，内层会把它落入错误的默认分支
+  （静默错操作 = 最坏失败形态）。入口规范化天然免疫此陷阱。
+- 测试（S2 红→绿）：仿 `rpc_session_slash_alias_route`（web.rs tests，别名与点号形
+  对同一 boot 响应同形）——settings 面用 `boot_with_sessions()` 的默认注册面
+  （`register_host_settings` 已注册 ui-theme 等，describe 必出 namespaces）。
+- S1 已落地注记：`schemaFields` + form XOR fieldsFrom 校验在 `f642496`（node 30/30）。
