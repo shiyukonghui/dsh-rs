@@ -4,7 +4,8 @@
 端到端验证 + 用户拍板（自主轮次不代宣）。本清单 = 判定所需的逐项烟测脚本与已知缺口。
 
 ## 0. 准备
-1. `cargo run -- serve`（确保 wasm_base=wasm-plugins/ 存在已构建组件；首次启动 scan 会自动构建缺失单元）。
+1. 起服（D-206 实证配方）：`target\debug\dsh.exe web scenarios\web-smoke.cordis.yml --port <端口>`
+   （生产换正式 cordis.yml；`dsh serve` 不存在，子命令 = `web` + 配置必填）。
 2. 打开 `http://127.0.0.1:<port>/canvas`。验收基线：清单应含 **13 卡**、侧栏五分类齐
    （model/runtime/resource/session/config）、无「渲染器未实现/校验失败」红卡。
 3. 热插拔抽查：运行中把 `wasm-plugins/panel-dynamic-plugins` 改名 → ≤2s 卡片消失、分类收缩；

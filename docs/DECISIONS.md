@@ -8341,7 +8341,12 @@ settings/update、session.approval/decide）活体全灭**（canvas 上设置概
 
 **验收实测**：新断言（别名信封×规范化方法过闸 / 同形对照 / 异方法仍拒）全绿；
 dsh-cli **259/0**、clippy **0**。教训入册：**自主冒烟必须走渲染器真实形状**；
-§0/§1 的活体证据自此有 RPC 层背书（DOM 层仍待用户浏览器）。**回滚点**：撤本提交回 `46877fc`。E2E 清单已同步（13 卡基线 + §1 行）。
+§0/§1 的活体证据自此有 RPC 层背书（DOM 层仍待用户浏览器）。**回滚点**：撤本提交回 `46877fc`。
+
+**活体重冒烟补记（修复后新二进制，渲染器真实 slash 信封）**：`settings/describe`
+ok=true/12 ns；`settings/update` 过闸**打到真实乐观锁域**（SETTINGS_CONFLICT=乱猜
+revision 被正确拒——信封修复与锁语义活体双重自证）；`session.approval/decide`
+invalid-args（非 bad-request）=过闸。三别名活体全绿，HANDOFF/E2E 起服配方同步实证版。E2E 清单已同步（13 卡基线 + §1 行）。
 
 
 
