@@ -318,6 +318,15 @@ test("rowActionBody wraps the full row untouched (wire contract)", () => {
   });
 });
 
+test("rowActionBody merges action.args alongside the row (D-198)", () => {
+  assert.deepEqual(
+    rowActionBody({ toolCallId: "c1" }, { args: { decision: "rejected" } }),
+    { row: { toolCallId: "c1" }, decision: "rejected" },
+  );
+  assert.deepEqual(rowActionBody({ a: 1 }, {}), { row: { a: 1 } }, "无 args 逐位不变");
+  assert.deepEqual(rowActionBody({ a: 1 }, null), { row: { a: 1 } });
+});
+
 test("needsConfirm only strict true (no silent enforcement, no silent skip)", () => {
   assert.equal(needsConfirm({ confirm: true }), true);
   assert.equal(needsConfirm({}), false);

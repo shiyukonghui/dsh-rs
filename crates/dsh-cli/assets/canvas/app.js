@@ -432,7 +432,7 @@ function renderDataBody(el, decl) {
       return;
     }
     stat("→ " + action.rpc.join("/") + " …", "");
-    rpc(action.rpc.join("/"), rowActionBody(row)).then((res) => {
+    rpc(action.rpc.join("/"), rowActionBody(row, action)).then((res) => {
       report(stat, res);
       if (res && res.ok !== false) load();
     });

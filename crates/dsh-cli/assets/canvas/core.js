@@ -234,9 +234,15 @@ export function statusItems(view, dataValue) {
 
 // ---- C6（D-189）：行动作（rowActions）----
 
-/** 行动作线形状：整行原样入 `row`（渲染器不挑字段；单元自己校验身份——渲染器不是安全边界）。 */
-export function rowActionBody(row) {
-  return { row: row };
+/** 行动作线形状：整行原样入 `row`；可选 `action.args` 并入顶层（D-198：decision
+ *  等动作级参数——同一 rpc 的多个动作靠 args 区分）。渲染器不挑字段；单元/宿主自校验。 */
+export function rowActionBody(row, action) {
+  const body = { row: row };
+  const extra = action && action.args;
+  if (extra && typeof extra === "object") {
+    for (const k of Object.keys(extra)) body[k] = extra[k];
+  }
+  return body;
 }
 
 /** `confirm` 语义：只认严格 true（缺省/其他值 = 直接执行，向后兼容，无静默强制）。 */

@@ -2211,6 +2211,7 @@ pub(crate) fn canonical_rpc_method(m: &str) -> String {
     match m {
         "settings/describe" => "settings.describe",
         "settings/update" => "settings.update",
+        "session.approval/decide" => "session.approval.decide",
         other => return other.to_string(),
     }
     .to_string()
@@ -3720,6 +3721,29 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
                 }
             }
         },
+        // D-198（panel-approval 读端）：pending = wire.pending_requests()
+        // （requested−resolved 由 ApprovalWire 自持，单一权威不另折叠）；未装配诚实报错。
+        "approval/pending" => match &boot.approval_wire {
+            None => serde_json::json!({"ok": false, "error": {
+                "code": "no-approval-wire",
+                "message": "approval wire not assembled (agent loop disabled?)",
+            }}),
+            Some(wire) => {
+                let items: Vec<Value> = wire
+                    .pending_requests()
+                    .iter()
+                    .filter_map(|f| f.get("payload").cloned())
+                    .map(|p| serde_json::json!({
+                        "callId": p.get("callId").cloned().unwrap_or(Value::Null),
+                        "toolCallId": p.get("callId").cloned().unwrap_or(Value::Null),
+                        "sessionId": p.get("sessionId").cloned().unwrap_or(Value::Null),
+                        "toolName": p.get("toolName").cloned().unwrap_or(Value::Null),
+                        "reason": p.get("reason").cloned().unwrap_or(Value::Null),
+                    }))
+                    .collect();
+                serde_json::json!({"ok": true, "value": {"items": items}})
+            }
+        },
         "sessions" | "session.list" | "session/list" => {
             // M1e：SessionStore 提供权威列表（创建顺序、失活/空判定）。
             let updated_at = now_ms();
@@ -4560,8 +4584,12 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
         }
         // D-106：执行层审批决定——写 `approval/decided` + 裸踢恢复（GUI 弹窗回执）。
         "session.approval.decide" => {
+            // D-196 wire 审计：解包画布 {args}；D-198：rowAction 行形吃 `row.toolCallId`
+            // （pending 卡动作体 = {row, decision}，decision 来自 action.args）。
+            let payload = payload.get("args").unwrap_or(payload);
             let call_id = payload
                 .get("toolCallId")
+                .or_else(|| payload.get("row").and_then(|r| r.get("toolCallId")))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -5736,6 +5764,41 @@ mod tests {
         assert!(
             v["result"]["value"]["items"].as_array().unwrap().is_empty(),
             "删除后 fold 回读应为空: {v}"
+        );
+    }
+
+    /// D-198：approval/pending 闭环——requested 可见（callId/toolName 提取）→
+    /// resolve_by_call_id 结算 → pending 清空；decide 的画布别名同测钉死。
+    #[test]
+    fn rpc_approval_pending_roundtrip() {
+        let mut boot = boot_with_sessions();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "client-request", "rpcId": "rap", "method": "approval/pending", "payload": {},
+        }))
+        .unwrap();
+        let v = handle_rpc(&boot, "approval/pending", &body).1;
+        assert_eq!(
+            v["result"]["error"]["code"], "no-approval-wire",
+            "缺 wire 必须诚实: {v}"
+        );
+        let wire = std::sync::Arc::new(crate::web::approval_wire::ApprovalWire::new());
+        wire.push_requested("s-1", "call-1", "bash", Some("需确认"));
+        boot.approval_wire = Some(wire.clone());
+        let v = handle_rpc(&boot, "approval/pending", &body).1;
+        assert_eq!(v["result"]["ok"], true, "{v}");
+        let items = v["result"]["value"]["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["callId"], "call-1");
+        assert_eq!(items[0]["toolCallId"], "call-1", "行形直喂 decide 的键");
+        assert!(wire.resolve_by_call_id("call-1", crate::web::approval_wire::WIRE_OUTCOME_REJECTED));
+        let v = handle_rpc(&boot, "approval/pending", &body).1;
+        assert!(
+            v["result"]["value"]["items"].as_array().unwrap().is_empty(),
+            "结算后 pending 必须清空: {v}"
+        );
+        assert_eq!(
+            canonical_rpc_method("session.approval/decide"),
+            "session.approval.decide"
         );
     }
 

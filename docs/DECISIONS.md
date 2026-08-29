@@ -8127,7 +8127,6 @@ m41 补 rowActions(confirm) 断言；dsh-cli **258/0**、m41 3/3、clippy **0**�
 关口（调度面板自此读+删可用；create 表单卡 panel-schedule-create 与审批交互仍排队）。
 
 ## D-197（panel-schedule-create：调度创建表单声明单元——静态 form × 声明单元两型合体，调度写端闭环）
-
 **日期**：2026-09-05
 
 **内容**：第十一个装配单元 = 静态 form 卡（kind select [after/at/every] + prompt +
@@ -8137,6 +8136,34 @@ afterSeconds；保存动作 `schedule/create`）+ 声明单元纪律（零自有
 **建/看/删** 全部以服务单元形态运行。**回滚点**：撤包目录 + m42 + 清单三行断言。
 **验收**：m42 3/3（form 契约 + 一份契约 + 无自有端点）、清单第十一卡断言、全套 0 失败、
 clippy **0**。审批交互为最后排队的技术项；E2E + 下线判定仍待用户。
+
+## D-198（审批宿主切片：`approval/pending` 薄臂 + decide 行形兼容 + rowAction `args` 契约扩展）
+
+**日期**：2026-09-05
+
+**触发问题**：技术队列最后一项（panel-approval 种子开工）。取证：`session.approval.decide`
+双臂已存在（长 RPC + dispatch，`toolCallId + decision`）；`ApprovalWire` 自持
+`pending_requests()`（requested−resolved 由 wire 管理——**无需另折叠**）；wire 未装配
+（无 agent loop）为常态。
+
+**考虑过的选项与裁定**：
+- **pending 数据面**：从 `frames_since` 日志自行折叠 requested−resolved vs
+  **直接用 `wire.pending_requests()`**。选后者——pending 生命周期本就归 wire，
+  折叠 = 第二权威（否决）。
+- **decide 的 per-动作参数**（同一 rpc 的 允许/拒绝 两个动作）：rowActions 线形状
+  v1 只有 `{row}`，装不下 `decision` → **C6 契约扩展：`rowActionBody(row, action)`
+  合并 `action.args` 入顶层**（`{row, decision}`）——渲染器仍零语义（args 是声明里
+  的字面量），decide 臂加 `row.toolCallId` 回退 + D-196 遮蔽解包（该臂正是审计清单
+  里的漏网臂）。
+- **归属**：decide 是长 RPC 面（&mut Boot）→ 原生臂先例（D-193-B）；卡片将照
+  声明单元定型（第十二卡，下轮 m43）。
+
+**验收实测**：宿主 `rpc_approval_pending_roundtrip`（缺 wire 诚实 → push_requested
+可见（callId/toolCallId 双键行形直喂 decide）→ resolve → 清空 + canonical 别名钉死）；
+node 31/31（args 合并 + 无 args 逐位不变）；dsh-cli **259/0**、clippy **0**。
+诚实注记：rowActionBody 扩展未跑独立桩红（合并逻辑直白 + 双向断言钉死，注记入册）。
+
+**回滚点**：撤本提交（宿主切片）；第十二卡（panel-approval 声明单元 + E2E 划账）下轮。
 
 
 
