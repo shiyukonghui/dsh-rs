@@ -3973,6 +3973,8 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
             serde_json::json!({"ok": true, "value": {"accepted": true}})
         }
         "session.cancel" => {
+            // D-196 wire 审计补漏（D-203 取证发现）：解包画布 {args} 形（sessionId）。
+            let payload = payload.get("args").unwrap_or(payload);
             // D-114：真取消——按会话定位其 driver，向运行中的 turn 注入 User abort
             // （driver 在 step 边界检查 abort_reason → turn/end reason=aborted）。
             // 幂等：无对应 agent / 已 idle → 同样 accepted（driver.cancel 对 idle 为

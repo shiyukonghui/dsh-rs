@@ -51,6 +51,7 @@ fn describe_ui_returns_valid_chat_declaration() {
     assert_eq!(view["sessionSource"], json!(["session", "list"]));
     assert_eq!(view["historyRpc"], json!(["session", "history"]));
     assert_eq!(view["sendRpc"], json!(["session", "prompt"]));
+    assert_eq!(view["cancelRpc"], json!(["session", "cancel"]), "D-203 停止入口声明");
     assert_eq!(view["stream"], "session-events", "闭集单值");
 }
 

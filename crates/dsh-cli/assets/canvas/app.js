@@ -613,6 +613,17 @@ function renderChat(el, decl) {
   go.type = "submit";
   form.appendChild(input);
   form.appendChild(go);
+  // 停止按钮（D-203）：仅当声明 cancelRpc 时绘制；语义 = 取消当前会话驱动
+  // （宿主 session.cancel 幂等臂，turn 中可并发送达），不删历史。
+  if (Array.isArray(view.cancelRpc) && view.cancelRpc.length === 2) {
+    form.appendChild(button("停止", "", () => {
+      if (!sid) { stat("✗ 当前无会话", "err"); return; }
+      stat("→ 取消 " + sid + " …", "");
+      rpc(view.cancelRpc.join("/"), { sessionId: sid })
+        .then((res) => report(stat, res))
+        .catch((e) => stat("✗ 取消：" + e.message, "err"));
+    }));
+  }
   el.appendChild(form);
 
   let sid = null;
