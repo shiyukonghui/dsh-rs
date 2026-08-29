@@ -10,9 +10,9 @@ export const TYPE_ORDER = ["model", "config", "capability", "runtime", "resource
 const SCHEMA = "dsh/plugin-ui/v2";
 const REJECTED = ["board"]; // 画布本身；卡内嵌画布 = 递归陷阱
 const RESERVED = ["chat", "chart", "table"]; // 契约预留：签名已定，渲染器未建
-// C3 点亮 form；status/list 属 C4（本轮落 renderer-unimplemented——三档制回落，不虚报）。
-const IMPLEMENTED = ["form"];
-const UNIMPLEMENTED = RESERVED.concat(["status", "list"]);
+// C4 点亮 form/status/list（§4.1 三档「实现档」齐）；预留档落 renderer-unimplemented。
+const IMPLEMENTED = ["form", "status", "list"];
+const UNIMPLEMENTED = RESERVED;
 
 /** 默认网格几何（CSS 变量可覆写；格距 10px 是契约值，非打印 pt）。 */
 export const GRID = { col: 260, row: 100, gap: 10 };
@@ -102,6 +102,9 @@ export function validateDeclaration(d) {
   if (k === "form" && (!Array.isArray(d.view.fields) || !Array.isArray(d.view.actions))) {
     return { code: "view-malformed", message: "form 视图缺 fields/actions 数组" };
   }
+  if (k === "list" && typeof d.view.rowsPath !== "string") {
+    return { code: "view-malformed", message: "list 视图缺 rowsPath（数据面位置必须显式）" };
+  }
   return null;
 }
 
@@ -147,4 +150,39 @@ export function pollDecision(current, value) {
 /** 焦点身份（点侧栏名 → 该卡滚动+高亮；不改布局输入）。 */
 export function focusKey(card) {
   return card.pluginName + "/" + card.cardId;
+}
+
+// ---- C4：list/status 数据面（行语义只信单元数据——双权威禁令；永不伪造） ----
+
+/** 点路径提取（"items" / "a.b"）；任何一段不是对象 → undefined。 */
+export function extractPath(obj, dotted) {
+  if (!obj || typeof obj !== "object" || typeof dotted !== "string" || dotted === "") return undefined;
+  let cur = obj;
+  for (const seg of dotted.split(".")) {
+    if (cur === null || typeof cur !== "object") return undefined;
+    cur = cur[seg];
+  }
+  return cur;
+}
+
+/**
+ * list 行提取（优先级：dataRpc 值[rowsPath] > 静态 view.rows > 诚实空）。
+ * 非数组一律视同「没有数据」——**绝不把对象/字符串拼成行**（诚实）。
+ */
+export function listRows(view, dataValue) {
+  const fromData = Array.isArray(extractPath(dataValue, view.rowsPath))
+    ? extractPath(dataValue, view.rowsPath)
+    : null;
+  const rows = fromData ?? (Array.isArray(view.rows) ? view.rows : []);
+  return {
+    rows,
+    columns: Array.isArray(view.columns) ? view.columns : [],
+    emptyText: view.emptyText || "暂无条目",
+  };
+}
+
+/** status 项提取（优先级：dataRpc 值.items > 静态 view.items > 诚实空）。 */
+export function statusItems(view, dataValue) {
+  const fromData = Array.isArray(extractPath(dataValue, "items")) ? extractPath(dataValue, "items") : null;
+  return fromData ?? (Array.isArray(view.items) ? view.items : []);
 }

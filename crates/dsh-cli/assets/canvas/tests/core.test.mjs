@@ -13,6 +13,9 @@ import {
   rpcEnvelope,
   pollDecision,
   focusKey,
+  extractPath,
+  listRows,
+  statusItems,
 } from "../core.js";
 
 function card(pluginName, cardId, type, w, h) {
@@ -169,12 +172,21 @@ test("validateDeclaration covers all nine fail-loud rows", () => {
   const board = goodForm();
   board.view = { kind: "board" };
   assert.equal(validateDeclaration(board).code, "view-kind-rejected");
-  // 6 契约预留 → renderer-unimplemented（C3 阶段 status/list 亦落此档，C4 点亮）
-  for (const k of ["chat", "chart", "table", "status", "list"]) {
+  // 6 契约预留 → renderer-unimplemented（C4 起 status/list **已实现**，只剩三员预留）
+  for (const k of ["chat", "chart", "table"]) {
     const d = goodForm();
     d.view = { kind: k };
     assert.equal(validateDeclaration(d).code, "renderer-unimplemented", k);
   }
+  for (const k of ["status", "list"]) {
+    const d = goodForm();
+    d.view = { kind: k, ...(k === "list" ? { rowsPath: "items" } : {}) };
+    assert.equal(validateDeclaration(d), null, k + " 已点亮（C4）");
+  }
+  // 6b list 缺 rowsPath → view-malformed（数据面位置必须显式）
+  const listNoPath = goodForm();
+  listNoPath.view = { kind: "list" };
+  assert.equal(validateDeclaration(listNoPath).code, "view-malformed");
   // 7 未定义 kind
   const weird = goodForm();
   weird.view = { kind: "widget" };
@@ -249,4 +261,43 @@ test("focusKey is stable card identity; layout has no hidden state", () => {
   const g1 = layoutGrid(cards, 3);
   const g2 = layoutGrid(cards, 3); // 「点了焦点再来一次」
   assert.deepEqual(g1, g2, "同输入同坐标——focus 只是视图态，布局输入不变");
+});
+
+// ---- C4：list/status 数据面纯函数（行语义只信单元数据，永不伪造） ----
+
+test("extractPath walks dotted paths, missing → undefined", () => {
+  assert.equal(extractPath({ items: [1] }, "items").length, 1);
+  assert.equal(extractPath({ a: { b: 7 } }, "a.b"), 7);
+  assert.equal(extractPath({ a: 3 }, "a.b"), undefined, "非对象中段 → undefined");
+  assert.equal(extractPath(null, "a"), undefined);
+  assert.equal(extractPath({ x: 1 }, ""), undefined);
+});
+
+test("listRows: dataRpc value by rowsPath > static view.rows > honest empty", () => {
+  const view = { kind: "list", rowsPath: "items", columns: [{ key: "name", label: "插件" }] };
+  assert.deepEqual(listRows(view, { items: [{ name: "a" }] }).rows, [{ name: "a" }]);
+  assert.deepEqual(listRows(view, { other: 1 }).rows, [], "rowsPath 不中且无静态兜底 → 空");
+  const withStatic = { ...view, rows: [{ name: "s" }] };
+  assert.deepEqual(listRows(withStatic, null).rows, [{ name: "s" }], "拉不到 → 静态兜底");
+  const empty = listRows({ kind: "list", rowsPath: "items" }, {});
+  assert.deepEqual(empty.rows, []);
+  assert.equal(empty.emptyText, "暂无条目", "诚实空态默认文案");
+  assert.equal(listRows({ kind: "list", rowsPath: "i", emptyText: "没有入口" }, {}).emptyText, "没有入口");
+  assert.deepEqual(listRows(view, { items: [{ name: "a" }] }).columns, view.columns, "columns 透传");
+});
+
+test("listRows never fabricates: non-array rowsPath target falls back honest", () => {
+  const view = { kind: "list", rowsPath: "items" };
+  assert.deepEqual(listRows(view, { items: "not an array" }).rows, []);
+  assert.deepEqual(listRows(view, { items: { 0: "x" } }).rows, [], "对象不是数组 → 不伪造行");
+});
+
+test("statusItems: dataRpc items > static view.items > honest empty", () => {
+  assert.deepEqual(statusItems({ kind: "status" }, { items: [{ label: "L", value: 1 }] }), [
+    { label: "L", value: 1 },
+  ]);
+  assert.deepEqual(statusItems({ kind: "status", items: [{ label: "S", value: 0 }] }, null), [
+    { label: "S", value: 0 },
+  ]);
+  assert.deepEqual(statusItems({ kind: "status" }, {}), []);
 });

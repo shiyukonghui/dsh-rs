@@ -1,0 +1,26 @@
+[package]
+name = "panel-plugin-inventory-plugin"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[dependencies]
+serde_json = "1"
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+# C4（D-185）：首个 harness 面板改写——插件清单服务装配单元
+# （复用 dsh:host-remote 接口身份 -> 宿主 WasmRemoteEndpointPlugin 无需改绑定即可加载）。
+[package.metadata.component]
+package = "dsh:panel-plugin-inventory"
+
+[package.metadata.component.target]
+path = "wit"
+
+[package.metadata.component.target.dependencies]
+"dsh:host-remote" = { path = "../../crates/dsh-wasmrt/wit-host-remote" }
+
+[workspace]

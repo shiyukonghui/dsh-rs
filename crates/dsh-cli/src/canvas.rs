@@ -72,6 +72,9 @@ mod tests {
             "rpcEnvelope",
             "pollDecision",
             "focusKey",
+            "extractPath",
+            "listRows",
+            "statusItems",
         ] {
             assert!(CANVAS_CORE_JS.contains(&format!("export function {name}")), "core 导出 {name}");
         }

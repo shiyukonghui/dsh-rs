@@ -1,0 +1,14 @@
+// panel-plugin-inventory 服务装配单元（C4，D-185）：首个 harness 面板改写。
+//
+// 复用 `dsh:host-remote/remote` 与 `dsh:host-remote/host-services` 同一接口身份：
+// 宿主 `WasmRemoteEndpointPlugin` 零改动即可加载本组件，
+// 组件携带自己的 UI 声明面 + 数据面（namespace = panel-plugin-inventory）。
+package dsh:panel-plugin-inventory;
+
+use dsh:host-remote/remote;
+use dsh:host-remote/host-services;
+
+world panel-plugin-inventory {
+  export remote;
+  import host-services;
+}

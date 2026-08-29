@@ -1,0 +1,21 @@
+{
+  "$schema": "dsh/plugin-ui/v2",
+  "kind": "card",
+  "cardId": "panel-plugin-inventory.list",
+  "type": "runtime",
+  "title": "插件清单",
+  "description": "loader 已组装服务装配单元的实时清单（只读）",
+  "size": { "w": 4, "h": 4 },
+  "view": {
+    "kind": "list",
+    "dataRpc": ["panel-plugin-inventory", "list"],
+    "columns": [
+      { "key": "name", "label": "插件" },
+      { "key": "id", "label": "入口" },
+      { "key": "state", "label": "状态" }
+    ],
+    "rowsPath": "items",
+    "actions": [],
+    "emptyText": "暂无已组装入口"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "wasm": "target/wasm32-wasip1/debug/panel_plugin_inventory_plugin.wasm",
+  "web": "web",
+  "caps": ["remote"],
+  "world": "remote"
+}

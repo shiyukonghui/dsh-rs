@@ -10,6 +10,8 @@ import {
   rpcEnvelope,
   pollDecision,
   focusKey,
+  listRows,
+  statusItems,
   GRID,
 } from "./core.js";
 
@@ -201,7 +203,11 @@ async function loadBody(el, card) {
     failLoud(el, decl, bad.code, bad.message);
     return;
   }
-  renderForm(el, decl);
+  if (decl.view.kind === "form") {
+    renderForm(el, decl);
+  } else {
+    renderDataBody(el, decl); // status / list（C4）
+  }
 }
 
 /** fail-loud 元数据卡：契约缺陷显式呈现，但**卡级动作仍可用**（§4.2 明令）。 */
@@ -329,6 +335,122 @@ function renderActions(el, decl, inputs, stat) {
     }));
   });
   el.appendChild(box);
+}
+
+// ---------- status / list 渲染器（C4 实现档） ----------
+
+/**
+ * status/list 卡体：dataRpc 拉真实数据（拉失败 = 诚实错误行 + 静态兜底 view.items/rows）；
+ * 有 dataRpc 的卡给「刷新」affordance（重放 dataRpc——渲染器便利，不是契约动作）。
+ */
+function renderDataBody(el, decl) {
+  const view = decl.view;
+  const body = document.createElement("div");
+  el.appendChild(body);
+  const stat = statLine(el);
+
+  const paint = (dataValue) => {
+    body.innerHTML = "";
+    if (view.kind === "status") paintStatus(body, view, dataValue);
+    else paintList(body, view, dataValue);
+  };
+
+  const load = () => {
+    const rpc2 = view.dataRpc;
+    if (!Array.isArray(rpc2) || rpc2.length !== 2) {
+      paint(null); // 无数据面：静态兜底（契约 §4.1 允许）
+      return;
+    }
+    stat("载入数据…", "");
+    rpc(rpc2.join("/"), {})
+      .then((res) => {
+        if (res && res.ok === false) {
+          const err = res.error || {};
+          stat("✗ 数据面失败：" + (err.message || err.code || "?") + "（静态兜底）", "err");
+          paint(null);
+          return;
+        }
+        stat("✓ 数据已更新", "ok");
+        paint((res && res.value) || null);
+      })
+      .catch((e) => {
+        stat("✗ 数据面不可达：" + e.message + "（静态兜底）", "err");
+        paint(null);
+      });
+  };
+
+  if (Array.isArray(view.dataRpc) && view.dataRpc.length === 2) {
+    const box = document.createElement("div");
+    box.className = "actions";
+    box.appendChild(button("刷新", "", load));
+    el.appendChild(box);
+  }
+  load();
+}
+
+function paintStatus(body, view, dataValue) {
+  const items = statusItems(view, dataValue);
+  if (items.length === 0) {
+    const e = document.createElement("div");
+    e.className = "note";
+    e.textContent = "暂无状态项";
+    body.appendChild(e);
+    return;
+  }
+  for (const it of items) {
+    const row = document.createElement("div");
+    row.className = "srow";
+    const l = document.createElement("span");
+    l.className = "slabel";
+    l.textContent = String(it.label ?? "");
+    const v = document.createElement("span");
+    v.className = "svalue" + (it.tone ? " tone-" + it.tone : "");
+    v.textContent = it.value === null || it.value === undefined
+      ? "—"
+      : typeof it.value === "object" ? JSON.stringify(it.value) : String(it.value);
+    row.appendChild(l);
+    row.appendChild(v);
+    body.appendChild(row);
+  }
+}
+
+function paintList(body, view, dataValue) {
+  const { rows, columns, emptyText } = listRows(view, dataValue);
+  if (rows.length === 0) {
+    const e = document.createElement("div");
+    e.className = "note";
+    e.textContent = emptyText;
+    body.appendChild(e);
+    return;
+  }
+  const table = document.createElement("table");
+  table.className = "ltable";
+  const thead = document.createElement("tr");
+  (columns.length > 0
+    ? columns
+    : Object.keys(rows[0]).map((k) => ({ key: k, label: k }))
+  ).forEach((c) => {
+    const th = document.createElement("th");
+    th.textContent = String(c.label || c.key);
+    thead.appendChild(th);
+  });
+  table.appendChild(thead);
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    (columns.length > 0
+      ? columns
+      : Object.keys(r).map((k) => ({ key: k, label: k }))
+    ).forEach((c) => {
+      const td = document.createElement("td");
+      const cell = r[c.key];
+      td.textContent = cell === null || cell === undefined
+        ? "—"
+        : typeof cell === "object" ? JSON.stringify(cell) : String(cell);
+      tr.appendChild(td);
+    });
+    table.appendChild(tr);
+  }
+  body.appendChild(table);
 }
 
 // ---------- 启动 ----------
