@@ -8423,7 +8423,33 @@ Pretext 计算布局还是可拖动。
 不再截半）。遗留排期如实：report() 成功态 JSON 整坨、ns 切换旧 stat 残留、热插拔
 DOM 最后一公里、布局空隙（宽卡按声明序装箱的窄缝——widest-first 排序候补）、拖动。
 
-**回滚点**：撤本提交回 `a7865af`。E2E 清单已同步（13 卡基线 + §1 行）。
+**回滚点**：撤本提交回 `a7865af`。
+
+## D-210（桌布壳 Rust 化：Dioxus 选型与选项 C 开工——单元契约零迁移）
+
+**日期**：2026-09-05
+
+**触发**：用户提出 Dioxus 或可让插件全 Rust 化，按流程调研。
+
+**现状澄清（调研第一果）**：「插件 Rust 化」已完成 95%——单元本就是 Rust wasip1 组件；
+JS 仅剩浏览器渲染器（~1200 行 + 35 测）。Dioxus 真命题 = **壳的 Rust 化 + 表达力天花板**。
+
+**体检**：crates.io 实查 0.7 稳定 / 0.8-alpha、累计 246 万下载、MIT/Apache；但 web 目标
+= wasm32-unknown-unknown（与单元 wasip1 组件模型是两个世界）、多 wasm 模块无法共享
+运行时（岛方案体积×N 否决）、0.6→0.7 破坏性变更史（钉 0.7.x）。
+
+**选项与裁定**：A 维持 / B 岛逃生舱 / C 壳重写 / D 全量。**用户拍板：动机=消灭 JS
+优先，路线=C**——core/app.js 全能力由 Dioxus 壳实现，**单元声明契约不动、13 单元零
+迁移**；`/canvas`（旧）与 `/canvas/rust`（新）**并存灰度**，回滚=不切默认路径。
+JS 终态= <40 行 wasm-bindgen 引导（零业务逻辑；诚实口径：胶水不可为零）。
+
+**工件**：调研 `.spec/service-assembly-ui-dioxus-research/requirements.md`、设计
+`.spec/service-assembly-ui-shell-dioxus/design.md`（模块映射 core.js 纯函数→原生可测
+Rust；S0–S6 切分，每片 TDD；node 35 测断言逐条移植 cargo 测，夹具复用 live 抓样形）。
+
+**S0 哨兵已过（本轮）**：独立 workspace `canvas-shell/` dioxus 0.7 web 编译通过
+（依赖树全量编过=工具链成立），debug wasm 45MB（含调试信息，非决策数据）；release+gzip
+真实体积后台实测中。**回滚点**：删 canvas-shell/ 即全退（未触任何现行代码）。E2E 清单已同步（13 卡基线 + §1 行）。
 
 
 
