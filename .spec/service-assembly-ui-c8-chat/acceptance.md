@@ -18,7 +18,8 @@ chatFoldFrame 全在 JS）· Rust 不渲染（宿主只出事件/列表/prompt �
 其数据 RPC 直连宿主既表面，与旧前端**同一事实源**。
 
 ## 诚实台账
-1. SSE `stream:"session-events"` 直订未接（宿主帧形状未取证）；v1 = 5s 轮询走同一
-   折叠事实源，接入时仅换驱动不改语义。
+1. ~~SSE 直订未接~~ **已接（C8-3b）**：渲染器订 `/api/events.mux`（session/event 帧
+   仅 mux 通道——D-113 实证），帧映射两侧已钉死（宿主 `mux_session_event_frame_shape`
+   测 / core 折叠测），轮询保留为断线兜底，同一折叠事实源。
 2. 浏览器端到端手测未执行（无基建）；折叠/选择/校验纯函数面 node 全钉死，DOM 为接线。
 3. 中断/审批交互未做（D-193 边界：宿主面未实证，诚实缺省）。

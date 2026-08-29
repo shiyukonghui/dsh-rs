@@ -16,7 +16,7 @@ kv / sessionMessages / workspaceFiles / time / …），避免宿主扩张。
 | 5 | 会话清单 | `wasm-plugins/panel-sessions` | list | sessionCandidates 行零加工（epoch 原样）；**session 分类首卡**，发现端先行（打开/切换与 chat 同题留契约演进） | ✅ D-191（m37） |
 | — | 会话打开/切换 | — | chat（预留） | 需「卡级选择/跳转」交互形态 + chat 渲染器点亮（远景关键路径，独立契约流程） | ⬜ 契约演进 |
 | 6 | 设置概览 | `wasm-plugins/panel-settings` | list | 宿主新投影 arm `settingsDescribe`（与原生 describe 同形状共用 namespace_view，redact 在源头）；行拍平 {ns,field,value}；**config 分类首卡** | ✅ D-192（m38 + 宿主 2 测） |
-| C8 | 聊天 | `wasm-plugins/panel-chat`（声明单元） | chat（**全链路落地**） | 三 RPC 面复用宿主既表面；折叠同源；SSE 直订待帧形状取证（轮询同事实源兜底） | ✅ D-193 C8-1..4（m39 3/3，清单第八卡） |
+| C8 | 聊天 | `wasm-plugins/panel-chat`（声明单元） | chat（**全链路落地**） | 三 RPC 面复用宿主既表面；折叠同源；**SSE 直订已接（C8-3b，仅订 events.mux）** | ✅ D-193 C8-1..4+3b（m39 3/3，清单第八卡） |
 | … | 设置编辑/调度/任务… | form（动态 fields）/list+写动作 | 契约演进：async schema、调度投影 arm（照 D-192 受测扩展型） | — | ⬜ 契约演进后迁移 |
 
 ## 迁移完成的判定（远景）

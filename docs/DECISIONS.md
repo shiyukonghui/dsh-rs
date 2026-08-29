@@ -8032,6 +8032,16 @@ m39 先红 → **3/3**。**C8 全链路验收**：`.spec/service-assembly-ui-c8-
 ——聊天主视图以服务单元形态运行，与旧前端同一事实源；「替代 deepseek 前端」的最后
 一个主视图打通。
 
+**补充切片 C8-3b（2026-09-05）：`stream:"session-events"` SSE 直订接入**。取证闭环
+（此前暂缓的原因就此消除）：宿主帧形状 `mux_session_event_frame` = `{type:
+"server-request", method:"session/event", payload:{sessionId, event:SessionEvent}}`，
+且 **`session/event` 仅 `events.mux` 通道携带**（D-113 实证：host 通道下推即被前端
+zod 判 malformed——渲染器只订 `/api/events.mux`）。折叠与轮询**同一事实源**（frameText
+归一提到 renderChat 顶层共用 + `chatFoldFrame` 引用差重绘），轮询保留为断线兜底；
+hello/keepalive/plan/approval 帧按 method 过滤忽略。诚实台账更新：浏览器端到端手测
+仍缺（无基建），但帧映射两侧（宿主 `mux_session_event_frame_shape` 测 / core 折叠测）
+均已钉死，渲染器为形状匹配的接线。验证：node 语法门 + dsh-cli **255/0**、clippy **0**。
+
 
 
 

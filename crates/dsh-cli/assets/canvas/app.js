@@ -524,6 +524,21 @@ function renderChat(el, decl) {
   let sid = null;
   let chat = { sessionId: null, busy: false, messages: [] };
 
+  // 事件 data 形状（user `{content}`、assistant 或嵌 `message.content`，content 为
+  // 串或 text 块数组）→ 归一成 core 折叠契约的 `{text}`（传输适配在 DOM 层；
+  // 历史与 SSE 帧共用同一归一，无第二权威）。
+  const frameText = (d) => {
+    if (!d) return "";
+    const c = d.content !== undefined
+      ? d.content
+      : d.message && d.message.content !== undefined ? d.message.content : d.text;
+    if (typeof c === "string") return c;
+    if (Array.isArray(c)) {
+      return c.filter((b) => b && b.type === "text").map((b) => b.text || "").join("");
+    }
+    return "";
+  };
+
   const paint = () => {
     msgs.innerHTML = "";
     for (const m of chat.messages) {
@@ -538,20 +553,6 @@ function renderChat(el, decl) {
 
   const loadHistory = () => {
     if (!sid) return;
-    // 历史事件 data 形状（user `{content}`、assistant 或嵌 `message.content`，
-    // content 为串或 text 块数组）→ 归一成 core 折叠契约的 `{text}`（传输适配在
-    // DOM 层，core 契约单一：SSE 直订接入时复用同一归一）。
-    const frameText = (d) => {
-      if (!d) return "";
-      const c = d.content !== undefined
-        ? d.content
-        : d.message && d.message.content !== undefined ? d.message.content : d.text;
-      if (typeof c === "string") return c;
-      if (Array.isArray(c)) {
-        return c.filter((b) => b && b.type === "text").map((b) => b.text || "").join("");
-      }
-      return "";
-    };
     rpc(view.historyRpc.join("/"), { sessionId: sid })
       .then((res) => {
         if (!res || res.ok === false) {
@@ -629,6 +630,33 @@ function renderChat(el, decl) {
       loadHistory();
     })
     .catch((e) => stat("✗ 会话列表拉取：" + e.message, "err"));
+
+  // C8-3 契约字段 `stream:"session-events"` 的直订接入（C8-3b）：
+  // **只订 events.mux**——`session/event` 帧仅 mux 通道携带（D-113 实证：host 通道
+  // 下推即被前端 zod 判 malformed 丢弃）。折叠与轮询**同一事实源**（frameText 归一 +
+  // chatFoldFrame 引用差重绘）；轮询保留为断线兜底。
+  if (view.stream === "session-events") {
+    try {
+      const es = new EventSource("/api/events.mux");
+      es.onmessage = (msg) => {
+        let frame;
+        try { frame = JSON.parse(msg.data); } catch { return; }
+        const p = frame && frame.payload;
+        if (!frame || frame.method !== "session/event" || !p || p.sessionId !== sid || !p.event) return;
+        const next = chatFoldFrame(chat, {
+          sessionId: sid,
+          kind: p.event.type,
+          data: { text: frameText(p.event.data) },
+          time: p.event.time,
+        });
+        if (next !== chat) {
+          chat = next;
+          paint();
+        }
+      };
+      es.onerror = () => { /* 断线静默：EventSource 自动重连，轮询兜底在跑 */ };
+    } catch { /* 无 EventSource 环境：轮询仍是完整兜底 */ }
+  }
 
   setInterval(() => loadHistory(), 5000);
 }
