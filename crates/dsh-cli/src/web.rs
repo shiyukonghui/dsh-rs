@@ -985,7 +985,7 @@ fn dispatch_request(
     }
 
     if path.starts_with("/api") {
-        let method = path.trim_start_matches("/api/").to_string();
+        let method = canonical_rpc_method(path.trim_start_matches("/api/"));
         match (request.method(), method.as_str()) {
             // D-098：`host.pickDirectory` 是 user-paced 模态对话框（可能挂很久）。
             // serve 的 accept 循环单线程内联处理 RPC——若在此阻塞会饿死整个服务
@@ -2199,6 +2199,19 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// S2（D-194）：RPC 方法名入口规范化——`/api/<ns>/<m>` 面（桌布 rpc join 出的 slash 形）
+/// 在**单点**收敛到点号既表面。**不逐臂加别名**的原因：`settings.update|replace|mutate`
+/// 是共享臂且体内二次 `match method`——外层 naive 别名会落入错误默认分支（静默错操作）。
+/// 未列举方法名原样返回（session/* 等既有 arm 直配别名不经此处，行为逐位不变）。
+pub(crate) fn canonical_rpc_method(m: &str) -> String {
+    match m {
+        "settings/describe" => "settings.describe",
+        "settings/update" => "settings.update",
+        other => return other.to_string(),
+    }
+    .to_string()
 }
 
 /// M3b：namespace 描述 → wire `SettingsNamespaceView`（对齐 settingsNamespaceViewSchema）。
@@ -5554,6 +5567,16 @@ mod tests {
     /// C8-2（D-193）：slash 别名路由（桌布 rpc 面 `[ns,method]` join 出的方法名）——
     /// session/list 与 session.list 同形；session/prompt slash + 简化 text args 与
     /// 点号 content 形同为可接受响应（不 panic、信封完整）。
+    /// S2（D-194）：canonical_rpc_method——settings slash 别名在单点收敛到点号既表面；
+    /// 未列举方法名原样（既有直配别名与点号面行为逐位不变）。
+    #[test]
+    fn canonical_rpc_method_settings_aliases() {
+        assert_eq!(canonical_rpc_method("settings/describe"), "settings.describe");
+        assert_eq!(canonical_rpc_method("settings/update"), "settings.update");
+        assert_eq!(canonical_rpc_method("session/history"), "session/history");
+        assert_eq!(canonical_rpc_method("uiManifest/list"), "uiManifest/list");
+    }
+
     #[test]
     fn rpc_session_slash_aliases_route() {
         let boot = boot_with_sessions();
