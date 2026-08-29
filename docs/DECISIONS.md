@@ -7691,6 +7691,40 @@ dsh-cli **241 通过 / 0 失败**（基线 230 + 新增 11，零劣化）、m32 
 clippy `-D warnings` **0**、verify-diff **26/26**。逐条验收与诚实台账见
 `.spec/service-assembly-ui-c2/acceptance.md`。
 
+## D-184（桌布 C3 设计定稿：桌布壳资产宿主 = 编译进 dsh-cli 的 /canvas 独立视图 + 纯函数核心 TDD）
+
+**日期**：2026-09-05
+
+**触发问题**：C3 桌布壳（侧栏分类 + 10px 网格工作台 + form 渲染器 + §7 fail-loud 表）
+要落地，先要回答：壳住哪（不进 harness dist？）、怎么测（无浏览器基建）、若干展示层
+开放点（默认视图/侧栏序/网格几何/排布细节/轮询间隔）。用户休息中明示自主推进，需求关
+自主过闸，默认值全部标注可回退。
+
+**考虑过的选项与裁定**：
+- **资产宿主**：(a) harness dist 外挂 vs (b) `include_str!` 编译进 dsh-cli + `/canvas` 路由。
+  **选 (b)**——web_root 是 harness dist（外部件），插件基建不混入；且 SPA fallback
+  （web.rs:1115）会把任何未路由路径吞成前端 index.html，(b) 在 fallback 前立独立路由、
+  `/canvas/*` miss → 404（不回落——防「桌布失踪变前端」）。独立视图承诺 = harness 前端零改动。
+- **可测性架构**：排布/校验/模型/信封全部进 `core.js` **纯函数**（零 DOM/零 fetch/零 eval），
+  `node --test`（v24）断言；`app.js` 只做粘合。无浏览器基建是现实约束——把**该测的都
+  挪进纯函数**，粘合层以路由冒烟 + 手测补偿并诚实声明。测试 ESM 用 assets 目录内
+  `package.json {"type":"module"}` 标记（浏览器忽略该文件）。
+- **排布算法契约**（可证无重叠）：`layoutGrid(cards, C)`——`w=min(w,C)` 收窄；卡顶 =
+  跨列 heights 最大值；平手取最左；`heights[span]=top+h`。瀑布流 first-fit 的确定性化，
+  配合 seeded-LCG 性质测试（无重叠/不出界）。
+- **展示层默认值**（均可回退，回看清单在 c3 requirements §2）：默认「全部」视图、
+  侧栏闭集枚举序 misc 恒末、列宽 260px/行高单元 100px/格距 10px（契约值）CSS 变量化、
+  rev 轮询 4s（C5 SSE 后转兜底）。
+- **error 条目落位**：清单 error 条目在壳内归 `misc` 组画 fail-loud 卡（**不发 fetch**——
+  清单已判死刑），保证「装了但坏了」必然可见。
+- **附带修复（发现于自下而上实证）**：试点 demo `renderer.js::callRpc` 发裸 `{args}`，
+  缺 client-request 信封——真实 HTTP 下 `rpc_envelope_ok`（web.rs:1898）必 400。
+  属 C1 包内 demo 的 wire 缺陷（测试都走 dispatch 直调没暴露）。本轮按同一 wire 修一行。
+  `rpcEnvelope` 的红验证刻意让桩先返回裸 `{args}` 形——证明测试能抓住这类缺陷。
+
+**预期影响与回滚点**：新增 `crates/dsh-cli/assets/canvas/` + `canvas.rs` + serve 闭包一插 +
+demo renderer 一行修复；既有 wire/路由/前端零改动。回滚 = 撤销 C3 提交即回到 C2 完成态。
+
 
 
 
