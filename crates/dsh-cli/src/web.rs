@@ -1988,11 +1988,16 @@ fn rpc_id_of(body: &[u8]) -> String {
 }
 
 /// client-request 信封校验（对齐 clientRequestSchema：type + method 一致）。
+/// D-206（live 冒烟抓出）：S2 canonical 令 dispatch 方法规范化而画布信封带 slash 别名
+/// （`settings/describe`）——**两侧同 canonical 后比较**（非别名方法恒等变换，零影响）。
 fn rpc_envelope_ok(body: &[u8], method: &str) -> bool {
     serde_json::from_slice::<Value>(body)
         .map(|v| {
-            v.get("type").and_then(|t| t.as_str()) == Some("client-request")
-                && v.get("method").and_then(|m| m.as_str()) == Some(method)
+            if v.get("type").and_then(|t| t.as_str()) != Some("client-request") {
+                return false;
+            }
+            let envelope = v.get("method").and_then(|m| m.as_str()).map(canonical_rpc_method);
+            envelope.as_deref() == Some(canonical_rpc_method(method).as_str())
         })
         .unwrap_or(false)
 }
@@ -5693,6 +5698,11 @@ mod tests {
         assert_eq!(canonical_rpc_method("settings/update"), "settings.update");
         assert_eq!(canonical_rpc_method("session/history"), "session/history");
         assert_eq!(canonical_rpc_method("uiManifest/list"), "uiManifest/list");
+        // D-206：信封校验两侧同 canonical——画布 slash 信封 × 规范化 dispatch 方法必过。
+        let body = br#"{"type":"client-request","rpcId":"x","method":"settings/describe","payload":{}}"#;
+        assert!(rpc_envelope_ok(body, "settings.describe"), "别名信封过闸");
+        assert!(rpc_envelope_ok(body, "settings/describe"), "同形对照");
+        assert!(!rpc_envelope_ok(body, "session/list"), "异方法仍拒");
     }
 
     /// D-195：schedule/list 诚实两面——无宿主 = no-schedule-host（不伪造空表）；

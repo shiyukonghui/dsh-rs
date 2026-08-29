@@ -8318,7 +8318,30 @@ README 钉死语义——「host runner 把每个定义的**代码留在进程�
 **里程碑结论（据此判定技术侧收口）**：旧前端**全部浏览器能力**（provider 配置/清单/
 状态/动态启停卸/文件/会话/设置读写含 secrets 写/聊天含停止/调度建看删/审批决定）均已有
 服务单元等价物；「不可机械化」清单**清空**（define 非目标、附件属新协议非改写）。
-剩余 = 纯流程：真实浏览器 E2E（§1 十三行）+ 用户下线拍板。**回滚点**：撤本条回到 `d4878ac`。E2E 清单已同步（13 卡基线 + §1 行）。
+剩余 = 纯流程：真实浏览器 E2E（§1 十三行）+ 用户下线拍板。**回滚点**：撤本条回到 `d4878ac`。
+
+## D-206（live serve 冒烟：13 卡活体全挂载 + 抓出 canonical 别名信封闸 bug——两侧同 canonical 修复）
+
+**日期**：2026-09-05
+
+**触发**：自主增值项「live serve 冒烟」——`dsh web scenarios/web-smoke.cordis.yml`
+（顺带实证 HANDOFF 起服步骤两处错误：子命令是 `dsh web <cordis.yml>`，非 `dsh serve`）。
+
+**活体成果**：① `/api/uiManifest/list` = **13 卡全挂载**（scan→装配→清单链活体）；
+② session/list ok、dynamic/files（wasm remote）ok、schedule/approval **诚实未装配态
+×2**（设计行为实证）；③ **settings/describe 400**——冒烟抓到单测层不可见的 bug。
+
+**根因与裁定**：S2 canonical 在路径派生处把 dispatch 方法规范化（`settings/describe→
+settings.describe`），但 `rpc_envelope_ok` 要求信封 method **逐字**等于 dispatch 方法
+——画布信封带 slash 别名 → **三个 canonical 别名方法（settings/describe、
+settings/update、session.approval/decide）活体全灭**（canvas 上设置概览/编辑/审批决定
+必坏；S2 单测用规范化信封调用未暴露——测试口形状与渲染器真实形状不一致的教训）。
+**两侧同 canonical 后比较**（非别名恒等变换，旧前端零影响）；否决「渲染器改发点号形」
+（信封形状是渲染器不变量）与「入口不规范化」（回到共享臂误派陷阱）。
+
+**验收实测**：新断言（别名信封×规范化方法过闸 / 同形对照 / 异方法仍拒）全绿；
+dsh-cli **259/0**、clippy **0**。教训入册：**自主冒烟必须走渲染器真实形状**；
+§0/§1 的活体证据自此有 RPC 层背书（DOM 层仍待用户浏览器）。**回滚点**：撤本提交回 `46877fc`。E2E 清单已同步（13 卡基线 + §1 行）。
 
 
 
