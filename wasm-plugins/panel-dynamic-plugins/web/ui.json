@@ -16,6 +16,12 @@
     ],
     "rowsPath": "items",
     "actions": [],
+    "rowActions": [
+      { "name": "stop", "label": "停止", "rpc": ["panel-dynamic-plugins", "stop"],
+        "scope": "row", "confirm": true },
+      { "name": "undefine", "label": "卸载", "rpc": ["panel-dynamic-plugins", "undefine"],
+        "scope": "row", "confirm": true }
+    ],
     "emptyText": "没有已定义的动态插件"
   }
 }

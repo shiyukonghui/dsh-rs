@@ -32,6 +32,12 @@ fn ui_declaration() -> Value {
             ],
             "rowsPath": "items",
             "actions": [],
+            "rowActions": [
+                { "name": "stop", "label": "停止", "rpc": ["panel-dynamic-plugins", "stop"],
+                  "scope": "row", "confirm": true },
+                { "name": "undefine", "label": "卸载", "rpc": ["panel-dynamic-plugins", "undefine"],
+                  "scope": "row", "confirm": true }
+            ],
             "emptyText": "没有已定义的动态插件"
         }
     })
@@ -86,10 +92,7 @@ fn list(_body: &Value) -> Vec<u8> {
         Err(_) => return error("decode", "dynamicPlugins projection unparseable"),
     };
     if proj.get("ok").and_then(|o| o.as_bool()) != Some(true) {
-        let err = proj.get("error").cloned().unwrap_or_else(|| {
-            json!({"code": "service", "message": "host service dynamicPlugins failure"})
-        });
-        return serde_json::to_vec(&json!({ "ok": false, "error": err })).unwrap_or_default();
+        return passthrough_error(&proj);
     }
     let plugins = proj
         .get("plugins")
@@ -100,6 +103,53 @@ fn list(_body: &Value) -> Vec<u8> {
     serde_json::to_vec(&json!({ "ok": true, "value": { "items": items } })).unwrap_or_default()
 }
 
+/// 透传宿主错误（不裹成功、不夹带数据）。
+fn passthrough_error(proj: &Value) -> Vec<u8> {
+    let err = proj.get("error").cloned().unwrap_or_else(|| {
+        json!({"code": "service", "message": "host service failure"})
+    });
+    serde_json::to_vec(&json!({ "ok": false, "error": err })).unwrap_or_default()
+}
+
+/// C6（D-189）：行身份提取——**渲染器不是安全边界**，单元自己校验：
+/// `row.pluginId` 必须是非空字符串，否则 fail-loud 且绝不触达宿主服务。
+fn row_identity(body: &Value) -> Option<String> {
+    body.get("row")
+        .and_then(|r| r.get("pluginId"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// 行写动作（stop/undefine 同型）：校验身份 → `host_services.set` → 透传。
+fn row_action(body: &Value, endpoint: &str, set_service: &str, done_key: &str) -> Vec<u8> {
+    let Some(plugin_id) = row_identity(body) else {
+        return error(
+            "internal",
+            &format!("panel-dynamic-plugins/{endpoint}: body.row.pluginId must be a non-empty string"),
+        );
+    };
+    let payload = json!({ "pluginId": plugin_id });
+    let bytes = host_services::set(set_service, &serde_json::to_vec(&payload).unwrap_or_default());
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v) if v.get("ok").and_then(|o| o.as_bool()) == Some(true) => {
+            let mut value = json!({ "pluginId": plugin_id });
+            value[done_key] = json!(true);
+            serde_json::to_vec(&json!({ "ok": true, "value": value })).unwrap_or_default()
+        }
+        Ok(v) => passthrough_error(&v),
+        Err(_) => error("decode", &format!("{set_service} response unparseable")),
+    }
+}
+
+fn stop(body: &Value) -> Vec<u8> {
+    row_action(body, "stop", "dynamicStop", "stopped")
+}
+
+fn undefine(body: &Value) -> Vec<u8> {
+    row_action(body, "undefine", "dynamicUndefine", "undefined")
+}
+
 struct PanelDynamicPlugins;
 
 impl Guest for PanelDynamicPlugins {
@@ -108,6 +158,8 @@ impl Guest for PanelDynamicPlugins {
         match (namespace.as_str(), method.as_str()) {
             ("panel-dynamic-plugins", "describeUI") => describe_ui(&body_value),
             ("panel-dynamic-plugins", "list") => list(&body_value),
+            ("panel-dynamic-plugins", "stop") => stop(&body_value),
+            ("panel-dynamic-plugins", "undefine") => undefine(&body_value),
             _ => error(
                 "internal",
                 &format!(

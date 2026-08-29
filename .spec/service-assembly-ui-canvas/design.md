@@ -112,7 +112,7 @@
 "view": { "kind": "list",
   "columns": [ {key,label,type?} ],
   "rowsPath": "items",                    // 数据里行数组的位置
-  "rowActions": [ {name,label,rpc:[ns,method],scope:"row"} ],
+  "rowActions": [ {name,label,rpc:[ns,method],scope:"row",confirm?:true} ],  // C6（D-189）：confirm:true → 渲染器执行前必须用户确认（只认严格 true）；参数线形状 args = { row: <该行完整对象> }——单元自校验身份（渲染器不是安全边界）
   "actions": [ {name,label,rpc:[ns,method]} ],   // 卡级动作
   "emptyText": "暂无条目" }
 ```
@@ -283,6 +283,7 @@
 | **C3** 桌布壳最小集 | ✅ **已落地**（2026-09-05，D-184） | `/canvas` 独立视图（资产编译进 dsh-cli，SPA 前拦截，miss→404）；`core.js` 纯函数（buildModel/layoutGrid 可证无重叠/validateDeclaration §7 九行/rpcEnvelope/pollDecision）12 测试 + canvas.rs 3 测试；侧栏分类 + 10px 瀑布工作台 + form 渲染器 + dataRpc + 4s rev 轮询；附带修复 demo renderer 裸 `{args}` 信封缺陷；dsh-cli **244/0**、clippy **0**、`node --test` **12/12**；`status/list` 落回落待 C4；详见 `.spec/service-assembly-ui-c3/acceptance.md` |
 | **C4** `status`/`list` 渲染器 + 首个面板改写 | ✅ **已落地**（2026-09-05，D-185） | 渲染器实现档齐（form/status/list；list 加 rowsPath 必备校验）；首个 harness 面板改写 = `wasm-plugins/panel-plugin-inventory`（list 卡，wasm 自持 loader 行投影，服务失败不伪造空表）；宿主泛化 `Boot.remote_carriers` + serve `scan_remote_units` 发现挂载（关死「每面板一次宿主提交」）；node 16/16、m33 5/5、dsh-cli **246/0**、clippy **0**；详见 `.spec/service-assembly-ui-c4/acceptance.md` |
 | **C5** 热插拔 SSE | ✅ **已落地**（2026-09-05，D-186） | serve 主循环 tick（2s 节流）同步 scan 挂载的单元装/卸（运行时**不构建**、失败不炸、只卸 mounted 登记）→ rev 变经 `/plugins/events` 广播 `ui-manifest-changed {rev}`；桌布 EventSource 消费 + 10s 轮询兜底；watch 4 测 + 帧形状测（桩红→绿；clippy 复活一条被吞 `#[test]`）；dsh-cli **251/0**、clippy **0**；详见 `.spec/service-assembly-ui-c5/acceptance.md` |
+| **C6** 行动作 + 确认 | ✅ **已落地**（2026-09-05，D-189） | §4.1 rowActions 渲染 + `confirm` 契约字段（只认严格 true；v1 = window.confirm）；线形状 `args={row}` 单元自校验；首张写能力卡 = panel-dynamic-plugins stop/undefine（宿主 dynamicStop/Undefine 透传）；node 19/19 + m35 10/10（探针红×3 生效）；详见 `.spec/service-assembly-ui-c6-row-actions/acceptance.md` |
 
 **C1 的三点诚实交代**：
 

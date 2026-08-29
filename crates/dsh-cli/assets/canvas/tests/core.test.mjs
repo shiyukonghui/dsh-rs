@@ -16,6 +16,8 @@ import {
   extractPath,
   listRows,
   statusItems,
+  rowActionBody,
+  needsConfirm,
 } from "../core.js";
 
 function card(pluginName, cardId, type, w, h) {
@@ -300,4 +302,42 @@ test("statusItems: dataRpc items > static view.items > honest empty", () => {
     { label: "S", value: 0 },
   ]);
   assert.deepEqual(statusItems({ kind: "status" }, {}), []);
+});
+
+// ---- C6（D-189）：行动作线形状 + confirm 语义 ----
+
+test("rowActionBody wraps the full row untouched (wire contract)", () => {
+  const row = { pluginId: "hello", name: "Hello v2", state: "running" };
+  assert.deepEqual(rowActionBody(row), {
+    row: { pluginId: "hello", name: "Hello v2", state: "running" },
+  });
+});
+
+test("needsConfirm only strict true (no silent enforcement, no silent skip)", () => {
+  assert.equal(needsConfirm({ confirm: true }), true);
+  assert.equal(needsConfirm({}), false);
+  assert.equal(needsConfirm({ confirm: "true" }), false, "字符串 \"true\" 不触发");
+  assert.equal(needsConfirm(null), false);
+});
+
+test("validateDeclaration rejects malformed rowActions", () => {
+  const listView = () => {
+    const d = goodForm();
+    d.view = { kind: "list", rowsPath: "items" };
+    return d;
+  };
+  const okCard = listView();
+  okCard.view.rowActions = [
+    { name: "stop", label: "停止", rpc: ["ns", "stop"], scope: "row", confirm: true },
+  ];
+  assert.equal(validateDeclaration(okCard), null, "合法 rowActions 直通");
+  const notArr = listView();
+  notArr.view.rowActions = "nope";
+  assert.equal(validateDeclaration(notArr).code, "view-malformed");
+  const missingName = listView();
+  missingName.view.rowActions = [{ rpc: ["ns", "stop"] }];
+  assert.equal(validateDeclaration(missingName).code, "view-malformed");
+  const badRpc = listView();
+  badRpc.view.rowActions = [{ name: "x", rpc: ["ns", "a", "b"] }];
+  assert.equal(validateDeclaration(badRpc).code, "view-malformed");
 });

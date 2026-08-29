@@ -11,7 +11,7 @@ kv / sessionMessages / workspaceFiles / time / …），避免宿主扩张。
 | 0 | Provider 设置（试点） | `wasm-plugins/llm-deepseek` | form | kv 读写 + 模型目录 | ✅ D-180/D-182 |
 | 1 | 插件清单 | `wasm-plugins/panel-plugin-inventory` | list | loader 投影行 | ✅ D-185（m33） |
 | 2 | 运行时状态 | `wasm-plugins/panel-runtime-status` | status | loader+dynamicPlugins 聚合 | ✅ D-187（m34） |
-| 3 | 动态插件 | `wasm-plugins/panel-dynamic-plugins` | list | dynamicPlugins 投影行（running/defined）；写动作（stop/undefine）待"卡内确认"渲染形态 | ✅ D-188（m35） |
+| 3 | 动态插件 | `wasm-plugins/panel-dynamic-plugins` | list + **rowActions(stop/undefine, confirm)** | dynamicPlugins 投影行（running/defined）；**首张写能力卡（C6/D-189）** | ✅ D-188/D-189（m35 10 测） |
 | 4 | 会话概览 | `panel-sessions` | list | sessionMessages/sessionIdentity（payload 需 sessionId，需评估卡级选择形态） | ⬜ 候选 |
 | 5 | 工作区文件 | `panel-workspace-files` | list | workspaceFiles | ⬜ 候选 |
 | … | 设置/调度/任务/聊天… | — | form/list/chat（chat 渲染器属契约预留，点亮前无法迁移聊天面板） | — | ⬜ 路线图 |

@@ -105,6 +105,20 @@ export function validateDeclaration(d) {
   if (k === "list" && typeof d.view.rowsPath !== "string") {
     return { code: "view-malformed", message: "list 视图缺 rowsPath（数据面位置必须显式）" };
   }
+  if (k === "list" && d.view.rowActions !== undefined) {
+    if (!Array.isArray(d.view.rowActions)) {
+      return { code: "view-malformed", message: "list.rowActions 必须是数组" };
+    }
+    for (const ra of d.view.rowActions) {
+      const rpcOk =
+        Array.isArray(ra?.rpc) &&
+        ra.rpc.length === 2 &&
+        ra.rpc.every((x) => typeof x === "string");
+      if (!ra || typeof ra.name !== "string" || !rpcOk) {
+        return { code: "view-malformed", message: "rowActions 项须含 name 与 [ns,method] rpc" };
+      }
+    }
+  }
   return null;
 }
 
@@ -185,4 +199,16 @@ export function listRows(view, dataValue) {
 export function statusItems(view, dataValue) {
   const fromData = Array.isArray(extractPath(dataValue, "items")) ? extractPath(dataValue, "items") : null;
   return fromData ?? (Array.isArray(view.items) ? view.items : []);
+}
+
+// ---- C6（D-189）：行动作（rowActions）----
+
+/** 行动作线形状：整行原样入 `row`（渲染器不挑字段；单元自己校验身份——渲染器不是安全边界）。 */
+export function rowActionBody(row) {
+  return { row: row };
+}
+
+/** `confirm` 语义：只认严格 true（缺省/其他值 = 直接执行，向后兼容，无静默强制）。 */
+export function needsConfirm(action) {
+  return !!action && action.confirm === true;
 }

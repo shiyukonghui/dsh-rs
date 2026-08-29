@@ -12,6 +12,8 @@ import {
   focusKey,
   listRows,
   statusItems,
+  rowActionBody,
+  needsConfirm,
   GRID,
 } from "./core.js";
 
@@ -352,7 +354,21 @@ function renderDataBody(el, decl) {
   const paint = (dataValue) => {
     body.innerHTML = "";
     if (view.kind === "status") paintStatus(body, view, dataValue);
-    else paintList(body, view, dataValue);
+    else paintList(body, view, dataValue, act);
+  };
+
+  /** 行动作（C6/D-189）：confirm 未确认**不发 RPC**；成功刷新列表（行数据随动作变）。 */
+  const act = (action, row) => {
+    if (needsConfirm(action) &&
+        !window.confirm("对「" + String(row.name ?? row.pluginId ?? row.label ?? "?") +
+          "」执行 " + String(action.label ?? action.name) + "？")) {
+      return;
+    }
+    stat("→ " + action.rpc.join("/") + " …", "");
+    rpc(action.rpc.join("/"), rowActionBody(row)).then((res) => {
+      report(stat, res);
+      if (res && res.ok !== false) load();
+    });
   };
 
   const load = () => {
@@ -414,7 +430,7 @@ function paintStatus(body, view, dataValue) {
   }
 }
 
-function paintList(body, view, dataValue) {
+function paintList(body, view, dataValue, act) {
   const { rows, columns, emptyText } = listRows(view, dataValue);
   if (rows.length === 0) {
     const e = document.createElement("div");
@@ -423,24 +439,27 @@ function paintList(body, view, dataValue) {
     body.appendChild(e);
     return;
   }
+  const rowActions = Array.isArray(view.rowActions) ? view.rowActions : [];
+  const cols = columns.length > 0
+    ? columns
+    : Object.keys(rows[0]).map((k) => ({ key: k, label: k }));
   const table = document.createElement("table");
   table.className = "ltable";
   const thead = document.createElement("tr");
-  (columns.length > 0
-    ? columns
-    : Object.keys(rows[0]).map((k) => ({ key: k, label: k }))
-  ).forEach((c) => {
+  cols.forEach((c) => {
     const th = document.createElement("th");
     th.textContent = String(c.label || c.key);
     thead.appendChild(th);
   });
+  if (rowActions.length > 0) {
+    const th = document.createElement("th");
+    th.textContent = "操作";
+    thead.appendChild(th);
+  }
   table.appendChild(thead);
   for (const r of rows) {
     const tr = document.createElement("tr");
-    (columns.length > 0
-      ? columns
-      : Object.keys(r).map((k) => ({ key: k, label: k }))
-    ).forEach((c) => {
+    cols.forEach((c) => {
       const td = document.createElement("td");
       const cell = r[c.key];
       td.textContent = cell === null || cell === undefined
@@ -448,6 +467,15 @@ function paintList(body, view, dataValue) {
         : typeof cell === "object" ? JSON.stringify(cell) : String(cell);
       tr.appendChild(td);
     });
+    if (rowActions.length > 0) {
+      const td = document.createElement("td");
+      rowActions.forEach((a) => {
+        const btn = button(a.label ?? a.name, "", () => act(a, r));
+        btn.className = "row-action";
+        td.appendChild(btn);
+      });
+      tr.appendChild(td);
+    }
     table.appendChild(tr);
   }
   body.appendChild(table);

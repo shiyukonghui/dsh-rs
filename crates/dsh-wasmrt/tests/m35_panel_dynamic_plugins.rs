@@ -2,6 +2,7 @@
 //
 // 改写型第三次复制：describeUI 与静态 ui.json 一份契约；list 端点经 host-services
 // "dynamicPlugins" 投影出行（state: activeRun→running/否则 defined）；服务失败透传。
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
@@ -160,4 +161,139 @@ fn unknown_endpoint_fail_loud() {
         .unwrap();
     assert_eq!(r["ok"], false);
     assert!(r.to_string().contains("nope"));
+}
+
+// ---- C6（D-189）：写端点 stop/undefine（row.pluginId 校验 + 宿主 set 透传） ----
+
+/// set 记录桩：记录 (service, payload) 调用，返回固定响应。
+struct SetDynProjector {
+    set_calls: RefCell<Vec<(String, Value)>>,
+    set_response: Value,
+}
+
+impl RemoteServiceProjector for SetDynProjector {
+    fn get(&self, service: &str, _payload: &[u8]) -> Vec<u8> {
+        match service {
+            "dynamicPlugins" => serde_json::to_vec(&json!({"ok": true, "plugins": []})).unwrap(),
+            _ => serde_json::to_vec(&json!({"ok": false, "error": {"code": "unknown-service"}})).unwrap(),
+        }
+    }
+    fn set(&self, service: &str, payload: &[u8]) -> Vec<u8> {
+        let parsed: Value = serde_json::from_slice(payload).unwrap_or(Value::Null);
+        self.set_calls
+            .borrow_mut()
+            .push((service.to_string(), parsed));
+        serde_json::to_vec(&self.set_response).unwrap_or_default()
+    }
+}
+
+fn plugin_set(set_response: Value) -> (WasmRemoteEndpointPlugin, Rc<SetDynProjector>) {
+    let projector = Rc::new(SetDynProjector {
+        set_calls: RefCell::new(vec![]),
+        set_response,
+    });
+    let p = WasmRemoteEndpointPlugin::new(
+        "panel-dynamic-plugins",
+        &component(),
+        Default::default(),
+        Some(projector.clone()),
+    )
+    .expect("plugin constructs");
+    (p, projector)
+}
+
+/// 身份校验（渲染器不是安全边界）：坏 body 一律 fail-loud 且**不触达宿主服务**。
+#[test]
+fn stop_requires_row_plugin_id_fail_loud() {
+    let (p, calls) = plugin_set(json!({"ok": true}));
+    for body in [
+        "{}",
+        r#"{"row":{}}"#,
+        r#"{"row":{"pluginId":""}}"#,
+        r#"{"row":{"pluginId":7}}"#,
+        r#"{"pluginId":"sneaky"}"#,
+    ] {
+        let r = p
+            .handle("panel-dynamic-plugins", "stop", body.as_bytes(), None)
+            .unwrap();
+        assert_eq!(r["ok"], false, "坏 body 必须 fail-loud: {body} -> {r}");
+    }
+    assert!(
+        calls.set_calls.borrow().is_empty(),
+        "校验失败不得触达宿主 set 服务（不猜测身份）"
+    );
+}
+
+#[test]
+fn stop_passthrough_success() {
+    let (p, calls) = plugin_set(json!({"ok": true}));
+    let r = p
+        .handle(
+            "panel-dynamic-plugins",
+            "stop",
+            br#"{"row":{"pluginId":"hello","state":"running"}}"#,
+            None,
+        )
+        .unwrap();
+    assert_eq!(r["ok"], true, "{r}");
+    let recorded = calls.set_calls.borrow();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].0, "dynamicStop");
+    assert_eq!(recorded[0].1, json!({"pluginId": "hello"}), "payload 只带身份字段");
+}
+
+#[test]
+fn stop_service_failure_passthrough() {
+    let (p, _calls) = plugin_set(json!({
+        "ok": false,
+        "error": { "code": "internal", "message": "dynamic plugin ghost is not running" }
+    }));
+    let r = p
+        .handle(
+            "panel-dynamic-plugins",
+            "stop",
+            br#"{"row":{"pluginId":"ghost"}}"#,
+            None,
+        )
+        .unwrap();
+    assert_eq!(r["ok"], false, "宿主失败必须透传：{r}");
+    assert_eq!(r["error"]["code"], "internal");
+    assert!(r["error"]["message"].as_str().unwrap().contains("not running"));
+}
+
+#[test]
+fn undefine_passthrough_and_validation() {
+    let (p, calls) = plugin_set(json!({"ok": true}));
+    let r = p
+        .handle(
+            "panel-dynamic-plugins",
+            "undefine",
+            br#"{"row":{"pluginId":"hello"}}"#,
+            None,
+        )
+        .unwrap();
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(calls.set_calls.borrow()[0].0, "dynamicUndefine");
+    let r = p
+        .handle("panel-dynamic-plugins", "undefine", br#"{"row":{}}"#, None)
+        .unwrap();
+    assert_eq!(r["ok"], false, "缺身份 fail-loud：{r}");
+    assert_eq!(calls.set_calls.borrow().len(), 1, "坏 body 不再触达服务");
+}
+
+/// 声明层：rowActions 齐（stop/undefine，均 confirm:true）——一份契约由 static 测试继续守。
+#[test]
+fn declaration_carries_confirm_row_actions() {
+    let p = plugin(json!({"ok": true, "plugins": []}));
+    let r = p
+        .handle("panel-dynamic-plugins", "describeUI", br#"{}"#, None)
+        .unwrap();
+    let actions = r["value"]["view"]["rowActions"].as_array().expect("rowActions");
+    assert_eq!(actions.len(), 2, "{actions:?}");
+    for a in actions {
+        assert_eq!(a["scope"], "row");
+        assert_eq!(a["confirm"], true, "破坏性动作必须声明确认");
+        let rpc = a["rpc"].as_array().unwrap();
+        assert_eq!(rpc[0], "panel-dynamic-plugins");
+    }
 }

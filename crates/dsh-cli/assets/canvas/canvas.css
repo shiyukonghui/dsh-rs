@@ -66,3 +66,15 @@ header h1 { font-size: 16px; margin: 0; }
 .card .cstat.err { color: var(--err); }
 .card.fail .fail-msg { color: var(--err); }
 .card.fail .code { color: var(--dim); font-size: 11px; }
+.ltable { border-collapse: collapse; width: 100%; font-size: 12px; }
+.ltable th, .ltable td { text-align: left; padding: 3px 6px;
+  border-bottom: 1px solid var(--line); }
+.ltable th { color: var(--dim); font-weight: 600; }
+.ltable .row-action { background: var(--line); color: var(--text); border: 0;
+  border-radius: 3px; padding: 2px 8px; margin-right: 4px; cursor: pointer; font: inherit; }
+.ltable .row-action:hover { background: var(--err); color: #fff; }
+.srow { display: flex; justify-content: space-between; padding: 2px 0; font-size: 12px; }
+.srow .slabel { color: var(--dim); }
+.srow .svalue.tone-ok { color: var(--ok); }
+.srow .svalue.tone-warn { color: #d9a94b; }
+.srow .svalue.tone-err { color: var(--err); }
