@@ -21,6 +21,7 @@ kv / sessionMessages / workspaceFiles / time / …），避免宿主扩张。
 | 10 | 调度任务 | `wasm-plugins/panel-schedule`（声明单元） | list | 宿主薄臂 `schedule/list`（Boot 挂载与 M4 工具同一 ScheduleHost，fold 事件日志权威；缺宿主诚实报错）；写端另立切片 | ✅ D-195（m41 3/3 + 宿主测） |
 | 11 | 创建调度 | `wasm-plugins/panel-schedule-create`（声明单元） | form | 保存走 `schedule/create` 臂（D-196 wire 形钉死）；rowActions 删除带 confirm | ✅ D-197（m42 3/3，调度建/看/删闭环） |
 | 12 | 待审批 | `wasm-plugins/panel-approval`（声明单元） | list + rowActions | `approval/pending` 臂（wire.pending_requests 单权威）；允许/拒绝同臂 args.decision 区分（D-198 扩展），拒绝 confirm | ✅ D-199（m43 3/3，**技术队列清零**） |
+| 13 | 设置编辑 · locale | `wasm-plugins/panel-locale-edit`（声明单元） | form + fieldsFrom | panel-settings-edit 逐字节同构仅换 pick=locale（「机械复制」实证）；define/activate 取证后**重分级非机械**（vendored 面无源码） | ✅ D-200（m44 3/3） |
 | … | 审批… | — | 契约演进：审批交互形态 | — | ⬜ 契约演进后迁移 |
 
 ## 迁移完成的判定（远景）

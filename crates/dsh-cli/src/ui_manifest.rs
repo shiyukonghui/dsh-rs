@@ -704,5 +704,13 @@ mod tests {
             .unwrap_or_else(|| panic!("审批卡应在清单里，得 {:?}", m.cards));
         assert_eq!(ap["type"], "session");
         assert_eq!(ap["cardId"], "panel-approval.pending");
+        // D-200：locale 设置编辑卡（第十三卡，多 ns 机械复制首卡）。
+        let le = m
+            .cards
+            .iter()
+            .find(|c| c["pluginName"] == "panel-locale-edit")
+            .unwrap_or_else(|| panic!("locale 编辑卡应在清单里，得 {:?}", m.cards));
+        assert_eq!(le["type"], "config");
+        assert_eq!(le["cardId"], "panel-locale-edit.edit");
     }
 }

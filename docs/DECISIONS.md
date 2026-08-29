@@ -8183,6 +8183,25 @@ approval.rs 源码核实（不猜字面量）。
 审批）。剩余仅流程步：真实浏览器 E2E（清单 §1 逐项）+ 用户下线拍板（清单 §3 规则）。
 **回滚点**：撤包目录 + m43 + 清单四行断言。
 
+## D-200（panel-locale-edit：多 ns 设置编辑「机械复制」兑现首卡 + define/activate 重分级）
+
+**日期**：2026-09-05
+
+**触发问题**：技术队列清零后削 §2 已标注缺口。原计划做 define/activate，**取证后否决**：
+`dynamicCordisRunner/*` 是 vendored wasm 组件面（本仓库无源码；runHostHalf 顶层线形
+`{pluginId,packageId}` 与 rowActions `{row,…}` 形不兼容，改 vendored 二进制不可行）——
+该项**重分级为非机械缺口**（如需激活面须另立原生臂 + 声明单元，独立需求轮）。转做 §2
+明示「机械工作」项：设置编辑多 ns。
+
+**裁定**：locale（Live、产品向、独立）为首个复制 ns——`panel-locale-edit` 与
+panel-settings-edit **逐字节同构仅换 pick**（schemaFields 投影 + 乐观锁全复用，零新机制
+= 「机械」的实证）；其余 ns（llm[Restart]/shell/agent-loop/…）同法待点单。
+
+**验收实测**：m44 3/3（fieldsFrom pick=locale 契约 + 一份契约 + 零自有端点）、清单
+第十三卡断言、dsh-cli **259/0**、clippy **0**（新包无独立红跑，红型已九次实证——注记）。
+
+**回滚点**：撤包目录 + m44 + 清单四行断言。E2E 清单已同步（13 卡基线 + §1 行）。
+
 
 
 

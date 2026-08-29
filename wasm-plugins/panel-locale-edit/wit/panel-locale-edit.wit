@@ -1,0 +1,10 @@
+// panel-locale-edit 服务装配单元（面板改写 #12 / D-200）：locale 设置编辑声明单元。
+package dsh:panel-locale-edit;
+
+use dsh:host-remote/remote;
+use dsh:host-remote/host-services;
+
+world panel-locale-edit {
+  export remote;
+  import host-services;
+}
