@@ -14,6 +14,7 @@ import {
   statusItems,
   rowActionBody,
   needsConfirm,
+  layoutMeasured,
   chatFoldFrame,
   chatOptions,
   schemaFields,
@@ -30,6 +31,15 @@ function status(text, cls) {
   const s = $("status");
   s.textContent = text;
   s.className = cls || "";
+}
+
+// D-209 可关闭卡：closed 集合 localStorage 持久（侧栏点标题即重开，永远可恢复）。
+const CLOSED_KEY = "dsh.canvas.closed";
+const closedSet = new Set((() => {
+  try { return JSON.parse(localStorage.getItem(CLOSED_KEY) || "[]"); } catch { return []; }
+})());
+function persistClosed() {
+  try { localStorage.setItem(CLOSED_KEY, JSON.stringify([...closedSet])); } catch { /* 隐私模式：本会话内仍有效 */ }
 }
 
 function rpc(method, args) {
@@ -104,7 +114,18 @@ function renderSidebar() {
     if (state.selectedType === g.type) t.classList.add("active");
     nav.appendChild(t);
     for (const c of g.cards) {
-      const n = button(c.bad ? "✗ " + c.pluginName : c.pluginName, "name", () => focusCard(c));
+      const k = focusKey(c);
+      const shut = closedSet.has(k);
+      const n = button((c.bad ? "✗ " : "") + c.pluginName, "name" + (shut ? " shut" : ""), () => {
+        if (closedSet.has(k)) {
+          closedSet.delete(k);
+          persistClosed();
+          renderSidebar();
+          renderWorkbench();
+        }
+        focusCard(c);
+      });
+      if (shut) n.title = "已关闭——点击重新打开";
       nav.appendChild(n);
     }
   }
@@ -118,16 +139,49 @@ function button(text, cls, onClick) {
   return b;
 }
 
+// D-209 实测重排：内容稳定后（异步数据/字段变化）按真实高度重装箱——防重叠终排。
+const ro = typeof ResizeObserver !== "undefined"
+  ? new ResizeObserver(() => scheduleRelayout())
+  : null;
+let relayoutTimer = null;
+function scheduleRelayout() {
+  clearTimeout(relayoutTimer);
+  relayoutTimer = setTimeout(measureRelayout, 200);
+}
+function measureRelayout() {
+  const wb = $("workbench");
+  const els = [...wb.querySelectorAll(".card")];
+  if (!els.length) return;
+  const items = els.map((el) => ({
+    key: el.dataset.focusKey,
+    w: Number(el.dataset.gridW) || 2,
+    hPx: Math.max(el.offsetHeight, Number(el.dataset.minH) || 0),
+  }));
+  const laid = layoutMeasured(items, columnsForWidth(wb.clientWidth));
+  for (const p of laid.positions) {
+    const el = els.find((e) => e.dataset.focusKey === p.key);
+    if (el) {
+      el.style.left = p.col * (GRID.col + GRID.gap) + "px";
+      el.style.top = p.yPx + "px";
+    }
+  }
+  wb.style.minHeight = laid.totalH + 28 + "px";
+}
+
 function renderWorkbench() {
   const wb = $("workbench");
   wb.innerHTML = "";
-  const cards = state.selectedType
+  if (ro) ro.disconnect();
+  const cards = (state.selectedType
     ? ((state.model.groups.find((g) => g.type === state.selectedType) || {}).cards || [])
-    : state.model.cards;
+    : state.model.cards
+  ).filter((c) => !closedSet.has(focusKey(c)));
   if (cards.length === 0) {
     const e = document.createElement("div");
     e.className = "empty";
-    e.textContent = "还没有服务装配单元声明 UI——向 wasm-plugins/<name>/web/ui.json 提交 v2 卡片声明即自动出现。";
+    e.textContent = closedSet.size
+      ? "本组卡片已全部关闭——点左侧灰显标题可重新打开。"
+      : "还没有服务装配单元声明 UI——向 wasm-plugins/<name>/web/ui.json 提交 v2 卡片声明即自动出现。";
     wb.appendChild(e);
     return;
   }
@@ -139,9 +193,11 @@ function renderWorkbench() {
   wb.style.minHeight = grid.totalRows * (GRID.row + GRID.gap) + 28 + "px";
   const byKey = new Map(cards.map((c) => [focusKey(c), c]));
   for (const p of grid.positions) {
-    const card = byKey.get(p.key);
-    wb.appendChild(cardEl(card, p));
+    const el = cardEl(byKey.get(p.key), p);
+    wb.appendChild(el);
+    if (ro) ro.observe(el);
   }
+  requestAnimationFrame(measureRelayout);
 }
 
 /** 焦点：滚动 + 高亮。**不调用任何重排**——布局输入不变（S6）。 */
@@ -161,10 +217,24 @@ function cardEl(card, pos) {
   el.style.top = pos.row * (GRID.row + GRID.gap) + "px";
   el.style.width = pos.w * GRID.col + (pos.w - 1) * GRID.gap + "px";
   el.style.minHeight = pos.h * GRID.row + (pos.h - 1) * GRID.gap + "px";
+  el.dataset.gridW = String(pos.w);
+  el.dataset.minH = String(pos.h * GRID.row + (pos.h - 1) * GRID.gap);
 
   const cap = document.createElement("div");
   cap.className = "cap";
   cap.textContent = card.title || card.pluginName;
+  // D-209：✕ 关闭——从工作区移除，侧栏留灰显入口，一键可逆。
+  const x = document.createElement("button");
+  x.className = "card-close";
+  x.textContent = "✕";
+  x.title = "关闭卡片（侧栏点标题可重开）";
+  x.addEventListener("click", () => {
+    closedSet.add(focusKey(card));
+    persistClosed();
+    renderSidebar();
+    renderWorkbench();
+  });
+  cap.appendChild(x);
   el.appendChild(cap);
   const badges = document.createElement("div");
   badges.className = "badges";

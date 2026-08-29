@@ -18,6 +18,7 @@ import {
   statusItems,
   rowActionBody,
   needsConfirm,
+  layoutMeasured,
   chatFoldFrame,
   chatOptions,
   schemaFields,
@@ -351,6 +352,32 @@ test("collectValues omits empty write-only secret values (D-204 wipe gate)", () 
     collectValues(view, (n) => (n === "token" ? "s3cr3t" : "en")),
     { token: "s3cr3t", lang: "en" },
   );
+});
+
+// D-209：实测高度装箱——重叠缺陷的正解（真实 hPx 参与排布，非声明格数）。
+test("layoutMeasured masonry: never overlaps, spans clamped, order stable", () => {
+  const cards = [
+    { key: "a", w: 2, hPx: 300 },
+    { key: "b", w: 2, hPx: 100 },
+    { key: "c", w: 1, hPx: 500 },
+    { key: "d", w: 9, hPx: 50 },
+  ];
+  const r = layoutMeasured(cards, 4);
+  assert.equal(r.positions.length, 4);
+  const rects = r.positions.map((p) => ({
+    x: p.col * 270, y: p.yPx, w: p.w * 260 + (p.w - 1) * 10, h: p.hPx,
+  }));
+  for (let i = 0; i < rects.length; i++)
+    for (let j = i + 1; j < rects.length; j++) {
+      const A = rects[i];
+      const B = rects[j];
+      const disj = A.x + A.w <= B.x || B.x + B.w <= A.x || A.y + A.h <= B.y || B.y + B.h <= A.y;
+      assert.ok(disj, `重叠 ${cards[i].key}×${cards[j].key}: ${JSON.stringify(rects)}`);
+    }
+  assert.equal(r.positions.map((p) => p.key).join(","), "a,b,c,d", "顺序保持");
+  assert.equal(r.positions[3].w, 4, "超宽 span 钳到列数");
+  assert.ok(r.totalH >= 500, "总高覆盖内容");
+  assert.deepEqual(layoutMeasured([], 4), { positions: [], totalH: 0 });
 });
 
 test("nsSelectModel projects namespaces into a selector model (D-201)", () => {

@@ -81,6 +81,7 @@ mod tests {
             "chatOptions",
             "schemaFields",
             "nsSelectModel",
+            "layoutMeasured",
         ] {
             assert!(CANVAS_CORE_JS.contains(&format!("export function {name}")), "core 导出 {name}");
         }

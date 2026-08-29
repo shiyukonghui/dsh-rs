@@ -46,7 +46,12 @@ header h1 { font-size: 16px; margin: 0; }
   overflow-y: auto; }
 .card.focus-hl { border-color: var(--accent);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent); }
-.card .cap { font-weight: 600; }
+.card .cap { font-weight: 600; display: flex; justify-content: space-between;
+  align-items: baseline; gap: 8px; }
+.card-close { background: none; border: 0; color: var(--dim); cursor: pointer;
+  font-size: 13px; line-height: 1; padding: 0 2px; }
+.card-close:hover { color: var(--err); }
+#sidebar .name.shut { opacity: .45; text-decoration: line-through; }
 .card .badges { display: flex; gap: 6px; align-items: center;
   font-size: 11px; color: var(--dim); margin: 2px 0 8px; }
 .card .badges .type { border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; }

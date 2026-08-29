@@ -69,6 +69,29 @@ export function layoutGrid(cards, columns) {
   return { positions, totalRows: heights.reduce((a, b) => Math.max(a, b), 0) };
 }
 
+/** D-209 实测装箱（重叠缺陷正解）：cards=[{key,w,hPx}]（hPx=真实内容高，w=声明格宽）
+ *  → 列窗口 masonry：每张卡放「最低的最矮列窗口」，矩形互不重叠（node 测钉死）。 */
+export function layoutMeasured(cards, columns) {
+  const C = Math.max(1, columns | 0);
+  const colY = new Array(C).fill(0);
+  const positions = [];
+  for (const c of Array.isArray(cards) ? cards : []) {
+    if (!c || typeof c.key !== "string") continue;
+    const w = Math.max(1, Math.min(c.w || 1, C));
+    const hPx = Math.max(1, c.hPx || 1);
+    let best = 0;
+    let bestY = Infinity;
+    for (let s = 0; s + w <= C; s++) {
+      let y = 0;
+      for (let k = s; k < s + w; k++) y = Math.max(y, colY[k]);
+      if (y < bestY) { bestY = y; best = s; }
+    }
+    positions.push({ key: c.key, col: best, yPx: bestY, w, hPx });
+    for (let k = best; k < best + w; k++) colY[k] = bestY + hPx + GRID.gap;
+  }
+  return { positions, totalH: positions.length ? Math.max(...colY) - GRID.gap : 0 };
+}
+
 /**
  * 声明校验（§7 fail-loud 表，画不画得出一问）；返回 null = 可画。
  * 清单已判的死刑（error 条目）不会走到这里——那是 app 层的短路。
