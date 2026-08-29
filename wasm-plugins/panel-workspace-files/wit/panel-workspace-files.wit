@@ -1,0 +1,13 @@
+// panel-workspace-files 服务装配单元（面板改写 #4，D-190）：工作区文件清单卡。
+//
+// 复用 `dsh:host-remote/remote` 与 `dsh:host-remote/host-services` 同一接口身份：
+// 宿主 `WasmRemoteEndpointPlugin` 零改动即可加载（namespace = panel-workspace-files）。
+package dsh:panel-workspace-files;
+
+use dsh:host-remote/remote;
+use dsh:host-remote/host-services;
+
+world panel-workspace-files {
+  export remote;
+  import host-services;
+}

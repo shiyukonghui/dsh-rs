@@ -640,5 +640,13 @@ mod tests {
             .unwrap_or_else(|| panic!("动态插件卡应在清单里，得 {:?}", m.cards));
         assert_eq!(dyn_card["type"], "runtime");
         assert_eq!(dyn_card["cardId"], "panel-dynamic-plugins.list");
+        // 面板改写 #4（D-190）：工作区文件卡（第五卡，resource 分类首卡）。
+        let ws = m
+            .cards
+            .iter()
+            .find(|c| c["pluginName"] == "panel-workspace-files")
+            .unwrap_or_else(|| panic!("工作区文件卡应在清单里，得 {:?}", m.cards));
+        assert_eq!(ws["type"], "resource");
+        assert_eq!(ws["cardId"], "panel-workspace-files.list");
     }
 }

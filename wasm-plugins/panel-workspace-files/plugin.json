@@ -1,0 +1,6 @@
+{
+  "wasm": "target/wasm32-wasip1/debug/panel_workspace_files_plugin.wasm",
+  "web": "web",
+  "caps": ["remote"],
+  "world": "remote"
+}
