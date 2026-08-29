@@ -2,4 +2,6 @@
 //! 零 DOM/零 fetch（与 core.js 同不变式：一切可证的都在这一层证）。
 
 pub mod layout;
+pub mod model;
 pub mod schema;
+pub mod values;
