@@ -9,7 +9,7 @@ use wasm_bindgen_futures::spawn_local;
 use serde_json::{json, Value};
 
 use canvas_shell::chat::{chat_fold_frame, chat_options};
-use canvas_shell::layout::{columns_for_width, layout_grid, layout_measured, GRID_COL, GRID_GAP};
+use canvas_shell::layout::{columns_for_width, layout_grid, layout_measured_avoid, GRID_COL, GRID_GAP};
 use canvas_shell::model::{build_model, focus_key, validate_declaration};
 use canvas_shell::schema::{ns_select_model, schema_fields};
 use canvas_shell::values::{collect_values, list_rows, needs_confirm, poll_decision, row_action_body, status_items};
@@ -833,14 +833,21 @@ pub fn App() -> Element {
         crate::interop::spawn_poll(move || { let mut b = b; *b.write() += 1; }, 1500);
         crate::interop::observe_bump(move || { let mut b = b; *b.write() += 1; });
         // D-214：拖拽落位 → 写当前板钉位（一次性写信号+存储；期间零信号风暴）。
-        let mut pos_d = pos;
+        // D-215：钉前磁吸——吸附列栅格且必落非重叠空格（所见即所记）。
+        let pos_d = pos;
         let sel_d = selected;
         crate::interop::install_drag_listener(move |id, x, y| {
             let board = canvas_shell::board::board_of(sel_d.read().as_ref()).to_string();
+            let (own_w, own_h) = crate::interop::card_own_size(&id);
+            let w_cols = ((own_w + 10.0) / (260.0 + 10.0)).round().max(1.0);
+            let cols = (crate::interop::workbench_width() as f64 / (260.0 + 10.0)).floor().max(1.0);
+            let others = crate::interop::other_card_rects(&id);
+            let (sx, sy) = canvas_shell::board::snap_slot(w_cols, own_h, x, y, &others, cols);
+            crate::interop::set_card_pos(&id, sx, sy);
             {
                 let mut pd = pos_d;
                 let mut p = pd.write();
-                canvas_shell::board::set_pin(&mut p, &board, &id, x, y);
+                canvas_shell::board::set_pin(&mut p, &board, &id, sx, sy);
                 crate::interop::ls_set_pos(&p);
             }
         });
@@ -874,7 +881,15 @@ pub fn App() -> Element {
             .collect();
         let heights: std::collections::HashMap<String, i64> =
             metrics.iter().map(|(k, h, _)| (k.clone(), *h as i64)).collect();
-        let (positions, auto_total) = layout_measured(&items, cols);
+        // D-215：钉卡矩形=障碍，未钉卡绕行（永不再流进钉区）。
+        let obstacles: Vec<(f64, f64, f64, f64)> = pins
+            .iter()
+            .filter_map(|(k, x, y)| {
+                let m = metrics.iter().find(|(mk, _, _)| mk == k)?;
+                Some((*x, *y, m.2 * GRID_COL as f64 + (m.2 - 1.0) * GRID_GAP as f64, m.1))
+            })
+            .collect();
+        let (positions, auto_total) = layout_measured_avoid(&items, cols, &obstacles);
         let auto: Vec<(String, i64, i64)> = positions
             .into_iter()
             .map(|p| (p.key, p.col as i64 * (GRID_COL + GRID_GAP), p.y_px))
@@ -924,7 +939,7 @@ pub fn App() -> Element {
         .iter()
         .map(|p| (p.key.clone(), (p.col as i64 * (GRID_COL + GRID_GAP)) as f64, (p.row * (100 + GRID_GAP)) as f64))
         .collect();
-    let mut pos_r = pos;
+    let pos_r = pos;
     let board_r = board.clone();
     let mut bump_r = bump;
 

@@ -61,6 +61,16 @@ pub struct MeasuredPlacement {
 
 /// D-209 实测装箱：真实 hPx 入位，矩形互不重叠。
 pub fn layout_measured(cards: &[Value], columns: usize) -> (Vec<MeasuredPlacement>, i64) {
+    layout_measured_avoid(cards, columns, &[])
+}
+
+/// D-215 避障实测装箱：obstacles=(x,y,w,h) 像素矩形（钉卡区）。
+/// 候选位下沉直到与一切障碍无交集——钉卡怎么放，装箱卡都绕着走。
+pub fn layout_measured_avoid(
+    cards: &[Value],
+    columns: usize,
+    obstacles: &[(f64, f64, f64, f64)],
+) -> (Vec<MeasuredPlacement>, i64) {
     let c_n = columns.max(1);
     let mut col_y = vec![0i64; c_n];
     let mut out: Vec<MeasuredPlacement> = Vec::new();
@@ -75,7 +85,21 @@ pub fn layout_measured(cards: &[Value], columns: usize) -> (Vec<MeasuredPlacemen
         let mut best = 0usize;
         let mut best_y = i64::MAX;
         for s in 0..=(c_n - w) {
-            let y = col_y[s..s + w].iter().copied().max().unwrap_or(0);
+            let mut y = col_y[s..s + w].iter().copied().max().unwrap_or(0);
+            // 下沉直到避开一切障碍（障碍有限 ⇒ 必终止）。
+            let mut guard = 0;
+            while guard < 64 {
+                let hit = obstacles.iter().find(|(ox, oy, ow, oh)| {
+                    let ax = (s as i64 * (GRID_COL + GRID_GAP)) as f64;
+                    let aw = (w as i64 * GRID_COL + (w as i64 - 1) * GRID_GAP) as f64;
+                    ax < *ox + *ow && *ox < ax + aw && (y as f64) < *oy + *oh && *oy < y as f64 + h_px as f64
+                });
+                match hit {
+                    Some(ob) => y = (ob.1 + ob.3 + GRID_GAP as f64).ceil() as i64,
+                    None => break,
+                }
+                guard += 1;
+            }
             if y < best_y {
                 best_y = y;
                 best = s;
@@ -181,5 +205,30 @@ mod tests {
         let (pos, _) = layout_measured(&cards, 2);
         assert_eq!(pos.len(), 1);
         assert_eq!(pos[0].key, "ok");
+    }
+
+    /// D-215：无障碍=原行为；有障碍=候选下沉绕行，永不与障碍相交。
+    #[test]
+    fn layout_measured_avoid_routes_around_obstacles() {
+        let cards = vec![card("a", 1, 100, true), card("b", 1, 100, true), card("c", 2, 60, true)];
+        let (plain, _) = layout_measured(&cards, 3);
+        let (same, _) = layout_measured_avoid(&cards, 3, &[]);
+        assert_eq!(plain, same, "无障碍=原样");
+        // 障碍竖占第 1 列 0..250（像素 x=270..530）
+        let obstacles = vec![(270.0f64, 0.0, 260.0, 250.0)];
+        let (pos, _total) = layout_measured_avoid(&cards, 3, &obstacles);
+        for p in &pos {
+            let ax = (p.col as i64 * (GRID_COL + GRID_GAP)) as f64;
+            let aw = (p.w as i64 * GRID_COL + (p.w as i64 - 1) * GRID_GAP) as f64;
+            let (ox, oy, ow, oh) = obstacles[0];
+            let hit = ax < ox + ow && ox < ax + aw && (p.y_px as f64) < oy + oh && oy < p.y_px as f64 + p.h_px as f64;
+            assert!(!hit, "装箱卡 {} 撞上障碍 {:?}", p.key, p);
+        }
+        // 互不重叠不变式在有障碍时同样成立
+        for i in 0..pos.len() {
+            for j in i + 1..pos.len() {
+                assert!(!overlap(&pos[i], &pos[j]), "重叠 {}×{}", pos[i].key, pos[j].key);
+            }
+        }
     }
 }

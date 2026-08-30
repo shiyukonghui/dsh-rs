@@ -145,7 +145,7 @@ await send("Page.navigate", { url: URL_ + "#board=session" }); await sleep(4500)
 R.T13_deeplink = await evl(`(()=>{const cs=[...document.querySelectorAll('#workbench .card')];return JSON.stringify({n:cs.length, allSession:cs.length>0&&cs.every(c=>{const t=c.querySelector('.badges .type');return t&&t.textContent==='session';})})})()`);
 await send("Page.navigate", { url: "about:blank" }); await sleep(400);
 await send("Page.navigate", { url: URL_ }); await sleep(4500);
-// T14 拖拽摆位（CDP 真事件）：拖动首卡 → 位移≈拖距 + 钉位持久 + 板间零牵连 → 刷新持久 → 重置
+// T14 拖拽摆位（CDP 真事件）：拖首卡落位 → 钉位持久 + 板间零牵连（D-215 后位移=磁吸槽位差，非拖距） → 刷新持久 → 重置
 {
   const geo = JSON.parse(await evl(`(()=>{const c=document.querySelector('#workbench .card');const cap=c.querySelector('.cap').getBoundingClientRect();return JSON.stringify({id:c.id,x:Math.round(cap.x+70),y:Math.round(cap.y+cap.height/2),left:parseFloat(c.style.left)||0,top:parseFloat(c.style.top)||0})})()`));
   const idj = JSON.stringify(geo.id);
@@ -173,6 +173,22 @@ await send("Page.navigate", { url: URL_ }); await sleep(4500);
     b.click(); await new Promise(r=>setTimeout(r,800));
     const pos=JSON.parse(localStorage.getItem('dsh.canvas.pos')||'{}');
     return JSON.stringify({allGone:!(pos.all&&Object.keys(pos.all).length), btnGone:!document.getElementById('reset-positions')})})()`);
+}
+// T15 磁吸防重叠：把首卡直接压到次卡上松手 → 落位磁吸空格 + 全桌两两零重叠（松手后+脉冲重排后各测一次）
+{
+  const g = JSON.parse(await evl(`(()=>{const cs=[...document.querySelectorAll('#workbench .card')];const ra=cs[0].querySelector('.cap').getBoundingClientRect();const rb=cs[1].getBoundingClientRect();return JSON.stringify({aid:cs[0].id,ax:Math.round(ra.x+70),ay:Math.round(ra.y+ra.height/2),tx:Math.round(rb.x+Math.min(rb.width/2,120)),ty:Math.round(rb.y+18)})})()`));
+  await send("Input.dispatchMouseEvent",{type:"mousePressed",x:g.ax,y:g.ay,button:"left",clickCount:1});
+  for(let i=1;i<=6;i++){ await send("Input.dispatchMouseEvent",{type:"mouseMoved",x:Math.round(g.ax+(g.tx-g.ax)*i/6),y:Math.round(g.ay+(g.ty-g.ay)*i/6),button:"left"}); }
+  await send("Input.dispatchMouseEvent",{type:"mouseReleased",x:g.tx,y:g.ty,button:"left",clickCount:1});
+  await sleep(700);
+  const ovscan = `(()=>{const rs=[...document.querySelectorAll('#workbench .card')].map(c=>({l:c.offsetLeft,t:c.offsetTop,w:c.offsetWidth,h:c.offsetHeight}));let ov=0;for(let i=0;i<rs.length;i++)for(let j=i+1;j<rs.length;j++){const a=rs[i],b=rs[j];if(!(a.l+a.w<=b.l||b.l+b.w<=a.l||a.t+a.h<=b.t||b.t+b.h<=a.t))ov++;}return ov})()`;
+  const ov0 = await evl(ovscan);
+  await sleep(1800);
+  const ov1 = await evl(ovscan);
+  const pinned = await evl(`!!((JSON.parse(localStorage.getItem('dsh.canvas.pos')||'{}').all||{})[${JSON.stringify(g.aid)}])`);
+  R.T15_noOverlap = JSON.stringify({ovAfterDrop:ov0, ovAfterPulse:ov1, pinned});
+  await evl(`(()=>{const b=document.getElementById('reset-positions'); b&&b.click(); return 'ok'})()`);
+  await sleep(700);
 }
 let t7 = { note: "skipped" };
 try {

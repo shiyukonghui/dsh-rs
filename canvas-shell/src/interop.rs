@@ -340,6 +340,45 @@ pub fn card_metrics() -> Vec<(String, f64, f64)> {
     out
 }
 
+/// D-215：同板其它在排卡的矩形（工作台偏移坐标，供磁吸判撞）。
+pub fn other_card_rects(exclude_id: &str) -> Vec<(f64, f64, f64, f64)> {
+    let mut out = Vec::new();
+    let Ok(nodes) = doc().query_selector_all("#workbench .card") else { return out };
+    for i in 0..nodes.length() {
+        let Some(node) = nodes.item(i) else { continue };
+        let Ok(el) = node.dyn_into::<HtmlElement>() else { continue };
+        if el.id() == exclude_id {
+            continue;
+        }
+        out.push((
+            el.offset_left() as f64,
+            el.offset_top() as f64,
+            el.offset_width() as f64,
+            el.offset_height() as f64,
+        ));
+    }
+    out
+}
+
+/// D-215：指定卡自身实测尺寸 (w_px, h_px)。
+pub fn card_own_size(id: &str) -> (f64, f64) {
+    match doc().get_element_by_id(id) {
+        Some(node) => {
+            let Ok(el) = node.dyn_into::<HtmlElement>() else { return (270.0, 300.0) };
+            (el.offset_width() as f64, el.offset_height() as f64)
+        }
+        None => (270.0, 300.0),
+    }
+}
+
+/// D-215：单卡即时写位（磁吸后所见即所记，不等下一脉冲）。
+pub fn set_card_pos(id: &str, x: f64, y: f64) {
+    if let Some(el) = doc().get_element_by_id(id).and_then(|e| e.dyn_into::<HtmlElement>().ok()) {
+        let _ = el.style().set_property("left", &format!("{}px", x));
+        let _ = el.style().set_property("top", &format!("{}px", y));
+    }
+}
+
 /// 写回坐标（按 id 直取）+ 工作区总高。positions: key → [x, y]。
 pub fn set_positions(positions: &serde_json::Map<String, Value>, total_h: f64) {
     for (key, xy) in positions {
