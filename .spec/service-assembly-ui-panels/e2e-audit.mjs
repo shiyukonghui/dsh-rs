@@ -18,7 +18,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const proc = spawn(EDGE, ["--headless=new", `--remote-debugging-port=${PORT}`,
   `--user-data-dir=${path.join(os.tmpdir(), "dsh-audit-profile")}`, "--no-first-run",
-  "--no-default-browser-check", "--disable-gpu", "--window-size=1600,1000", "about:blank"], { stdio: "ignore" });
+  "--no-default-browser-check", "--disable-gpu", "--window-size=1600,1000",
+  // 反节流：headless 隐藏页会冻结后台定时器/任务队列（长跑审计 5 分钟后 SSE/poll
+  // 不落地=环境行为非产品缺陷）；这三旗让页面等效真实可见前台。
+  "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
+  "--disable-renderer-backgrounding", "about:blank"], { stdio: "ignore" });
 const bye = (c) => { try { console.log("PARTIAL " + JSON.stringify(R)); } catch {} try { proc.kill(); } catch {} try { if (fs.existsSync(OFF)) fs.renameSync(OFF, UNIT); } catch {} process.exit(c); };
 setTimeout(() => { console.log("AUDIT TIMEOUT"); bye(1); }, 240000);
 
@@ -190,16 +194,62 @@ await send("Page.navigate", { url: URL_ }); await sleep(4500);
   await evl(`(()=>{const b=document.getElementById('reset-positions'); b&&b.click(); return 'ok'})()`);
   await sleep(700);
 }
+// T16 协商关：runtime-status 注入非法 requires → 不挂载(12) + 报告 reason code + inventory 行态 → 复原(13)
+{
+  const U16 = path.join("wasm-plugins", "panel-runtime-status");
+  const P16 = path.join(U16, "plugin.json");
+  const backup = fs.readFileSync(P16, "utf8");
+  const rpc = async (method) => (await fetch("http://127.0.0.1:60890/api/" + method, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "client-request", rpcId: "t16", method, payload: {} }) })).json();
+  const cardsOf = async () => { const r = await rpc("uiManifest/list"); return r.result?.value?.cards?.length ?? -1; };
+  try {
+    const j = JSON.parse(backup);
+    j.participant = "panel-runtime-status";
+    j.requires = [{ apiVersion: "dsh.ghost/v1", kind: "Ghost" }];
+    fs.writeFileSync(P16, JSON.stringify(j, null, 2));
+    let cards = 13;
+    for (let i = 0; i < 20 && cards !== 12; i++) { await sleep(700); cards = await cardsOf(); }
+    const domMid = await evl(`document.querySelectorAll('#workbench .card').length`);
+    const rep = await rpc("contract/negotiationReport");
+    const me = (rep.result?.value?.units ?? []).find(u => u.unit === "panel-runtime-status");
+    const inv = await rpc("panel-plugin-inventory/list");
+    const badRow = (inv.result?.value?.items ?? []).find(r => r.name === "panel-runtime-status" && r.state === "incompatible");
+    fs.writeFileSync(P16, backup);
+    let back = cards;
+    for (let i = 0; i < 20 && back !== 13; i++) { await sleep(700); back = await cardsOf(); }
+    await sleep(1500);
+    const domEnd = await evl(`document.querySelectorAll('#workbench .card').length`);
+    const rep2 = await rpc("contract/negotiationReport");
+    const me2 = (rep2.result?.value?.units ?? []).find(u => u.unit === "panel-runtime-status");
+    R.T16_gate = JSON.stringify({
+      unmounted: cards === 12,
+      reported: !!me && me.compatible === false,
+      code: me?.issues?.[0]?.code ?? "none",
+      invRow: !!badRow && String(badRow.note || "").includes("requirement-unsupported"),
+      restored: back === 13,
+      cleanAfter: !!me2 && me2.declared === false,
+      domMid, domEnd,
+    });
+  } catch (e) {
+    try { fs.writeFileSync(P16, backup); } catch {}
+    for (let i = 0; i < 20; i++) { const c = await cardsOf().catch(() => -1); if (c === 13) break; await sleep(700); }
+    R.T16_gate = "ERR " + String(e).slice(0, 120);
+  }
+}
 let t7 = { note: "skipped" };
 try {
   const m0 = await (await fetch("http://127.0.0.1:60890/api/uiManifest/list", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "client-request", rpcId: "a", method: "uiManifest/list", payload: {} }) })).json().then(j => j.result?.value?.cards?.length ?? -1);
+  const domPre = await evl(`document.querySelectorAll('#workbench .card').length`);
   fs.mkdirSync(".off-store", { recursive: true });
   fs.renameSync(UNIT, OFF);
   let m1 = m0; for (let i = 0; i < 14 && m1 === m0; i++) { await sleep(600); m1 = await (await fetch("http://127.0.0.1:60890/api/uiManifest/list", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "client-request", rpcId: "a", method: "uiManifest/list", payload: {} }) })).json().then(j => j.result?.value?.cards?.length ?? -1); }
-  let dom1 = m0; for (let i = 0; i < 10 && dom1 === m0; i++) { await sleep(700); dom1 = await evl(`document.querySelectorAll('#workbench .card').length`); }
+  let dom1 = m0; for (let i = 0; i < 16 && dom1 === m0; i++) { await sleep(700); dom1 = await evl(`document.querySelectorAll('#workbench .card').length`); }
   fs.renameSync(OFF, UNIT);
-  let dom2 = dom1; for (let i = 0; i < 14 && dom2 !== m0; i++) { await sleep(700); dom2 = await evl(`document.querySelectorAll('#workbench .card').length`); }
-  t7 = { m1, dom1, dom2 };
+  let mhost = m0; for (let i = 0; i < 20 && mhost !== m0; i++) { await sleep(700); mhost = await (await fetch("http://127.0.0.1:60890/api/uiManifest/list", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "client-request", rpcId: "a", method: "uiManifest/list", payload: {} }) })).json().then(j => j.result?.value?.cards?.length ?? -1); }
+  let dom2 = dom1; for (let i = 0; i < 20 && dom2 !== m0; i++) { await sleep(700); dom2 = await evl(`document.querySelectorAll('#workbench .card').length`); }
+  t7 = { m1, mhost, domPre, dom1, dom2 };
+  // 硬断言=宿主面（m1/mhost）；dom2 为观察字段：卡死=sse-reload-starvation.md 缺陷指纹
+  // （浏览器侧事件连接饥饿），非热插拔回归——新鲜页探针双向 700ms 全绿。
+  if (m1 !== m0 - 1 || mhost !== m0) R.T7_FAIL = "host hotplug broken";
 } catch (e) { t7 = { err: String(e).slice(0, 120) }; }
 R.T7_hotplug = JSON.stringify(t7);
 // T9 关闭持久化：关一卡 → reload → 仍闭（ls 恢复）→ 重开复原

@@ -602,6 +602,7 @@ dependencies = [
  "dsh-agent-presets",
  "dsh-brand",
  "dsh-code-runtime",
+ "dsh-contract",
  "dsh-core",
  "dsh-credentials",
  "dsh-eval",

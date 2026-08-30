@@ -65,6 +65,9 @@ pub mod ui_manifest;
 /// D-184：桌布 C3——`/canvas` 独立视图路由（壳资产编译进二进制；miss → 404 不落 SPA）。
 pub mod canvas;
 
+/// D-216 P2：契约协商关（mount-sync 实例化前纯函数协商 + 结构化报告；三原语来自 dsh-contract）。
+pub mod contract_gate;
+
 /// M6 step5b：真实 LLM 装配（deepseek 适配器 + dsh-core 流式 HTTP 桥 + 诚实 no-key
 /// fail-loud；key 仅 `DEEPSEEK_API_KEY` 环境变量）。
 pub mod m6_llm;

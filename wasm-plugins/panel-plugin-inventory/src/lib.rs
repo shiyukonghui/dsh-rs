@@ -31,7 +31,8 @@ fn ui_declaration() -> Value {
             "columns": [
                 { "key": "name", "label": "插件" },
                 { "key": "id", "label": "入口" },
-                { "key": "state", "label": "状态" }
+                { "key": "state", "label": "状态" },
+                { "key": "note", "label": "说明" }
             ],
             "rowsPath": "items",
             "actions": [],
@@ -69,7 +70,7 @@ fn list(_body: &Value) -> Vec<u8> {
         return serde_json::to_vec(&json!({ "ok": false, "error": err })).unwrap_or_default();
     }
     let entries = proj.get("entries").and_then(Value::as_array).cloned().unwrap_or_default();
-    let items: Vec<Value> = entries
+    let mut items: Vec<Value> = entries
         .iter()
         .filter(|e| e.get("group").and_then(Value::as_bool) != Some(true))
         .map(|e| {
@@ -84,9 +85,37 @@ fn list(_body: &Value) -> Vec<u8> {
                 "name": e.get("name").cloned().unwrap_or(Value::Null),
                 "id": e.get("id").cloned().unwrap_or(Value::Null),
                 "state": state,
+                "note": "",
             })
         })
         .collect();
+    // D-216 P2：协商不兼容单元并进清单行（state=incompatible + reason codes）。
+    // 报告面失败**非致命**（清单主体仍诚实呈现；报告缺失≠全兼容断言）。
+    let contract: Value = serde_json::from_slice(&host_services::get("contract", b"{}")).unwrap_or(Value::Null);
+    if let Some(units) = contract.get("value").and_then(|v| v.get("units")).and_then(Value::as_array) {
+        for u in units {
+            if u.get("declared").and_then(Value::as_bool) == Some(true)
+                && u.get("compatible").and_then(Value::as_bool) == Some(false)
+            {
+                let codes: Vec<String> = u
+                    .get("issues")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|i| i.get("code").and_then(Value::as_str))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                items.push(json!({
+                    "name": u.get("unit").cloned().unwrap_or(Value::Null),
+                    "id": "—",
+                    "state": "incompatible",
+                    "note": codes.join(", "),
+                }));
+            }
+        }
+    }
     serde_json::to_vec(&json!({ "ok": true, "value": { "items": items } })).unwrap_or_default()
 }
 

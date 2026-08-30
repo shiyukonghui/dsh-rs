@@ -266,6 +266,8 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
     boot.remote_plugin = Some(std::rc::Rc::new(std::cell::RefCell::new(remote_plugin)));
     boot.remote_projector = Some(remote_projector);
 
+    // D-216 P2：协商报告基准目录（RPC/投影两处现扫现算的唯一路径来源）。
+    crate::contract_gate::set_report_base(&cfg.wasm_base);
     // P2/D-185（服务装配单元）：发现挂载——扫描 wasm_base 下 plugin.json
     // world:"remote" 的包（每装配单元一载体 + `/plugins/<name>/**` 静态面，D-175）。
     // 缺构建物 → 尝试构建一次；仍缺 → 跳过 + 诚实提示（不炸 serve）；构件存在但
@@ -1326,11 +1328,25 @@ pub fn scan_remote_units_opts(
             eprintln!("dsh web: skip remote unit {name}: unreadable plugin.json");
             continue;
         };
-        match serde_json::from_str::<Value>(&text) {
-            Ok(j) if j.get("world").and_then(|w| w.as_str()) == Some("remote") => {}
+        let j = match serde_json::from_str::<Value>(&text) {
+            Ok(j) if j.get("world").and_then(|w| w.as_str()) == Some("remote") => j,
             Ok(_) => continue,
             Err(e) => {
                 eprintln!("dsh web: skip remote unit {name}: bad plugin.json: {e}");
+                continue;
+            }
+        };
+        // D-216 P2 协商关：有声明（participant/requires/supports 任一键）→ 实例化前
+        // 纯函数协商；不兼容 → 不挂载（理由进报告面，经 RPC/inventory 可见）。
+        if let Some(rep) = crate::contract_gate::negotiate_unit(&name, &j) {
+            if !rep.compatible {
+                let codes: Vec<&str> = rep
+                    .issues
+                    .iter()
+                    .filter(|i| i.severity == dsh_contract::catalog::Severity::Error)
+                    .map(|i| i.code.as_str())
+                    .collect();
+                eprintln!("dsh web: skip remote unit {name}: negotiation incompatible {codes:?}");
                 continue;
             }
         }
@@ -4663,6 +4679,8 @@ fn dispatch(boot: &Boot, method: &str, payload: &Value, host: &Arc<SessionHost>)
         // 桌布 C2（D-183）：装配单元卡片发现面——原生臂（与 pluginInventory/list 同形；
         // 实时聚合清单，禁缓存；坏声明带 error 条目）。
         "uiManifest/list" => crate::ui_manifest::ui_manifest_result(boot, payload),
+        // D-216 P2：协商报告（每请求现扫目录，禁缓存——与 uiManifest 同纪律）。
+        "contract/negotiationReport" => crate::contract_gate::report_value(),
         m if m.starts_with("dynamicCordisRunner/") || m.starts_with("pluginInventory/")
             || m.starts_with("messageFeedback/") || m.starts_with("fileReferences/")
             || m.starts_with("sessionReferenceResolver/") => {

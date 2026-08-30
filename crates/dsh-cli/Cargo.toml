@@ -11,6 +11,7 @@ name = "dsh"
 path = "src/main.rs"
 
 [dependencies]
+dsh-contract = { path = "../dsh-contract" }
 dsh-core = { path = "../dsh-core" }
 dsh-loader = { path = "../dsh-loader" }
 dsh-wasmrt = { path = "../dsh-wasmrt" }

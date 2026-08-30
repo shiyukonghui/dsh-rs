@@ -12,7 +12,8 @@
     "columns": [
       { "key": "name", "label": "插件" },
       { "key": "id", "label": "入口" },
-      { "key": "state", "label": "状态" }
+      { "key": "state", "label": "状态" },
+      { "key": "note", "label": "说明" }
     ],
     "rowsPath": "items",
     "actions": [],

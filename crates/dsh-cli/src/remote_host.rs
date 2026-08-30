@@ -266,6 +266,8 @@ impl RemoteServiceProjector for RemoteHost {
                 "entries": self.loader_entries_json(),
             }))
             .unwrap_or_default(),
+            // D-216 P2：协商报告面（inventory 单元据此把不兼容单元并进清单行）。
+            "contract" => serde_json::to_vec(&crate::contract_gate::report_value()).unwrap_or_default(),
             // dynamicCordisRunner/inventory 数据源（阶段 C 真实语义）：dynamic 注册表的
             // 包定义（packages = 该插件已定义的全部不可变版本，对齐 TS define order）+
             // 装配状态（entry 是否 active → latestRun）。无包在跑 → 诚实无 latestRun/activeRun。
