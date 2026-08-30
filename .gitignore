@@ -20,3 +20,6 @@ DSH-插件开发经验.md
 /.spec/service-assembly-ui-panels/e2e-shots/
 /.off-store/
 *_MSG_TMP.txt
+
+# 嵌套参考仓库（dsh-std 元协议只读参考，不入库）
+/dsh-std/
