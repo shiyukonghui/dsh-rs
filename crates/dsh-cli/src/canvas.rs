@@ -35,13 +35,13 @@ pub fn canvas_response(path: &str) -> Option<(u16, &'static str, &'static [u8])>
     if path == "/canvas/rust" || path == "/canvas/rust/" {
         let body = SHELL_ASSETS
             .iter()
-            .find(|(p, _)| *p == "rust.html")
-            .map(|(_, b)| *b)?;
+            .find(|(p, _, _)| *p == "rust.html")
+            .map(|(_, b, _)| *b)?;
         return Some((200, "text/html; charset=utf-8", body));
     }
     if let Some(rel) = path.strip_prefix("/canvas/rust/assets/") {
         let rel = rel.trim_start_matches('/');
-        let (_, body) = SHELL_ASSETS.iter().find(|(p, _)| *p == rel)?;
+        let (_, body, _) = SHELL_ASSETS.iter().find(|(p, _, _)| *p == rel)?;
         return Some((200, shell_mime(rel), body));
     }
     let (ct, body) = match path {
@@ -52,6 +52,23 @@ pub fn canvas_response(path: &str) -> Option<(u16, &'static str, &'static [u8])>
         _ => return None,
     };
     Some((200, ct, body))
+}
+
+/// S5 尾项：带内容协商的响应——第四值 = Content-Encoding。`gz_ok` 且该件有构建期
+/// 预压缩产物 → gzip 字节；否则原样。纯函数可测；miss 仍 None（404 铁律不变）。
+pub fn canvas_response_enc(path: &str, gz_ok: bool) -> Option<(u16, &'static str, &'static [u8], Option<&'static str>)> {
+    let (status, ct, body) = canvas_response(path)?;
+    if gz_ok {
+        if let Some(rel) = path.strip_prefix("/canvas/rust/assets/") {
+            let rel = rel.trim_start_matches('/');
+            if let Some((_, _, gz)) = SHELL_ASSETS.iter().find(|(p, _, _)| *p == rel) {
+                if !gz.is_empty() {
+                    return Some((status, ct, *gz, Some("gzip")));
+                }
+            }
+        }
+    }
+    Some((status, ct, body, None))
 }
 
 #[cfg(test)]
@@ -148,8 +165,26 @@ mod tests {
         assert_eq!(ct3, "application/wasm");
         assert!(b3.starts_with(b"\0asm"), "wasm 魔数");
         // snippets 相对导入面：表里有的必须可按 assets 前缀命中（mime=js）。
-        let snip = SHELL_ASSETS.iter().find(|(p, _)| p.starts_with("snippets/")).expect("snippets 存在");
+        let snip = SHELL_ASSETS.iter().find(|(p, _, _)| p.starts_with("snippets/")).expect("snippets 存在");
         let hit = canvas_response(&format!("/canvas/rust/assets/{}", snip.0)).expect("snippet 命中");
         assert_eq!(hit.1, "text/javascript; charset=utf-8");
+    }
+
+    /// S5 尾项：gzip 内容协商——accept 方得预压缩件（magic+头），拒绝方得原样；
+    /// 未知路径在协商面同样 miss（404 铁律不破）。
+    #[test]
+    fn rust_shell_gzip_negotiation() {
+        let p = "/canvas/rust/assets/canvas-shell_bg.wasm";
+        let (_s, _ct, body, enc) = canvas_response_enc(p, true).expect("gz served");
+        assert_eq!(enc, Some("gzip"));
+        assert!(body.starts_with(&[0x1f, 0x8b]), "gzip magic");
+        let (_s2, _ct2, raw, enc2) = canvas_response_enc(p, false).expect("raw served");
+        assert_eq!(enc2, None);
+        assert!(raw.starts_with(b"\0asm"), "raw 仍是 wasm");
+        assert!(raw.len() > body.len(), "gzip 必须真瘦身");
+        assert!(canvas_response_enc("/canvas/rust/nope.js", true).is_none());
+        // 非 Rust 壳面（旧 JS 资产）不经 gzip 表，恒原样。
+        let (_s3, _ct3, _b3, enc3) = canvas_response_enc("/canvas/assets/app.js", true).expect("js served");
+        assert_eq!(enc3, None);
     }
 }

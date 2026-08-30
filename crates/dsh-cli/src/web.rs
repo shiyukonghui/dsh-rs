@@ -1112,11 +1112,19 @@ fn dispatch_request(
     // 桌布 C3（D-184）：`/canvas` 独立视图（资产编译进二进制，零依赖 harness dist）。
     // 未识别的 /canvas/* → 404——**绝不回落 SPA**（防「桌布失踪变前端」的诡异现场）。
     if path == "/canvas" || path.starts_with("/canvas/") {
-        match crate::canvas::canvas_response(&path) {
-            Some((status, ct, body)) => {
-                let resp = Response::from_data(body.to_vec())
+        // S5 尾项：Accept-Encoding: gzip → 预压缩件（构建期表，纯协商无运行时压缩）。
+        let gz_ok = request
+            .headers()
+            .iter()
+            .any(|h| h.field.equiv("Accept-Encoding") && h.value.as_str().contains("gzip"));
+        match crate::canvas::canvas_response_enc(&path, gz_ok) {
+            Some((status, ct, body, enc)) => {
+                let mut resp = Response::from_data(body.to_vec())
                     .with_status_code(status)
                     .with_header(Header::from_bytes(&b"Content-Type"[..], ct.as_bytes()).unwrap());
+                if let Some(ce) = enc {
+                    resp.add_header(Header::from_bytes(&b"Content-Encoding"[..], ce.as_bytes()).unwrap());
+                }
                 let _ = request.respond(resp);
             }
             None => {

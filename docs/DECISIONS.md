@@ -8475,7 +8475,14 @@ Rust；S0–S6 切分，每片 TDD；node 35 测断言逐条移植 cargo 测，�
   内嵌件 **1,384,902 → 937,426 字节（-32.3%）**；真路由 e2e-audit 全量复跑**全绿
   零 console 错误**（行为零变化）。配方入 build.ps1（WAO 可缺省自动跳过）。
   环境注记：binaryen windows 现行只发 tar.gz（无 zip），GitHub assets 以
-  API latest 为准（盲猜 tag 404 两次后改查 API 一次命中）。E2E 清单已同步（13 卡基线 + §1 行）。
+  API latest 为准（盲猜 tag 404 两次后改查 API 一次命中）。
+- **S5 尾项 gzip（第 57 轮）**：S5 当时记过「gzip 519KB」但压缩**传输**未实现——
+  本轮补齐。方案=**构建期预压缩**（build.rs flate2 Level::best 产 .gz 随表 include，
+  运行时零压缩开销）+ **纯协商**（web.rs 读 Accept-Encoding → canvas_response_enc
+  第四值 Content-Encoding；协商纯函数有测钉：magic/原样/瘦身/miss/旧面不动）。
+  实测：**938,129 → 367,512 字节（-61%）**，identity 客户端原样无头，
+  浏览器全量 e2e-audit 穿 gzip 全绿（透明解码）。依赖评估：flate2 纯 Rust
+  miniz_oxide 后端零 C 工具链，成熟通用直接引入（build-dependencies 位）。E2E 清单已同步（13 卡基线 + §1 行）。
 
 
 
