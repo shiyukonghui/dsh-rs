@@ -696,9 +696,12 @@ pub fn dispatch_long_rpc(
     payload: &Value,
 ) -> Value {
     match method {
-        "session.prompt" => {
-            let sid = payload.get("sessionId").and_then(|v| v.as_str()).unwrap_or("default").to_string();
-            let content = payload.get("content").cloned().unwrap_or(Value::Null);
+        "session.prompt" | "session/prompt" => {
+            // D-211：信封两形兼容——canvas/JS 壳走 D-207 规范 `payload:{args:{…}}`，
+            // 旧前端直调是平形 `{sessionId,content}`。args 在位则以 args 为准。
+            let args = payload.get("args").filter(|a| a.is_object()).unwrap_or(payload);
+            let sid = args.get("sessionId").and_then(|v| v.as_str()).unwrap_or("default").to_string();
+            let content = args.get("content").cloned().unwrap_or(Value::Null);
             let host = match facts.agent_loop.as_ref() {
                 Some(h) => h.clone(),
                 None => {
@@ -717,6 +720,13 @@ pub fn dispatch_long_rpc(
                         (b.get("type").and_then(|t| t.as_str()) == Some("text"))
                             .then(|| b.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string())
                     })
+                })
+                // D-211：canvas UI 契约短形 {sessionId, text}（sendRpc 声明面 join "/"）
+                // ——content 缺位时回落 text 字段。
+                .or_else(|| {
+                    args.get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
                 })
                 .unwrap_or_default();
             match crate::run_rust_loop_on_host(&host, &sid, &text) {
@@ -11082,6 +11092,81 @@ mod tests {
     }
 
     /// D-115（Phase 4 serve worker 化）：完整装配路径下，长 RPC 走 **worker 线程**
+    /// D-211：UI 契约的斜杠形 sendRpc（["session","prompt"] join "/"）+ canvas 短载荷
+    /// {sessionId,text}——必须与旧前端 content 块形等价（历史半修：白名单放进斜杠形
+    /// 但 dispatch 只匹点形；且只认 content 让 canvas 的 text 被空块吞掉）。
+    #[test]
+    fn dispatch_long_rpc_accepts_canvas_slash_text_form() {
+        use std::collections::VecDeque;
+        let session_host = SessionHost::in_memory();
+        let _ = session_host.session("default");
+        let root = std::env::temp_dir().join(format!("dsh-m6-canvas-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let script = Arc::new(Mutex::new(VecDeque::from_iter([vec![
+            dsh_llm::StreamChunk::BlockStart {
+                index: 0,
+                block_type: "text".parse().unwrap(),
+            },
+            dsh_llm::StreamChunk::TextDelta { index: 0, text: "echo via canvas".into() },
+            dsh_llm::StreamChunk::BlockEnd {
+                index: 0,
+                block: dsh_llm::ContentBlock::text("echo via canvas"),
+            },
+            dsh_llm::StreamChunk::Finish {
+                reason: dsh_llm::FinishReason::Stop,
+                replay_state: None,
+            },
+        ]])));
+        struct Adapter {
+            script: Arc<Mutex<VecDeque<Vec<dsh_llm::StreamChunk>>>>,
+        }
+        impl dsh_llm::LlmAdapter for Adapter {
+            fn stream(
+                &self,
+                _options: dsh_llm::GenerateOptions,
+            ) -> Box<dyn Iterator<Item = dsh_llm::StreamChunk>> {
+                let next = self.script.lock().unwrap().pop_front().unwrap_or_default();
+                Box::new(next.into_iter())
+            }
+        }
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
+        llm.register_adapter(&["mock"], Arc::new(Adapter { script })).unwrap();
+        let bundle = match crate::web::assemble_server_runtime_with_llm(
+            &session_host,
+            root.clone(),
+            llm,
+            "mock",
+            "mock-model",
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("assemble deferred (bash unavailable?): {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+        };
+        let mut boot = boot_with_sessions();
+        boot.agent_loop = Some(bundle.host.clone());
+        let facts = crate::web::ServeWorkerFacts::from_boot(&boot);
+        let v = crate::web::dispatch_long_rpc(
+            &facts,
+            "session/prompt",
+            &serde_json::json!({"args": {"sessionId": "default", "text": "hi via canvas"}}),
+        );
+        assert_eq!(v["ok"], true, "slash+text 形必须受理: {v}");
+        let evs = session_host.events("default");
+        assert!(
+            evs.iter().any(|e| e.kind.as_str() == "user/message"
+                && e.data.to_string().contains("hi via canvas")),
+            "D-207 args 信封形 text 必须落 user 事件（不许被空块吞掉）: {evs:?}"
+        );
+        assert!(evs.iter().any(|e| e.kind.as_str() == "assistant/message"), "turn 必须产出 assistant 事件");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// （`dispatch_long_rpc` on `ServeWorkerFacts`）与 accept 内联的 `handle_rpc_host`
     /// **同语义**——HTTP 同步契约不变（accepted + 事件落共享 store）。worker 线程
     /// 驱动真实 agent-loop；测试把 `dispatch_long_rpc` 显式放在 `std::thread::spawn`

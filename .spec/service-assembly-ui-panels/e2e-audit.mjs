@@ -108,6 +108,14 @@ R.T6_chat = await evl(`(async()=>{
   await new Promise(r=>setTimeout(r,1200));
   return JSON.stringify({bubbles:card.querySelectorAll('.chat-bubble').length});
 })()`);
+// T11 活体折叠：发送后不刷新，SSE 帧应把 turn 事件折进气泡（历史零依赖的实时证据）
+R.T11_liveFold = await evl(`(async()=>{
+  const card=[...document.querySelectorAll('.card')].find(c=>c.textContent.includes('聊天')&&c.querySelector('.chat-send,input'));
+  if(!card) return 'NO-CARD';
+  await new Promise(r=>setTimeout(r,2600));
+  const t=card.textContent;
+  return JSON.stringify({assistant:t.includes('助手'), echo:/echo|e2e-audit/.test(t)});
+})()`);
 // T7 热插拔：rename → manifest=12 → DOM 即时降 → restore → DOM 回 13
 let t7 = { note: "skipped" };
 try {
