@@ -11,7 +11,9 @@ const URL_ = process.argv[2] || "http://127.0.0.1:60890/canvas";
 const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
 const PORT = 9337;
 const UNIT = path.join("wasm-plugins", "panel-locale-edit");
-const OFF = UNIT + ".off";
+// 技术修正（第 59 轮）：rename-.off 仍在扫描树内=假卸载（mount-sync 重扫 ~1.2s 计回，
+// 旧「绿」实为瞬态窗口幸运采样）。真卸载=整目录移出 wasm-plugins（同盘树外）。
+const OFF = path.join(".off-store", "panel-locale-edit");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const proc = spawn(EDGE, ["--headless=new", `--remote-debugging-port=${PORT}`,
@@ -120,6 +122,7 @@ R.T11_liveFold = await evl(`(async()=>{
 let t7 = { note: "skipped" };
 try {
   const m0 = await (await fetch("http://127.0.0.1:60890/api/uiManifest/list", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "client-request", rpcId: "a", method: "uiManifest/list", payload: {} }) })).json().then(j => j.result?.value?.cards?.length ?? -1);
+  fs.mkdirSync(".off-store", { recursive: true });
   fs.renameSync(UNIT, OFF);
   let m1 = m0; for (let i = 0; i < 14 && m1 === m0; i++) { await sleep(600); m1 = await (await fetch("http://127.0.0.1:60890/api/uiManifest/list", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "client-request", rpcId: "a", method: "uiManifest/list", payload: {} }) })).json().then(j => j.result?.value?.cards?.length ?? -1); }
   let dom1 = m0; for (let i = 0; i < 10 && dom1 === m0; i++) { await sleep(700); dom1 = await evl(`document.querySelectorAll('#workbench .card').length`); }
