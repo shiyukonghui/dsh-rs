@@ -26,83 +26,9 @@ const DEFAULT_MAX_TOKENS: u64 = 256_000;
 
 /// 声明生产（P2：Rust 只生声明，不渲染）。
 fn ui_declaration() -> Value {
-    json!({
-        "$schema": "dsh.panel-ui/v2",
-        "kind": "card",
-        "cardId": "llm-deepseek.settings",
-        "type": "model",
-        "title": "DeepSeek Provider",
-        "description": "DeepSeek provider 连接与模型目录设置",
-        "size": { "w": 2, "h": 3 },
-        "view": {
-            "kind": "form",
-            "dataRpc": ["llm-deepseek", "currentValues"],
-            "fields": [
-            {
-                "name": "apiKeyEnv",
-                "label": "API Key 环境变量",
-                "type": "text",
-                "role": "credential-ref",
-                "default": "DEEPSEEK_API_KEY",
-                "required": true
-            },
-            {
-                "name": "baseURL",
-                "label": "Base URL",
-                "type": "text",
-                "default": "https://api.deepseek.com"
-            },
-            {
-                "name": "thinking",
-                "label": "Thinking",
-                "type": "select",
-                "options": ["enabled", "disabled"],
-                "default": "enabled"
-            },
-            {
-                "name": "reasoningEffort",
-                "label": "Reasoning Effort",
-                "type": "select",
-                "options": ["off", "low", "high", "max"],
-                "default": "high"
-            },
-            {
-                "name": "maxTokens",
-                "label": "Max Tokens",
-                "type": "number",
-                "default": DEFAULT_MAX_TOKENS,
-                "min": 1
-            },
-            {
-                "name": "defaultContextWindow",
-                "label": "Default Context Window",
-                "type": "number",
-                "default": DEFAULT_CONTEXT_WINDOW,
-                "min": 1
-            },
-            {
-                "name": "models",
-                "label": "Models（目录）",
-                "type": "list",
-                "item": {
-                    "type": "object",
-                    "fields": [
-                        { "name": "id", "label": "Model ID", "type": "text", "required": true },
-                        { "name": "name", "label": "显示名", "type": "text" },
-                        { "name": "contextWindow", "label": "Context Window", "type": "number", "min": 1 }
-                    ]
-                }
-            }
-            ],
-            "actions": [
-                { "name": "save", "label": "保存", "rpc": ["llm-deepseek", "save"], "primary": true, "valuesKey": "values" },
-                { "name": "discoverModels", "label": "发现模型", "rpc": ["llm-deepseek", "discoverModels"],
-                  "valuesKey": "values", "resultToField": "models", "resultPath": "models" }
-            ]
-        }
-    })
+    // D-225：单一事实源=web/ui.json（编译期嵌入；声明=数据，非代码）。
+    serde_json::from_str(include_str!("../web/ui.json")).expect("ui.json must be valid JSON")
 }
-
 /// 规范化错误（fail-loud：绝不伪造成功；code 用前端 RpcError 联合内的 internal）。
 fn error(code: &str, message: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({

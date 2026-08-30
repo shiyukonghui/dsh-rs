@@ -11,24 +11,9 @@ use bindings::exports::dsh::host_remote::remote::Guest;
 use serde_json::{json, Value};
 
 fn ui_declaration() -> Value {
-    json!({
-        "$schema": "dsh.panel-ui/v2",
-        "kind": "card",
-        "cardId": "panel-settings-edit.edit",
-        "type": "config",
-        "title": "设置编辑",
-        "description": "命名空间下拉 + 动态 fields 投影（D-201 一卡通用；保存带乐观锁；secrets 不可编辑）",
-        "size": { "w": 4, "h": 6 },
-        "view": {
-            "kind": "form",
-            "fieldsFrom": { "rpc": ["settings", "describe"], "pick": "ui-theme", "nsSelect": true },
-            "actions": [
-                { "name": "save", "label": "保存", "rpc": ["settings", "update"], "primary": true }
-            ]
-        }
-    })
+    // D-225：单一事实源=web/ui.json（编译期嵌入；声明=数据，非代码）。
+    serde_json::from_str(include_str!("../web/ui.json")).expect("ui.json must be valid JSON")
 }
-
 fn error(code: &str, message: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "ok": false,

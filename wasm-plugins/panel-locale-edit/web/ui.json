@@ -3,14 +3,40 @@
   "kind": "card",
   "cardId": "panel-locale-edit.edit",
   "type": "config",
-  "title": "设置编辑 · locale",
-  "description": "语言偏好（D-200 多 ns 机械复制首卡；保存带乐观锁）",
-  "size": { "w": 3, "h": 3 },
+  "title": {
+    "zh": "设置编辑 · locale",
+    "en": "Settings Editor · locale"
+  },
+  "description": {
+    "zh": "语言偏好（D-200 多 ns 机械复制首卡；保存带乐观锁）",
+    "en": "Language preference (multi-ns settings card; optimistic-locked save)"
+  },
+  "size": {
+    "w": 3,
+    "h": 3
+  },
   "view": {
     "kind": "form",
-    "fieldsFrom": { "rpc": ["settings", "describe"], "pick": "locale" },
+    "fieldsFrom": {
+      "rpc": [
+        "settings",
+        "describe"
+      ],
+      "pick": "locale"
+    },
     "actions": [
-      { "name": "save", "label": "保存", "rpc": ["settings", "update"], "primary": true }
+      {
+        "name": "save",
+        "label": {
+          "zh": "保存",
+          "en": "Save"
+        },
+        "rpc": [
+          "settings",
+          "update"
+        ],
+        "primary": true
+      }
     ]
   }
 }

@@ -169,11 +169,7 @@ fn card_entry(plugin_name: &str, decl_path: &str, decl: &Value) -> Value {
         "pluginName": plugin_name,
         "cardId": card_id,
         "type": entry_type,
-        "title": decl
-            .get("title")
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty())
-            .unwrap_or(card_id),
+        "title": card_title(decl.get("title"), card_id),
         "size": size,
         "declPath": decl_path,
     });
@@ -208,6 +204,18 @@ fn resolve_size(size: Option<&Value>, view_kind: Option<&str>) -> (Value, Option
         None
     };
     (json!({"w": cw, "h": ch}), declared)
+}
+
+/// D-225：标题=LocalizedText 契约——字符串或非空 `{任意键:字符串}` 对象原样透传
+/// （渲染端按语言解析）；缺失/空串/坏形状 → 回退 cardId（原行为）。
+fn card_title(declared: Option<&Value>, card_id: &str) -> Value {
+    match declared {
+        Some(Value::String(s)) if !s.is_empty() => json!(s),
+        Some(Value::Object(m)) if !m.is_empty() && m.values().all(Value::is_string) => {
+            declared.cloned().unwrap_or_else(|| json!(card_id))
+        }
+        _ => json!(card_id),
+    }
 }
 
 /// `rev` = SHA-256(cards canonical JSON) 小写 hex。**内容哈希非单调计数**：
@@ -590,6 +598,37 @@ mod tests {
 
     /// 测试 8：disabled 交叉——同名 entry **全部**禁用才排除；任一 enabled 出卡；
     /// 无同名 entry（试点现状）出卡；group 条目不参与匹配。
+    /// D-225：LocalizedText 标题（{zh,en}）必须原样透传（对象值渲染端解析）；
+    /// 坏形状（空对象/含非字符串值）回退 cardId。
+    #[test]
+    fn localized_title_passthrough() {
+        let (_b, pkg) = tmp_pkg("loct", "pkg-loct");
+        write_ui(
+            &pkg,
+            &json!({
+                "$schema": "dsh.panel-ui/v2", "kind": "card", "cardId": "l.c",
+                "type": "misc", "title": {"zh": "待审批", "en": "Pending"},
+                "size": {"w": 2, "h": 2}, "view": {"kind": "form", "fields": [], "actions": []}
+            })
+            .to_string(),
+        );
+        let m = build_manifest(&[pkg], &[]);
+        assert_eq!(m.cards[0]["title"], json!({"zh": "待审批", "en": "Pending"}));
+        // 坏形状回退 cardId。
+        let (_b2, pkg2) = tmp_pkg("loct2", "pkg-loct2");
+        write_ui(
+            &pkg2,
+            &json!({
+                "$schema": "dsh.panel-ui/v2", "kind": "card", "cardId": "l2.c",
+                "type": "misc", "title": {"zh": {}},
+                "size": {"w": 2, "h": 2}, "view": {"kind": "form", "fields": [], "actions": []}
+            })
+            .to_string(),
+        );
+        let m2 = build_manifest(&[pkg2], &[]);
+        assert_eq!(m2.cards[0]["title"], "l2.c", "非字符串值对象必须回退 cardId");
+    }
+
     #[test]
     fn disabled_entry_excludes_card() {
         let (base, a) = tmp_pkg("dis", "pkg-dis");

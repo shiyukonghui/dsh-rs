@@ -3,17 +3,38 @@
   "kind": "card",
   "cardId": "panel-workspace-files.list",
   "type": "resource",
-  "title": "工作区文件",
-  "description": "agent 默认工作区顶层文件（只读）",
-  "size": { "w": 4, "h": 4 },
+  "title": {
+    "zh": "工作区文件",
+    "en": "Workspace Files"
+  },
+  "description": {
+    "zh": "agent 默认工作区顶层文件（只读）",
+    "en": "Top-level files in agent workspace (read-only)"
+  },
+  "size": {
+    "w": 4,
+    "h": 4
+  },
   "view": {
     "kind": "list",
-    "dataRpc": ["panel-workspace-files", "list"],
+    "dataRpc": [
+      "panel-workspace-files",
+      "list"
+    ],
     "columns": [
-      { "key": "path", "label": "文件路径" }
+      {
+        "key": "path",
+        "label": {
+          "zh": "文件路径",
+          "en": "File path"
+        }
+      }
     ],
     "rowsPath": "items",
     "actions": [],
-    "emptyText": "工作区没有文件"
+    "emptyText": {
+      "zh": "工作区没有文件",
+      "en": "Workspace has no files"
+    }
   }
 }

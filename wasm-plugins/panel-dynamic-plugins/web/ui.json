@@ -3,27 +3,92 @@
   "kind": "card",
   "cardId": "panel-dynamic-plugins.list",
   "type": "runtime",
-  "title": "动态插件",
-  "description": "dynamicCordisRunner 定义与运行态（启用/停止/卸载）",
-  "size": { "w": 4, "h": 4 },
+  "title": {
+    "zh": "动态插件",
+    "en": "Dynamic Plugins"
+  },
+  "description": {
+    "zh": "dynamicCordisRunner 定义与运行态（启用/停止/卸载）",
+    "en": "dynamicCordisRunner definitions & runtime (start/stop/unload)"
+  },
+  "size": {
+    "w": 4,
+    "h": 4
+  },
   "view": {
     "kind": "list",
-    "dataRpc": ["panel-dynamic-plugins", "list"],
+    "dataRpc": [
+      "panel-dynamic-plugins",
+      "list"
+    ],
     "columns": [
-      { "key": "pluginId", "label": "插件 ID" },
-      { "key": "name", "label": "包名" },
-      { "key": "state", "label": "状态" }
+      {
+        "key": "pluginId",
+        "label": {
+          "zh": "插件 ID",
+          "en": "Plugin ID"
+        }
+      },
+      {
+        "key": "name",
+        "label": {
+          "zh": "包名",
+          "en": "Package"
+        }
+      },
+      {
+        "key": "state",
+        "label": {
+          "zh": "状态",
+          "en": "Status"
+        }
+      }
     ],
     "rowsPath": "items",
     "actions": [],
     "rowActions": [
-      { "name": "activate", "label": "启用", "rpc": ["panel-dynamic-plugins", "activate"],
-        "scope": "row" },
-      { "name": "stop", "label": "停止", "rpc": ["panel-dynamic-plugins", "stop"],
-        "scope": "row", "confirm": true },
-      { "name": "undefine", "label": "卸载", "rpc": ["panel-dynamic-plugins", "undefine"],
-        "scope": "row", "confirm": true }
+      {
+        "name": "activate",
+        "label": {
+          "zh": "启用",
+          "en": "Start"
+        },
+        "rpc": [
+          "panel-dynamic-plugins",
+          "activate"
+        ],
+        "scope": "row"
+      },
+      {
+        "name": "stop",
+        "label": {
+          "zh": "停止",
+          "en": "Stop"
+        },
+        "rpc": [
+          "panel-dynamic-plugins",
+          "stop"
+        ],
+        "scope": "row",
+        "confirm": true
+      },
+      {
+        "name": "undefine",
+        "label": {
+          "zh": "卸载",
+          "en": "Unload"
+        },
+        "rpc": [
+          "panel-dynamic-plugins",
+          "undefine"
+        ],
+        "scope": "row",
+        "confirm": true
+      }
     ],
-    "emptyText": "没有已定义的动态插件"
+    "emptyText": {
+      "zh": "没有已定义的动态插件",
+      "en": "No dynamic plugins defined"
+    }
   }
 }

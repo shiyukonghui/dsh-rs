@@ -8766,3 +8766,11 @@ semi-theme-default 语义值（源码为权威），DOM 与布局几何（D-181 
 - 验证：verify-locale.mjs 12/12（zh→EN 断言英文章/刷新持久/点中复原，console 零错）；rsx 坑=路径表达式子元素必须 { } 包裹（:: 与属性语法冲突）。
 - 审计观察：连跑两轮出现 NO-CARD/悬挂 flake（T9 或 T4/T6/T11 交替），consoleErrs 均空=与已知 serve 瞬时挂起/sse-reload-starvation 同族，非本改动引入（待下轮干净板复跑定档）。
 - 回滚点：增量链（i18n.rs+app.rs+assets），revert 即回中文硬编码态。
+
+### D-225 续（同日收口）：单元声明双语落地
+- 迁移：13 单元 ui.json 文案位（title/description/label/emptyText）全部包 {zh,en}（migrate-ui-json.mjs 字典驱动，unmapped=0）。
+- 镜像根除：13 个 lib.rs 的 ui_declaration 字面量 → include_str!(../web/ui.json) 解析——describeUI==ui.json 一致由**构造**保证（m3X 免漂）；13 组件重建。
+- 揪出清单归一坑：ui_manifest card_entry 把 title as_str 归一→双声明被回退成 cardId（卡头双语言皆空=静默丢语义）。修复=LocalizedText 校验透传（非空字符串值对象原样过；坏形回退 cardId）+ 新测试 localized_title_passthrough（18/18 绿）。
+- m3X 契约面同步：m33/m35 列 label 断言放宽为 LocalizedText（字符串|非空字符串值对象）；dsh-wasmrt 全套件 28 二进制全绿。
+- 边界（诚实记录）：数据面标签（如 runtime-status 条目标题）仍中文——单元数据端点硬编码，属数据不是声明；如需双语需单元数据面改造（另行立项）。
+- 终验：verify-locale2.mjs PASS（zh 4/4↔EN 卡标题 6/6+列名+行钮，切 EN 中文清零=无漏网，back_zh 复原，console 零错）；审计除已知 flake 外与基线一致。

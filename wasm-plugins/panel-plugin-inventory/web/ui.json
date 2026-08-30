@@ -3,20 +3,59 @@
   "kind": "card",
   "cardId": "panel-plugin-inventory.list",
   "type": "runtime",
-  "title": "插件清单",
-  "description": "loader 已组装服务装配单元的实时清单（只读）",
-  "size": { "w": 4, "h": 4 },
+  "title": {
+    "zh": "插件清单",
+    "en": "Plugin Inventory"
+  },
+  "description": {
+    "zh": "loader 已组装服务装配单元的实时清单（只读）",
+    "en": "Live inventory of assembled service units (read-only)"
+  },
+  "size": {
+    "w": 4,
+    "h": 4
+  },
   "view": {
     "kind": "list",
-    "dataRpc": ["panel-plugin-inventory", "list"],
+    "dataRpc": [
+      "panel-plugin-inventory",
+      "list"
+    ],
     "columns": [
-      { "key": "name", "label": "插件" },
-      { "key": "id", "label": "入口" },
-      { "key": "state", "label": "状态" },
-      { "key": "note", "label": "说明" }
+      {
+        "key": "name",
+        "label": {
+          "zh": "插件",
+          "en": "Plugin"
+        }
+      },
+      {
+        "key": "id",
+        "label": {
+          "zh": "入口",
+          "en": "Entry"
+        }
+      },
+      {
+        "key": "state",
+        "label": {
+          "zh": "状态",
+          "en": "Status"
+        }
+      },
+      {
+        "key": "note",
+        "label": {
+          "zh": "说明",
+          "en": "Description"
+        }
+      }
     ],
     "rowsPath": "items",
     "actions": [],
-    "emptyText": "暂无已组装入口"
+    "emptyText": {
+      "zh": "暂无已组装入口",
+      "en": "No assembled entries"
+    }
   }
 }

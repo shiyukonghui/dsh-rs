@@ -3,18 +3,45 @@
   "kind": "card",
   "cardId": "panel-sessions.list",
   "type": "session",
-  "title": "会话清单",
-  "description": "宿主真实会话候选（只读；打开/切换属未来交互形态）",
-  "size": { "w": 4, "h": 4 },
+  "title": {
+    "zh": "会话清单",
+    "en": "Sessions"
+  },
+  "description": {
+    "zh": "宿主真实会话候选（只读；打开/切换属未来交互形态）",
+    "en": "Host session candidates (read-only)"
+  },
+  "size": {
+    "w": 4,
+    "h": 4
+  },
   "view": {
     "kind": "list",
-    "dataRpc": ["panel-sessions", "list"],
+    "dataRpc": [
+      "panel-sessions",
+      "list"
+    ],
     "columns": [
-      { "key": "sessionId", "label": "会话" },
-      { "key": "createdAt", "label": "创建 (epoch ms)" }
+      {
+        "key": "sessionId",
+        "label": {
+          "zh": "会话",
+          "en": "Session"
+        }
+      },
+      {
+        "key": "createdAt",
+        "label": {
+          "zh": "创建 (epoch ms)",
+          "en": "Created (epoch ms)"
+        }
+      }
     ],
     "rowsPath": "items",
     "actions": [],
-    "emptyText": "还没有会话"
+    "emptyText": {
+      "zh": "还没有会话",
+      "en": "No sessions yet"
+    }
   }
 }

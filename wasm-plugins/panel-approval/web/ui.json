@@ -3,25 +3,85 @@
   "kind": "card",
   "cardId": "panel-approval.pending",
   "type": "session",
-  "title": "待审批",
-  "description": "未决工具审批（决定走宿主 session.approval.decide；拒绝需确认）",
-  "size": { "w": 4, "h": 4 },
+  "title": {
+    "zh": "待审批",
+    "en": "Pending Approvals"
+  },
+  "description": {
+    "zh": "未决工具审批（决定走宿主 session.approval.decide；拒绝需确认）",
+    "en": "Pending tool approvals (decided via host session.approval.decide; reject needs confirm)"
+  },
+  "size": {
+    "w": 4,
+    "h": 4
+  },
   "view": {
     "kind": "list",
-    "dataRpc": ["approval", "pending"],
+    "dataRpc": [
+      "approval",
+      "pending"
+    ],
     "columns": [
-      { "key": "toolName", "label": "工具" },
-      { "key": "sessionId", "label": "会话" },
-      { "key": "reason", "label": "原因" }
+      {
+        "key": "toolName",
+        "label": {
+          "zh": "工具",
+          "en": "Tool"
+        }
+      },
+      {
+        "key": "sessionId",
+        "label": {
+          "zh": "会话",
+          "en": "Session"
+        }
+      },
+      {
+        "key": "reason",
+        "label": {
+          "zh": "原因",
+          "en": "Reason"
+        }
+      }
     ],
     "rowsPath": "items",
     "actions": [],
     "rowActions": [
-      { "name": "allow", "label": "允许", "rpc": ["session.approval", "decide"],
-        "scope": "row", "args": { "decision": "allowedOnce" } },
-      { "name": "reject", "label": "拒绝", "rpc": ["session.approval", "decide"],
-        "scope": "row", "args": { "decision": "rejected" }, "confirm": true }
+      {
+        "name": "allow",
+        "label": {
+          "zh": "允许",
+          "en": "Approve"
+        },
+        "rpc": [
+          "session.approval",
+          "decide"
+        ],
+        "scope": "row",
+        "args": {
+          "decision": "allowedOnce"
+        }
+      },
+      {
+        "name": "reject",
+        "label": {
+          "zh": "拒绝",
+          "en": "Reject"
+        },
+        "rpc": [
+          "session.approval",
+          "decide"
+        ],
+        "scope": "row",
+        "args": {
+          "decision": "rejected"
+        },
+        "confirm": true
+      }
     ],
-    "emptyText": "没有待审批项"
+    "emptyText": {
+      "zh": "没有待审批项",
+      "en": "No pending approvals"
+    }
   }
 }

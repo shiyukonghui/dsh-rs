@@ -10,34 +10,9 @@ use bindings::exports::dsh::host_remote::remote::Guest;
 use serde_json::{json, Value};
 
 fn ui_declaration() -> Value {
-    json!({
-        "$schema": "dsh.panel-ui/v2",
-        "kind": "card",
-        "cardId": "panel-schedule.list",
-        "type": "runtime",
-        "title": "调度任务",
-        "description": "after/at/every 调度记录（只读；协议在宿主事件日志权威）",
-        "size": { "w": 4, "h": 4 },
-        "view": {
-            "kind": "list",
-            "dataRpc": ["schedule", "list"],
-            "columns": [
-                { "key": "id", "label": "ID" },
-                { "key": "kind", "label": "类型" },
-                { "key": "prompt", "label": "提示" },
-                { "key": "scheduledAt", "label": "计划时间" }
-            ],
-            "rowsPath": "items",
-            "actions": [],
-            "rowActions": [
-                { "name": "delete", "label": "删除", "rpc": ["schedule", "delete"],
-                  "scope": "row", "confirm": true }
-            ],
-            "emptyText": "没有调度记录"
-        }
-    })
+    // D-225：单一事实源=web/ui.json（编译期嵌入；声明=数据，非代码）。
+    serde_json::from_str(include_str!("../web/ui.json")).expect("ui.json must be valid JSON")
 }
-
 fn error(code: &str, message: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "ok": false,

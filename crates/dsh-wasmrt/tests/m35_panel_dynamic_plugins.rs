@@ -91,7 +91,9 @@ fn describe_ui_returns_valid_list_declaration() {
     let cols = view["columns"].as_array().expect("columns 数组");
     assert!(!cols.is_empty());
     for c in cols {
-        assert!(c["key"].as_str().is_some() && c["label"].as_str().is_some(), "{c:?}");
+        // D-225：label 位=LocalizedText 契约（字符串 | 非空字符串值对象）。
+        let txt = |v: &Value| v.is_string() || v.as_object().is_some_and(|m| !m.is_empty() && m.values().all(Value::is_string));
+        assert!(c["key"].as_str().is_some() && txt(&c["label"]), "{c:?}");
     }
 }
 

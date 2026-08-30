@@ -3,12 +3,24 @@
   "kind": "card",
   "cardId": "panel-runtime-status.status",
   "type": "runtime",
-  "title": "运行时状态",
-  "description": "loader / 动态包实时聚合（只读）",
-  "size": { "w": 2, "h": 2 },
+  "title": {
+    "zh": "运行时状态",
+    "en": "Runtime Status"
+  },
+  "description": {
+    "zh": "loader / 动态包实时聚合（只读）",
+    "en": "Live loader / dynamic package aggregate (read-only)"
+  },
+  "size": {
+    "w": 2,
+    "h": 2
+  },
   "view": {
     "kind": "status",
-    "dataRpc": ["panel-runtime-status", "status"],
+    "dataRpc": [
+      "panel-runtime-status",
+      "status"
+    ],
     "actions": []
   }
 }

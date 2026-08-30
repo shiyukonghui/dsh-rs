@@ -14,37 +14,9 @@ use serde_json::{json, Value};
 
 /// UI 声明（数据，非代码）。静态 web/ui.json 与其保持逐字段一致（m35 断言）。
 fn ui_declaration() -> Value {
-    json!({
-        "$schema": "dsh.panel-ui/v2",
-        "kind": "card",
-        "cardId": "panel-dynamic-plugins.list",
-        "type": "runtime",
-        "title": "动态插件",
-        "description": "dynamicCordisRunner 定义与运行态（启用/停止/卸载）",
-        "size": { "w": 4, "h": 4 },
-        "view": {
-            "kind": "list",
-            "dataRpc": ["panel-dynamic-plugins", "list"],
-            "columns": [
-                { "key": "pluginId", "label": "插件 ID" },
-                { "key": "name", "label": "包名" },
-                { "key": "state", "label": "状态" }
-            ],
-            "rowsPath": "items",
-            "actions": [],
-            "rowActions": [
-                { "name": "activate", "label": "启用", "rpc": ["panel-dynamic-plugins", "activate"],
-                  "scope": "row" },
-                { "name": "stop", "label": "停止", "rpc": ["panel-dynamic-plugins", "stop"],
-                  "scope": "row", "confirm": true },
-                { "name": "undefine", "label": "卸载", "rpc": ["panel-dynamic-plugins", "undefine"],
-                  "scope": "row", "confirm": true }
-            ],
-            "emptyText": "没有已定义的动态插件"
-        }
-    })
+    // D-225：单一事实源=web/ui.json（编译期嵌入；声明=数据，非代码）。
+    serde_json::from_str(include_str!("../web/ui.json")).expect("ui.json must be valid JSON")
 }
-
 fn error(code: &str, message: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "ok": false,

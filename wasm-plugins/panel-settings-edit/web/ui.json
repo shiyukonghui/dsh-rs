@@ -3,14 +3,41 @@
   "kind": "card",
   "cardId": "panel-settings-edit.edit",
   "type": "config",
-  "title": "设置编辑",
-  "description": "命名空间下拉 + 动态 fields 投影（D-201 一卡通用；保存带乐观锁；secrets 不可编辑）",
-  "size": { "w": 4, "h": 6 },
+  "title": {
+    "zh": "设置编辑",
+    "en": "Settings Editor"
+  },
+  "description": {
+    "zh": "命名空间下拉 + 动态 fields 投影（D-201 一卡通用；保存带乐观锁；secrets 不可编辑）",
+    "en": "Namespace picker + dynamic fields (optimistic-locked save; secrets not editable)"
+  },
+  "size": {
+    "w": 4,
+    "h": 6
+  },
   "view": {
     "kind": "form",
-    "fieldsFrom": { "rpc": ["settings", "describe"], "pick": "ui-theme", "nsSelect": true },
+    "fieldsFrom": {
+      "rpc": [
+        "settings",
+        "describe"
+      ],
+      "pick": "ui-theme",
+      "nsSelect": true
+    },
     "actions": [
-      { "name": "save", "label": "保存", "rpc": ["settings", "update"], "primary": true }
+      {
+        "name": "save",
+        "label": {
+          "zh": "保存",
+          "en": "Save"
+        },
+        "rpc": [
+          "settings",
+          "update"
+        ],
+        "primary": true
+      }
     ]
   }
 }

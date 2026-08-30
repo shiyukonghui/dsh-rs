@@ -11,29 +11,9 @@ use bindings::exports::dsh::host_remote::remote::Guest;
 use serde_json::{json, Value};
 
 fn ui_declaration() -> Value {
-    json!({
-        "$schema": "dsh.panel-ui/v2",
-        "kind": "card",
-        "cardId": "panel-schedule-create.form",
-        "type": "runtime",
-        "title": "创建调度",
-        "description": "after/at/every 调度创建（写端；动作走宿主 schedule/create 臂）",
-        "size": { "w": 2, "h": 4 },
-        "view": {
-            "kind": "form",
-            "fields": [
-                { "name": "kind", "label": "类型", "type": "select",
-                  "options": ["after", "at", "every"], "default": "after", "required": true },
-                { "name": "prompt", "label": "提示", "type": "text", "required": true },
-                { "name": "afterSeconds", "label": "延迟秒（after）", "type": "number", "default": 60 }
-            ],
-            "actions": [
-                { "name": "create", "label": "创建", "rpc": ["schedule", "create"], "primary": true }
-            ]
-        }
-    })
+    // D-225：单一事实源=web/ui.json（编译期嵌入；声明=数据，非代码）。
+    serde_json::from_str(include_str!("../web/ui.json")).expect("ui.json must be valid JSON")
 }
-
 fn error(code: &str, message: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "ok": false,

@@ -12,35 +12,9 @@ use bindings::exports::dsh::host_remote::remote::Guest;
 use serde_json::{json, Value};
 
 fn ui_declaration() -> Value {
-    json!({
-        "$schema": "dsh.panel-ui/v2",
-        "kind": "card",
-        "cardId": "panel-approval.pending",
-        "type": "session",
-        "title": "待审批",
-        "description": "未决工具审批（决定走宿主 session.approval.decide；拒绝需确认）",
-        "size": { "w": 4, "h": 4 },
-        "view": {
-            "kind": "list",
-            "dataRpc": ["approval", "pending"],
-            "columns": [
-                { "key": "toolName", "label": "工具" },
-                { "key": "sessionId", "label": "会话" },
-                { "key": "reason", "label": "原因" }
-            ],
-            "rowsPath": "items",
-            "actions": [],
-            "rowActions": [
-                { "name": "allow", "label": "允许", "rpc": ["session.approval", "decide"],
-                  "scope": "row", "args": { "decision": "allowedOnce" } },
-                { "name": "reject", "label": "拒绝", "rpc": ["session.approval", "decide"],
-                  "scope": "row", "args": { "decision": "rejected" }, "confirm": true }
-            ],
-            "emptyText": "没有待审批项"
-        }
-    })
+    // D-225：单一事实源=web/ui.json（编译期嵌入；声明=数据，非代码）。
+    serde_json::from_str(include_str!("../web/ui.json")).expect("ui.json must be valid JSON")
 }
-
 fn error(code: &str, message: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "ok": false,

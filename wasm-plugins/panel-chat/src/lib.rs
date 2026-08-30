@@ -13,25 +13,9 @@ use serde_json::{json, Value};
 
 /// UI 声明（数据，非代码）。静态 web/ui.json 与其保持逐字段一致（m39 断言）。
 fn ui_declaration() -> Value {
-    json!({
-        "$schema": "dsh.panel-ui/v2",
-        "kind": "card",
-        "cardId": "panel-chat.chat",
-        "type": "session",
-        "title": "聊天",
-        "description": "会话聊天（选择/历史/发送/停止；会话协议在宿主，C8-4 声明单元）",
-        "size": { "w": 4, "h": 6 },
-        "view": {
-            "kind": "chat",
-            "sessionSource": ["session", "list"],
-            "historyRpc": ["session", "history"],
-            "sendRpc": ["session", "prompt"],
-            "cancelRpc": ["session", "cancel"],
-            "stream": "session-events"
-        }
-    })
+    // D-225：单一事实源=web/ui.json（编译期嵌入；声明=数据，非代码）。
+    serde_json::from_str(include_str!("../web/ui.json")).expect("ui.json must be valid JSON")
 }
-
 fn error(code: &str, message: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "ok": false,

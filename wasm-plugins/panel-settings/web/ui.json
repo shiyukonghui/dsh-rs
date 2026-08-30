@@ -3,19 +3,52 @@
   "kind": "card",
   "cardId": "panel-settings.list",
   "type": "config",
-  "title": "设置概览",
-  "description": "已注册 settings 命名空间的 resolved 值（只读；redact 在源头）",
-  "size": { "w": 4, "h": 4 },
+  "title": {
+    "zh": "设置概览",
+    "en": "Settings Overview"
+  },
+  "description": {
+    "zh": "已注册 settings 命名空间的 resolved 值（只读；redact 在源头）",
+    "en": "Resolved values of registered settings namespaces (read-only; redacted at source)"
+  },
+  "size": {
+    "w": 4,
+    "h": 4
+  },
   "view": {
     "kind": "list",
-    "dataRpc": ["panel-settings", "list"],
+    "dataRpc": [
+      "panel-settings",
+      "list"
+    ],
     "columns": [
-      { "key": "ns", "label": "命名空间" },
-      { "key": "field", "label": "字段" },
-      { "key": "value", "label": "值" }
+      {
+        "key": "ns",
+        "label": {
+          "zh": "命名空间",
+          "en": "Namespace"
+        }
+      },
+      {
+        "key": "field",
+        "label": {
+          "zh": "字段",
+          "en": "Field"
+        }
+      },
+      {
+        "key": "value",
+        "label": {
+          "zh": "值",
+          "en": "Value"
+        }
+      }
     ],
     "rowsPath": "items",
     "actions": [],
-    "emptyText": "没有已注册的设置"
+    "emptyText": {
+      "zh": "没有已注册的设置",
+      "en": "No registered settings"
+    }
   }
 }

@@ -14,27 +14,9 @@ use serde_json::{json, Value};
 
 /// UI 声明（数据，非代码）。静态 web/ui.json 与其保持逐字段一致（m36 断言）。
 fn ui_declaration() -> Value {
-    json!({
-        "$schema": "dsh.panel-ui/v2",
-        "kind": "card",
-        "cardId": "panel-workspace-files.list",
-        "type": "resource",
-        "title": "工作区文件",
-        "description": "agent 默认工作区顶层文件（只读）",
-        "size": { "w": 4, "h": 4 },
-        "view": {
-            "kind": "list",
-            "dataRpc": ["panel-workspace-files", "list"],
-            "columns": [
-                { "key": "path", "label": "文件路径" }
-            ],
-            "rowsPath": "items",
-            "actions": [],
-            "emptyText": "工作区没有文件"
-        }
-    })
+    // D-225：单一事实源=web/ui.json（编译期嵌入；声明=数据，非代码）。
+    serde_json::from_str(include_str!("../web/ui.json")).expect("ui.json must be valid JSON")
 }
-
 fn error(code: &str, message: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "ok": false,

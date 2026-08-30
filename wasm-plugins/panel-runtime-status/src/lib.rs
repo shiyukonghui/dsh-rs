@@ -13,22 +13,9 @@ use serde_json::{json, Value};
 
 /// UI 声明（数据，非代码）。静态 web/ui.json 与其保持逐字段一致（m34 断言）。
 fn ui_declaration() -> Value {
-    json!({
-        "$schema": "dsh.panel-ui/v2",
-        "kind": "card",
-        "cardId": "panel-runtime-status.status",
-        "type": "runtime",
-        "title": "运行时状态",
-        "description": "loader / 动态包实时聚合（只读）",
-        "size": { "w": 2, "h": 2 },
-        "view": {
-            "kind": "status",
-            "dataRpc": ["panel-runtime-status", "status"],
-            "actions": []
-        }
-    })
+    // D-225：单一事实源=web/ui.json（编译期嵌入；声明=数据，非代码）。
+    serde_json::from_str(include_str!("../web/ui.json")).expect("ui.json must be valid JSON")
 }
-
 fn error(code: &str, message: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "ok": false,
