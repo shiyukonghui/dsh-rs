@@ -2,7 +2,7 @@
 //! 纪律：业务逻辑零在此层——只搬运（可证逻辑全在 canvas_shell lib）。
 
 use canvas_shell::values::rpc_envelope;
-use js_sys::{JSON, Reflect};
+use js_sys::JSON;
 use serde_json::{json, Value};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -229,7 +229,7 @@ pub fn observe_bump<F: FnMut() + 'static>(f: F) {
             w.clear_timeout_with_handle(handle.get());
         }
         if let Ok(id) = w.set_timeout_with_callback_and_timeout_and_arguments_0(&fire, 200) {
-            handle.set(id as i32);
+            handle.set(id);
         }
     });
     if let Ok(ro) = ResizeObserver::new(&outer) {

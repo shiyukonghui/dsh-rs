@@ -35,17 +35,14 @@ pub fn layout_grid(cards: &[Value], columns: usize) -> (Vec<Placement>, i64) {
         let mut best_col = 0usize;
         let mut best_top = i64::MAX;
         for s in 0..=(c_n - w) {
-            let mut top = 0i64;
-            for k in s..s + w {
-                top = top.max(heights[k]);
-            }
+            let top = heights[s..s + w].iter().copied().max().unwrap_or(0);
             if top < best_top {
                 best_top = top;
                 best_col = s;
             }
         }
-        for k in best_col..best_col + w {
-            heights[k] = best_top + h;
+        for cell in &mut heights[best_col..best_col + w] {
+            *cell = best_top + h;
         }
         out.push(Placement { key, col: best_col, row: best_top, w, h });
     }
@@ -78,18 +75,15 @@ pub fn layout_measured(cards: &[Value], columns: usize) -> (Vec<MeasuredPlacemen
         let mut best = 0usize;
         let mut best_y = i64::MAX;
         for s in 0..=(c_n - w) {
-            let mut y = 0i64;
-            for k in s..s + w {
-                y = y.max(col_y[k]);
-            }
+            let y = col_y[s..s + w].iter().copied().max().unwrap_or(0);
             if y < best_y {
                 best_y = y;
                 best = s;
             }
         }
         out.push(MeasuredPlacement { key, col: best, y_px: best_y, w, h_px });
-        for k in best..best + w {
-            col_y[k] = best_y + h_px + GRID_GAP;
+        for cell in &mut col_y[best..best + w] {
+            *cell = best_y + h_px + GRID_GAP;
         }
     }
     let total_h = if out.is_empty() {
@@ -101,6 +95,7 @@ pub fn layout_measured(cards: &[Value], columns: usize) -> (Vec<MeasuredPlacemen
 }
 
 /// 矩形求交判重叠（测试用谓词，JS 侧同款数学）。
+#[cfg(test)]
 fn overlap(a: &MeasuredPlacement, b: &MeasuredPlacement) -> bool {
     let ax = a.col as i64 * (GRID_COL + GRID_GAP);
     let bx = b.col as i64 * (GRID_COL + GRID_GAP);
@@ -109,6 +104,7 @@ fn overlap(a: &MeasuredPlacement, b: &MeasuredPlacement) -> bool {
     !(ax + aw <= bx || bx + bw <= ax || a.y_px + a.h_px <= b.y_px || b.y_px + b.h_px <= a.y_px)
 }
 
+#[cfg(test)]
 fn card(key: &str, w: i64, h: i64, measured: bool) -> Value {
     let k = if measured { "hPx" } else { "h" };
     serde_json::json!({ "key": key, "w": w, k: h })

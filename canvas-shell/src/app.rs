@@ -73,11 +73,6 @@ fn scalar_text(v: Option<&Value>) -> String {
     }
 }
 
-/// Vec<Element> → 可作子节点的 Vec<VNode>（rsx 只收 VNode 迭代器）。
-fn nodes(v: Vec<Element>) -> Vec<dioxus::prelude::VNode> {
-    v.into_iter().map(|r| r.unwrap_or_default()).collect()
-}
-
 /// 卡片体面管线：ui.json → validate → dataRpc →（视图渲染在 card_body）。
 async fn load_card_body(fk: String, pn: String, mut body: Signal<serde_json::Map<String, Value>>) {
     let mut entry = json!({ "stage": "load" });
@@ -127,7 +122,7 @@ async fn load_card_body(fk: String, pn: String, mut body: Signal<serde_json::Map
                 }
             }
             let hist = rpc_join(view_v.get("historyRpc"));
-            let mut bd2 = body;
+            let bd2 = body;
             let fk2 = fk.clone();
             spawn_local(async move { load_chat_history(fk2, hist, sid, bd2).await; });
         }
@@ -214,7 +209,7 @@ fn ChatIsland(view: Value, k: String, body: Signal<serde_json::Map<String, Value
         .map(|o| (scalar_text(o.get("value")), scalar_text(o.get("label"))))
         .collect();
 
-    let (k_r, h_r, mut b_r) = (k.clone(), hist_rpc.clone(), body);
+    let (k_r, h_r, b_r) = (k.clone(), hist_rpc.clone(), body);
     let reload = move |_| {
         let sid_now = {
             let g = b_r.read();
@@ -222,7 +217,7 @@ fn ChatIsland(view: Value, k: String, body: Signal<serde_json::Map<String, Value
         };
         if sid_now.is_empty() { return; }
         let (k2, h2) = (k_r.clone(), h_r.clone());
-        let mut b2 = b_r;
+        let b2 = b_r;
         spawn(async move { load_chat_history(k2, h2, sid_now, b2).await; });
     };
 
@@ -235,7 +230,7 @@ fn ChatIsland(view: Value, k: String, body: Signal<serde_json::Map<String, Value
                 en["chat"] = json!({"sessionId": v.clone(), "busy": false, "messages": []});
             }
         }
-        let (k2, h2, mut b2) = (k_s.clone(), h_s.clone(), b_s);
+        let (k2, h2, b2) = (k_s.clone(), h_s.clone(), b_s);
         spawn(async move { load_chat_history(k2, h2, v, b2).await; });
     };
 
@@ -283,7 +278,7 @@ fn ChatIsland(view: Value, k: String, body: Signal<serde_json::Map<String, Value
         });
     };
 
-    let (k_c, c_rpc, mut b_c) = (k.clone(), cancel_rpc.clone(), body);
+    let (k_c, c_rpc, b_c) = (k.clone(), cancel_rpc.clone(), body);
     let stop = move |_| {
         let sid_now = {
             let g = b_c.read();
@@ -294,7 +289,7 @@ fn ChatIsland(view: Value, k: String, body: Signal<serde_json::Map<String, Value
             return;
         }
         set_act(b_c, &k_c, format!("→ 取消 {} …", sid_now));
-        let (k2, mut b2) = (k_c.clone(), b_c);
+        let (k2, b2) = (k_c.clone(), b_c);
         let (cc, sid2) = (c_rpc.clone(), sid_now);
         spawn(async move {
             let msg = match crate::interop::fetch_rpc(&cc, json!({"sessionId": sid2})).await {
@@ -332,7 +327,7 @@ fn ChatIsland(view: Value, k: String, body: Signal<serde_json::Map<String, Value
     }
 }
 
-fn mark_pending_fail(mut body: &mut Signal<serde_json::Map<String, Value>>, k: &str) {
+fn mark_pending_fail(body: &mut Signal<serde_json::Map<String, Value>>, k: &str) {
     let mut g = body.write();
     if let Some(en) = g.get_mut(k) {
         if let Some(arr) = en.get_mut("chat").and_then(|c| c.get_mut("messages")).and_then(Value::as_array_mut) {
@@ -557,7 +552,7 @@ fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, 
     let th_labels: Vec<String> = columns.iter().map(|c| scalar_text(c.get("label"))).collect();
     let cells_all: Vec<Vec<String>> = rows
         .iter()
-        .map(|r| columns.iter().map(|c| scalar_text(r.get(&scalar_text(c.get("key"))))).collect())
+        .map(|r| columns.iter().map(|c| scalar_text(r.get(scalar_text(c.get("key"))))).collect())
         .collect();
     // ---- form 预计算（rsx for 体零语句纪律：全部归一化在视图外完成） ----
     let mut form_fields: Vec<Value> = Vec::new();
@@ -569,7 +564,7 @@ fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, 
     if kind == "form" {
         let actions = view.get("actions").and_then(Value::as_array).cloned().unwrap_or_default();
         let ff = view.get("fieldsFrom").cloned().filter(|x| x.is_object());
-        let (mut n_rev, n_ns) = match &ff {
+        let (n_rev, n_ns) = match &ff {
             Some(ff) => {
                 let pick = ff.get("pick").and_then(Value::as_str).unwrap_or("").to_string();
                 let model_v = ns_select_model(&data, &pick);
@@ -745,7 +740,7 @@ pub fn App() -> Element {
     let status = use_signal(|| ("载入清单…".to_string(), String::new()));
     let model = use_signal(|| Option::<Value>::None);
     let selected = use_signal(|| Option::<String>::None);
-    let closed = use_signal(|| crate::interop::ls_closed());
+    let closed = use_signal(crate::interop::ls_closed);
     let bump = use_signal(|| 0u32);
     let body = use_signal(serde_json::Map::<String, Value>::new);
 
@@ -781,7 +776,7 @@ pub fn App() -> Element {
                 let Some(sid) = en.get("chat").and_then(|c| c.get("sessionId")).and_then(Value::as_str) else { continue };
                 let hist = rpc_join(en.get("view").and_then(|v| v.get("historyRpc")));
                 if hist.is_empty() { continue; }
-                let (k2, s2, mut b2) = (kk.clone(), sid.to_string(), body);
+                let (k2, s2, b2) = (kk.clone(), sid.to_string(), body);
                 spawn_local(async move { load_chat_history(k2, hist, s2, b2).await; });
             }
         }, 5000);
@@ -809,7 +804,7 @@ pub fn App() -> Element {
             }
         }
         for (k, pn) in todo {
-            let mut bd = body;
+            let bd = body;
             spawn(async move { load_card_body(k, pn, bd).await; });
         }
     });
@@ -964,7 +959,7 @@ pub fn App() -> Element {
                         else { "还没有服务装配单元声明 UI——向 wasm-plugins/<name>/web/ui.json 提交 v2 卡片声明即自动出现。" }
                     }
                 }
-                for (idx, c) in visible.iter().enumerate() {
+                for c in visible.iter() {
                     {
                         let k = fk(c);
                         let bad = c.get("bad").and_then(Value::as_bool).unwrap_or(false);

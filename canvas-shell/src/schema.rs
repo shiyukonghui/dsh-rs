@@ -110,6 +110,7 @@ pub fn schema_fields(ns_view: &Value) -> Value {
 }
 
 /// live 抓样形夹具（= core.test.mjs themeNsView，D-208 纪律：不臆造形状）。
+#[cfg(test)]
 fn theme_ns_view() -> Value {
     json!({
       "ns": "ui-theme", "applies": "live", "revision": 7,
@@ -128,6 +129,7 @@ fn theme_ns_view() -> Value {
     })
 }
 
+#[cfg(test)]
 fn by_key<'a>(proj: &'a Value, key: &str) -> Option<&'a Value> {
     proj["fields"].as_array()?.iter().find(|f| f["key"] == json!(key))
 }

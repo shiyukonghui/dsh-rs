@@ -8,16 +8,16 @@
 同源于同一声明契约（声明=数据、单元=wasip1 组件、渲染器只是壳）。
 剩两步 = **你的目检 + S6d/下线拍板**（材料已备齐，见 §3/§5）。
 
-## 2. 生态账本（末次认证 = 第 52 轮）
+## 2. 生态账本（末次认证 = 第 55 轮·全工作区回归）
 | 维度 | 数字 | 权威出处 |
 |---|---|---|
 | 装配单元 / 桌面卡 | **13 / 13**（契约未动，双壳共用） | `wasm-plugins/` + `ui_manifest.rs` 逐卡断言 |
-| 决策日志 | D-180 … **D-210**（含 S1–S6a 进度补记、S6a 教训） | `docs/DECISIONS.md` |
-| Rust 壳（canvas-shell） | lib 纯函数 **22/22**（宿主可测）+ 活体审计全绿 | `canvas-shell/`，`.spec/…-shell-dioxus/s6-audit.md` |
-| JS 壳测试 | node **35/35**（D-209 后） | `assets/canvas/tests/core.test.mjs` |
-| 宿主 | dsh-cli lib **260/0**（含 Rust 壳内嵌路由测） | cargo test 第 52 轮 |
-| wasmrt / verify-diff | m32–m44、ALL PASS（D-208 期认证；此后单元层零改动） | DECISIONS D-19x–D-208 |
-| 内嵌面 | `/canvas/rust` + assets 由 **build.rs include_bytes!** 表驱动 | `crates/dsh-cli/build.rs`、D-210 S5 |
+| 决策日志 | D-180 … **D-210**（含 S1–S6a 进度补记、S6a 教训、体积优化） | `docs/DECISIONS.md` |
+| Rust 壳（canvas-shell） | lib **22/22** + clippy **0**（wasm32 all-targets）+ 活体审计全绿 | `canvas-shell/`，s6-audit.md |
+| JS 壳测试 | node **35/35** | `assets/canvas/tests/core.test.mjs` |
+| 宿主 | dsh-cli lib **260/0** + clippy **0** | cargo 第 55 轮 |
+| 工作区 | **cargo test --workspace 全绿零失败** + verify-diff **ALL PASS** | 第 55 轮认证 |
+| 内嵌面 | `/canvas/rust` assets = **build.rs include_bytes!** 表驱动，wasm-opt 件 **938KB** | `crates/dsh-cli/build.rs`、D-210 |
 
 ## 3. 晨间三步（更新版）
 1. **起服**（配方不变）：`target\debug\dsh.exe web scenarios\web-smoke.cordis.yml --port <端口>`。

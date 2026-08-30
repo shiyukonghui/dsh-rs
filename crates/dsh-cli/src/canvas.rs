@@ -13,7 +13,7 @@ pub const CANVAS_CORE_JS: &str = include_str!("../assets/canvas/core.js");
 /// DOM/fetch/定时器粘合层（薄）。
 pub const CANVAS_APP_JS: &str = include_str!("../assets/canvas/app.js");
 
-/// D-210 S5：Rust 壳发布产物内嵌表（build.rs 扫描 assets/canvas-shell/ 生成）。
+// D-210 S5：Rust 壳发布产物内嵌表（build.rs 扫描 assets/canvas-shell/ 生成）。
 include!(concat!(env!("OUT_DIR"), "/shell_assets.rs"));
 
 fn shell_mime(rel: &str) -> &'static str {
