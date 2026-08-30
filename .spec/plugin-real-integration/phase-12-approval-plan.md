@@ -13,13 +13,21 @@
    （canonical→session.approval.decide 臂）→ `approval_respond` →
    allowedOnce 执行工具 / rejected 合成拒绝 + `approval/decided` 事件。
 
-## 唯一前置缺口（与阶段 13 共用解法）
-echo provider 不发 tool call → **必须先换真 LLM 起 serve**：
-凭据在 `target/verify-secrets.env`（base=http://100.105.152.101:18080/v1,
-model=qwen3.8-flash-next, key=sk-…）。下轮第一步=查 main.rs `--llm-base-url/
---llm-model/--env-file` 与 key 的环境变量名 → 重启 serve（其余旗标沿用配方：
---agent-loop --service-units --dynamic-plugins-dir）→ 冒烟一发
-session/prompt「请用 bash 工具执行 echo hi」看是否出 tool call。
+## 唯一前置缺口（与阶段 13 共用解法）——**解法已查实**
+echo provider 不发 tool call → 必须真 LLM 起 serve。装配链：
+`server_llm_runtime(base_url, model)`（m6_llm.rs:104）注册 **`deepseek` adapter**，
+**key 只从环境变量 `DEEPSEEK_API_KEY` 读取**（`DEEPSEEK_API_KEY_ENV`）。
+故 serve 新配方（凭据见 `target/verify-secrets.env`）：
+```
+$env:DEEPSEEK_API_KEY = "<verify-secrets.env 里的 key>"
+target\debug\dsh.exe web scenarios\web-smoke.cordis.yml --port 60890 `
+  --agent-loop --service-units --dynamic-plugins-dir target\web\dynamic-plugins `
+  --llm-base-url http://100.105.152.101:18080/v1 --llm-model qwen3.8-flash-next
+```
+注意：provider 名固定 `deepseek`（adapter 注册 `["deepseek"]`），故 settings 的
+`llm.provider` 需为 deepseek 才走真外呼（当前冒烟=dsh/echo）——先经
+`settings/update` 臂切 provider（阶段 6 已验证该臂真写），或直接确认
+serve 的 --llm-* 覆盖优先于 settings（下轮实测为准）。
 
 ## 浏览器验收脚本设计（verify-approval.mjs）
 1. RPC `session.plan.mode`{active:true} 开 plan（或 /plan 命令走 UI）；
