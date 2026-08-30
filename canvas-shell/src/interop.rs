@@ -1,0 +1,195 @@
+//! JS 互操作薄层（仅 wasm32）：fetch/SSE/localStorage/DOM 度量。
+//! 纪律：业务逻辑零在此层——只搬运（可证逻辑全在 canvas_shell lib）。
+
+use canvas_shell::values::rpc_envelope;
+use js_sys::{JSON, Reflect};
+use serde_json::Value;
+use std::cell::Cell;
+use std::rc::Rc;
+use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
+use web_sys::{EventSource, HtmlElement, MessageEvent, Request, RequestInit, RequestMode, ResizeObserver};
+
+fn win() -> web_sys::Window {
+    web_sys::window().expect("no window")
+}
+fn doc() -> web_sys::Document {
+    win().document().expect("no document")
+}
+fn ls() -> Option<web_sys::Storage> {
+    win().local_storage().ok().flatten()
+}
+
+fn js_cb<F: FnMut() + 'static>(f: F) -> js_sys::Function {
+    Closure::wrap(Box::new(f) as Box<dyn FnMut()>).into_js_value().unchecked_into()
+}
+
+fn to_js(v: &Value) -> JsValue {
+    JSON::parse(&v.to_string()).unwrap_or(JsValue::NULL)
+}
+
+fn from_js(v: &JsValue) -> Result<Value, String> {
+    let s = JSON::stringify(v).map_err(|_| "不可序列化".to_string())?;
+    serde_json::from_str(&String::from(s)).map_err(|e| e.to_string())
+}
+
+/// POST /api/<method>（client-request 信封）→ arm 层 {ok,value|error}。
+/// 信封解包单点（D-207 语义移植）。
+pub async fn fetch_rpc(method: &str, args: Value) -> Result<Value, String> {
+    let body = JSON::stringify(&to_js(&rpc_envelope(method, Some(args), "rust-shell")))
+        .map_err(|_| "body".to_string())?;
+    let opts = RequestInit::new();
+    opts.set_method("POST");
+    opts.set_mode(RequestMode::SameOrigin);
+    opts.set_body(&body);
+    let req = Request::new_with_str_and_init(&format!("/api/{}", method), &opts)
+        .map_err(|e| format!("req: {:?}", e))?;
+    req.headers().set("content-type", "application/json").map_err(|e| format!("hdr: {:?}", e))?;
+    let resp_val = JsFuture::from(win().fetch_with_request(&req))
+        .await
+        .map_err(|e| format!("fetch: {:?}", e))?;
+    let resp: web_sys::Response = resp_val.dyn_into().map_err(|e| format!("resp: {:?}", e))?;
+    let json = from_js(&JsFuture::from(resp.json().map_err(|e| format!("json: {:?}", e))?).await.map_err(|e| format!("jsonf: {:?}", e))?)?;
+    Ok(json.get("result").cloned().unwrap_or(json))
+}
+
+pub fn spawn_poll<F: FnMut() + 'static>(f: F, ms: i32) {
+    let _h = win().set_interval_with_callback_and_timeout_and_arguments_0(&js_cb(f), ms);
+}
+
+/// SSE 主通道：/plugins/events 的 ui-manifest-changed 帧 → cb（帧形按 live 抓样解析）。
+pub fn watch_manifest<F: FnMut() + 'static>(f: F) {
+    let Ok(es) = EventSource::new("/plugins/events") else { return };
+    let inner = js_cb(f);
+    let outer = Closure::wrap(Box::new(move |ev: MessageEvent| {
+        let Some(txt) = ev.data().as_string() else { return };
+        if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+            if v.get("type").and_then(Value::as_str) == Some("ui-manifest-changed") {
+                let _ = inner.call0(&JsValue::NULL);
+            }
+        }
+    }) as Box<dyn FnMut(MessageEvent)>);
+    es.set_onmessage(Some(outer.as_ref().unchecked_ref()));
+    outer.forget();
+}
+
+// ---------- localStorage（closed 集合，与旧壳同 key 同格式） ----------
+
+pub fn ls_closed() -> Vec<String> {
+    let Some(s) = ls() else { return vec![] };
+    let Some(txt) = s.get_item("dsh.canvas.closed").ok().flatten() else { return vec![] };
+    serde_json::from_str::<Vec<String>>(&txt).unwrap_or_default()
+}
+
+pub fn ls_set_closed(list: &[String]) {
+    if let Some(s) = ls() {
+        let _ = s.set_item("dsh.canvas.closed", &Value::from(list.to_vec()).to_string());
+    }
+}
+
+// ---------- 布局度量 ----------
+
+pub fn workbench_width() -> f64 {
+    doc().get_element_by_id("workbench")
+        .and_then(|e| e.dyn_into::<HtmlElement>().ok())
+        .map(|e| e.client_width() as f64)
+        .unwrap_or(1200.0)
+}
+
+/// 每张在排卡：[id, offsetHeight, 声明格宽 w]。w 由宽反推（= round((w+gap)/(col+gap))），
+/// offsetHeight 天然 >= min-height，故 hPx 直接取实测（D-209 语义）。
+pub fn card_metrics() -> Vec<(String, f64, f64)> {
+    let mut out = Vec::new();
+    let Ok(nodes) = doc().query_selector_all("#workbench .card") else { return out };
+    for i in 0..nodes.length() {
+        let Some(node) = nodes.item(i) else { continue };
+        let Ok(el) = node.dyn_into::<HtmlElement>() else { continue };
+        let key = el.id();
+        if key.is_empty() { continue; }
+        let h = el.offset_height() as f64;
+        // 反推声明格宽 w：width = w*COL + (w-1)*GAP ⇒ w = (width+GAP)/(COL+GAP)
+        let w = (((el.offset_width() as f64) + 10.0) / (260.0 + 10.0)).round().max(1.0);
+        out.push((key, h, w));
+    }
+    out
+}
+
+/// 写回坐标（按 id 直取）+ 工作区总高。positions: key → [x, y]。
+pub fn set_positions(positions: &serde_json::Map<String, Value>, total_h: f64) {
+    for (key, xy) in positions {
+        if let Some(el) = doc().get_element_by_id(key).and_then(|e| e.dyn_into::<HtmlElement>().ok()) {
+            let x = xy.get(0).and_then(Value::as_f64).unwrap_or(0.0);
+            let y = xy.get(1).and_then(Value::as_f64).unwrap_or(0.0);
+            let _ = el.style().set_property("left", &format!("{}px", x));
+            let _ = el.style().set_property("top", &format!("{}px", y));
+        }
+    }
+    if let Some(wb) = doc().get_element_by_id("workbench").and_then(|e| e.dyn_into::<HtmlElement>().ok()) {
+        let _ = wb.style().set_property("min-height", &format!("{}px", total_h + 28.0));
+    }
+}
+
+/// 聚焦：滚动 + 高亮 1600ms（focusCard 语义移植；id 直取，无选择器转义）。
+pub fn focus_card(key: &str) {
+    let Some(el) = doc().get_element_by_id(key).and_then(|e| e.dyn_into::<HtmlElement>().ok()) else { return };
+    el.scroll_into_view();
+    let _ = el.class_list().add_1("focus-hl");
+    let el2 = el.clone();
+    let rm = Closure::wrap(Box::new(move || {
+        let _ = el2.class_list().remove_1("focus-hl");
+    }) as Box<dyn FnMut()>);
+    let _h = win().set_timeout_with_callback_and_timeout_and_arguments_0(rm.as_ref().unchecked_ref::<js_sys::Function>(), 1600);
+    rm.forget();
+}
+
+/// RO → debounce(200ms) → bump。S2 另配 1500ms 脉冲兜底（RO 精细化列后续打磨）。
+pub fn observe_bump<F: FnMut() + 'static>(f: F) {
+    let bump = js_cb(f);
+    let handle = Rc::new(Cell::new(0i32));
+    let outer = js_cb(move || {
+        let b = bump.clone();
+        let fire = js_cb(move || {
+            let _ = b.call0(&JsValue::NULL);
+        });
+        let w = win();
+        if handle.get() != 0 {
+            w.clear_timeout_with_handle(handle.get());
+        }
+        if let Ok(id) = w.set_timeout_with_callback_and_timeout_and_arguments_0(&fire, 200) {
+            handle.set(id as i32);
+        }
+    });
+    if let Ok(ro) = ResizeObserver::new(&outer) {
+        observe_all(&ro);
+        RO_SLOT.with(|slot| {
+            if let Some(prev) = slot.borrow_mut().replace(ro) {
+                prev.disconnect();
+            }
+        });
+    }
+}
+
+fn observe_all(ro: &ResizeObserver) {
+    if let Ok(nodes) = doc().query_selector_all("#workbench .card") {
+        for i in 0..nodes.length() {
+            if let Some(el) = nodes.item(i).and_then(|n| n.dyn_into::<web_sys::Element>().ok()) {
+                ro.observe(&el);
+            }
+        }
+    }
+}
+
+pub fn reobserve() {
+    RO_SLOT.with(|slot| {
+        if let Some(ro) = slot.borrow().as_ref() {
+            ro.disconnect();
+            observe_all(ro);
+        }
+    });
+}
+
+thread_local! {
+    static RO_SLOT: std::cell::RefCell<Option<ResizeObserver>> = const { std::cell::RefCell::new(None) };
+}
+
