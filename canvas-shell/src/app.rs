@@ -65,6 +65,13 @@ fn grid_px(w: i64) -> f64 {
     w as f64 * GRID_COL as f64 + (w as f64 - 1.0) * GRID_GAP as f64
 }
 
+/// D-225：全局语言信号（免 prop 钻透；组件读取即订阅，切换→全壳重渲）。
+static LANG: Global<Signal<String>, String> = Signal::global(|| "zh".to_string());
+/// 一次性取当前语言（组件内=订阅；回调内=快照）。
+fn L() -> String {
+    LANG()
+}
+
 fn scalar_text(v: Option<&Value>) -> String {
     match v {
         Some(Value::String(s)) => s.clone(),
@@ -266,14 +273,14 @@ fn ChatIsland(view: Value, k: String, body: Signal<serde_json::Map<String, Value
             match crate::interop::fetch_rpc(&ss, json!({"sessionId": sid2, "text": txt2})).await {
                 Err(e) => {
                     mark_pending_fail(&mut b2, &k2);
-                    set_act(b2, &k2, format!("✗ 发送：{}", e));
+                    set_act(b2, &k2, format!("{}{}", canvas_shell::i18n::t(&L(), "send_failed"), e));
                 }
                 Ok(res) if res.get("ok").and_then(Value::as_bool) == Some(false) => {
                     mark_pending_fail(&mut b2, &k2);
                     let m = res.get("error").and_then(|x| x.get("message")).and_then(Value::as_str).unwrap_or("?");
                     set_act(b2, &k2, format!("✗ {}", m));
                 }
-                Ok(_) => set_act(b2, &k2, "✓ 已发送".into()),
+                Ok(_) => set_act(b2, &k2, canvas_shell::i18n::t(&L(), "sent").into()),
             }
         });
     };
@@ -288,16 +295,16 @@ fn ChatIsland(view: Value, k: String, body: Signal<serde_json::Map<String, Value
             set_act(b_c, &k_c, "✗ 当前无会话".into());
             return;
         }
-        set_act(b_c, &k_c, format!("→ 取消 {} …", sid_now));
+        set_act(b_c, &k_c, format!("{}{}{}", canvas_shell::i18n::t(&L(), "cancel"), sid_now, canvas_shell::i18n::t(&L(), "cancel2")));
         let (k2, b2) = (k_c.clone(), b_c);
         let (cc, sid2) = (c_rpc.clone(), sid_now);
         spawn(async move {
             let msg = match crate::interop::fetch_rpc(&cc, json!({"sessionId": sid2})).await {
-                Err(e) => format!("✗ 取消：{}", e),
+                Err(e) => format!("{}{}", canvas_shell::i18n::t(&L(), "cancel_failed"), e),
                 Ok(res) if res.get("ok").and_then(Value::as_bool) == Some(false) => {
                     format!("✗ {}", res.get("error").and_then(|x| x.get("message")).and_then(Value::as_str).unwrap_or("?"))
                 }
-                Ok(_) => "✓ 已请求取消".into(),
+                Ok(_) => canvas_shell::i18n::t(&L(), "cancel_ok").into(),
             };
             set_act(b2, &k2, msg);
         });
@@ -318,10 +325,10 @@ fn ChatIsland(view: Value, k: String, body: Signal<serde_json::Map<String, Value
             }
         }
         form { class: "chat-send", onsubmit: send,
-            input { name: "chat-input", placeholder: "发消息…", autocomplete: "off" }
-            button { r#type: "submit", class: "primary", "发送" }
+            input { name: "chat-input", placeholder: canvas_shell::i18n::t(&L(), "chat_ph"), autocomplete: "off" }
+            button { r#type: "submit", class: "primary", { canvas_shell::i18n::t(&L(), "send") } }
             if has_cancel {
-                button { onclick: stop, "停止" }
+                button { onclick: stop, { canvas_shell::i18n::t(&L(), "stop") } }
             }
         }
     }
@@ -349,7 +356,7 @@ fn action_click(
     mut body: Signal<serde_json::Map<String, Value>>,
 ) {
     if needs_confirm(a)
-        && !crate::interop::confirm_dialog(&format!("确认「{}」？", a.get("label").and_then(Value::as_str).unwrap_or("")))
+        && !crate::interop::confirm_dialog(&format!("{}{}{}", canvas_shell::i18n::t(&L(), "confirm_act"), canvas_shell::i18n::ltext(a.get("label"), &L()), canvas_shell::i18n::t(&L(), "confirm_act2")))
     {
         return;
     }
@@ -381,7 +388,7 @@ fn action_click(
 /// 行动作按钮（组件化以获得 key/props 语义）。
 #[component]
 fn ActionBtn(k: String, view: Value, row: Value, a: Value, body: Signal<serde_json::Map<String, Value>>) -> Element {
-    let label = if a.get("label").is_some() { scalar_text(a.get("label")) } else { scalar_text(a.get("name")) };
+    let label = if a.get("label").is_some() { canvas_shell::i18n::ltext(a.get("label"), &L()) } else { scalar_text(a.get("name")) };
     rsx! {
         button {
             class: "row-action",
@@ -450,7 +457,7 @@ fn NsPick(options: Vec<String>, current: String, k: String, mut body: Signal<ser
 /// 保存/动作按钮（spec: {rpc, mode, ns, revision, fields:[desc]}）。
 #[component]
 fn FormSave(spec: Value, k: String, mut body: Signal<serde_json::Map<String, Value>>) -> Element {
-    let label = scalar_text(spec.get("label"));
+    let label = if spec.get("label").is_some() { canvas_shell::i18n::ltext(spec.get("label"), &L()) } else { String::new() };
     let primary = spec.get("primary").and_then(Value::as_bool).unwrap_or(false);
     rsx! {
         button {
@@ -463,11 +470,19 @@ fn FormSave(spec: Value, k: String, mut body: Signal<serde_json::Map<String, Val
                     Err((field, e)) => {
                         let mut bw = body;
                         let mut g = bw.write();
-                        if let Some(en) = g.get_mut(&k) { en["act"] = json!(format!("✗ 字段 {}：{}", field, e)); }
+                        if let Some(en) = g.get_mut(&k) { en["act"] = json!(format!("{}{}{}{}", canvas_shell::i18n::t(&L(), "field_err"), field, canvas_shell::i18n::t(&L(), "field_err2"), e)); }
                         return;
                     }
                 };
                 let mode = spec.get("mode").and_then(Value::as_str).unwrap_or("values");
+                // D-225：locale 联动——本表单若编辑 ns=locale 的 preference，保存成功即切壳语言。
+                let locale_pref = if mode == "settings-update"
+                    && spec.get("ns").and_then(Value::as_str) == Some("locale")
+                {
+                    patch.get("preference").and_then(Value::as_str).map(str::to_string)
+                } else {
+                    None
+                };
                 let args = if mode == "settings-update" {
                     json!({"ns": spec.get("ns").cloned().unwrap_or(Value::Null),
                            "patch": patch,
@@ -487,22 +502,28 @@ fn FormSave(spec: Value, k: String, mut body: Signal<serde_json::Map<String, Val
                 let mut b2 = body;
                 spawn(async move {
                     let msg = match crate::interop::fetch_rpc(&rpc, args).await {
-                        Err(e) => format!("✗ 保存失败：{}", e),
+                        Err(e) => format!("{}{}", canvas_shell::i18n::t(&L(), "save_failed"), e),
                         Ok(res) if res.get("ok").and_then(Value::as_bool) == Some(false) => {
                             let m = res.get("error").and_then(|x| x.get("message")).and_then(Value::as_str).unwrap_or("?");
                             let c = res.get("error").and_then(|x| x.get("code")).and_then(Value::as_str).unwrap_or("");
                             format!("✗ {}（code={}）", m, c)
                         }
                         Ok(res) => {
+                            // D-225：locale 卡保存成功→壳语言即时切换（本页联动）。
+                            if res.get("ok").and_then(Value::as_bool) == Some(true) {
+                                if let Some(p) = locale_pref.clone() {
+                                    *LANG.signal().write() = p;
+                                }
+                            }
                             let mut msg = {
                                 let applies = res.get("value").and_then(|v| v.get("applies")).and_then(Value::as_str).unwrap_or("");
-                                if applies == "restart" { "✓ 已保存——需重启生效".to_string() } else { "✓ 已保存".to_string() }
+                                if applies == "restart" { canvas_shell::i18n::t(&L(), "saved_restart").to_string() } else { canvas_shell::i18n::t(&L(), "saved").to_string() }
                             };
                             if let (Some(field), Some(path)) = (inject_field.as_deref(), inject_path.as_deref()) {
                                 if let Some(v) = dig(&res, &format!("value.{path}")) {
                                     let (text, n) = list_to_json_text(v);
                                     crate::interop::set_input_value(&k2, field, &text);
-                                    msg = format!("✓ 发现 {n} 项 · 已注入 {field}（未保存）");
+                                    msg = if L() == "en" { format!("✓ Found {n} items · injected into {field} (unsaved)") } else { format!("✓ 发现 {n} 项 · 已注入 {field}（未保存）") };
                                 }
                             }
                             msg
@@ -552,11 +573,11 @@ fn list_to_json_text(v: &Value) -> (String, usize) {
 fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, Value>>) -> Element {
     let st = match st {
         Some(s) => s,
-        None => return rsx! { div { class: "cstat", "载入体面…" } },
+        None => return rsx! { div { class: "cstat", { canvas_shell::i18n::t(&L(), "load_body") } } },
     };
     let stage = st.get("stage").and_then(Value::as_str).unwrap_or("").to_string();
     if stage == "load" {
-        return rsx! { div { class: "cstat", "载入当前值…" } };
+        return rsx! { div { class: "cstat", { canvas_shell::i18n::t(&L(), "load_values") } } };
     }
     if stage == "decl" {
         let msg = scalar_text(st.get("msg"));
@@ -576,14 +597,17 @@ fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, 
     let lr = list_rows(&view, &data);
     let columns = lr.get("columns").and_then(Value::as_array).cloned().unwrap_or_default();
     let rows = lr.get("rows").and_then(Value::as_array).cloned().unwrap_or_default();
-    let empty_text = lr.get("emptyText").and_then(Value::as_str).unwrap_or("暂无条目").to_string();
+    let empty_text = {
+        let et = canvas_shell::i18n::ltext(lr.get("emptyText"), &L());
+        if et.is_empty() { canvas_shell::i18n::t(&L(), "no_items").to_string() } else { et }
+    };
     let row_actions = view.get("rowActions").and_then(Value::as_array).cloned().unwrap_or_default();
     // rsx for 体不收 let：先在外部把 wire 形状压成纯字符串对（视图层零逻辑再证一次）。
     let status_pairs: Vec<(String, String)> = items
         .iter()
-        .map(|it| (scalar_text(it.get("label")), scalar_text(it.get("value"))))
+        .map(|it| (canvas_shell::i18n::ltext(it.get("label"), &L()), scalar_text(it.get("value"))))
         .collect();
-    let th_labels: Vec<String> = columns.iter().map(|c| scalar_text(c.get("label"))).collect();
+    let th_labels: Vec<String> = columns.iter().map(|c| canvas_shell::i18n::ltext(c.get("label"), &L())).collect();
     let cells_all: Vec<Vec<String>> = rows
         .iter()
         .map(|r| columns.iter().map(|c| scalar_text(r.get(scalar_text(c.get("key"))))).collect())
@@ -619,7 +643,7 @@ fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, 
                 for pf in proj.get("fields").and_then(Value::as_array).unwrap_or(&vec![]) {
                     let mut nf = json!({
                         "name": scalar_text(pf.get("key")),
-                        "label": scalar_text(pf.get("label")),
+                        "label": canvas_shell::i18n::ltext(pf.get("label"), &L()),
                         "type": scalar_text(pf.get("type")),
                         "value": scalar_text(pf.get("value")),
                         "options": pf.get("options").cloned().unwrap_or(json!([])),
@@ -643,7 +667,7 @@ fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, 
                     let name = scalar_text(fd.get("name"));
                     let initial = value_text(vals.get(&name), fd.get("default"));
                     form_fields.push(json!({
-                        "name": name, "label": scalar_text(fd.get("label")),
+                        "name": name, "label": canvas_shell::i18n::ltext(fd.get("label"), &L()),
                         "type": scalar_text(fd.get("type")), "value": initial,
                         "options": fd.get("options").cloned().unwrap_or(json!([])),
                         "required": fd.get("required").and_then(Value::as_bool).unwrap_or(false),
@@ -659,7 +683,7 @@ fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, 
                 .unwrap_or_default();
             let mode = if rpc == "settings/update" { "settings-update" } else { "values" };
             let mut spec = json!({
-                "label": if a.get("label").is_some() { scalar_text(a.get("label")) } else { scalar_text(a.get("name")) },
+                "label": if a.get("label").is_some() { canvas_shell::i18n::ltext(a.get("label"), &L()) } else { scalar_text(a.get("name")) },
                 "primary": a.get("primary").and_then(Value::as_bool).unwrap_or(false),
                 "rpc": rpc, "mode": mode, "ns": json!(n_ns.clone()), "revision": n_rev.clone(), "fields": form_desc.clone(),
             });
@@ -693,7 +717,7 @@ fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, 
         }
         if kind == "status" {
             if items.is_empty() && err_msg.is_empty() {
-                div { class: "row", "暂无条目" }
+                div { class: "row", { canvas_shell::i18n::t(&L(), "no_items") } }
             }
             for (idx, (label, value)) in status_pairs.iter().enumerate() {
                 div {
@@ -788,6 +812,30 @@ pub fn App() -> Element {
     let pos = use_signal(crate::interop::ls_pos_map);
     let bump = use_signal(|| 0u32);
     let body = use_signal(serde_json::Map::<String, Value>::new);
+    // D-225：启动读 locale.preference（settings 权威；缺省 zh）。
+    {
+        let mut li = LANG.signal();
+        use_effect(move || {
+            spawn(async move {
+                if let Ok(res) = crate::interop::fetch_rpc("settings/describe", json!({})).await {
+                    if let Some(p) = res
+                        .get("value")
+                        .and_then(|v| v.get("namespaces"))
+                        .and_then(Value::as_array)
+                        .and_then(|a| {
+                            a.iter()
+                                .find(|n| n.get("ns").and_then(Value::as_str) == Some("locale"))
+                        })
+                        .and_then(|n| n.get("value"))
+                        .and_then(|v| v.get("preference"))
+                        .and_then(Value::as_str)
+                    {
+                        *li.write() = p.to_string();
+                    }
+                }
+            });
+        });
+    }
 
     // 体面管线：清单版本变 → 未加载卡逐个 ui.json→validate→dataRpc（S3a）。
     use_effect(move || {
@@ -987,12 +1035,45 @@ pub fn App() -> Element {
 
     rsx! {
         header {
-            h1 { "服务装配单元 · 桌布 " }
+            h1 { { canvas_shell::i18n::t(&L(), "app_title") } }
             span { class: "rev", id: "rev", title: "清单内容哈希（rev）",
                 if rev.is_empty() { "" } else { "rev {revshort}…" }
             }
             span { class: statuscls, id: "status",
-                if modelv.is_some() { "✓ 清单 {allcards.len()} 卡" } else { "{statustxt}" }
+                if modelv.is_some() { { format!("✓ {} {} {}", canvas_shell::i18n::t(&L(), "manifest_ok"), allcards.len(), canvas_shell::i18n::t(&L(), "cards")) } } else { { "{statustxt}".to_string() } }
+            }
+            // D-225：顶栏一键语言钮——settings/update（同 FormSave 线形）成功后即切。
+            button {
+                id: "lang-toggle",
+                class: "reset-pos",
+                onclick: move |_| {
+                    let next = if L() == "en" { "zh" } else { "en" };
+                    let next = next.to_string();
+                    let mut li = LANG.signal();
+                    spawn(async move {
+                        let rev = crate::interop::fetch_rpc("settings/describe", json!({}))
+                            .await
+                            .ok()
+                            .and_then(|res| {
+                                let ns = res.get("value")?.get("namespaces")?.as_array()?.iter()
+                                    .find(|n| n.get("ns").and_then(Value::as_str) == Some("locale"))?
+                                    .get("revision")?.clone();
+                                Some(ns)
+                            })
+                            .unwrap_or(Value::Null);
+                        if let Ok(res) = crate::interop::fetch_rpc(
+                            "settings/update",
+                            json!({ "ns": "locale", "patch": { "preference": &next }, "expectedRevision": rev }),
+                        )
+                        .await
+                        {
+                            if res.get("ok").and_then(Value::as_bool) == Some(true) {
+                                *li.write() = next;
+                            }
+                        }
+                    });
+                },
+                if L() == "en" { "中" } else { "EN" }
             }
             if canvas_shell::board::has_pins(&posv, &board) {
                 button {
@@ -1008,7 +1089,7 @@ pub fn App() -> Element {
                         }
                         *bump_r.write() += 1;
                     },
-                    "⟲ 重置摆位"
+                    { canvas_shell::i18n::t(&L(), "reset_pos") }
                 }
             }
         }
@@ -1021,7 +1102,7 @@ pub fn App() -> Element {
                         s.set(None);
                         crate::interop::set_hash_board(canvas_shell::board::BOARD_ALL);
                     },
-                    "全部（{allcards.len()}）"
+                    {format!("{}（{}）", canvas_shell::i18n::t(&L(), "board_all"), allcards.len())}
                 }
                 for g in groups.iter() {
                     {
@@ -1108,7 +1189,7 @@ pub fn App() -> Element {
             main { id: "workbench",
                 if visible.is_empty() {
                     div { class: "empty",
-                        if !closedv.is_empty() { "本组卡片已全部关闭——点左侧灰显标题可重新打开。" }
+                        if !closedv.is_empty() { { canvas_shell::i18n::t(&L(), "all_closed") } }
                         else { "还没有服务装配单元声明 UI——向 wasm-plugins/<name>/web/ui.json 提交 v2 卡片声明即自动出现。" }
                     }
                 }
@@ -1128,7 +1209,7 @@ pub fn App() -> Element {
                                 .map(|d| (d.1, d.2))
                                 .unwrap_or((0.0, 0.0)),
                         };
-                        let title = c.get("title").and_then(Value::as_str).unwrap_or("").to_string();
+                        let title = canvas_shell::i18n::ltext(c.get("title"), &L());
                         let ty = c.get("type").and_then(Value::as_str).unwrap_or("").to_string();
                         let pn = c.get("pluginName").and_then(Value::as_str).unwrap_or("").to_string();
                         let emsg = c.get("error").and_then(|e| e.get("message")).and_then(Value::as_str).unwrap_or("").to_string();

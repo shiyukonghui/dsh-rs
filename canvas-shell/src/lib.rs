@@ -3,6 +3,7 @@
 
 pub mod board;
 pub mod chat;
+pub mod i18n;
 pub mod layout;
 pub mod model;
 pub mod schema;

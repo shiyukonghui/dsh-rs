@@ -8759,3 +8759,10 @@ semi-theme-default 语义值（源码为权威），DOM 与布局几何（D-181 
 **验证**：双主题+卡特写截图（console 零错）；e2e-audit T0-T17 与基线逐项一致
 （零回归）。逐卡逐视图收口进行中。
 **回滚**：revert canvas.css 单文件。
+
+## D-225 中英文点击切换（进行中：shell 侧落地，单元声明迁移下轮）
+- 日期 2026-09-06 / 触发=目标「完善中英文切换，前端点击切换可验证」；现状=locale ns 有存储零消费方。
+- 决策：①LocalizedText 契约（字符串|{zh,en}，lang→zh→en 回退）兼容旧声明；②shell 全局语言信号 Global<Signal>（免 prop 钻透，组件读取即订阅→切换全壳重渲）；③顶栏一键钮走 settings/update（同 FormSave 线形，成功才切）；④启动 settings/describe 读偏好（缺省 zh）→刷新持久；⑤locale-edit 卡保存联动本页。
+- 验证：verify-locale.mjs 12/12（zh→EN 断言英文章/刷新持久/点中复原，console 零错）；rsx 坑=路径表达式子元素必须 { } 包裹（:: 与属性语法冲突）。
+- 审计观察：连跑两轮出现 NO-CARD/悬挂 flake（T9 或 T4/T6/T11 交替），consoleErrs 均空=与已知 serve 瞬时挂起/sse-reload-starvation 同族，非本改动引入（待下轮干净板复跑定档）。
+- 回滚点：增量链（i18n.rs+app.rs+assets），revert 即回中文硬编码态。
