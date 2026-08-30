@@ -8644,3 +8644,28 @@ workspace 全绿；实测 plan/projection+exitCheck+报告 declared:true；审�
 后页面事件通道饥饿；宿主面铁证正确、新鲜页 700ms 全绿）——档案
 `.spec/service-assembly-ui-panels/sse-reload-starvation.md`，修复候选=unload 显式
 es.close() + CDP 连接数实证，另轮 spike。
+
+
+## D-218 · 调度到期消费端接线（framing → agent loop 轮次）
+
+**日期**：2026-09-06
+**触发问题**：阶段 10 浏览器实测「创建调度→60s 真触发→聊天可见」全链时，
+派发事件准点落档但聊天永远无轮次——生产主循环（web.rs 主 tick）调用
+`m5g_tick_once` 后**丢弃返回的 framing**：「调度到期注入」只注入到事件日志，
+从不进 agent loop；既有 m5g 测试只断言派发事件（断言止步于事件面，从未
+断言语义终点=提示被执行）。
+**考虑的选项**：
+- 调度器自起最小 loop（独立跑提示）——**否决**：第二套轮次语义（双权威）。
+- 注入走 HTTP 自调 session/prompt——**否决**：绕网络/鉴权面自增耦合。
+**最终选择**：`spawn_schedule_turns`——framing 逐条经
+`run_rust_loop_on_host`（chat `session/prompt` 同一执行权威）注入 default
+会话；批内顺序单线程保序；线程隔离（LLM 轮次绝不阻塞 accept 循环）；
+loop 未装配 → 诚实 eprintln 不吞提示。serve 主循环 tick 消费改为
+`match m5g_tick_once → 非空 framing 注入`。
+**验证**：红先行（新测试断言 framing 成会话轮次事件，修复前必败）→
+绿 + 全量 lib 271/271；浏览器端到端 5/5（真填表→创建→准点触发→聊天卡
+出现提示原文 + 助手回应，console 零错）。
+**预期影响与回滚点**：调度族语义终点闭合（提醒=真执行）；回滚=revert 本
+改动（framing 回到丢弃态，事件日志面不受影响）。
+**教训入册**：对接验证必须断言到**语义终点**（用户可见效果），事件落档
+≠功能发生——本目标逐插件浏览器验证的直接价值实证。

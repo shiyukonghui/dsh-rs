@@ -422,8 +422,21 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
         }
         if let (Some(sched), Some(bridge)) = (&tick_schedule, &tick_bridge) {
             let now = system_now_ms();
-            if let Err(e) = web_m5::m5g_tick_once(sched, Some(bridge), now) {
-                eprintln!("dsh web: tick advance failed: {e}");
+            match web_m5::m5g_tick_once(sched, Some(bridge), now) {
+                Ok((framing, _dispatched)) => {
+                    // D-218：到期 framing 进 agent loop 执行（与 chat session/prompt
+                    // 同一执行权威）。此前 framing 被丢弃=「到期注入」名不副实。
+                    if !framing.is_empty() {
+                        match boot.agent_loop.clone() {
+                            Some(loop_host) => spawn_schedule_turns(loop_host, "default".to_string(), framing),
+                            None => eprintln!(
+                                "dsh web: {} schedule prompt(s) not injected (agent loop not assembled)",
+                                framing.len()
+                            ),
+                        }
+                    }
+                }
+                Err(e) => eprintln!("dsh web: tick advance failed: {e}"),
             }
         }
         // D-186：热插拔 watch（2s 节流）——装配单元装/卸同步 + 清单 rev 变化经
@@ -443,6 +456,26 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
 /// M6（step3）：serve 主循环自驱节拍间隔（毫秒）。推进点每 tick 一次：调度到期注入 +
 /// bash jobs 合作结算；非阻塞（recv_timeout），无忙轮询。
 pub const M6_SERVE_TICK_INTERVAL_MS: u64 = 250;
+
+/// D-218：调度到期 framing 的消费端——作为会话轮次进 agent loop 执行。
+/// 执行权威=chat `session/prompt` 同一入口（`run_rust_loop_on_host`），杜绝第二套
+/// 轮次语义。批内**顺序**单线程（同到期批次保序），线程隔离=LLM 轮次绝不阻塞
+/// accept 循环；loop 缺席 → 调用方诚实 eprintln（不静默吞提示）。
+pub fn spawn_schedule_turns(
+    loop_host: std::sync::Arc<dsh_agent_loop::AgentLoopHost>,
+    session_id: String,
+    framing: Vec<String>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("sched-turn".to_string())
+        .spawn(move || {
+            for text in framing {
+                if let Err(e) = crate::run_rust_loop_on_host(&loop_host, &session_id, &text) {
+                    eprintln!("dsh web: schedule prompt inject failed: {e}");
+                }
+            }
+        });
+}
 
 /// `/plugins/events` HMR SSE 通道的路由决策（D-099）：GET→连接流、HEAD→事件流头、
 /// 其他方法→405（对齐 TS 路由的非 GET/HEAD 405 语义）；路径不匹配 → None
@@ -9742,6 +9775,69 @@ mod tests {
             .filter(|e| e.kind == dsh_session::types::EventKind::ScheduleChange)
             .count();
         assert!(sched_events >= 2, "create + dispatch events: {sched_events}");
+    }
+
+    /// D-218（P10 对接缺口修复）：调度到期 → framing **进 agent loop 执行**成轮次。
+    /// 此前 m5g_tick_once 的 framing 在生产循环被丢弃（只落 dispatch 事件，无轮次）。
+    #[test]
+    fn schedule_dispatch_executes_prompt_as_agent_turn() {
+        let store = SessionHost::in_memory();
+        let _ = store.session("default");
+        let sched = Arc::new(dsh_cli_host::ScheduleHost::new(
+            store.session("default").expect("default live"),
+        ));
+        let root = std::env::temp_dir().join(format!("dsh-sched-turn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let m5 = web_m5::M5Host::assemble(root.clone(), None).expect("m5 assembles");
+        let m4 = M4HostServices {
+            jobs: None,
+            schedule: None,
+            todo: None,
+            plan_mode: None,
+        };
+        let llm = Arc::new(dsh_llm::LlmRuntime::new());
+        let loop_host = assemble_server_loop(
+            store.store.clone(),
+            root.clone(),
+            llm,
+            "dsh",
+            "echo",
+            m4,
+            m5,
+        )
+        .expect("loop assembles");
+
+        let now = m5g_epoch_now_ms();
+        let _id = sched
+            .create("after", "sched-turn-probe", Some(1), None, None, now)
+            .expect("create after(1)");
+        let mut framing = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while framing.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "dispatch starvation");
+            let (f, _d) = web_m5::m5g_tick_once(&sched, None, m5g_epoch_now_ms()).expect("tick_once");
+            framing = f;
+            if framing.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        assert!(framing[0].contains("sched-turn-probe"), "framing 含提示原文: {:?}", framing[0]);
+
+        // serve 同款注入（含线程），等轮次落会话日志（非 schedule/change）。
+        spawn_schedule_turns(loop_host.clone(), "default".into(), framing);
+        let mut seen = false;
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if store.events("default").iter().any(|e| {
+                e.kind != dsh_session::types::EventKind::ScheduleChange
+                    && serde_json::to_string(&e.data).unwrap_or_default().contains("sched-turn-probe")
+            }) {
+                seen = true;
+                break;
+            }
+        }
+        assert!(seen, "到期提示经注入成为会话轮次事件（framing 被消费执行）");
     }
 
     /// M5i 接线 #7（验收 5/7）：M5g 服务线程 tick 自动结算 bash 后台 job（**非手工** pump：
