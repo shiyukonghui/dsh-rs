@@ -340,7 +340,14 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
             .clone()
             .or_else(|| std::env::var("DSH_LLM_MODEL").ok())
             .unwrap_or_else(|| "deepseek-chat".to_string());
-        let bundle = assemble_server_runtime(&host, ws_root, &base_url, &model).map_err(|e| {
+        let bundle = assemble_server_runtime_with_kv(
+            &host,
+            ws_root,
+            &base_url,
+            &model,
+            remote_host.kv.clone(),
+        )
+        .map_err(|e| {
             CordisError::Internal(format!(
                 "agent loop assembly failed (enable_agent_loop, base {base_url}, model {model}): {e}"
             ))
@@ -3593,6 +3600,20 @@ pub fn assemble_server_runtime(
     model: &str,
 ) -> Result<ServerLoopBundle, String> {
     let llm = crate::m6_llm::server_llm_runtime(base_url, model);
+    assemble_server_runtime_with_llm(host, workspace_root, llm, "deepseek", model)
+}
+
+/// D-221：serve 专用——共享 kv（RemoteHost 权威单源）注入 LLM 连接闭包，
+/// llm-deepseek 卡的 baseURL/effort/thinking 保存即热生效。
+pub fn assemble_server_runtime_with_kv(
+    host: &Arc<crate::session_host::SessionHost>,
+    workspace_root: std::path::PathBuf,
+    base_url: &str,
+    model: &str,
+    kv: crate::m6_llm::LlmSharedKv,
+) -> Result<ServerLoopBundle, String> {
+    let key = std::env::var(crate::m6_llm::DEEPSEEK_API_KEY_ENV).ok();
+    let llm = crate::m6_llm::server_llm_runtime_shared_kv(base_url, model, key.as_deref(), Some(kv));
     assemble_server_runtime_with_llm(host, workspace_root, llm, "deepseek", model)
 }
 

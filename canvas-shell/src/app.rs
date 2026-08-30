@@ -472,10 +472,17 @@ fn FormSave(spec: Value, k: String, mut body: Signal<serde_json::Map<String, Val
                     json!({"ns": spec.get("ns").cloned().unwrap_or(Value::Null),
                            "patch": patch,
                            "expectedRevision": spec.get("revision").cloned().unwrap_or(Value::Null)})
+                } else if let Some(w) = spec.get("valuesKey").and_then(Value::as_str) {
+                    // D-223：valuesKey 声明——表单值按声明键包装（llm-deepseek 契约={values}）。
+                    json!({ w: patch })
                 } else {
                     patch
                 };
                 let rpc = scalar_text(spec.get("rpc"));
+                // D-223：结果注入声明（resultToField + resultPath）——动作成功后
+                // 把返回值写回指定表单字段（如 discoverModels → models 目录）。
+                let inject_field = spec.get("resultToField").and_then(Value::as_str).map(str::to_string);
+                let inject_path = spec.get("resultPath").and_then(Value::as_str).map(str::to_string);
                 let k2 = k.clone();
                 let mut b2 = body;
                 spawn(async move {
@@ -487,8 +494,18 @@ fn FormSave(spec: Value, k: String, mut body: Signal<serde_json::Map<String, Val
                             format!("✗ {}（code={}）", m, c)
                         }
                         Ok(res) => {
-                            let applies = res.get("value").and_then(|v| v.get("applies")).and_then(Value::as_str).unwrap_or("");
-                            if applies == "restart" { "✓ 已保存——需重启生效".to_string() } else { "✓ 已保存".to_string() }
+                            let mut msg = {
+                                let applies = res.get("value").and_then(|v| v.get("applies")).and_then(Value::as_str).unwrap_or("");
+                                if applies == "restart" { "✓ 已保存——需重启生效".to_string() } else { "✓ 已保存".to_string() }
+                            };
+                            if let (Some(field), Some(path)) = (inject_field.as_deref(), inject_path.as_deref()) {
+                                if let Some(v) = dig(&res, &format!("value.{path}")) {
+                                    let (text, n) = list_to_json_text(v);
+                                    crate::interop::set_input_value(&k2, field, &text);
+                                    msg = format!("✓ 发现 {n} 项 · 已注入 {field}（未保存）");
+                                }
+                            }
+                            msg
                         }
                     };
                     // JS 对齐：保存后不自动重拉（保留 stale revision → 再点必显式 CONFLICT）。
@@ -511,6 +528,23 @@ fn value_text(v: Option<&Value>, default: Option<&Value>) -> String {
             Some(o) => o.to_string(),
         },
         Some(o) => o.to_string(),
+    }
+}
+
+/// 点分路径取值（D-223 resultPath 契约）。
+fn dig<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut cur = root;
+    for seg in path.split('.') {
+        cur = cur.get(seg)?;
+    }
+    Some(cur)
+}
+
+/// 目录值 → textarea JSON 文本（返回文本与条数；非数组诚实按单值）。
+fn list_to_json_text(v: &Value) -> (String, usize) {
+    match v.as_array() {
+        Some(arr) => (serde_json::to_string(arr).unwrap_or_default(), arr.len()),
+        None => (v.to_string(), 1),
     }
 }
 
@@ -624,11 +658,19 @@ fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, 
                 .map(|r| r.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("/"))
                 .unwrap_or_default();
             let mode = if rpc == "settings/update" { "settings-update" } else { "values" };
-            form_specs.push(json!({
+            let mut spec = json!({
                 "label": if a.get("label").is_some() { scalar_text(a.get("label")) } else { scalar_text(a.get("name")) },
                 "primary": a.get("primary").and_then(Value::as_bool).unwrap_or(false),
                 "rpc": rpc, "mode": mode, "ns": json!(n_ns.clone()), "revision": n_rev.clone(), "fields": form_desc.clone(),
-            }));
+            });
+            // D-223：声明透传——valuesKey（表单值包装键）与 resultToField/resultPath
+            //（动作结果注入字段）。此前装配白名单静默丢未知键，声明到不了 FormSave。
+            for k in ["valuesKey", "resultToField", "resultPath"] {
+                if let Some(v) = a.get(k) {
+                    spec[k] = v.clone();
+                }
+            }
+            form_specs.push(spec);
         }
     }
     let chat_opts = chat_options(&data.get("items").cloned().unwrap_or(Value::Null));

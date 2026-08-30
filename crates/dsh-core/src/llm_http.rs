@@ -184,6 +184,12 @@ pub fn messages_to_wire(messages: &[Value]) -> Vec<Value> {
 /// 支持 `http://host:port[/prefix]` 与 `https://host[:port][/prefix]`；
 /// 默认端口 80（http）/ 443（https）。
 fn parse_base(base: &str) -> Option<(String, String, u16, String)> {
+    let (scheme, host, port, prefix) = parse_parts(base)?;
+    Some((scheme, host, port, format!("{prefix}{CHAT_PATH}")))
+}
+
+/// 拆 base URL → (scheme, host, port, 路径前缀〔不含端点〕)。
+fn parse_parts(base: &str) -> Option<(String, String, u16, String)> {
     let (scheme, rest) = if let Some(r) = base.strip_prefix("https://") {
         ("https".to_string(), r)
     } else if let Some(r) = base.strip_prefix("http://") {
@@ -206,8 +212,7 @@ fn parse_base(base: &str) -> Option<(String, String, u16, String)> {
         return None;
     }
     let port = port.unwrap_or(if scheme == "https" { 443 } else { 80 });
-    let path = format!("{prefix}{CHAT_PATH}");
-    Some((scheme, host, port, path))
+    Some((scheme, host, port, prefix.to_string()))
 }
 
 /// 构造 HTTP/1.1 POST 请求（Connection: close；可选 Bearer 认证）。
@@ -223,6 +228,67 @@ fn build_request(path: &str, api_key: Option<&str>, body: &str) -> String {
     req.push_str("Connection: close\r\n\r\n");
     req.push_str(body);
     req
+}
+
+/// D-222：GET JSON 资源（OpenAI 兼容 `GET {base}/models` 之模型发现）。
+/// 复用同款手写传输（http；https 经 native-tls）；2xx → 解析 JSON，否则 Err 带细节。
+/// 兼容 `Transfer-Encoding: chunked`（node/uvicorn 等对 JSON 也分块，无 Content-Length）。
+pub fn http_get_json(base: &str, api_key: Option<&str>, suffix: &str) -> Result<Value, String> {
+    let (scheme, host, port, prefix) =
+        parse_parts(base).ok_or_else(|| format!("invalid base url \"{base}\""))?;
+    let path = format!("{prefix}{suffix}");
+    let mut req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\n"
+    );
+    if let Some(key) = api_key {
+        req.push_str(&format!("Authorization: Bearer {key}\r\n"));
+    }
+    req.push_str("Connection: close\r\n\r\n");
+    let response = tcp_exchange(&scheme, &host, port, &req)?;
+    let sep = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("malformed HTTP response")?;
+    let head = String::from_utf8_lossy(&response[..sep]).to_ascii_lowercase();
+    let status_line = head.lines().next().unwrap_or("");
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or("malformed status line")?;
+    let raw = &response[sep + 4..];
+    let body = if head.contains("transfer-encoding: chunked") {
+        dechunk_body(raw)
+    } else {
+        raw.to_vec()
+    };
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}: {}", String::from_utf8_lossy(&body)));
+    }
+    serde_json::from_slice(&body).map_err(|e| format!("response parse: {e}"))
+}
+
+/// 解码 HTTP/1.1 chunked 体（`HEX\r\n data \r\n … 0\r\n`；扩展/尾块容错）。
+fn dechunk_body(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < raw.len() {
+        let nl = match raw[i..].windows(2).position(|w| w == b"\r\n") {
+            Some(p) => i + p,
+            None => break,
+        };
+        let line = String::from_utf8_lossy(&raw[i..nl]);
+        let size = match u64::from_str_radix(line.trim().split(';').next().unwrap_or("").trim(), 16) {
+            Ok(0) => break,
+            Ok(n) => n as usize,
+            Err(_) => break,
+        };
+        let start = nl + 2;
+        let end = (start + size).min(raw.len());
+        out.extend_from_slice(&raw[start..end]);
+        i = (end + 2).min(raw.len());
+    }
+    out
 }
 
 /// TCP 交换：发送请求、读取完整响应（按 Content-Length 或读到关闭）。
@@ -520,6 +586,44 @@ mod tests {
         let req_text = handle.join().unwrap();
         assert!(req_text.contains("Authorization: Bearer K"), "Bearer header sent");
         assert!(req_text.contains("\"stream\":true") || req_text.contains("stream\":true"), "stream request body passed through");
+    }
+
+    /// D-222：GET JSON（模型发现）——本地一次性服务端返回 OpenAI 形 models 列表。
+    #[test]
+    fn http_get_json_fetches_models_with_bearer() {
+        let body = br#"{"object":"list","data":[{"id":"stub-model-a"}]}"#;
+        let (port, handle) = serve_once("HTTP/1.1 200 OK", body);
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let v = http_get_json(&base, Some("K"), "/models").expect("get ok");
+        assert_eq!(v["data"][0]["id"], "stub-model-a");
+        let req_text = handle.join().unwrap();
+        assert!(req_text.starts_with("GET /v1/models HTTP/1.1"), "GET path from base prefix + suffix: {req_text}");
+        assert!(req_text.contains("Authorization: Bearer K"), "Bearer header sent");
+    }
+
+    /// D-222：chunked 传输编码（node/uvicorn 对 JSON 也分块）必须能解码解析。
+    #[test]
+    fn http_get_json_decodes_chunked_body() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf);
+            let json = "{\"object\":\"list\",\"data\":[{\"id\":\"chunked-model\"}]}";
+            let mid = json.len() - 8;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{}\r\n8\r\n{}\r\n0\r\n\r\n",
+                mid, &json[..mid], &json[mid..]
+            );
+            std::io::Write::write_all(&mut sock, resp.as_bytes()).unwrap();
+            std::io::Write::flush(&mut sock).unwrap();
+        });
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let v = http_get_json(&base, None, "/models").expect("chunked get ok");
+        assert_eq!(v["data"][0]["id"], "chunked-model", "分块体重组正确");
+        handle.join().unwrap();
     }
 
     /// 非 2xx → 结构化错误（带 status + detail）。

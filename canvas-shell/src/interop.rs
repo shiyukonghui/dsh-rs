@@ -106,13 +106,16 @@ pub fn watch_session_events<F: FnMut(Value) + 'static>(f: F) {
     outer.forget();
 }
 
-/// 写控件值（发送后清空输入框）。
+/// 写控件值（发送后清空输入框；textarea 无 value 属性，须走 set_value——D-223 注入依赖）。
 pub fn set_input_value(card_id: &str, name: &str, val: &str) {
     let sel = format!("[id='{}'] [name='{}']", card_id.replace('\'', ""), name.replace('\'', ""));
     if let Some(el) = doc().query_selector(&sel).ok().flatten().and_then(|e| e.dyn_into::<HtmlElement>().ok()) {
         let _ = el.set_attribute("value", val);
         if let Some(inp) = el.dyn_ref::<web_sys::HtmlInputElement>().cloned() {
             inp.set_value(val);
+        }
+        if let Some(ta) = el.dyn_ref::<web_sys::HtmlTextAreaElement>().cloned() {
+            ta.set_value(val);
         }
     }
 }

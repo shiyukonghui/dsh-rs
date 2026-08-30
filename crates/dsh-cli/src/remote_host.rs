@@ -29,7 +29,7 @@ pub struct RemoteHost {
     /// 真实工作区注册表（workspaceFiles / agentWorkspace 数据源）。
     pub workspaces: Option<Rc<RefCell<crate::workspace_host::WorkspaceRegistry>>>,
     /// `kv` 的进程内后端（messageFeedback 持久；serve 可换成 SQLite）。
-    pub kv: Rc<RefCell<HashMap<String, serde_json::Value>>>,
+    pub kv: crate::m6_llm::LlmSharedKv,
     /// 阶段 B/C：动态插件包注册表（pluginId → 包定义）。serve/测试注入真实 wasm
     /// 组件字节；`runHostHalf` 按 packageId 装配进 loader（真实 fiber）。
     pub dynamic_packages: Rc<RefCell<HashMap<String, DynamicPackage>>>,
@@ -69,7 +69,7 @@ impl RemoteHost {
             events,
             loader,
             workspaces,
-            kv: Rc::new(RefCell::new(HashMap::new())),
+            kv: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             dynamic_packages: Rc::new(RefCell::new(HashMap::new())),
             calls: Rc::new(RefCell::new(Vec::new())),
             settings,
@@ -406,8 +406,31 @@ impl RemoteServiceProjector for RemoteHost {
             // 持久 KV（messageFeedback 后端）。
             "kv" => {
                 let key = payload.get("key").and_then(|k| k.as_str()).unwrap_or("");
-                let value = self.kv.borrow().get(key).cloned().unwrap_or(serde_json::Value::Null);
+                let value = self.kv.lock().unwrap().get(key).cloned().unwrap_or(serde_json::Value::Null);
                 serde_json::to_vec(&serde_json::json!({"ok": true, "value": value})).unwrap_or_default()
+            }
+            // D-222：llm-deepseek 模型发现真外呼臂（GET {baseURL}/models，OpenAI 形）。
+            // key 与生产 loop 同权威——只从 `DEEPSEEK_API_KEY` 进程环境读，wasm 永不接触。
+            "llmDiscover" => {
+                let base = payload.get("baseURL").and_then(|b| b.as_str()).unwrap_or("");
+                if base.trim().is_empty() {
+                    return Self::err_json("bad-request", "llmDiscover requires baseURL");
+                }
+                match std::env::var(crate::m6_llm::DEEPSEEK_API_KEY_ENV).ok() {
+                    None => Self::err_json(
+                        "auth",
+                        &format!("{} not set — discovery needs the same credential as agent turns",
+                            crate::m6_llm::DEEPSEEK_API_KEY_ENV),
+                    ),
+                    Some(k) => match dsh_core::llm_http::http_get_json(base, Some(&k), "/models") {
+                        Ok(v) => serde_json::to_vec(&serde_json::json!({
+                            "ok": true,
+                            "models": v.get("data").cloned().unwrap_or(serde_json::Value::Array(vec![])),
+                        }))
+                        .unwrap_or_default(),
+                        Err(e) => Self::err_json("discovery-failed", &e),
+                    },
+                }
             }
             // 阶段 B/C：动态包注册表（真实可装配包清单）。
             "dynamicRegistry" => serde_json::to_vec(&serde_json::json!({
@@ -450,7 +473,7 @@ impl RemoteServiceProjector for RemoteHost {
                     serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
                 let key = payload.get("key").and_then(|k| k.as_str()).unwrap_or("").to_string();
                 let value = payload.get("value").cloned().unwrap_or(serde_json::Value::Null);
-                self.kv.borrow_mut().insert(key, value.clone());
+                self.kv.lock().unwrap().insert(key, value.clone());
                 serde_json::to_vec(&serde_json::json!({"ok": true, "value": value})).unwrap_or_default()
             }
             // 阶段 B：动态激活（runHostHalf 宿主后端）——真实装配进 loader。

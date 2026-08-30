@@ -19,27 +19,68 @@ use std::sync::Arc;
 use dsh_llm::{LlmError, LlmRuntime, StreamChunk};
 use dsh_llm_deepseek::{
     http_error_code, parse_sse, DeepSeekAdapter, DeepSeekAdapterOptions, DeepSeekCatalogModel,
-    DeepSeekConnection, PayloadsResolver, RequestDefaults, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS,
+    DeepSeekConnection, Effort, PayloadsResolver, RequestDefaults, Thinking,
+    DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS,
 };
 
 /// API key 环境变量名——M6 装配的**唯一** key 来源（进程环境，永不落盘）。
 pub const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 
-/// 从装配参数解析一次操作的连接事实。
-fn deepseek_connection(base_url: &str, model: &str) -> DeepSeekConnection {
-    // D-219：wire 默认 reasoning effort。适配器缺省注入 "high"，非 DeepSeek 原厂
-    // 兼容端点可能拒绝（HTTP 400）。仿 key 的 env-only 先例提供启动期旋钮：
-    // `DSH_LLM_EFFORT=off|low|high|max`（缺省=不设=原行为）。
+/// D-221：卡面 provider 设置的共享权威（与 RemoteHost kv **同一 store**）。
+/// llm-deepseek 卡 save → kv["llm-deepseek/settings"]；连接闭包每调用现读=热生效。
+pub type LlmSharedKv =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>;
+
+/// 与 wasm-plugins/llm-deepseek 的 KV_SETTINGS_KEY 逐字一致（双端契约）。
+pub const KV_LLM_DEEPSEEK: &str = "llm-deepseek/settings";
+
+fn apply_effort(d: &mut RequestDefaults, e: &str) {
+    d.reasoning_effort = match e {
+        "off" => Some(Effort::Off),
+        "low" => Some(Effort::Low),
+        "high" => Some(Effort::High),
+        "max" => Some(Effort::Max),
+        _ => d.reasoning_effort,
+    };
+}
+
+/// D-221：有效 provider 配置（每次调用 live 合并）——装配参基址 ← env 缺省
+/// （`DSH_LLM_EFFORT`，D-219）← 卡面 kv 覆盖（baseURL/reasoningEffort/thinking）。
+pub fn provider_cfg(base_url: &str, kv: Option<&LlmSharedKv>) -> (String, RequestDefaults) {
     let mut defaults = RequestDefaults::default();
     if let Ok(e) = std::env::var("DSH_LLM_EFFORT") {
-        defaults.reasoning_effort = match e.as_str() {
-            "off" => Some(dsh_llm_deepseek::Effort::Off),
-            "low" => Some(dsh_llm_deepseek::Effort::Low),
-            "high" => Some(dsh_llm_deepseek::Effort::High),
-            "max" => Some(dsh_llm_deepseek::Effort::Max),
-            _ => None,
-        };
+        apply_effort(&mut defaults, &e);
     }
+    let mut base = base_url.to_string();
+    if let Some(kv) = kv {
+        if let Ok(g) = kv.lock() {
+            if let Some(v) = g.get(KV_LLM_DEEPSEEK) {
+                if let Some(b) = v.get("baseURL").and_then(|s| s.as_str()) {
+                    if !b.trim().is_empty() {
+                        base = b.to_string();
+                    }
+                }
+                if let Some(e) = v.get("reasoningEffort").and_then(|s| s.as_str()) {
+                    apply_effort(&mut defaults, e);
+                }
+                match v.get("thinking").and_then(|s| s.as_str()) {
+                    Some("disabled") => defaults.thinking = Some(Thinking::Disabled),
+                    Some("enabled") => defaults.thinking = Some(Thinking::Enabled),
+                    _ => {}
+                }
+            }
+        }
+    }
+    (base, defaults)
+}
+
+/// 从装配参数解析一次操作的连接事实（env 缺省；无共享 kv 的旧形态）。
+fn deepseek_connection(base_url: &str, model: &str) -> DeepSeekConnection {
+    let (eff_base, defaults) = provider_cfg(base_url, None);
+    connection_with(&eff_base, model, defaults)
+}
+
+fn connection_with(base_url: &str, model: &str, defaults: RequestDefaults) -> DeepSeekConnection {
     DeepSeekConnection {
         base_url: base_url.to_string(),
         defaults,
@@ -52,15 +93,64 @@ fn deepseek_connection(base_url: &str, model: &str) -> DeepSeekConnection {
     }
 }
 
+#[cfg(test)]
+mod provider_cfg_tests {
+    use super::*;
+
+    #[test]
+    fn kv_overrides_base_url_effort_and_thinking() {
+        let kv: LlmSharedKv = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        ));
+        kv.lock().unwrap().insert(
+            KV_LLM_DEEPSEEK.into(),
+            serde_json::json!({ "baseURL": "http://127.0.0.1:9/v1", "reasoningEffort": "low", "thinking": "disabled" }),
+        );
+        let (base, d) = provider_cfg("http://flag:1/v1", Some(&kv));
+        assert_eq!(base, "http://127.0.0.1:9/v1", "卡面 baseURL 热覆盖装配基址");
+        assert_eq!(d.reasoning_effort, Some(Effort::Low));
+        assert_eq!(d.thinking, Some(Thinking::Disabled));
+    }
+
+    #[test]
+    fn empty_or_unknown_kv_values_are_ignored() {
+        let kv: LlmSharedKv = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        ));
+        kv.lock().unwrap().insert(
+            KV_LLM_DEEPSEEK.into(),
+            serde_json::json!({ "baseURL": "  ", "reasoningEffort": "ultra" }),
+        );
+        let (base, d) = provider_cfg("http://flag:1/v1", Some(&kv));
+        assert_eq!(base, "http://flag:1/v1", "空 baseURL 不覆盖");
+        assert_eq!(d.reasoning_effort, None, "未知 effort 值不生效（诚实缺省）");
+    }
+}
+
 /// 装配 LlmRuntime + deepseek 适配器；key 显式传入（测试用，不进进程环境）。
 /// 空/None key **不**报错——首个回合 fail-loud（诚实降级，P3）。
+/// 旧形态（无共享 kv）：保持既有调用方契约不变。
 pub fn server_llm_runtime_with_key(base_url: &str, model: &str, key: Option<&str>) -> Arc<LlmRuntime> {
+    server_llm_runtime_shared_kv(base_url, model, key, None)
+}
+
+/// D-221：共享 kv 形态——卡面 baseURL/reasoningEffort/thinking **live 覆盖**
+/// （连接与传输每调用现读 `provider_cfg`，保存即热生效，无需重启）。
+pub fn server_llm_runtime_shared_kv(
+    base_url: &str,
+    model: &str,
+    key: Option<&str>,
+    kv: Option<LlmSharedKv>,
+) -> Arc<LlmRuntime> {
     let base_url = base_url.to_string();
     let model = model.to_string();
     let key = key.map(|s| s.to_string());
     let conn: Arc<dyn Fn() -> DeepSeekConnection + Send + Sync> = {
-        let (b, m) = (base_url.clone(), model.clone());
-        Arc::new(move || deepseek_connection(&b, &m))
+        let (b, m, kv) = (base_url.clone(), model.clone(), kv.clone());
+        Arc::new(move || {
+            let (eff, defaults) = provider_cfg(&b, kv.as_ref());
+            connection_with(&eff, &m, defaults)
+        })
     };
     let resolve: PayloadsResolver = Arc::new(move |_conn, wire, opts| {
         let Some(k) = &key else {
@@ -85,7 +175,9 @@ pub fn server_llm_runtime_with_key(base_url: &str, model: &str, key: Option<&str
                 Box::new(move || s.aborted())
             });
         let cancel: Option<&(dyn Fn() -> bool + Send + Sync)> = _cancel_owned.as_deref();
-        let body_result = dsh_core::llm_http::chat_completions_stream_abortable(&base_url, Some(k.as_str()), &body, cancel)
+        // D-221：传输基址每调用现读（卡面 baseURL 热覆盖同权威）。
+        let (eff_base, _) = provider_cfg(&base_url, kv.as_ref());
+        let body_result = dsh_core::llm_http::chat_completions_stream_abortable(&eff_base, Some(k.as_str()), &body, cancel)
             .map_err(|e| {
                 let code = if e.status == 0 {
                     "NETWORK".to_string()

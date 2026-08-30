@@ -23,8 +23,9 @@
       ] } }
     ],
     "actions": [
-      { "name": "save", "label": "保存", "rpc": ["llm-deepseek", "save"], "primary": true },
-      { "name": "discoverModels", "label": "发现模型", "rpc": ["llm-deepseek", "discoverModels"] }
+      { "name": "save", "label": "保存", "rpc": ["llm-deepseek", "save"], "primary": true, "valuesKey": "values" },
+      { "name": "discoverModels", "label": "发现模型", "rpc": ["llm-deepseek", "discoverModels"],
+        "valuesKey": "values", "resultToField": "models", "resultPath": "models" }
     ]
   }
 }

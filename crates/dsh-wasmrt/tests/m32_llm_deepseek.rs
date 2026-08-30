@@ -7,7 +7,7 @@
 //      （声明=数据，一份契约，Rust 只生声明不渲染）；
 //    - save：白名单校验后经 host-services kv 落宿主；坏入参 fail-loud 不落盘；
 //    - currentValues：读回已保存设置（roundtrip）；
-//    - discoverModels：返回默认模型目录（对齐 TS DEFAULT_MODELS）。
+//    - discoverModels：真外呼契约（D-222：表单/已存 baseURL → 宿主 llmDiscover 臂透传）。
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -55,6 +55,15 @@ impl RemoteServiceProjector for KvProjector {
                 }))
                 .unwrap_or_default()
             }
+            // D-222：宿主真外呼臂的测试替身（真实 HTTP 在宿主臂，wasm 侧只验契约）。
+            "llmDiscover" => serde_json::to_vec(&json!({
+                "ok": true,
+                "models": [
+                    { "id": "stub-model-a", "name": "Stub A" },
+                    { "id": "stub-model-b", "name": "Stub B" },
+                ],
+            }))
+            .unwrap_or_default(),
             _ => serde_json::to_vec(&json!({
                 "ok": false,
                 "error": { "code": "unknown-service", "message": service },
@@ -304,7 +313,79 @@ fn current_values_roundtrips_saved_settings() {
 }
 
 #[test]
-fn discover_models_returns_default_catalog() {
+fn discover_models_uses_form_base_url_via_host_arm() {
+    let bytes = llm_deepseek_component();
+    let projector = Rc::new(KvProjector {
+        kv: RefCell::new(HashMap::new()),
+        calls: RefCell::new(Vec::new()),
+    });
+    let plugin = WasmRemoteEndpointPlugin::new(
+        "llm-deepseek",
+        &bytes,
+        Default::default(),
+        Some(projector.clone()),
+    )
+    .expect("constructs");
+
+    // D-222：baseURL 优先当前表单值（values 形=画布 valuesKey 声明的线形）。
+    let result = plugin
+        .handle(
+            "llm-deepseek",
+            "discoverModels",
+            br#"{"values":{"baseURL":"http://form:1/v1"}}"#,
+            None,
+        )
+        .unwrap();
+    assert_eq!(result["ok"], true, "discoverModels ok: {result}");
+    let models = result["value"]["models"].as_array().expect("models array");
+    assert_eq!(models.len(), 2, "host-arm passthrough: {models:?}");
+    assert_eq!(models[0]["id"], "stub-model-a");
+    let call = projector
+        .calls
+        .borrow()
+        .iter()
+        .find(|(s, _)| s == "llmDiscover")
+        .expect("llmDiscover arm invoked")
+        .1
+        .clone();
+    assert_eq!(call["baseURL"], "http://form:1/v1", "表单 baseURL 透传宿主臂");
+}
+
+#[test]
+fn discover_models_falls_back_to_saved_base_url() {
+    let bytes = llm_deepseek_component();
+    let mut kv = HashMap::new();
+    kv.insert(
+        "llm-deepseek/settings".to_string(),
+        json!({ "baseURL": "http://saved:2/v1" }),
+    );
+    let projector = Rc::new(KvProjector {
+        kv: RefCell::new(kv),
+        calls: RefCell::new(Vec::new()),
+    });
+    let plugin = WasmRemoteEndpointPlugin::new(
+        "llm-deepseek",
+        &bytes,
+        Default::default(),
+        Some(projector.clone()),
+    )
+    .expect("constructs");
+
+    let result = plugin.handle("llm-deepseek", "discoverModels", br#"{}"#, None).unwrap();
+    assert_eq!(result["ok"], true, "kv 回落可用: {result}");
+    let call = projector
+        .calls
+        .borrow()
+        .iter()
+        .find(|(s, _)| s == "llmDiscover")
+        .expect("llmDiscover arm invoked")
+        .1
+        .clone();
+    assert_eq!(call["baseURL"], "http://saved:2/v1", "未填表单→已存 baseURL 回落");
+}
+
+#[test]
+fn discover_models_without_base_url_is_honest() {
     let bytes = llm_deepseek_component();
     let projector = Rc::new(KvProjector {
         kv: RefCell::new(HashMap::new()),
@@ -319,11 +400,14 @@ fn discover_models_returns_default_catalog() {
     .expect("constructs");
 
     let result = plugin.handle("llm-deepseek", "discoverModels", br#"{}"#, None).unwrap();
-    assert_eq!(result["ok"], true, "discoverModels ok: {result}");
-    let models = result["value"]["models"].as_array().expect("models array");
-    assert_eq!(models.len(), 3, "default catalog size: {models:?}");
-    assert_eq!(models[1]["id"], "deepseek-v4-pro");
-    assert!(models.iter().any(|m| m["id"] == "deepseek-v4-flash-vision-exp"));
+    assert_eq!(result["ok"], false, "无 baseURL 必须诚实失败: {result}");
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("baseURL"),
+        "错误指向缺口字段: {result}"
+    );
 }
 
 #[test]

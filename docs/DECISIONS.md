@@ -8698,3 +8698,44 @@ D-198 把 rowAction 行形支持只加在 accept 短臂（handle_rpc），而
 reject→confirm 应答→decided(rejected)）。
 **教训**：RPC 臂 accept/worker **双拷贝**是漂移温床（本例 D-198 修一漏一）——
 后续宜合并单源。**回滚**：revert web.rs worker 臂该段。
+
+
+## D-221 · 卡面 provider 设置→生产 loop 热接线（真缺口）
+
+**日期**：2026-09-06 ｜ **触发**：阶段 13 查证实「DeepSeek Provider 卡对生产 loop
+零影响」——`server_llm_runtime_with_key` 的 conn/传输闭包只吃启动参数+env，
+卡 save 落 kv 无人消费（「插件功能真正对接」的反例）。
+**选项**：① 启动快照读一次 → 否决（卡面控制须即时生效，重启才生效=假对接）；
+② 事件总线推送 → 否决（双权威+新增机制）；③ **共享权威单源**：RemoteHost kv
+升 `Arc<Mutex<HashMap>>`（同 store），runtime conn/传输闭包每调用
+`provider_cfg` live 合并（装配基址←env(D-219)←卡面覆盖）。
+**选择**：③。serve 经 `assemble_server_runtime_with_kv` 注入（旧 API 零变）。
+**验证**：provider_cfg 双测试 + 浏览器铁证（卡 baseURL=本地桩→chat 轮经桩回复；
+复原真端点→真 qwen 回复，全程无重启）。
+**回滚**：revert m6_llm/remote_host 该段 + serve 调用点。
+
+## D-222 · discoverModels 真外呼 + http_get_json（chunked 必修）
+
+**日期**：2026-09-06 ｜ **触发**：单元 discoverModels 是硬编码桩（注释自认）；
+R4=真凭据全形态。真 GET 走宿主新臂 `llmDiscover`（wasm 不碰 key，与 loop 同
+env-only 权威）；dsh-core 补 `http_get_json`（复用既有手写传输）。
+**实测教训**：node/uvicorn 对 JSON 也回 `Transfer-Encoding: chunked`——
+首版按 Content-Length 语义解析必 `response parse: trailing characters`，
+补 chunked 解码 + 双测试（CL/chunked）。
+**验证**：m32 契约三例（表单/已存 baseURL→臂透传；缺 baseURL 诚实报错）+
+浏览器真外呼（stubHits 计数 + textarea 注入可见）。
+**回滚**：revert llm_http/remote_host/单元该段。
+
+## D-223 · 表单动作声明贯通（valuesKey + resultToField）
+
+**日期**：2026-09-06 ｜ **触发**：llm-deepseek 卡面 save/discoverModels 端到端断链
+三处：①FormSave 平铺 args vs 单元契约 `{values}`（schedule-create 依赖平铺，
+不能改默认）；②form_specs 装配白名单静默丢未知键（声明到不了 FormSave）；
+③`set_input_value` 走 `set_attribute("value")` 对 textarea 无效（HTML 规范
+textarea 无 value 属性）。
+**选项**：为 llm-deepseek 特判 → 否决（壳不做插件特判）；
+**选择**：声明式贯通——action 声明 `valuesKey`（值包装键）与
+`resultToField/resultPath`（动作结果注入指定字段），装配层透传，FormSave 按声明
+执行；textarea 补 `set_value`。发现目录→models 字段→保存→kv 成闭环。
+**验证**：浏览器全链（act「✓ 发现 2 项」+ textarea 实值 + 保存往返）。
+**回滚**：revert canvas-shell 三处 + ui.json/lib.rs 声明。

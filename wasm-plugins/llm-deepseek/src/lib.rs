@@ -17,23 +17,10 @@ use bindings::exports::dsh::host_remote::remote::Guest;
 use bindings::dsh::host_remote::host_services;
 use serde_json::{json, Value};
 
-// ---- 默认模型目录（对齐 TS llm-deepseek 的 DEFAULT_MODELS）----
+// ---- 默认容量常量（D-222：模型目录改真外呼，DEFAULT_MODELS 桩已退役）----
 
 const DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
 const DEFAULT_MAX_TOKENS: u64 = 256_000;
-
-fn default_models() -> Value {
-    json!([
-        { "id": "deepseek-v4-flash", "name": "DeepSeek-V4-Flash", "contextWindow": DEFAULT_CONTEXT_WINDOW },
-        { "id": "deepseek-v4-pro", "name": "DeepSeek-V4-Pro", "contextWindow": DEFAULT_CONTEXT_WINDOW },
-        {
-            "id": "deepseek-v4-flash-vision-exp",
-            "name": "DeepSeek-V4-Flash-Vision-Exp",
-            "contextWindow": DEFAULT_CONTEXT_WINDOW,
-            "inputModalities": ["text", "image"],
-        },
-    ])
-}
 
 // ---- UI 声明（数据，非代码）。静态 web/ui.json 与其保持逐字段一致（m32 断言）。----
 
@@ -108,8 +95,9 @@ fn ui_declaration() -> Value {
             }
             ],
             "actions": [
-                { "name": "save", "label": "保存", "rpc": ["llm-deepseek", "save"], "primary": true },
-                { "name": "discoverModels", "label": "发现模型", "rpc": ["llm-deepseek", "discoverModels"] }
+                { "name": "save", "label": "保存", "rpc": ["llm-deepseek", "save"], "primary": true, "valuesKey": "values" },
+                { "name": "discoverModels", "label": "发现模型", "rpc": ["llm-deepseek", "discoverModels"],
+                  "valuesKey": "values", "resultToField": "models", "resultPath": "models" }
             ]
         }
     })
@@ -209,13 +197,39 @@ fn save(body: &Value) -> Vec<u8> {
     }
 }
 
-/// discoverModels：返回默认模型目录（试点阶段；真实网络探测留后续 genai 决策）。
-fn discover_models(_body: &Value) -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "ok": true,
-        "value": { "models": default_models() },
-    }))
-    .unwrap_or_default()
+/// discoverModels：真外呼发现（D-222）——baseURL 优先当前表单值、缺省回落
+/// 已存设置；真实 HTTP 由宿主 `llmDiscover` 臂承担（key 宿主 env-only，wasm 不接触）。
+fn discover_models(body: &Value) -> Vec<u8> {
+    let mut base = body
+        .get("values")
+        .or_else(|| body.get("baseURL").map(|_| body))
+        .and_then(|v| v.get("baseURL"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if base.trim().is_empty() {
+        if let Ok(proj) = get_service("kv", &json!({ "key": KV_SETTINGS_KEY })) {
+            base = proj
+                .get("value")
+                .and_then(|v| v.get("baseURL"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+        }
+    }
+    if base.trim().is_empty() {
+        return error(
+            "internal",
+            "llm-deepseek/discoverModels: baseURL not configured (fill form or save first)",
+        );
+    }
+    match get_service("llmDiscover", &json!({ "baseURL": base })) {
+        Ok(proj) => {
+            let models = proj.get("models").cloned().unwrap_or_else(|| json!([]));
+            serde_json::to_vec(&json!({ "ok": true, "value": { "models": models } })).unwrap_or_default()
+        }
+        Err(e) => e,
+    }
 }
 
 struct LlmDeepSeek;
