@@ -1,4 +1,12 @@
-# 阶段 12 · panel-approval 勘察结论（下轮执行蓝图）
+# 阶段 12 · panel-approval 勘察结论（**已执行完毕，见 phase-12-panel-approval.md**）
+
+结果速览：蓝图全部落地，全链 5/5 PASS（真 LLM 真工具调用）。执行中揪出并修复
+一个真缺陷 **D-220**：worker 长 RPC 臂 `session.approval.decide` 只认平铺
+`toolCallId`，不吃画布 rowAction 行形 `{args:{row:{toolCallId},decision}}`
+（D-198 的 row 形支持只加在 accept 短臂上，worker 化那份拷贝漏了）——
+即**卡面 allow/reject 此前必失败**（invalid-args），已补齐并加回归测试
+`worker_decide_arm_accepts_canvas_row_shape`。另立 **D-219**：`DSH_LLM_EFFORT`
+启动期 env 旋钮（缺省原行为），因非原厂兼容端点拒绝适配器缺省的 `effort=high`。
 
 ## 真 pending 的唯一生产链（已核实）
 1. **plan mode 激活**：RPC `session.plan.mode`（web.rs:927 → set_plan_mode_on）

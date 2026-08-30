@@ -27,9 +27,22 @@ pub const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 
 /// 从装配参数解析一次操作的连接事实。
 fn deepseek_connection(base_url: &str, model: &str) -> DeepSeekConnection {
+    // D-219：wire 默认 reasoning effort。适配器缺省注入 "high"，非 DeepSeek 原厂
+    // 兼容端点可能拒绝（HTTP 400）。仿 key 的 env-only 先例提供启动期旋钮：
+    // `DSH_LLM_EFFORT=off|low|high|max`（缺省=不设=原行为）。
+    let mut defaults = RequestDefaults::default();
+    if let Ok(e) = std::env::var("DSH_LLM_EFFORT") {
+        defaults.reasoning_effort = match e.as_str() {
+            "off" => Some(dsh_llm_deepseek::Effort::Off),
+            "low" => Some(dsh_llm_deepseek::Effort::Low),
+            "high" => Some(dsh_llm_deepseek::Effort::High),
+            "max" => Some(dsh_llm_deepseek::Effort::Max),
+            _ => None,
+        };
+    }
     DeepSeekConnection {
         base_url: base_url.to_string(),
-        defaults: RequestDefaults::default(),
+        defaults,
         max_tokens: DEFAULT_MAX_TOKENS,
         default_context_window: DEFAULT_CONTEXT_WINDOW,
         // catalog 至少包含装配模型（发现/能力面可用；请求不受 catalog 限制）。

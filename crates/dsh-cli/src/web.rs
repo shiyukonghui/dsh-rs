@@ -807,8 +807,14 @@ pub fn dispatch_long_rpc(
             commands_execute_on_host(facts, agent_id, &line, &images)
         }
         "session.approval.decide" => {
+            // D-220：与 accept 短臂（handle_rpc 同法名）同形——解包画布 {args} 并吃
+            // rowAction 行形 `row.toolCallId`（卡面动作体 = {row, decision}）。
+            // 此前 worker 臂只吃平铺 {toolCallId}：画布行形 → invalid-args（真缺陷，
+            // 阶段 12 浏览器实证）。
+            let payload = payload.get("args").filter(|a| a.is_object()).unwrap_or(payload);
             let call_id = payload
                 .get("toolCallId")
+                .or_else(|| payload.get("row").and_then(|r| r.get("toolCallId")))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -5937,6 +5943,29 @@ mod tests {
             canonical_rpc_method("session.approval/decide"),
             "session.approval.decide"
         );
+    }
+
+    /// D-220（阶段 12 真缺陷）：worker 长 RPC 臂必须吃画布行形
+    /// `{args:{row:{toolCallId}, decision}}`——此前只认平铺 toolCallId，
+    /// pending 卡 allow/reject 全部 invalid-args。
+    #[test]
+    fn worker_decide_arm_accepts_canvas_row_shape() {
+        let facts = ServeWorkerFacts {
+            agent_loop: None,
+            plan_session: None,
+            approval_wire: None,
+        };
+        let v = dispatch_long_rpc(
+            &facts,
+            "session.approval.decide",
+            &serde_json::json!({"args": {"row": {"toolCallId": "c1"}, "decision": "allowedOnce"}}),
+        );
+        assert_ne!(
+            v["error"]["code"], "invalid-args",
+            "行形必须过 worker 臂校验: {v}"
+        );
+        // 无 agent-loop → 诚实 internal（校验已过，装配缺位在下一层）。
+        assert_eq!(v["error"]["code"], "internal", "装配缺位诚实报错: {v}");
     }
 
     #[test]

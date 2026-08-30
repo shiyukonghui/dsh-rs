@@ -8669,3 +8669,32 @@ loop 未装配 → 诚实 eprintln 不吞提示。serve 主循环 tick 消费改
 改动（framing 回到丢弃态，事件日志面不受影响）。
 **教训入册**：对接验证必须断言到**语义终点**（用户可见效果），事件落档
 ≠功能发生——本目标逐插件浏览器验证的直接价值实证。
+
+
+## D-219 · DSH_LLM_EFFORT 启动期旋钮（非原厂端点兼容）
+
+**日期**：2026-09-06 ｜ **触发**：阶段 12 换真 LLM 后端（qwen 兼容端点）后，
+每轮 HTTP 400「Unexpected reasoning effort high」——DeepSeek 适配器缺省注入
+`reasoning_effort=high`（adapter.rs:222 fallback），原厂之外端点未必支持。
+**选项**：① 改适配器缺省 → 否决（原厂行为回归）；② 走 settings llm-deepseek
+→ **查实生产 runtime 的 conn 闭包不读 settings**（卡面控制对 loop 零影响，
+另记 v2）；③ **env 旋钮**（仿 `DEEPSEEK_API_KEY` env-only 先例）。
+**选择**：`DSH_LLM_EFFORT=off|low|high|max`（缺省不设=原行为），deepseek_connection
+读之落 RequestDefaults.reasoning_effort。实测端点收 `low`（直连 curl 钉死），
+serve 用 low 跑通真外呼。
+**回滚**：revert m6_llm.rs 该段。**影响面**：仅启动期；卡面→loop 热接未解（v2）。
+
+## D-220 · worker 长 RPC 臂 session.approval.decide 补画布行形（真缺陷）
+
+**日期**：2026-09-06 ｜ **触发**：阶段 12 浏览器点「允许/拒绝」全 invalid-args——
+D-198 把 rowAction 行形支持只加在 accept 短臂（handle_rpc），而
+`session.approval.decide` 经 serve worker 化路由到 **dispatch_long_rpc 的拷贝臂**，
+那份仍只认平铺 `{toolCallId}`。卡面动作体=`{args:{row:{toolCallId},decision}}`
+→ 必失败。**即审批卡此前在 worker 路径上端到端不可用**。
+**选项**：改卡发平铺形 → 否决（rowAction 行形是既定跨卡契约）；
+**选择**：worker 臂与短臂同形（解包 `{args}` + `row.toolCallId` 回退）。
+**验证**：新测试 `worker_decide_arm_accepts_canvas_row_shape`（先红后绿，lib 272/272）
++ 浏览器全链 5/5（allow→decided(allowedOnce)+tool/result 真执行；
+reject→confirm 应答→decided(rejected)）。
+**教训**：RPC 臂 accept/worker **双拷贝**是漂移温床（本例 D-198 修一漏一）——
+后续宜合并单源。**回滚**：revert web.rs worker 臂该段。
