@@ -16,6 +16,17 @@
 | T7 热插拔 rename→DOM 即时降 | ❌ **旧 bug 复现**：m1=12 但 dom1=13、dom2=13 | ✅ **dom1=12（SSE→重渲染工作！）**；⚠️ dom2=12（restore 后 10s 内未回 13——remount 帧迟到或漏拍，需复测） | Rust 反超 JS 已知缺陷 |
 | Console | 零错误 | **`RuntimeError: unreachable`（Rust panic→abort）×5** | ❌ **Rust 缺陷 C（最重）** |
 
+## 扩展关卡（第 56 轮追加：T9 reload 持久化 + T10 几何零重叠）
+
+审计基建同轮治理：全局超时 150→240s、preflight 自愈（共享 profile 污染→全量重开灰显卡）、
+T7 基线动态化、超时也输出 PARTIAL（挂点定位能力）。
+
+| 项 | JS 壳 /canvas | Rust 壳 /canvas/rust | 判定 |
+|---|---|---|---|
+| T10 几何（13 卡两两矩形） | ✅ overlaps=0 | ✅ overlaps=0 | 双壳实测布局硬不变式成立 |
+| T9 关闭→reload→仍闭→重开复原 | ⚠️ **harness 挂点**：reload 后 CDP eval 在旧壳永久挂起（PARTIAL 锁定于 T9；等价能力 D-209 当时已活体认证，旧壳退役在即不追加投资） | ✅ {closedCnt:1, afterCards:12, shutCnt:1, backCards:13} 完整闭环 | Rust 壳切默认前最后一道持久化关卡过 |
+| 全套复跑（Rust） | — | T2~T10 + T7 闭环 13→12→13 全绿，consoleErrs=[] | 持续保持 |
+
 ## 结论与决定
 
 ### 缺陷 C 定位补记（debug 复现成功，第 51 轮追加）
