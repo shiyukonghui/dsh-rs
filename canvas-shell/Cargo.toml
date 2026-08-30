@@ -21,6 +21,7 @@ web-sys = { version = "0.3", features = [
   "Request", "RequestInit", "RequestMode", "Response", "Headers", "Event",
   "EventSource", "MessageEvent", "Storage", "DomStringMap", "CssStyleDeclaration",
   "ResizeObserver", "ResizeObserverEntry", "DomTokenList", "Node", "NodeList",
+  "HtmlInputElement", "HtmlSelectElement", "HtmlTextAreaElement", "InputEvent", "EventTarget",
 ] }
 
 [workspace]

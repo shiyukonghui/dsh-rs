@@ -36,6 +36,8 @@ where
                 Value::from(n)
             };
             map.insert(name, v);
+        } else if ty == "checkbox" {
+            map.insert(name, json!(raw == "true"));
         } else if f.get("secretWriteOnly").and_then(Value::as_bool) == Some(true) {
             if !raw.is_empty() {
                 map.insert(name, json!(raw));

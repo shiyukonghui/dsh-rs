@@ -3,7 +3,7 @@
 
 use canvas_shell::values::rpc_envelope;
 use js_sys::{JSON, Reflect};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::cell::Cell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
@@ -61,6 +61,30 @@ pub async fn fetch_get_json(url: &str) -> Result<Value, String> {
         .map_err(|e| format!("fetch: {:?}", e))?;
     let resp: web_sys::Response = resp_val.dyn_into().map_err(|e| format!("resp: {:?}", e))?;
     from_js(&JsFuture::from(resp.json().map_err(|e| format!("json: {:?}", e))?).await.map_err(|e| format!("jsonf: {:?}", e))?)
+}
+
+/// 读表单控件：卡容器 id 内 input/select/textarea → {name: 字符串}（checkbox 读 checked）。
+pub fn read_form(card_id: &str) -> Value {
+    let mut map = serde_json::Map::new();
+    let Some(root) = doc().get_element_by_id(card_id) else { return Value::Object(map) };
+    let Ok(nodes) = root.query_selector_all("input,select,textarea") else { return Value::Object(map) };
+    for i in 0..nodes.length() {
+        let Some(el) = nodes.item(i).and_then(|n| n.dyn_into::<HtmlElement>().ok()) else { continue };
+        let name = el.get_attribute("name").unwrap_or_default();
+        if name.is_empty() { continue; }
+        if let Some(inp) = el.dyn_ref::<web_sys::HtmlInputElement>() {
+            if inp.type_() == "checkbox" {
+                map.insert(name, json!(if inp.checked() { "true" } else { "false" }));
+                continue;
+            }
+            map.insert(name, json!(inp.value()));
+        } else if let Some(sel) = el.dyn_ref::<web_sys::HtmlSelectElement>() {
+            map.insert(name, json!(sel.value()));
+        } else if let Some(ta) = el.dyn_ref::<web_sys::HtmlTextAreaElement>() {
+            map.insert(name, json!(ta.value()));
+        }
+    }
+    Value::Object(map)
 }
 
 /// 原生确认框（needsConfirm 严格 true 才走到这里）。

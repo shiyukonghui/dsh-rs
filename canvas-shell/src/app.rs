@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 
 use canvas_shell::layout::{columns_for_width, layout_grid, layout_measured, GRID_COL, GRID_GAP};
 use canvas_shell::model::{build_model, focus_key, validate_declaration};
-use canvas_shell::values::{list_rows, needs_confirm, poll_decision, row_action_body, status_items};
+use canvas_shell::schema::{ns_select_model, schema_fields};
+use canvas_shell::values::{collect_values, list_rows, needs_confirm, poll_decision, row_action_body, status_items};
 
 fn fk(c: &Value) -> String {
     focus_key(
@@ -83,7 +84,10 @@ async fn load_card_body(fk: String, pn: String, mut body: Signal<serde_json::Map
                 entry = json!({"stage":"decl","msg":msg,"code":code});
             } else {
                 let view = ui.get("view").cloned().unwrap_or(Value::Null);
-                if let Some(drpc) = view.get("dataRpc").and_then(Value::as_array).cloned() {
+                let rpc_src = view.get("dataRpc").and_then(Value::as_array)
+                    .or_else(|| view.get("fieldsFrom").and_then(|ff| ff.get("rpc")).and_then(Value::as_array))
+                    .cloned();
+                if let Some(drpc) = rpc_src {
                     let method = drpc.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("/");
                     match crate::interop::fetch_rpc(&method, json!({})).await {
                         Ok(res) if res.get("ok").and_then(Value::as_bool) == Some(false) => {
@@ -152,6 +156,129 @@ fn ActionBtn(k: String, view: Value, row: Value, a: Value, body: Signal<serde_js
     }
 }
 
+/// 表单控件（归一化字段：name/label/type/value/options/secret/exists/required）。
+#[component]
+fn FormField(f: Value) -> Element {
+    let name = scalar_text(f.get("name"));
+    let label = scalar_text(f.get("label"));
+    let ty = scalar_text(f.get("type"));
+    let val = scalar_text(f.get("value"));
+    let required = f.get("required").and_then(Value::as_bool).unwrap_or(false);
+    let secret = f.get("secret").and_then(Value::as_bool).unwrap_or(false);
+    let exists = f.get("exists").and_then(Value::as_bool).unwrap_or(false);
+    let opts: Vec<String> = f.get("options").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+    let star = if required { " *" } else { "" };
+    let ph = if secret && exists { "已设（留空=不改动）" } else if secret { "首次设置" } else { "" };
+    rsx! {
+        label {
+            span { "{label}{star}" }
+            if secret {
+                input { type: "password", name: "{name}", placeholder: "{ph}" }
+            } else if ty == "select" {
+                select { name: "{name}",
+                    for o in opts { option { value: "{o}", selected: o == val, "{o}" } }
+                }
+            } else if ty == "checkbox" {
+                input { type: "checkbox", name: "{name}", checked: val == "true" }
+            } else if ty == "list" {
+                textarea { name: "{name}", "{val}" }
+            } else if ty == "number" {
+                input { type: "number", name: "{name}", value: "{val}" }
+            } else {
+                input { type: "text", name: "{name}", value: "{val}" }
+            }
+        }
+    }
+}
+
+/// ns 选择器（fieldsFrom.nsSelect；不带 name——不进表单收集）。
+#[component]
+fn NsPick(options: Vec<String>, current: String, k: String, mut body: Signal<serde_json::Map<String, Value>>) -> Element {
+    rsx! {
+        select {
+            class: "ns-pick",
+            onchange: move |ev| {
+                let v = ev.value();
+                let mut bw = body;
+                let mut g = bw.write();
+                if let Some(e) = g.get_mut(&k) {
+                    e["nsSel"] = json!(v);
+                }
+            },
+            for o in options {
+                option { value: "{o}", selected: o == current, "{o}" }
+            }
+        }
+    }
+}
+
+/// 保存/动作按钮（spec: {rpc, mode, ns, revision, fields:[desc]}）。
+#[component]
+fn FormSave(spec: Value, k: String, mut body: Signal<serde_json::Map<String, Value>>) -> Element {
+    let label = scalar_text(spec.get("label"));
+    let primary = spec.get("primary").and_then(Value::as_bool).unwrap_or(false);
+    rsx! {
+        button {
+            class: if primary { "primary" } else { "" },
+            onclick: move |_| {
+                let vals = crate::interop::read_form(&k);
+                let desc = json!({ "fields": spec.get("fields").cloned().unwrap_or(json!([])) });
+                let patch = match collect_values(&desc, |n| vals.get(n).and_then(Value::as_str).map(str::to_string)) {
+                    Ok(p) => p,
+                    Err((field, e)) => {
+                        let mut bw = body;
+                        let mut g = bw.write();
+                        if let Some(en) = g.get_mut(&k) { en["act"] = json!(format!("✗ 字段 {}：{}", field, e)); }
+                        return;
+                    }
+                };
+                let mode = spec.get("mode").and_then(Value::as_str).unwrap_or("values");
+                let args = if mode == "settings-update" {
+                    json!({"ns": spec.get("ns").cloned().unwrap_or(Value::Null),
+                           "patch": patch,
+                           "expectedRevision": spec.get("revision").cloned().unwrap_or(Value::Null)})
+                } else {
+                    patch
+                };
+                let rpc = scalar_text(spec.get("rpc"));
+                let k2 = k.clone();
+                let mut b2 = body;
+                spawn(async move {
+                    let msg = match crate::interop::fetch_rpc(&rpc, args).await {
+                        Err(e) => format!("✗ 保存失败：{}", e),
+                        Ok(res) if res.get("ok").and_then(Value::as_bool) == Some(false) => {
+                            let m = res.get("error").and_then(|x| x.get("message")).and_then(Value::as_str).unwrap_or("?");
+                            let c = res.get("error").and_then(|x| x.get("code")).and_then(Value::as_str).unwrap_or("");
+                            format!("✗ {}（code={}）", m, c)
+                        }
+                        Ok(res) => {
+                            let applies = res.get("value").and_then(|v| v.get("applies")).and_then(Value::as_str).unwrap_or("");
+                            if applies == "restart" { "✓ 已保存——需重启生效".to_string() } else { "✓ 已保存".to_string() }
+                        }
+                    };
+                    // JS 对齐：保存后不自动重拉（保留 stale revision → 再点必显式 CONFLICT）。
+                    let mut b = b2.write();
+                    let en = b.entry(k2.clone()).or_insert_with(|| json!({"stage": "view"}));
+                    en["act"] = json!(msg);
+                });
+            },
+            "{label}"
+        }
+    }
+}
+
+fn value_text(v: Option<&Value>, default: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Null) | None => match default {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Null) | None => String::new(),
+            Some(o) => o.to_string(),
+        },
+        Some(o) => o.to_string(),
+    }
+}
+
 /// 体面渲染（S3a：status/list 实渲；form=S3b、chat=S4——诚实占位）。
 fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, Value>>) -> Element {
     let st = match st {
@@ -192,6 +319,83 @@ fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, 
         .iter()
         .map(|r| columns.iter().map(|c| scalar_text(r.get(&scalar_text(c.get("key"))))).collect())
         .collect();
+    // ---- form 预计算（rsx for 体零语句纪律：全部归一化在视图外完成） ----
+    let mut form_fields: Vec<Value> = Vec::new();
+    let mut form_desc: Vec<Value> = Vec::new();
+    let mut form_specs: Vec<Value> = Vec::new();
+    let mut show_ns = false;
+    let mut ns_opts: Vec<String> = Vec::new();
+    let mut ns_cur = String::new();
+    if kind == "form" {
+        let actions = view.get("actions").and_then(Value::as_array).cloned().unwrap_or_default();
+        let ff = view.get("fieldsFrom").cloned().filter(|x| x.is_object());
+        let (mut n_rev, n_ns) = match &ff {
+            Some(ff) => {
+                let pick = ff.get("pick").and_then(Value::as_str).unwrap_or("").to_string();
+                let model_v = ns_select_model(&data, &pick);
+                let opts: Vec<String> = model_v.get("options").and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                    .unwrap_or_default();
+                let cur = st.get("nsSel").and_then(Value::as_str)
+                    .filter(|s| opts.iter().any(|o| o == s))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| scalar_text(model_v.get("current")));
+                show_ns = ff.get("nsSelect").and_then(Value::as_bool).unwrap_or(false);
+                ns_opts = opts;
+                ns_cur = cur.clone();
+                let ns_view = data.get("namespaces").and_then(Value::as_array)
+                    .and_then(|a| a.iter().find(|n| n.get("ns").and_then(Value::as_str) == Some(cur.as_str())).cloned())
+                    .unwrap_or(Value::Null);
+                let proj = schema_fields(&ns_view);
+                for pf in proj.get("fields").and_then(Value::as_array).unwrap_or(&vec![]) {
+                    let mut nf = json!({
+                        "name": scalar_text(pf.get("key")),
+                        "label": scalar_text(pf.get("label")),
+                        "type": scalar_text(pf.get("type")),
+                        "value": scalar_text(pf.get("value")),
+                        "options": pf.get("options").cloned().unwrap_or(json!([])),
+                    });
+                    if pf.get("secretWriteOnly").and_then(Value::as_bool) == Some(true) {
+                        nf["secret"] = json!(true);
+                        nf["exists"] = json!(pf.get("exists").and_then(Value::as_bool).unwrap_or(false));
+                    }
+                    form_fields.push(nf);
+                    let mut d = json!({"name": scalar_text(pf.get("key")), "type": scalar_text(pf.get("type"))});
+                    if pf.get("secretWriteOnly").and_then(Value::as_bool) == Some(true) {
+                        d["secretWriteOnly"] = json!(true);
+                    }
+                    form_desc.push(d);
+                }
+                (proj.get("revision").cloned().unwrap_or(Value::Null), cur)
+            }
+            None => {
+                let vals = data.get("values").cloned().unwrap_or(Value::Null);
+                for fd in view.get("fields").and_then(Value::as_array).unwrap_or(&vec![]) {
+                    let name = scalar_text(fd.get("name"));
+                    let initial = value_text(vals.get(&name), fd.get("default"));
+                    form_fields.push(json!({
+                        "name": name, "label": scalar_text(fd.get("label")),
+                        "type": scalar_text(fd.get("type")), "value": initial,
+                        "options": fd.get("options").cloned().unwrap_or(json!([])),
+                        "required": fd.get("required").and_then(Value::as_bool).unwrap_or(false),
+                    }));
+                    form_desc.push(json!({"name": name, "type": scalar_text(fd.get("type"))}));
+                }
+                (Value::Null, String::new())
+            }
+        };
+        for a in &actions {
+            let rpc = a.get("rpc").and_then(Value::as_array)
+                .map(|r| r.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("/"))
+                .unwrap_or_default();
+            let mode = if rpc == "settings/update" { "settings-update" } else { "values" };
+            form_specs.push(json!({
+                "label": if a.get("label").is_some() { scalar_text(a.get("label")) } else { scalar_text(a.get("name")) },
+                "primary": a.get("primary").and_then(Value::as_bool).unwrap_or(false),
+                "rpc": rpc, "mode": mode, "ns": json!(n_ns.clone()), "revision": n_rev.clone(), "fields": form_desc.clone(),
+            }));
+        }
+    }
     rsx! {
         if !err_msg.is_empty() {
             div { class: "cstat err", "✗ 数据面失败：{err_msg}（静态兜底）" }
@@ -249,7 +453,17 @@ fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, 
             }
         }
         if kind == "form" {
-            div { class: "cstat", "form 体面待 S3b（fields/fieldsFrom + 保存接线）" }
+            if show_ns {
+                NsPick { options: ns_opts, current: ns_cur, k: k.clone(), body }
+            }
+            for f in form_fields {
+                FormField { f }
+            }
+            div { class: "actions",
+                for s in form_specs {
+                    FormSave { spec: s, k: k.clone(), body }
+                }
+            }
         }
         if kind == "chat" {
             div { class: "cstat", "chat 岛待 S4（选择/历史/发送/停止/SSE）" }
