@@ -54,6 +54,20 @@ pub async fn fetch_rpc(method: &str, args: Value) -> Result<Value, String> {
     Ok(json.get("result").cloned().unwrap_or(json))
 }
 
+/// GET 静态 JSON（ui.json 体面——非信封通道）。
+pub async fn fetch_get_json(url: &str) -> Result<Value, String> {
+    let resp_val = JsFuture::from(win().fetch_with_str(url))
+        .await
+        .map_err(|e| format!("fetch: {:?}", e))?;
+    let resp: web_sys::Response = resp_val.dyn_into().map_err(|e| format!("resp: {:?}", e))?;
+    from_js(&JsFuture::from(resp.json().map_err(|e| format!("json: {:?}", e))?).await.map_err(|e| format!("jsonf: {:?}", e))?)
+}
+
+/// 原生确认框（needsConfirm 严格 true 才走到这里）。
+pub fn confirm_dialog(msg: &str) -> bool {
+    win().confirm_with_message(msg).unwrap_or(false)
+}
+
 pub fn spawn_poll<F: FnMut() + 'static>(f: F, ms: i32) {
     let _h = win().set_interval_with_callback_and_timeout_and_arguments_0(&js_cb(f), ms);
 }

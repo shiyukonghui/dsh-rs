@@ -6,8 +6,8 @@ use dioxus::prelude::*;
 use serde_json::{json, Value};
 
 use canvas_shell::layout::{columns_for_width, layout_grid, layout_measured, GRID_COL, GRID_GAP};
-use canvas_shell::model::{build_model, focus_key};
-use canvas_shell::values::poll_decision;
+use canvas_shell::model::{build_model, focus_key, validate_declaration};
+use canvas_shell::values::{list_rows, needs_confirm, poll_decision, row_action_body, status_items};
 
 fn fk(c: &Value) -> String {
     focus_key(
@@ -60,6 +60,206 @@ fn grid_px(w: i64) -> f64 {
     w as f64 * GRID_COL as f64 + (w as f64 - 1.0) * GRID_GAP as f64
 }
 
+fn scalar_text(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(o) => o.to_string(),
+    }
+}
+
+/// Vec<Element> → 可作子节点的 Vec<VNode>（rsx 只收 VNode 迭代器）。
+fn nodes(v: Vec<Element>) -> Vec<dioxus::prelude::VNode> {
+    v.into_iter().map(|r| r.unwrap_or_default()).collect()
+}
+
+/// 卡片体面管线：ui.json → validate → dataRpc →（视图渲染在 card_body）。
+async fn load_card_body(fk: String, pn: String, mut body: Signal<serde_json::Map<String, Value>>) {
+    let mut entry = json!({ "stage": "load" });
+    match crate::interop::fetch_get_json(&format!("/plugins/{}/ui.json", pn)).await {
+        Err(e) => entry = json!({"stage":"decl","msg":format!("ui.json 拉取失败：{}", e),"code":"ui-fetch-failed"}),
+        Ok(ui) => {
+            if let Some((code, msg)) = validate_declaration(&ui) {
+                entry = json!({"stage":"decl","msg":msg,"code":code});
+            } else {
+                let view = ui.get("view").cloned().unwrap_or(Value::Null);
+                if let Some(drpc) = view.get("dataRpc").and_then(Value::as_array).cloned() {
+                    let method = drpc.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("/");
+                    match crate::interop::fetch_rpc(&method, json!({})).await {
+                        Ok(res) if res.get("ok").and_then(Value::as_bool) == Some(false) => {
+                            let msg = res.get("error").and_then(|e| e.get("message")).cloned().unwrap_or(json!("?"));
+                            entry = json!({"stage":"view","view":view,"dataErr":msg});
+                        }
+                        Ok(res) => entry = json!({"stage":"view","view":view,"data":res.get("value").cloned().unwrap_or(Value::Null)}),
+                        Err(e) => entry = json!({"stage":"view","view":view,"dataErr":e}),
+                    }
+                } else {
+                    entry = json!({"stage":"view","view":view});
+                }
+            }
+        }
+    }
+    body.write().insert(fk, entry);
+}
+
+fn action_click(
+    k: &str,
+    view: &Value,
+    row: &Value,
+    a: &Value,
+    mut body: Signal<serde_json::Map<String, Value>>,
+) {
+    if needs_confirm(a)
+        && !crate::interop::confirm_dialog(&format!("确认「{}」？", a.get("label").and_then(Value::as_str).unwrap_or("")))
+    {
+        return;
+    }
+    let method = a.get("rpc").and_then(Value::as_array).map(|r| r.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("/")).unwrap_or_default();
+    let args = row_action_body(row, Some(a));
+    let f2 = k.to_string();
+    let v2 = view.clone();
+    spawn(async move {
+        let msg = match crate::interop::fetch_rpc(&method, args).await {
+            Err(e) => format!("✗ 动作失败：{}", e),
+            Ok(res) if res.get("ok").and_then(Value::as_bool) == Some(false) => {
+                format!("✗ {}", res.get("error").and_then(|e| e.get("message")).and_then(Value::as_str).unwrap_or("?"))
+            }
+            Ok(_) => "✓ 已完成".to_string(),
+        };
+        let mut entry = json!({"stage":"view","view":v2.clone(),"act":msg});
+        if let Some(drpc) = v2.get("dataRpc").and_then(Value::as_array) {
+            let m2 = drpc.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("/");
+            if let Ok(r) = crate::interop::fetch_rpc(&m2, json!({})).await {
+                if r.get("ok").and_then(Value::as_bool) != Some(false) {
+                    entry["data"] = r.get("value").cloned().unwrap_or(Value::Null);
+                }
+            }
+        }
+        body.write().insert(f2, entry);
+    });
+}
+
+/// 行动作按钮（组件化以获得 key/props 语义）。
+#[component]
+fn ActionBtn(k: String, view: Value, row: Value, a: Value, body: Signal<serde_json::Map<String, Value>>) -> Element {
+    let label = if a.get("label").is_some() { scalar_text(a.get("label")) } else { scalar_text(a.get("name")) };
+    rsx! {
+        button {
+            class: "row-action",
+            onclick: move |_| action_click(&k, &view, &row, &a, body),
+            "{label}"
+        }
+    }
+}
+
+/// 体面渲染（S3a：status/list 实渲；form=S3b、chat=S4——诚实占位）。
+fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, Value>>) -> Element {
+    let st = match st {
+        Some(s) => s,
+        None => return rsx! { div { class: "cstat", "载入体面…" } },
+    };
+    let stage = st.get("stage").and_then(Value::as_str).unwrap_or("").to_string();
+    if stage == "load" {
+        return rsx! { div { class: "cstat", "载入当前值…" } };
+    }
+    if stage == "decl" {
+        let msg = scalar_text(st.get("msg"));
+        let code = scalar_text(st.get("code"));
+        return rsx! {
+            div { class: "fail-msg", "✗ {msg}" }
+            div { class: "code", "code={code}" }
+        };
+    }
+    let view = st.get("view").cloned().unwrap_or(Value::Null);
+    let kind = view.get("kind").and_then(Value::as_str).unwrap_or("").to_string();
+    let data = st.get("data").cloned().unwrap_or(Value::Null);
+    let data_err = st.get("dataErr").cloned();
+    let err_msg = data_err.as_ref().map(|e| if e.is_string() { e.as_str().unwrap_or("").to_string() } else { e.to_string() }).unwrap_or_default();
+    let act = scalar_text(st.get("act"));
+    let items = status_items(&view, &data);
+    let lr = list_rows(&view, &data);
+    let columns = lr.get("columns").and_then(Value::as_array).cloned().unwrap_or_default();
+    let rows = lr.get("rows").and_then(Value::as_array).cloned().unwrap_or_default();
+    let empty_text = lr.get("emptyText").and_then(Value::as_str).unwrap_or("暂无条目").to_string();
+    let row_actions = view.get("rowActions").and_then(Value::as_array).cloned().unwrap_or_default();
+    // rsx for 体不收 let：先在外部把 wire 形状压成纯字符串对（视图层零逻辑再证一次）。
+    let status_pairs: Vec<(String, String)> = items
+        .iter()
+        .map(|it| (scalar_text(it.get("label")), scalar_text(it.get("value"))))
+        .collect();
+    let th_labels: Vec<String> = columns.iter().map(|c| scalar_text(c.get("label"))).collect();
+    let cells_all: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| columns.iter().map(|c| scalar_text(r.get(&scalar_text(c.get("key"))))).collect())
+        .collect();
+    rsx! {
+        if !err_msg.is_empty() {
+            div { class: "cstat err", "✗ 数据面失败：{err_msg}（静态兜底）" }
+        }
+        if kind == "status" {
+            if items.is_empty() && err_msg.is_empty() {
+                div { class: "row", "暂无条目" }
+            }
+            for (idx, (label, value)) in status_pairs.iter().enumerate() {
+                div {
+                    class: "row",
+                    key: "{idx}",
+                    span { "{label}" }
+                    span { "{value}" }
+                }
+            }
+        }
+        if kind == "list" {
+            if rows.is_empty() {
+                div { class: "row", "{empty_text}" }
+            } else {
+                table {
+                    thead {
+                        tr {
+                            for (ci, th_label) in th_labels.iter().enumerate() {
+                                th { key: "{ci}", "{th_label}" }
+                            }
+                        }
+                    }
+                    tbody {
+                        for (ri, row) in rows.iter().enumerate() {
+                            tr {
+                                key: "{ri}",
+                                for cell in cells_all.get(ri).cloned().unwrap_or_default() {
+                                    td { "{cell}" }
+                                }
+                                if !row_actions.is_empty() {
+                                    td {
+                                        for (ai, a) in row_actions.iter().enumerate() {
+                                            ActionBtn {
+                                                key: "{ai}",
+                                                k: k.clone(),
+                                                view: view.clone(),
+                                                row: row.clone(),
+                                                a: a.clone(),
+                                                body,
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if kind == "form" {
+            div { class: "cstat", "form 体面待 S3b（fields/fieldsFrom + 保存接线）" }
+        }
+        if kind == "chat" {
+            div { class: "cstat", "chat 岛待 S4（选择/历史/发送/停止/SSE）" }
+        }
+        if !act.is_empty() {
+            div { class: "cstat", "{act}" }
+        }
+    }
+}
+
 #[component]
 pub fn App() -> Element {
     let status = use_signal(|| ("载入清单…".to_string(), String::new()));
@@ -67,6 +267,38 @@ pub fn App() -> Element {
     let selected = use_signal(|| Option::<String>::None);
     let closed = use_signal(|| crate::interop::ls_closed());
     let bump = use_signal(|| 0u32);
+    let body = use_signal(serde_json::Map::<String, Value>::new);
+
+    // 体面管线：清单版本变 → 未加载卡逐个 ui.json→validate→dataRpc（S3a）。
+    use_effect(move || {
+        let mut body = body;
+        let m = model.read().clone();
+        let rev = m.as_ref().and_then(|x| x.get("rev").and_then(Value::as_str)).unwrap_or("").to_string();
+        if rev.is_empty() {
+            return;
+        }
+        let cards = m.as_ref().and_then(|x| x.get("cards").and_then(Value::as_array).cloned()).unwrap_or_default();
+        let mut todo: Vec<(String, String)> = Vec::new();
+        {
+            let mut b = body.write();
+            for c in &cards {
+                if c.get("bad").and_then(Value::as_bool).unwrap_or(false) {
+                    continue;
+                }
+                let k = fk(c);
+                if b.contains_key(&k) {
+                    continue;
+                }
+                b.insert(k.clone(), json!({ "stage": "load" }));
+                let pn = c.get("pluginName").and_then(Value::as_str).unwrap_or("").to_string();
+                todo.push((k, pn));
+            }
+        }
+        for (k, pn) in todo {
+            let mut bd = body;
+            spawn(async move { load_card_body(k, pn, bd).await; });
+        }
+    });
 
     // 启动一次性：首拉 + rev 轮询兜底（SSE 主通道）+ SSE + 测量脉冲。
     use_effect(move || {
@@ -132,6 +364,7 @@ pub fn App() -> Element {
     let rev = modelv.as_ref().and_then(|m| m.get("rev").and_then(Value::as_str)).unwrap_or("").to_string();
     let revshort: String = rev.chars().take(12).collect();
     let visible = visible_cards(&modelv, &sel, &closedv);
+    let bodyv = body.read().clone();
     let cols = columns_for_width(crate::interop::workbench_width());
     let grid = layout_grid(
         &visible.iter().map(|c| json!({"key": fk(c), "w": c.get("size").and_then(|s| s.get("w")).and_then(Value::as_i64).unwrap_or(2), "h": c.get("size").and_then(|s| s.get("h")).and_then(Value::as_i64).unwrap_or(3)})).collect::<Vec<_>>(),
@@ -262,7 +495,7 @@ pub fn App() -> Element {
                                 div { class: "fail-msg", "✗ {emsg}" }
                                 div { class: "code", "code={ecode}" }
                             } else {
-                                div { class: "cstat", "体面待 S3：拉取 /plugins/{pn}/ui.json + 声明校验 + 视图渲染" }
+                                { card_body(k.clone(), bodyv.get(&k).cloned(), body) }
                             }
                         }
                         }
