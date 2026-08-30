@@ -92,6 +92,40 @@ pub fn confirm_dialog(msg: &str) -> bool {
     win().confirm_with_message(msg).unwrap_or(false)
 }
 
+/// SSE 会话事件通道：/api/events.mux 帧原样转发（帧筛选/折叠在 Rust 侧）。
+pub fn watch_session_events<F: FnMut(Value) + 'static>(f: F) {
+    let Ok(es) = EventSource::new("/api/events.mux") else { return };
+    let mut f = f;
+    let outer = Closure::wrap(Box::new(move |ev: MessageEvent| {
+        let Some(txt) = ev.data().as_string() else { return };
+        if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+            f(v);
+        }
+    }) as Box<dyn FnMut(MessageEvent)>);
+    es.set_onmessage(Some(outer.as_ref().unchecked_ref()));
+    outer.forget();
+}
+
+/// 写控件值（发送后清空输入框）。
+pub fn set_input_value(card_id: &str, name: &str, val: &str) {
+    let sel = format!("[id='{}'] [name='{}']", card_id.replace('\'', ""), name.replace('\'', ""));
+    if let Some(el) = doc().query_selector(&sel).ok().flatten().and_then(|e| e.dyn_into::<HtmlElement>().ok()) {
+        let _ = el.set_attribute("value", val);
+        if let Some(inp) = el.dyn_ref::<web_sys::HtmlInputElement>().cloned() {
+            inp.set_value(val);
+        }
+    }
+}
+
+/// 消息区滚到底（paint 尾步）。
+pub fn scroll_chat_bottom(card_id: &str) {
+    let sel = format!("[id='{}'] .chat-msgs", card_id.replace('\'', ""));
+    if let Some(el) = doc().query_selector(&sel).ok().flatten().and_then(|e| e.dyn_into::<web_sys::Element>().ok()) {
+        let h = el.scroll_height();
+        el.set_scroll_top(h);
+    }
+}
+
 pub fn spawn_poll<F: FnMut() + 'static>(f: F, ms: i32) {
     let _h = win().set_interval_with_callback_and_timeout_and_arguments_0(&js_cb(f), ms);
 }

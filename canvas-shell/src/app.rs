@@ -5,6 +5,7 @@
 use dioxus::prelude::*;
 use serde_json::{json, Value};
 
+use canvas_shell::chat::{chat_fold_frame, chat_options};
 use canvas_shell::layout::{columns_for_width, layout_grid, layout_measured, GRID_COL, GRID_GAP};
 use canvas_shell::model::{build_model, focus_key, validate_declaration};
 use canvas_shell::schema::{ns_select_model, schema_fields};
@@ -86,6 +87,7 @@ async fn load_card_body(fk: String, pn: String, mut body: Signal<serde_json::Map
                 let view = ui.get("view").cloned().unwrap_or(Value::Null);
                 let rpc_src = view.get("dataRpc").and_then(Value::as_array)
                     .or_else(|| view.get("fieldsFrom").and_then(|ff| ff.get("rpc")).and_then(Value::as_array))
+                    .or_else(|| view.get("sessionSource").and_then(Value::as_array))
                     .cloned();
                 if let Some(drpc) = rpc_src {
                     let method = drpc.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("/");
@@ -103,7 +105,242 @@ async fn load_card_body(fk: String, pn: String, mut body: Signal<serde_json::Map
             }
         }
     }
-    body.write().insert(fk, entry);
+    body.write().insert(fk.clone(), entry.clone());
+    // chat 引导（JS 同款）：选 default 或首项 sid → 初始历史折叠。
+    let view_v = entry.get("view").cloned().unwrap_or(Value::Null);
+    if view_v.get("kind").and_then(Value::as_str) == Some("chat") {
+        let rows = entry.get("data").and_then(|d| d.get("items")).cloned().unwrap_or(Value::Null);
+        let opts = chat_options(&rows);
+        if !opts.is_empty() {
+            let sid = if opts.iter().any(|o| o.get("value").and_then(Value::as_str) == Some("default")) {
+                "default".to_string()
+            } else {
+                scalar_text(opts.first().and_then(|o| o.get("value")))
+            };
+            {
+                let mut g = body.write();
+                if let Some(en) = g.get_mut(&fk) {
+                    en["chat"] = json!({"sessionId": sid, "busy": false, "messages": []});
+                }
+            }
+            let hist = rpc_join(view_v.get("historyRpc"));
+            let mut bd2 = body;
+            let fk2 = fk.clone();
+            spawn(async move { load_chat_history(fk2, hist, sid, bd2).await; });
+        }
+    }
+}
+
+fn frame_text(d: Option<&Value>) -> String {
+    let Some(d) = d else { return String::new() };
+    let c = d.get("content").cloned()
+        .or_else(|| d.get("message").and_then(|m| m.get("content")).cloned())
+        .or_else(|| d.get("text").cloned());
+    match c {
+        Some(Value::String(s)) => s,
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .map(|b| scalar_text(b.get("text")))
+            .collect::<String>(),
+        _ => String::new(),
+    }
+}
+
+fn rpc_join(v: Option<&Value>) -> String {
+    v.and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("/"))
+        .unwrap_or_default()
+}
+
+fn set_act(mut body: Signal<serde_json::Map<String, Value>>, k: &str, msg: String) {
+    let mut g = body.write();
+    let en = g.entry(k.to_string()).or_insert_with(|| json!({ "stage": "view" }));
+    en["act"] = json!(msg);
+}
+
+/// 历史 = session.history 事件面折叠（与 SSE 同一事实源，JS 壳 C8-3 同款）。
+async fn load_chat_history(k: String, hist_rpc: String, sid: String, mut body: Signal<serde_json::Map<String, Value>>) {
+    match crate::interop::fetch_rpc(&hist_rpc, json!({ "sessionId": sid })).await {
+        Err(e) => set_act(body, &k, format!("✗ 历史拉取：{}", e)),
+        Ok(res) if res.get("ok").and_then(Value::as_bool) == Some(false) => {
+            let m = res.get("error").and_then(|x| x.get("message")).and_then(Value::as_str).unwrap_or("?");
+            set_act(body, &k, format!("✗ 历史拉取：{}", m));
+        }
+        Ok(res) => {
+            let mut s = json!({ "sessionId": sid, "busy": false, "messages": [] });
+            let evs = res.get("value").and_then(|v| v.get("events")).and_then(Value::as_array).cloned().unwrap_or_default();
+            for wrap in &evs {
+                let Some(ev) = wrap.get("event") else { continue };
+                let nf = json!({ "sessionId": sid, "kind": ev.get("type").cloned().unwrap_or(Value::Null),
+                                 "data": { "text": frame_text(ev.get("data")) }, "time": ev.get("time").cloned().unwrap_or(Value::Null) });
+                if let Some(next) = chat_fold_frame(&s, &nf) {
+                    s = next;
+                }
+            }
+            let mut g = body.write();
+            if let Some(en) = g.get_mut(&k) {
+                en["chat"] = s;
+            }
+        }
+    }
+    crate::interop::scroll_chat_bottom(&k);
+}
+
+/// chat 岛（D-193 契约：选择/历史/发送乐观气泡/停止；折叠唯一事实源 chat_fold_frame）。
+#[component]
+fn ChatIsland(view: Value, k: String, body: Signal<serde_json::Map<String, Value>>, opts: Vec<Value>, sid: String, msgs: Value, has_cancel: bool) -> Element {
+    let pairs: Vec<(String, String)> = msgs
+        .as_array()
+        .map(|a| a.iter().map(|m| {
+            let role = scalar_text(m.get("role"));
+            let cls = format!("chat-bubble {}", role);
+            let who = match role.as_str() { "user" => "我: ", "assistant" => "助手: ", _ => "· " };
+            let mut t = format!("{}{}", who, scalar_text(m.get("text")));
+            if m.get("pending").and_then(Value::as_bool) == Some(true) { t.push_str(" …"); }
+            (cls, t)
+        }).collect())
+        .unwrap_or_default();
+    let hist_rpc = rpc_join(view.get("historyRpc"));
+    let send_rpc = rpc_join(view.get("sendRpc"));
+    let cancel_rpc = rpc_join(view.get("cancelRpc"));
+
+    let sid_for_sel = sid.clone();
+    let opts_sel: Vec<(String, String)> = opts
+        .iter()
+        .map(|o| (scalar_text(o.get("value")), scalar_text(o.get("label"))))
+        .collect();
+
+    let (k_r, h_r, mut b_r) = (k.clone(), hist_rpc.clone(), body);
+    let reload = move |_| {
+        let sid_now = {
+            let g = b_r.read();
+            g.get(&k_r).and_then(|e| e.get("chat")).and_then(|c| c.get("sessionId")).and_then(Value::as_str).unwrap_or("").to_string()
+        };
+        if sid_now.is_empty() { return; }
+        let (k2, h2) = (k_r.clone(), h_r.clone());
+        let mut b2 = b_r;
+        spawn(async move { load_chat_history(k2, h2, sid_now, b2).await; });
+    };
+
+    let (k_s, h_s, mut b_s) = (k.clone(), hist_rpc.clone(), body);
+    let sel_change = move |ev: dioxus::prelude::FormEvent| {
+        let v = ev.value();
+        {
+            let mut g = b_s.write();
+            if let Some(en) = g.get_mut(&k_s) {
+                en["chat"] = json!({"sessionId": v.clone(), "busy": false, "messages": []});
+            }
+        }
+        let (k2, h2, mut b2) = (k_s.clone(), h_s.clone(), b_s);
+        spawn(async move { load_chat_history(k2, h2, v, b2).await; });
+    };
+
+    let (k_send, ss_rpc, mut b_send) = (k.clone(), send_rpc.clone(), body);
+    let send = move |ev: dioxus::prelude::FormEvent| {
+        ev.prevent_default();
+        let vals = crate::interop::read_form(&k_send);
+        let text = scalar_text(vals.get("chat-input")).trim().to_string();
+        let sid_now = {
+            let g = b_send.read();
+            g.get(&k_send).and_then(|e| e.get("chat")).and_then(|c| c.get("sessionId")).and_then(Value::as_str).unwrap_or("").to_string()
+        };
+        if sid_now.is_empty() {
+            set_act(b_send, &k_send, "✗ 当前无会话".into());
+            return;
+        }
+        if text.is_empty() { return; }
+        {
+            let mut g = b_send.write();
+            if let Some(en) = g.get_mut(&k_send) {
+                if en.get("chat").is_none() {
+                    en["chat"] = json!({"sessionId": sid_now.clone(), "busy": false, "messages": []});
+                }
+                if let Some(arr) = en["chat"]["messages"].as_array_mut() {
+                    arr.push(json!({"role": "user", "text": text, "pending": true, "ts": js_sys::Date::now()}));
+                }
+            }
+        }
+        crate::interop::set_input_value(&k_send, "chat-input", "");
+        let (k2, mut b2) = (k_send.clone(), b_send);
+        let (ss, sid2, txt2) = (ss_rpc.clone(), sid_now.clone(), text.clone());
+        spawn(async move {
+            match crate::interop::fetch_rpc(&ss, json!({"sessionId": sid2, "text": txt2})).await {
+                Err(e) => {
+                    mark_pending_fail(&mut b2, &k2);
+                    set_act(b2, &k2, format!("✗ 发送：{}", e));
+                }
+                Ok(res) if res.get("ok").and_then(Value::as_bool) == Some(false) => {
+                    mark_pending_fail(&mut b2, &k2);
+                    let m = res.get("error").and_then(|x| x.get("message")).and_then(Value::as_str).unwrap_or("?");
+                    set_act(b2, &k2, format!("✗ {}", m));
+                }
+                Ok(_) => set_act(b2, &k2, "✓ 已发送".into()),
+            }
+        });
+    };
+
+    let (k_c, c_rpc, mut b_c) = (k.clone(), cancel_rpc.clone(), body);
+    let stop = move |_| {
+        let sid_now = {
+            let g = b_c.read();
+            g.get(&k_c).and_then(|e| e.get("chat")).and_then(|c| c.get("sessionId")).and_then(Value::as_str).unwrap_or("").to_string()
+        };
+        if sid_now.is_empty() {
+            set_act(b_c, &k_c, "✗ 当前无会话".into());
+            return;
+        }
+        set_act(b_c, &k_c, format!("→ 取消 {} …", sid_now));
+        let (k2, mut b2) = (k_c.clone(), b_c);
+        let (cc, sid2) = (c_rpc.clone(), sid_now);
+        spawn(async move {
+            let msg = match crate::interop::fetch_rpc(&cc, json!({"sessionId": sid2})).await {
+                Err(e) => format!("✗ 取消：{}", e),
+                Ok(res) if res.get("ok").and_then(Value::as_bool) == Some(false) => {
+                    format!("✗ {}", res.get("error").and_then(|x| x.get("message")).and_then(Value::as_str).unwrap_or("?"))
+                }
+                Ok(_) => "✓ 已请求取消".into(),
+            };
+            set_act(b2, &k2, msg);
+        });
+    };
+
+    rsx! {
+        div { class: "chat-bar",
+            select { value: sid_for_sel, onchange: sel_change,
+                for (ov, ol) in opts_sel {
+                    option { value: "{ov}", "{ol}" }
+                }
+            }
+            button { onclick: reload, "↻" }
+        }
+        div { class: "chat-msgs",
+            for (mi, (cls, txt)) in pairs.iter().enumerate() {
+                div { class: "{cls}", key: "{mi}", "{txt}" }
+            }
+        }
+        form { class: "chat-send", onsubmit: send,
+            input { name: "chat-input", placeholder: "发消息…", autocomplete: "off" }
+            button { r#type: "submit", class: "primary", "发送" }
+            if has_cancel {
+                button { onclick: stop, "停止" }
+            }
+        }
+    }
+}
+
+fn mark_pending_fail(mut body: &mut Signal<serde_json::Map<String, Value>>, k: &str) {
+    let mut g = body.write();
+    if let Some(en) = g.get_mut(k) {
+        if let Some(arr) = en.get_mut("chat").and_then(|c| c.get_mut("messages")).and_then(Value::as_array_mut) {
+            if let Some(last) = arr.last_mut() {
+                if last.get("pending").and_then(Value::as_bool) == Some(true) {
+                    let t = scalar_text(last.get("text"));
+                    last["text"] = json!(format!("{}（发送失败）", t));
+                }
+            }
+        }
+    }
 }
 
 fn action_click(
@@ -396,6 +633,20 @@ fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, 
             }));
         }
     }
+    let chat_opts = chat_options(&data.get("items").cloned().unwrap_or(Value::Null));
+    let chat_note = if data.is_null() { "载入会话列表…".to_string() } else { "没有可选会话".to_string() };
+    let chat_sid = {
+        let cur = st.get("chat").and_then(|c| c.get("sessionId")).and_then(Value::as_str).unwrap_or("").to_string();
+        if !cur.is_empty() {
+            cur
+        } else if chat_opts.iter().any(|o| o.get("value").and_then(Value::as_str) == Some("default")) {
+            "default".to_string()
+        } else {
+            scalar_text(chat_opts.first().and_then(|o| o.get("value")))
+        }
+    };
+    let chat_msgs = st.get("chat").and_then(|c| c.get("messages")).cloned().unwrap_or(json!([]));
+    let chat_cancel = view.get("cancelRpc").and_then(Value::as_array).map(|a| a.len() == 2).unwrap_or(false);
     rsx! {
         if !err_msg.is_empty() {
             div { class: "cstat err", "✗ 数据面失败：{err_msg}（静态兜底）" }
@@ -466,7 +717,19 @@ fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, 
             }
         }
         if kind == "chat" {
-            div { class: "cstat", "chat 岛待 S4（选择/历史/发送/停止/SSE）" }
+            if chat_opts.is_empty() {
+                div { class: "cstat", "{chat_note}" }
+            } else {
+                ChatIsland {
+                    view: view.clone(),
+                    k: k.clone(),
+                    body,
+                    opts: chat_opts,
+                    sid: chat_sid,
+                    msgs: chat_msgs,
+                    has_cancel: chat_cancel,
+                }
+            }
         }
         if !act.is_empty() {
             div { class: "cstat", "{act}" }
@@ -485,6 +748,40 @@ pub fn App() -> Element {
 
     // 体面管线：清单版本变 → 未加载卡逐个 ui.json→validate→dataRpc（S3a）。
     use_effect(move || {
+        // S4：mux 会话事件单监听（全壳一条，逐卡按 sid 匹配折叠——引用差语义同款）。
+        crate::interop::watch_session_events(move |frame| {
+            if frame.get("method").and_then(Value::as_str) != Some("session/event") {
+                return;
+            }
+            let Some(p) = frame.get("payload") else { return };
+            let Some(psid) = p.get("sessionId").and_then(Value::as_str) else { return };
+            let Some(ev) = p.get("event") else { return };
+            let nf = json!({"sessionId": psid, "kind": ev.get("type").cloned().unwrap_or(Value::Null),
+                            "data": { "text": frame_text(ev.get("data")) }, "time": ev.get("time").cloned().unwrap_or(Value::Null)});
+            let mut bw = body;
+            let mut g = bw.write();
+            for (_kk, en) in g.iter_mut() {
+                let is_chat = en.get("view").and_then(|v| v.get("kind")).and_then(Value::as_str) == Some("chat");
+                if !is_chat { continue; }
+                if en.get("chat").and_then(|c| c.get("sessionId")).and_then(Value::as_str) != Some(psid) { continue; }
+                let st = en.get("chat").cloned().unwrap_or(json!({"sessionId": psid, "busy": false, "messages": []}));
+                if let Some(next) = chat_fold_frame(&st, &nf) {
+                    en["chat"] = next;
+                }
+            }
+        });
+        // 断线兜底轮询（JS 壳同款 5000ms 历史重载）。
+        crate::interop::spawn_poll(move || {
+            let snap = body.read().clone();
+            for (kk, en) in snap.iter() {
+                if en.get("view").and_then(|v| v.get("kind")).and_then(Value::as_str) != Some("chat") { continue; }
+                let Some(sid) = en.get("chat").and_then(|c| c.get("sessionId")).and_then(Value::as_str) else { continue };
+                let hist = rpc_join(en.get("view").and_then(|v| v.get("historyRpc")));
+                if hist.is_empty() { continue; }
+                let (k2, s2, mut b2) = (kk.clone(), sid.to_string(), body);
+                spawn(async move { load_chat_history(k2, hist, s2, b2).await; });
+            }
+        }, 5000);
         let mut body = body;
         let m = model.read().clone();
         let rev = m.as_ref().and_then(|x| x.get("rev").and_then(Value::as_str)).unwrap_or("").to_string();
