@@ -13,9 +13,37 @@ pub const CANVAS_CORE_JS: &str = include_str!("../assets/canvas/core.js");
 /// DOM/fetch/定时器粘合层（薄）。
 pub const CANVAS_APP_JS: &str = include_str!("../assets/canvas/app.js");
 
+/// D-210 S5：Rust 壳发布产物内嵌表（build.rs 扫描 assets/canvas-shell/ 生成）。
+include!(concat!(env!("OUT_DIR"), "/shell_assets.rs"));
+
+fn shell_mime(rel: &str) -> &'static str {
+    if rel.ends_with(".wasm") {
+        "application/wasm"
+    } else if rel.ends_with(".js") {
+        "text/javascript; charset=utf-8"
+    } else if rel.ends_with(".html") {
+        "text/html; charset=utf-8"
+    } else {
+        "application/octet-stream"
+    }
+}
+
 /// `/canvas` 路由纯函数：命中 → `(status, content_type, body)`；miss → `None`（调用方
 /// 必须回 404，不得落到 SPA fallback）。
 pub fn canvas_response(path: &str) -> Option<(u16, &'static str, &'static [u8])> {
+    // D-210 S5：Rust 壳双轨（/canvas 旧 JS、/canvas/rust 新 Dioxus——S6 前并存）。
+    if path == "/canvas/rust" || path == "/canvas/rust/" {
+        let body = SHELL_ASSETS
+            .iter()
+            .find(|(p, _)| *p == "rust.html")
+            .map(|(_, b)| *b)?;
+        return Some((200, "text/html; charset=utf-8", body));
+    }
+    if let Some(rel) = path.strip_prefix("/canvas/rust/assets/") {
+        let rel = rel.trim_start_matches('/');
+        let (_, body) = SHELL_ASSETS.iter().find(|(p, _)| *p == rel)?;
+        return Some((200, shell_mime(rel), body));
+    }
     let (ct, body) = match path {
         "/canvas" | "/canvas/" => ("text/html; charset=utf-8", CANVAS_HTML.as_bytes()),
         "/canvas/assets/canvas.css" => ("text/css; charset=utf-8", CANVAS_CSS.as_bytes()),
@@ -90,8 +118,38 @@ mod tests {
     /// miss → None（调用方 404；**绝不回落 SPA**——D-184）。
     #[test]
     fn canvas_unknown_paths_are_none() {
-        for p in ["/canvas/nope.js", "/canvas/assets", "/canvas/assets/evil.wasm", "/canvasx"] {
+        for p in [
+            "/canvas/nope.js",
+            "/canvas/assets",
+            "/canvas/assets/evil.wasm",
+            "/canvasx",
+            "/canvas/rust/nope.js",
+            "/canvas/rust/assets/../../etc/passwd",
+        ] {
             assert!(canvas_response(p).is_none(), "{p} 必须 miss");
         }
+    }
+
+    /// D-210 S5：Rust 壳内嵌面——入口引用绝对路径、胶水/wasm mime 正确、表非空。
+    #[test]
+    fn rust_shell_embedded_served() {
+        assert!(!SHELL_ASSETS.is_empty(), "build.rs 表非空");
+        let (status, ct, body) = canvas_response("/canvas/rust").expect("/canvas/rust served");
+        assert_eq!((status, ct), (200, "text/html; charset=utf-8"));
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            html.contains("import init from '/canvas/rust/assets/canvas-shell.js'"),
+            "胶水引用绝对路径"
+        );
+        let (st2, ct2, b2) = canvas_response("/canvas/rust/assets/canvas-shell.js").unwrap();
+        assert_eq!((st2, ct2), (200, "text/javascript; charset=utf-8"));
+        assert!(!b2.is_empty());
+        let (_s, ct3, b3) = canvas_response("/canvas/rust/assets/canvas-shell_bg.wasm").unwrap();
+        assert_eq!(ct3, "application/wasm");
+        assert!(b3.starts_with(b"\0asm"), "wasm 魔数");
+        // snippets 相对导入面：表里有的必须可按 assets 前缀命中（mime=js）。
+        let snip = SHELL_ASSETS.iter().find(|(p, _)| p.starts_with("snippets/")).expect("snippets 存在");
+        let hit = canvas_response(&format!("/canvas/rust/assets/{}", snip.0)).expect("snippet 命中");
+        assert_eq!(hit.1, "text/javascript; charset=utf-8");
     }
 }

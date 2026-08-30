@@ -8449,7 +8449,23 @@ Rust；S0–S6 切分，每片 TDD；node 35 测断言逐条移植 cargo 测，�
 
 **S0 哨兵已过（本轮）**：独立 workspace `canvas-shell/` dioxus 0.7 web 编译通过
 （依赖树全量编过=工具链成立），debug wasm 45MB（含调试信息，非决策数据）；release+gzip
-真实体积后台实测中。**回滚点**：删 canvas-shell/ 即全退（未触任何现行代码）。E2E 清单已同步（13 卡基线 + §1 行）。
+真实体积后台实测中。**回滚点**：删 canvas-shell/ 即全退（未触任何现行代码）。
+
+### D-210 进度补记（S3–S5 全部活体，2026-09-05）
+
+- **S3a/S3b/S4**：四档渲染（status/list、form 含 fieldsFrom/nsSelect/乐观锁保存/
+  password 防误清、chat 岛含历史折叠/发送乐观气泡/停止/events.mux 单订 + 5000ms
+  兜底轮询）全部真实浏览器活体验证；wire 形状全程 live 抓样零臆造；JS 行为对齐纪律
+  （保存后不自动重拉=stale revision 可测 CONFLICT）。
+- **S5 路由内嵌**：`/canvas/rust` + `/canvas/rust/assets/**` 进 dsh-cli——
+  **build.rs 扫描 assets/canvas-shell/ 生成 include_bytes! 表**（产物入库同 wasm 惯例，
+  release wasm 1.37MB 内嵌，mime 严格按扩展名，miss→404 绝不回落 SPA 的 D-184 铁律
+  对 /canvas/rust/** 同样生效并有测钉死）。开发期 60700 代理退役。
+- **S5 双壳 CDP 对齐审计**（同探针打两壳）：cards=13/errEls=2/forms=1/selects=7 **全一致**；
+  rows 38 vs 46 为观感差（Rust 壳 status 行渲 div.row 被共享选择器多计）——非契约违背，
+  S6 对齐清单已记。
+- **回滚点**：revert S5 提交（assets + build.rs + canvas.rs 路由）即回双壳并存前态；
+  旧 /canvas JS 壳全程未动。E2E 清单已同步（13 卡基线 + §1 行）。
 
 
 
