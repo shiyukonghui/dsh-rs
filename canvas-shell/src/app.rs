@@ -3,6 +3,9 @@
 //! 数据体按设计文档在 S3/S4 接线（诚实占位，不伪造渲染）。
 
 use dioxus::prelude::*;
+// S6a：JS 回调（setInterval/SSE）无 dioxus 作用域——异步任务必须走 spawn_local，
+// 否则 dioxus::spawn 找 current_owner → runtime.rs unwrap(None) panic（s6-audit 根因）。
+use wasm_bindgen_futures::spawn_local;
 use serde_json::{json, Value};
 
 use canvas_shell::chat::{chat_fold_frame, chat_options};
@@ -126,7 +129,7 @@ async fn load_card_body(fk: String, pn: String, mut body: Signal<serde_json::Map
             let hist = rpc_join(view_v.get("historyRpc"));
             let mut bd2 = body;
             let fk2 = fk.clone();
-            spawn(async move { load_chat_history(fk2, hist, sid, bd2).await; });
+            spawn_local(async move { load_chat_history(fk2, hist, sid, bd2).await; });
         }
     }
 }
@@ -779,7 +782,7 @@ pub fn App() -> Element {
                 let hist = rpc_join(en.get("view").and_then(|v| v.get("historyRpc")));
                 if hist.is_empty() { continue; }
                 let (k2, s2, mut b2) = (kk.clone(), sid.to_string(), body);
-                spawn(async move { load_chat_history(k2, hist, s2, b2).await; });
+                spawn_local(async move { load_chat_history(k2, hist, s2, b2).await; });
             }
         }, 5000);
         let mut body = body;
@@ -819,14 +822,14 @@ pub fn App() -> Element {
         crate::interop::spawn_poll(
             move || {
                 let (m, s) = (m1, s1);
-                spawn(async move { load_manifest(m, s).await; });
+                spawn_local(async move { load_manifest(m, s).await; });
             },
             10000,
         );
         let (m2, s2) = (model, status);
         crate::interop::watch_manifest(move || {
             let (m, s) = (m2, s2);
-            spawn(async move { load_manifest(m, s).await; });
+            spawn_local(async move { load_manifest(m, s).await; });
         });
         let b = bump;
         crate::interop::spawn_poll(move || { let mut b = b; *b.write() += 1; }, 1500);

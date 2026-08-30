@@ -33,10 +33,21 @@ debug wasm 复现拿到 panic 原文（两处 dioxus-core 0.7.10 内部）：
      （dioxus 官方外部事件模式），壳内所有 `body.write()` 收口到一个 scope 内的泵；
   ③ 升级 dioxus 0.7.10→最新 patch（223/280 可能已修，查 changelog）。
 
+### 缺陷 C 修复回执（第 52 轮，S6a 完成）
+**根因**：JS 回调上下文（setInterval/SSE onmessage）无 dioxus 作用域，其内调用
+`dioxus::spawn` → `current_owner()` → `scope_stack.last().unwrap()` → runtime.rs:223
+panic（abort 级）。四处收口 `wasm_bindgen_futures::spawn_local`（chat bootstrap、
+聊天历史轮询、清单轮询、SSE manifest）；事件处理器内的 spawn 保留（delegated
+handler 自带作用域）。
+**复验（真路由 /canvas/rust，release 内嵌）**：T2/T3/T4/T5/T6/T7 **全过**
+（含 dom1=12→dom2=13 热插拔完整闭环），**consoleErrs=[]** 零 panic。
+缺陷 A 同灭（wasm 死因即 C；合成 change 事件 dioxus 本可正常处理）。
+**判定更新**：Rust 壳 = 全项与 JS 壳一致且 T7 反超（JS 壳三次复现 DOM 冻结）。
+S6d（切默认）技术阻塞解除——剩产品决策：旧 /canvas 退役节奏（按设计文档留用户拍板）。
+
 ### 决定
-1. **切默认（S6 原计划）冻结**：Rust 壳存在 panic=abort 级崩溃（release 下整页死透——
-   比 JS 壳已知 bug 更重的级别）。审计的目的正是拦住这一步。目标不变，路径修正：
-   **S6a = panic 修复+根因（先于一切切换）** → S6b = 缺陷 A/B → S6c = 对齐复核 → S6d 切默认。
+1. ~~切默认冻结~~ → **S6a 已修复（第 52 轮）**，S6b/S6c 随复验自动完成。
+   剩余 S6d=切默认/退役节奏=用户拍板项（新旧并存即回滚态，随时可切）。
 2. **热插拔定案**：JS 壳 DOM 不更新（连续第 3 次复现，坐实）；Rust 壳 SSE→model→重渲染
    链路**通**（dom1=12）。旧壳修复优先级进一步降低（倾向由 Rust 壳直接取代）。
 3. **panic 复现路径（下轮起点）**：审计序列 T4→T5 之间触发（T4 返回后、T5 期间死亡）。

@@ -8465,7 +8465,12 @@ Rust；S0–S6 切分，每片 TDD；node 35 测断言逐条移植 cargo 测，�
   rows 38 vs 46 为观感差（Rust 壳 status 行渲 div.row 被共享选择器多计）——非契约违背，
   S6 对齐清单已记。
 - **回滚点**：revert S5 提交（assets + build.rs + canvas.rs 路由）即回双壳并存前态；
-  旧 /canvas JS 壳全程未动。E2E 清单已同步（13 卡基线 + §1 行）。
+  旧 /canvas JS 壳全程未动。
+- **S6a panic 修复（第 52 轮）**：S6 交互审计拦下切默认——JS 回调（setInterval/SSE）
+  内调 `dioxus::spawn` → 空作用域栈 unwrap panic（dioxus-core runtime.rs:223）。
+  四处收口 `spawn_local`；真路由复验全项过 + 热插拔完整闭环（JS 壳同项三次复现
+  DOM 冻结）+ 零 panic。**教训固化：wasm 宿主里 JS 回调只准 spawn_local，
+  dioxus::spawn 仅限组件体/事件处理器/效应内。**E2E 清单已同步（13 卡基线 + §1 行）。
 
 
 
