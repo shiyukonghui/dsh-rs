@@ -1,0 +1,56 @@
+// 收口三拍 + 按钮计算样式探测
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+const URL_ = "http://127.0.0.1:60890/";
+const API = URL_ + "api/";
+const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+const PORT = 9374;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const rpc = (m, payload, ms = 60000) => fetch(API + m, { method: "POST", headers: { "content-type": "application/json" },
+  body: JSON.stringify({ type: "client-request", rpcId: "r", method: m, payload }), signal: AbortSignal.timeout(ms) }).then((r) => r.json()).then((j) => j.result);
+const sched = await rpc("schedule/create", { args: { kind: "after", prompt: "ui-shot-probe", afterSeconds: 3600 } });
+console.log("sched:", JSON.stringify(sched).slice(0, 50));
+const prof = path.join(os.tmpdir(), `dsh-cards3-${Date.now()}`);
+const proc = spawn(EDGE, ["--headless=new", `--remote-debugging-port=${PORT}`, `--user-data-dir=${prof}`,
+  "--no-first-run", "--no-default-browser-check", "--disable-gpu",
+  "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
+  "--disable-renderer-backgrounding", "--window-size=1680,1050", "about:blank"], { stdio: "ignore" });
+let ver = null;
+for (let i = 0; i < 30 && !ver; i++) { await sleep(400); try { const r = await fetch(`http://127.0.0.1:${PORT}/json/version`); if (r.ok) ver = await r.json(); } catch {} }
+const tgt = await (await fetch(`http://127.0.0.1:${PORT}/json/new?about:blank`, { method: "PUT" })).json();
+const ws = new WebSocket(tgt.webSocketDebuggerUrl);
+await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+let mid = 0; const pend = new Map();
+const send = (m, p = {}) => new Promise((res) => { const id = ++mid; pend.set(id, res); ws.send(JSON.stringify({ id, method: m, params: p })); });
+ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id); } };
+await send("Page.enable"); await send("Runtime.enable");
+const evl = async (expression) => { const m = await send("Runtime.evaluate", { expression, returnByValue: true }); return m.result?.result?.value; };
+await send("Page.navigate", { url: URL_ });
+await sleep(6000);
+const shotClip = async (file, title) => {
+  const b = await evl(`(() => { const c=[...document.querySelectorAll('#workbench .card')].find(c=>(c.innerText||'').includes(${JSON.stringify(title)})); if(!c) return null; const wb=document.getElementById('workbench'); wb.scrollTop = c.offsetTop - 10; const r=c.getBoundingClientRect(); return JSON.stringify({x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(Math.min(r.height,700))}); })()`);
+  await sleep(400);
+  if (!b) { console.log(file, "NO-CARD"); return; }
+  const r = await send("Page.captureScreenshot", { format: "png", clip: { ...JSON.parse(b), scale: 1.6 }, captureBeyondViewport: true });
+  if (r.result?.data) fs.writeFileSync(file, Buffer.from(r.result.data, "base64"));
+  console.log(file, r.result?.data ? "OK" : "FAIL");
+};
+// 样式探测（浅色下先探，再切深色探）
+const probe = () => evl(`(() => { const ra=document.querySelector('.ltable .row-action'); const cs=document.querySelector('.chat-send button'); const out={}; if(ra){const s=getComputedStyle(ra); out.rowAction={bg:s.backgroundColor,color:s.color,pad:s.padding};} if(cs){const s=getComputedStyle(cs); out.chatBtn={bg:s.backgroundColor,color:s.color};} const sel=document.querySelector('.card select'); if(sel){const s=getComputedStyle(sel); out.select={appearance:s.appearance,bgImg:s.backgroundImage.slice(0,42)};} return JSON.stringify(out); })()`);
+console.log("LIGHT probe:", await probe());
+await evl(`document.body.setAttribute('theme-mode','dark'); true`);
+await sleep(600);
+console.log("DARK probe:", await probe());
+await shotClip("target/ui-ref/cards/card-sched-dark.png", "调度任务");
+await shotClip("target/ui-ref/cards/card-chat-dark.png", "聊天");
+await evl(`document.body.removeAttribute('theme-mode'); true`);
+await sleep(500);
+await shotClip("target/ui-ref/cards/card-chat-light.png", "聊天");
+const l = await rpc("schedule/list", { args: {} }, 8000);
+const pr = (l?.value?.items || []).find((x) => x.prompt === "ui-shot-probe");
+if (pr) console.log("probe deleted:", JSON.stringify(await rpc("schedule/delete", { args: { row: { id: pr.id } } }, 8000)).slice(0, 40));
+proc.kill();
+try { await sleep(500); fs.rmSync(prof, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 }); } catch {}
+process.exit(0);
