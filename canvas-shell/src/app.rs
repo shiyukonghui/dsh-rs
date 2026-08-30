@@ -742,6 +742,8 @@ pub fn App() -> Element {
     // D-213：初始板从 #board= hash 直达；关闭集=板级 map（板→列表）。
     let selected = use_signal(crate::interop::hash_board);
     let closed = use_signal(crate::interop::ls_closed_map);
+    // D-214：摆位记忆（板→卡→{x,y}）。
+    let pos = use_signal(crate::interop::ls_pos_map);
     let bump = use_signal(|| 0u32);
     let body = use_signal(serde_json::Map::<String, Value>::new);
 
@@ -830,6 +832,18 @@ pub fn App() -> Element {
         let b = bump;
         crate::interop::spawn_poll(move || { let mut b = b; *b.write() += 1; }, 1500);
         crate::interop::observe_bump(move || { let mut b = b; *b.write() += 1; });
+        // D-214：拖拽落位 → 写当前板钉位（一次性写信号+存储；期间零信号风暴）。
+        let mut pos_d = pos;
+        let sel_d = selected;
+        crate::interop::install_drag_listener(move |id, x, y| {
+            let board = canvas_shell::board::board_of(sel_d.read().as_ref()).to_string();
+            {
+                let mut pd = pos_d;
+                let mut p = pd.write();
+                canvas_shell::board::set_pin(&mut p, &board, &id, x, y);
+                crate::interop::ls_set_pos(&p);
+            }
+        });
     });
 
     // 测量-重排：bump 或清单版本变化 → 实测覆盖声明位（D-209 语义）。
@@ -840,20 +854,35 @@ pub fn App() -> Element {
             .as_ref()
             .and_then(|m| m.get("rev").and_then(Value::as_str).map(str::to_string))
             .unwrap_or_default();
+        // D-214：拖拽中让路（松手后下一脉冲自然收敛）。
+        if crate::interop::is_dragging() {
+            return;
+        }
         crate::interop::reobserve();
         let cols = columns_for_width(crate::interop::workbench_width());
         let metrics = crate::interop::card_metrics();
         if metrics.is_empty() || t == 0 {
             return;
         }
+        // D-214：钉卡不进自动装箱；钉位直接并入成品，总高含钉卡底边。
+        let board_now = canvas_shell::board::board_of(selected.read().as_ref()).to_string();
+        let pins = canvas_shell::board::pins_of(&pos.read(), &board_now);
         let items: Vec<Value> = metrics
             .iter()
+            .filter(|(k, _, _)| !pins.iter().any(|(pk, _, _)| pk == k))
             .map(|(k, h, w)| json!({"key": k, "w": (*w as i64), "hPx": *h as i64}))
             .collect();
-        let (positions, total) = layout_measured(&items, cols);
+        let heights: std::collections::HashMap<String, i64> =
+            metrics.iter().map(|(k, h, _)| (k.clone(), *h as i64)).collect();
+        let (positions, auto_total) = layout_measured(&items, cols);
+        let auto: Vec<(String, i64, i64)> = positions
+            .into_iter()
+            .map(|p| (p.key, p.col as i64 * (GRID_COL + GRID_GAP), p.y_px))
+            .collect();
+        let (merged, total) = canvas_shell::board::merge_pinned(auto, auto_total, &pins, &heights);
         let mut map = serde_json::Map::new();
-        for p in positions {
-            map.insert(p.key, json!([p.col as i64 * (GRID_COL + GRID_GAP), p.y_px]));
+        for (k, x, y) in merged {
+            map.insert(k, json!([x, y]));
         }
         crate::interop::set_positions(&map, total as f64);
     });
@@ -874,6 +903,9 @@ pub fn App() -> Element {
         .cloned();
     let board = canvas_shell::board::board_of(sel_eff.as_ref()).to_string();
     let closedv = canvas_shell::board::closed_for(&closedmap, &board);
+    // D-214：本板钉位（渲染层钉位优先；重置按钮可见性同源）。
+    let posv = pos.read().clone();
+    let pins = canvas_shell::board::pins_of(&posv, &board);
     let allcards = modelv
         .as_ref()
         .and_then(|m| m.get("cards").and_then(Value::as_array).cloned())
@@ -892,6 +924,9 @@ pub fn App() -> Element {
         .iter()
         .map(|p| (p.key.clone(), (p.col as i64 * (GRID_COL + GRID_GAP)) as f64, (p.row * (100 + GRID_GAP)) as f64))
         .collect();
+    let mut pos_r = pos;
+    let board_r = board.clone();
+    let mut bump_r = bump;
 
     rsx! {
         header {
@@ -901,6 +936,23 @@ pub fn App() -> Element {
             }
             span { class: statuscls, id: "status",
                 if modelv.is_some() { "✓ 清单 {allcards.len()} 卡" } else { "{statustxt}" }
+            }
+            if canvas_shell::board::has_pins(&posv, &board) {
+                button {
+                    id: "reset-positions",
+                    class: "reset-pos",
+                    title: "清掉本桌板的钉位，回到自动排布",
+                    onclick: move |_| {
+                        {
+                            let mut pr = pos_r;
+                            let mut p = pr.write();
+                            canvas_shell::board::reset_board(&mut p, &board_r);
+                            crate::interop::ls_set_pos(&p);
+                        }
+                        *bump_r.write() += 1;
+                    },
+                    "⟲ 重置摆位"
+                }
             }
         }
         div { class: "layout",
@@ -1010,7 +1062,15 @@ pub fn App() -> Element {
                         let w = c.get("size").and_then(|s| s.get("w")).and_then(Value::as_i64).unwrap_or(2);
                         let h = c.get("size").and_then(|s| s.get("h")).and_then(Value::as_i64).unwrap_or(3);
                         let min_h = h as f64 * 100.0 + (h as f64 - 1.0) * GRID_GAP as f64;
-                        let (dx, dy) = declared.iter().find(|(dk, _, _)| *dk == k).map(|d| (d.1, d.2)).unwrap_or((0.0, 0.0));
+                        // D-214：钉位优先于自动/声明位。
+                        let (dx, dy) = match pins.iter().find(|(pk, _, _)| *pk == k) {
+                            Some((_, px, py)) => (*px, *py),
+                            None => declared
+                                .iter()
+                                .find(|(dk, _, _)| *dk == k)
+                                .map(|d| (d.1, d.2))
+                                .unwrap_or((0.0, 0.0)),
+                        };
                         let title = c.get("title").and_then(Value::as_str).unwrap_or("").to_string();
                         let ty = c.get("type").and_then(Value::as_str).unwrap_or("").to_string();
                         let pn = c.get("pluginName").and_then(Value::as_str).unwrap_or("").to_string();

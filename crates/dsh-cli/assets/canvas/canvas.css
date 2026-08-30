@@ -96,3 +96,11 @@ header h1 { font-size: 16px; margin: 0; }
 .chat-send { display: flex; gap: 6px; margin-top: 6px; }
 .chat-send input { flex: 1; background: var(--bg); color: var(--text);
   border: 1px solid var(--line); border-radius: 3px; font: inherit; padding: 3px 6px; }
+
+/* D-214 拖拽摆位：标题栏即把手（✕ 除外由 JS 侧排除）；重置入口。 */
+.cap { cursor: grab; user-select: none; }
+.cap:active { cursor: grabbing; }
+.reset-pos { margin-left: 12px; background: var(--bg); color: var(--text);
+  border: 1px solid var(--line); border-radius: 4px; font: inherit; font-size: 12px;
+  padding: 2px 10px; cursor: pointer; }
+.reset-pos:hover { border-color: var(--accent, #4a9eff); }

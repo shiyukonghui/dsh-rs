@@ -9,7 +9,7 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{EventSource, HtmlElement, MessageEvent, Request, RequestInit, RequestMode, ResizeObserver};
+use web_sys::{EventSource, HtmlElement, MessageEvent, MouseEvent, Request, RequestInit, RequestMode, ResizeObserver};
 
 fn win() -> web_sys::Window {
     web_sys::window().expect("no window")
@@ -193,6 +193,123 @@ pub fn hash_board() -> Option<String> {
 pub fn set_hash_board(board: &str) {
     if let Some(w) = web_sys::window() {
         let _ = w.location().set_hash(&format!("board={board}"));
+    }
+}
+
+// ---------- D-214 摆位持久化 + 拖拽（委托监听；拖中测量回路让路） ----------
+
+const LS_POS: &str = "dsh.canvas.pos";
+
+pub fn ls_pos_map() -> serde_json::Map<String, Value> {
+    let Some(s) = ls() else { return Default::default() };
+    let Some(txt) = s.get_item(LS_POS).ok().flatten() else { return Default::default() };
+    serde_json::from_str::<Value>(&txt)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+pub fn ls_set_pos(map: &serde_json::Map<String, Value>) {
+    if let Some(s) = ls() {
+        let _ = s.set_item(LS_POS, &Value::Object(map.clone()).to_string());
+    }
+}
+
+static DRAGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 拖拽进行中标记：测量-重排脉冲在此期间必须让路（否则会把拖中的卡拽回）。
+pub fn is_dragging() -> bool {
+    DRAGGING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 装一次全局委托拖拽监听：mousedown 命中 `.cap`（排除 ✕）开始跟手，
+/// 位移 >4px 才算拖拽（防误钉）；mouseup 回 `(card id, x, y)`——只回调一次，
+/// 期间直改元素 style，零信号风暴。
+pub fn install_drag_listener<F>(on_drop: F)
+where
+    F: Fn(String, f64, f64) + 'static,
+{
+    struct DragState {
+        card: HtmlElement,
+        off_x: f64,
+        off_y: f64,
+        start_x: f64,
+        start_y: f64,
+        cur_x: f64,
+        cur_y: f64,
+        moved: bool,
+    }
+    let st: Rc<std::cell::RefCell<Option<DragState>>> = Rc::new(std::cell::RefCell::new(None));
+
+    {
+        let st = st.clone();
+        let cb = Closure::wrap(Box::new(move |e: MouseEvent| {
+            if e.button() != 0 {
+                return;
+            }
+            let Some(t) = e.target() else { return };
+            let Ok(el) = t.dyn_into::<HtmlElement>() else { return };
+            if el.closest(".card-close").ok().flatten().is_some() {
+                return;
+            }
+            let (Ok(Some(_cap)), Ok(Some(card))) = (el.closest(".cap"), el.closest(".card")) else {
+                return;
+            };
+            let Some(wb) = doc().get_element_by_id("workbench") else { return };
+            let cr = card.get_bounding_client_rect();
+            let wr = wb.get_bounding_client_rect();
+            let card: HtmlElement = card.unchecked_into();
+            e.prevent_default();
+            DRAGGING.store(true, std::sync::atomic::Ordering::Relaxed);
+            *st.borrow_mut() = Some(DragState {
+                card,
+                off_x: e.client_x() as f64 - cr.left(),
+                off_y: e.client_y() as f64 - cr.top(),
+                start_x: e.client_x() as f64,
+                start_y: e.client_y() as f64,
+                cur_x: (cr.left() - wr.left()).max(0.0),
+                cur_y: (cr.top() - wr.top()).max(0.0),
+                moved: false,
+            });
+        }) as Box<dyn FnMut(MouseEvent)>);
+        let _ = doc().add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+    {
+        let st = st.clone();
+        let cb = Closure::wrap(Box::new(move |e: MouseEvent| {
+            let mut g = st.borrow_mut();
+            let Some(d) = g.as_mut() else { return };
+            let cx = e.client_x() as f64;
+            let cy = e.client_y() as f64;
+            if !d.moved && (cx - d.start_x).abs() + (cy - d.start_y).abs() < 4.0 {
+                return;
+            }
+            d.moved = true;
+            let Some(wb) = doc().get_element_by_id("workbench") else { return };
+            let wr = wb.get_bounding_client_rect();
+            let x = (cx - wr.left() - d.off_x).max(0.0).round();
+            let y = (cy - wr.top() - d.off_y).max(0.0).round();
+            d.cur_x = x;
+            d.cur_y = y;
+            let _ = d.card.style().set_property("left", &format!("{x}px"));
+            let _ = d.card.style().set_property("top", &format!("{y}px"));
+        }) as Box<dyn FnMut(MouseEvent)>);
+        let _ = win().add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+    {
+        let cb = Closure::wrap(Box::new(move |_e: MouseEvent| {
+            DRAGGING.store(false, std::sync::atomic::Ordering::Relaxed);
+            let d = st.borrow_mut().take();
+            let Some(d) = d else { return };
+            if !d.moved {
+                return;
+            }
+            on_drop(d.card.id(), d.cur_x, d.cur_y);
+        }) as Box<dyn FnMut(MouseEvent)>);
+        let _ = win().add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref());
+        cb.forget();
     }
 }
 

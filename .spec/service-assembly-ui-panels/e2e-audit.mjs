@@ -145,6 +145,35 @@ await send("Page.navigate", { url: URL_ + "#board=session" }); await sleep(4500)
 R.T13_deeplink = await evl(`(()=>{const cs=[...document.querySelectorAll('#workbench .card')];return JSON.stringify({n:cs.length, allSession:cs.length>0&&cs.every(c=>{const t=c.querySelector('.badges .type');return t&&t.textContent==='session';})})})()`);
 await send("Page.navigate", { url: "about:blank" }); await sleep(400);
 await send("Page.navigate", { url: URL_ }); await sleep(4500);
+// T14 拖拽摆位（CDP 真事件）：拖动首卡 → 位移≈拖距 + 钉位持久 + 板间零牵连 → 刷新持久 → 重置
+{
+  const geo = JSON.parse(await evl(`(()=>{const c=document.querySelector('#workbench .card');const cap=c.querySelector('.cap').getBoundingClientRect();return JSON.stringify({id:c.id,x:Math.round(cap.x+70),y:Math.round(cap.y+cap.height/2),left:parseFloat(c.style.left)||0,top:parseFloat(c.style.top)||0})})()`));
+  const idj = JSON.stringify(geo.id);
+  await send("Input.dispatchMouseEvent",{type:"mousePressed",x:geo.x,y:geo.y,button:"left",clickCount:1});
+  for(let i=1;i<=6;i++){ await send("Input.dispatchMouseEvent",{type:"mouseMoved",x:geo.x+i*25,y:geo.y+i*20,button:"left"}); }
+  await send("Input.dispatchMouseEvent",{type:"mouseReleased",x:geo.x+150,y:geo.y+120,button:"left",clickCount:1});
+  await sleep(600);
+  R.T14_drag = await evl(`(()=>{
+    const c=document.getElementById(${idj});
+    const lx=parseFloat(c.style.left),ty=parseFloat(c.style.top);
+    const pos=JSON.parse(localStorage.getItem('dsh.canvas.pos')||'{}');
+    const pin=(pos.all||{})[${idj}];
+    const cross=Object.entries(pos).filter(([b,m])=>b!=='all'&&m[${idj}]).length;
+    return JSON.stringify({movedX:Math.round(lx-${geo.left}),movedY:Math.round(ty-${geo.top}),
+      pinMatchesStyle:!!pin&&Math.abs(pin.x-lx)<=2&&Math.abs(pin.y-ty)<=2,cross});
+  })()`);
+  await send("Page.navigate", { url: "about:blank" }); await sleep(400);
+  await send("Page.navigate", { url: URL_ }); await sleep(4500);
+  R.T14_reloadPin = await evl(`(()=>{const c=document.getElementById(${idj});
+    const lx=parseFloat(c.style.left),ty=parseFloat(c.style.top);
+    const pin=JSON.parse(localStorage.getItem('dsh.canvas.pos')||'{}').all[${idj}];
+    return JSON.stringify({matches:!!pin&&Math.abs(pin.x-lx)<=3&&Math.abs(pin.y-ty)<=3})})()`);
+  R.T14_reset = await evl(`(async()=>{const b=document.getElementById('reset-positions');
+    if(!b) return 'NO-BTN';
+    b.click(); await new Promise(r=>setTimeout(r,800));
+    const pos=JSON.parse(localStorage.getItem('dsh.canvas.pos')||'{}');
+    return JSON.stringify({allGone:!(pos.all&&Object.keys(pos.all).length), btnGone:!document.getElementById('reset-positions')})})()`);
+}
 let t7 = { note: "skipped" };
 try {
   const m0 = await (await fetch("http://127.0.0.1:60890/api/uiManifest/list", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "client-request", rpcId: "a", method: "uiManifest/list", payload: {} }) })).json().then(j => j.result?.value?.cards?.length ?? -1);
@@ -175,7 +204,7 @@ try {
   R.T9_reloadPersist = JSON.stringify({ closedCnt, afterCards, shutCnt, backCards });
 } catch (e) { R.T9_reloadPersist = "ERR:" + String(e).slice(0, 80); }
 // T8 清场：closed 全恢复 + localStorage 干净
-R.T8_cleanup = await evl(`(()=>{localStorage.setItem('dsh.canvas.closed.v2','{}');localStorage.removeItem('dsh.canvas.closed');return 'ok'})()`);
+R.T8_cleanup = await evl(`(()=>{localStorage.setItem('dsh.canvas.closed.v2','{}');localStorage.removeItem('dsh.canvas.pos');localStorage.removeItem('dsh.canvas.closed');return 'ok'})()`);
 R.consoleErrs = consoleErrs.slice(0, 5);
 
 console.log("AUDIT " + URL_);
