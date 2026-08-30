@@ -4,6 +4,10 @@
 JS 壳热插拔缺陷三次复现坐实。**推荐序**：切默认 → 观察期 → 退役 JS 渲染器 → （远期）根 `/` 收编。
 
 ## 步骤 1 · 切默认（一个提交）
+> **已预制（第 60 轮）**：分支 `s6d-switch-default`（提交 `3accaf8`，守卫 7/7 绿）
+> 就是本步骤的成品提交。拍板 = `git merge s6d-switch-default` + 重建重启 serve；
+> 回滚 = `git revert 3accaf8`。以下原文为此提交的设计说明。
+
 `crates/dsh-cli/src/canvas.rs` 路由对调——入口给 Rust 壳，JS 壳降居 legacy：
 
 - `"/canvas" | "/canvas/"` → 返回 SHELL_ASSETS 里的 `rust.html`
