@@ -70,7 +70,7 @@ R.T10_overlap = await evl(`(()=>{
 R.T2_close = await evl(`(async()=>{
   const b=document.querySelector('#workbench .card .card-close'); if(!b) return 'NO-BTN';
   b.click(); await new Promise(r=>setTimeout(r,400));
-  return JSON.stringify({cards:document.querySelectorAll('#workbench .card').length, shut:document.querySelectorAll('#sidebar .name.shut').length, ls:(JSON.parse(localStorage.getItem('dsh.canvas.closed')||'[]')).length});
+  return JSON.stringify({cards:document.querySelectorAll('#workbench .card').length, shut:document.querySelectorAll('#sidebar .name.shut').length, ls:(JSON.parse(localStorage.getItem('dsh.canvas.closed.v2')||'{}').all||[]).length});
 })()`);
 // T3 侧栏重开
 R.T3_reopen = await evl(`(async()=>{
@@ -118,7 +118,33 @@ R.T11_liveFold = await evl(`(async()=>{
   const t=card.textContent;
   return JSON.stringify({assistant:t.includes('助手'), echo:/echo|e2e-audit/.test(t)});
 })()`);
-// T7 热插拔：rename → manifest=12 → DOM 即时降 → restore → DOM 回 13
+// T12 分组桌板：组标题切板 + 关闭板间隔离 + 卡片标题切板 + hash 跟随
+R.T12_boards = await evl(`(async()=>{
+  const cards=()=>document.querySelectorAll('#workbench .card').length;
+  const baseN=cards();
+  const g=[...document.querySelectorAll('#sidebar .group-title')].find(b=>b.textContent.trim().startsWith('config'));
+  if(!g) return 'NO-GROUP';
+  g.click(); await new Promise(r=>setTimeout(r,500));
+  const cfgN=cards(); const hash1=location.hash;
+  const c1=document.querySelector('#workbench .card .card-close'); c1&&c1.click();
+  await new Promise(r=>setTimeout(r,400));
+  const cfgN2=cards();
+  [...document.querySelectorAll('#sidebar button')].find(b=>b.textContent.includes('全部')).click();
+  await new Promise(r=>setTimeout(r,500));
+  const allBack=cards();
+  const nameBtn=[...document.querySelectorAll('#sidebar .name')].find(b=>b.textContent.includes('llm-deepseek'));
+  nameBtn&&nameBtn.click(); await new Promise(r=>setTimeout(r,500));
+  const modelN=cards(); const hash2=location.hash;
+  [...document.querySelectorAll('#sidebar button')].find(b=>b.textContent.includes('全部')).click();
+  await new Promise(r=>setTimeout(r,400));
+  return JSON.stringify({baseN,cfgN,cfgN2,allBack,modelN,hash1,hash2});
+})()`);
+// T13 hash 深链 fresh 直达（about:blank 强制真重载）
+await send("Page.navigate", { url: "about:blank" }); await sleep(400);
+await send("Page.navigate", { url: URL_ + "#board=session" }); await sleep(4500);
+R.T13_deeplink = await evl(`(()=>{const cs=[...document.querySelectorAll('#workbench .card')];return JSON.stringify({n:cs.length, allSession:cs.length>0&&cs.every(c=>{const t=c.querySelector('.badges .type');return t&&t.textContent==='session';})})})()`);
+await send("Page.navigate", { url: "about:blank" }); await sleep(400);
+await send("Page.navigate", { url: URL_ }); await sleep(4500);
 let t7 = { note: "skipped" };
 try {
   const m0 = await (await fetch("http://127.0.0.1:60890/api/uiManifest/list", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "client-request", rpcId: "a", method: "uiManifest/list", payload: {} }) })).json().then(j => j.result?.value?.cards?.length ?? -1);
@@ -136,7 +162,9 @@ R.T9_reloadPersist = "FAIL";
 try {
   await evl(`(()=>{const b=document.querySelector('#workbench .card .card-close'); b&&b.click(); return 'c';})()`);
   await sleep(500);
-  const closedCnt = await evl(`JSON.parse(localStorage.getItem('dsh.canvas.closed')||'[]').length`);
+  const closedCnt = await evl(`(JSON.parse(localStorage.getItem('dsh.canvas.closed.v2')||'{}').all||[]).length`);
+  await send("Page.navigate", { url: "about:blank" });
+  await sleep(400);
   await send("Page.navigate", { url: URL_ });
   await sleep(4500);
   const afterCards = await evl(`document.querySelectorAll('#workbench .card').length`);
@@ -147,7 +175,7 @@ try {
   R.T9_reloadPersist = JSON.stringify({ closedCnt, afterCards, shutCnt, backCards });
 } catch (e) { R.T9_reloadPersist = "ERR:" + String(e).slice(0, 80); }
 // T8 清场：closed 全恢复 + localStorage 干净
-R.T8_cleanup = await evl(`(()=>{localStorage.setItem('dsh.canvas.closed','[]');return 'ok'})()`);
+R.T8_cleanup = await evl(`(()=>{localStorage.setItem('dsh.canvas.closed.v2','{}');localStorage.removeItem('dsh.canvas.closed');return 'ok'})()`);
 R.consoleErrs = consoleErrs.slice(0, 5);
 
 console.log("AUDIT " + URL_);

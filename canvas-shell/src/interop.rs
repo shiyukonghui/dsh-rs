@@ -146,17 +146,53 @@ pub fn watch_manifest<F: FnMut() + 'static>(f: F) {
     outer.forget();
 }
 
-// ---------- localStorage（closed 集合，与旧壳同 key 同格式） ----------
+// ---------- localStorage（D-213：板级 closed map，旧全局键一次性迁移） ----------
 
-pub fn ls_closed() -> Vec<String> {
-    let Some(s) = ls() else { return vec![] };
-    let Some(txt) = s.get_item("dsh.canvas.closed").ok().flatten() else { return vec![] };
-    serde_json::from_str::<Vec<String>>(&txt).unwrap_or_default()
+const LS_CLOSED_V2: &str = "dsh.canvas.closed.v2";
+const LS_CLOSED_OLD: &str = "dsh.canvas.closed";
+
+/// 读板级关闭集：v2 对象优先；无 v2 时把旧全局数组迁移为「全部」板并立即回写 v2。
+pub fn ls_closed_map() -> serde_json::Map<String, Value> {
+    let Some(s) = ls() else { return Default::default() };
+    if let Some(txt) = s.get_item(LS_CLOSED_V2).ok().flatten() {
+        if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+            if let Some(m) = v.as_object() {
+                return m.clone();
+            }
+        }
+    }
+    let old_txt = s.get_item(LS_CLOSED_OLD).ok().flatten().unwrap_or_default();
+    let old: Vec<String> = serde_json::from_str::<Vec<String>>(&old_txt).unwrap_or_default();
+    let m = canvas_shell::board::migrate_legacy(&old);
+    if !m.is_empty() {
+        let _ = s.set_item(LS_CLOSED_V2, &Value::Object(m.clone()).to_string());
+    }
+    m
 }
 
-pub fn ls_set_closed(list: &[String]) {
+pub fn ls_set_closed_map(map: &serde_json::Map<String, Value>) {
     if let Some(s) = ls() {
-        let _ = s.set_item("dsh.canvas.closed", &Value::from(list.to_vec()).to_string());
+        let _ = s.set_item(LS_CLOSED_V2, &Value::Object(map.clone()).to_string());
+    }
+}
+
+// ---------- URL hash（板深链 #board=<id>） ----------
+
+/// 读当前 hash 的 board 值（无/非法 → None；"all" 也返回 None=总览）。
+pub fn hash_board() -> Option<String> {
+    let h = web_sys::window()?.location().hash().ok()?;
+    let v = h.trim_start_matches('#').strip_prefix("board=")?.to_string();
+    if v.is_empty() || v == canvas_shell::board::BOARD_ALL {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// 写 hash 到指定板（不影响页面加载；total 总览也显式写 #board=all 便于收藏）。
+pub fn set_hash_board(board: &str) {
+    if let Some(w) = web_sys::window() {
+        let _ = w.location().set_hash(&format!("board={board}"));
     }
 }
 

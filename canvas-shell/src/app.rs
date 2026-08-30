@@ -739,8 +739,9 @@ fn card_body(k: String, st: Option<Value>, body: Signal<serde_json::Map<String, 
 pub fn App() -> Element {
     let status = use_signal(|| ("载入清单…".to_string(), String::new()));
     let model = use_signal(|| Option::<Value>::None);
-    let selected = use_signal(|| Option::<String>::None);
-    let closed = use_signal(crate::interop::ls_closed);
+    // D-213：初始板从 #board= hash 直达；关闭集=板级 map（板→列表）。
+    let selected = use_signal(crate::interop::hash_board);
+    let closed = use_signal(crate::interop::ls_closed_map);
     let bump = use_signal(|| 0u32);
     let body = use_signal(serde_json::Map::<String, Value>::new);
 
@@ -861,18 +862,25 @@ pub fn App() -> Element {
     let modelv = model.read().clone();
     let (statustxt, statuscls) = { let g = status.read(); (g.0.clone(), g.1.clone()) };
     let sel = selected.read().clone();
-    let closedv = closed.read().clone();
+    let closedmap = closed.read().clone();
     let groups = modelv
         .as_ref()
         .and_then(|m| m.get("groups").and_then(Value::as_array).cloned())
         .unwrap_or_default();
+    // D-213：板级校验——hash/选中指向不存在的组（如热插拔后）→ 回总览。
+    let sel_eff = sel
+        .as_ref()
+        .filter(|t| groups.iter().any(|g| g.get("type").and_then(Value::as_str) == Some(t.as_str())))
+        .cloned();
+    let board = canvas_shell::board::board_of(sel_eff.as_ref()).to_string();
+    let closedv = canvas_shell::board::closed_for(&closedmap, &board);
     let allcards = modelv
         .as_ref()
         .and_then(|m| m.get("cards").and_then(Value::as_array).cloned())
         .unwrap_or_default();
     let rev = modelv.as_ref().and_then(|m| m.get("rev").and_then(Value::as_str)).unwrap_or("").to_string();
     let revshort: String = rev.chars().take(12).collect();
-    let visible = visible_cards(&modelv, &sel, &closedv);
+    let visible = visible_cards(&modelv, &sel_eff, &closedv);
     let bodyv = body.read().clone();
     let cols = columns_for_width(crate::interop::workbench_width());
     let grid = layout_grid(
@@ -898,10 +906,11 @@ pub fn App() -> Element {
         div { class: "layout",
             nav { id: "sidebar", "aria-label": "卡片分类",
                 button {
-                    class: if sel.is_none() { "all active" } else { "all" },
+                    class: if sel_eff.is_none() { "all active" } else { "all" },
                     onclick: move |_| {
                         let mut s = selected;
                         s.set(None);
+                        crate::interop::set_hash_board(canvas_shell::board::BOARD_ALL);
                     },
                     "全部（{allcards.len()}）"
                 }
@@ -910,7 +919,7 @@ pub fn App() -> Element {
                         let gtype = g.get("type").and_then(Value::as_str).unwrap_or("").to_string();
                         let gcount = g.get("count").and_then(Value::as_i64).unwrap_or(0);
                         let gcards: Vec<Value> = g.get("cards").and_then(Value::as_array).cloned().unwrap_or_default();
-                        let active = sel.as_deref() == Some(gtype.as_str());
+                        let active = sel_eff.as_deref() == Some(gtype.as_str());
                         let mut sel_h = selected;
                         let gt = gtype.clone();
                         rsx! {
@@ -918,7 +927,12 @@ pub fn App() -> Element {
                                 class: if active { "group-title active" } else { "group-title" },
                                 onclick: move |_| {
                                     let cur = sel_h.read().clone();
-                                    sel_h.set(if cur.as_deref() == Some(gt.as_str()) { None } else { Some(gt.clone()) });
+                                    let next: Option<String> =
+                                        if cur.as_deref() == Some(gt.as_str()) { None } else { Some(gt.clone()) };
+                                    crate::interop::set_hash_board(
+                                        next.as_deref().unwrap_or(canvas_shell::board::BOARD_ALL),
+                                    );
+                                    sel_h.set(next);
                                 },
                                 "{gtype}"
                                 span { class: "count", "{gcount}" }
@@ -927,20 +941,50 @@ pub fn App() -> Element {
                                 {
                                     let k = fk(c);
                                     let bad = c.get("bad").and_then(Value::as_bool).unwrap_or(false);
-                                    let shut = closedv.contains(&k);
+                                    // D-213：卡片项灰显状态按其「视野板」——当前板是本组或总览
+                                    // 时看当前板闭合集，否则看该卡所属组的原生板。
+                                    let view_board =
+                                        if board == "all" || board == gtype { board.clone() } else { gtype.clone() };
+                                    let shut =
+                                        canvas_shell::board::closed_for(&closedmap, &view_board).contains(&k);
                                     let label = format!("{}{}", if bad { "✗ " } else { "" }, c.get("pluginName").and_then(Value::as_str).unwrap_or("?"));
                                     let mut closed_h = closed;
                                     let kk = k.clone();
+                                    // D-213 点击语义：灰显=本视野板重开（原地，不跳板）；
+                                    // 正常标题=切到所属组桌板 + 聚焦（顺带重开目标/当前板关闭态）。
+                                    let gt2 = gtype.clone();
+                                    let board2 = board.clone();
+                                    let vb2 = view_board.clone();
+                                    let shut2 = shut;
+                                    let mut sel_w = selected;
                                     rsx! {
                                     button {
                                         class: if shut { "name shut" } else { "name" },
-                                        title: if shut { "已关闭——点击重新打开" } else { "" },
+                                        title: if shut { "已关闭——点击在本桌板重开" } else { "切到所属桌板并聚焦" },
                                         onclick: move |_| {
+                                            if shut2 {
+                                                {
+                                                    let mut c = closed_h.write();
+                                                    canvas_shell::board::open_on(&mut c, &vb2, &kk);
+                                                }
+                                                crate::interop::ls_set_closed_map(&closed_h.read().clone());
+                                                if vb2 != board2 {
+                                                    crate::interop::set_hash_board(&gt2);
+                                                    sel_w.set(Some(gt2.clone()));
+                                                }
+                                                crate::interop::focus_card(&kk);
+                                                return;
+                                            }
                                             {
                                                 let mut c = closed_h.write();
-                                                c.retain(|x| x != &kk);
+                                                canvas_shell::board::open_on(&mut c, &gt2, &kk);
+                                                if gt2 != board2 {
+                                                    canvas_shell::board::open_on(&mut c, &board2, &kk);
+                                                }
                                             }
-                                            crate::interop::ls_set_closed(&closed_h.read().clone());
+                                            crate::interop::ls_set_closed_map(&closed_h.read().clone());
+                                            crate::interop::set_hash_board(&gt2);
+                                            sel_w.set(Some(gt2.clone()));
                                             crate::interop::focus_card(&kk);
                                         },
                                         "{label}"
@@ -974,6 +1018,7 @@ pub fn App() -> Element {
                         let ecode = c.get("error").and_then(|e| e.get("code")).and_then(Value::as_str).unwrap_or("").to_string();
                         let mut closed_b = closed;
                         let kk = k.clone();
+                        let board_c = board.clone();
                         rsx! {
                         section {
                             key: "{kk}",
@@ -984,13 +1029,13 @@ pub fn App() -> Element {
                                 "{title}"
                                 button {
                                     class: "card-close",
-                                    title: "关闭卡片（侧栏点标题可重开）",
+                                    title: "关闭卡片（仅本桌板；侧栏点标题可重开）",
                                     onclick: move |_| {
                                         {
                                             let mut c = closed_b.write();
-                                            if !c.contains(&kk) { c.push(kk.clone()); }
+                                            canvas_shell::board::close_on(&mut c, &board_c, &kk);
                                         }
-                                        crate::interop::ls_set_closed(&closed_b.read().clone());
+                                        crate::interop::ls_set_closed_map(&closed_b.read().clone());
                                     },
                                     "✕"
                                 }
