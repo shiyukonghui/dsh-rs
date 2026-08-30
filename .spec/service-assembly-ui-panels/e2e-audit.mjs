@@ -235,6 +235,23 @@ await send("Page.navigate", { url: URL_ }); await sleep(4500);
     R.T16_gate = "ERR " + String(e).slice(0, 120);
   }
 }
+// T17 薄服务族（D-217）：plan 单元经 --service-units 挂载→RPC 语义面+报告声明位+零卡扰动
+{
+  const rpc = async (method, args) => (await fetch("http://127.0.0.1:60890/api/" + method, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "client-request", rpcId: "t17", method, payload: { args: args || {} } }) })).json();
+  try {
+    const proj = await rpc("plan/projection", { sessionId: "no-such-session" });
+    const chk = await rpc("plan/exitCheck", { sessionId: "no-such-session", plan: "x", reviewChannel: true });
+    const rep = await rpc("contract/negotiationReport", {});
+    const planU = (rep.result?.value?.units ?? []).find(u => u.unit === "plan");
+    const cardsNow = (await rpc("uiManifest/list", {})).result?.value?.cards?.length ?? -1;
+    R.T17_service = JSON.stringify({
+      projection: proj.result?.ok === true && typeof proj.result?.value?.active === "boolean" && typeof proj.result?.value?.pending === "boolean",
+      exitCheck: chk.result?.value?.allow === false && chk.result?.value?.reason === "not-in-plan-mode",
+      declared: !!planU && planU.declared === true && planU.compatible === true,
+      zeroCards: cardsNow === 13,
+    });
+  } catch (e) { R.T17_service = "ERR " + String(e).slice(0, 120); }
+}
 let t7 = { note: "skipped" };
 try {
   const m0 = await (await fetch("http://127.0.0.1:60890/api/uiManifest/list", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "client-request", rpcId: "a", method: "uiManifest/list", payload: {} }) })).json().then(j => j.result?.value?.cards?.length ?? -1);

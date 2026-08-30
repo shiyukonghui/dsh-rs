@@ -145,6 +145,9 @@ pub struct WebConfig {
     /// P2 试点：插件包文件夹根（`wasm-plugins`）。serve 据此解析 `llm-deepseek` 服务
     /// 装配单元包，把其 `web/` 挂到 `/plugins/llm-deepseek/**` 静态面。
     pub wasm_base: PathBuf,
+    /// D-217 薄服务族：`classification:"service"` 单元挂载开关（`--service-units`；
+    /// 缺省 false = 薄服务单元不挂载，生产零扰动）。
+    pub service_units: bool,
 }
 
 /// 一个已运行的 Web 服务器（持有实际监听地址）。
@@ -268,6 +271,8 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
 
     // D-216 P2：协商报告基准目录（RPC/投影两处现扫现算的唯一路径来源）。
     crate::contract_gate::set_report_base(&cfg.wasm_base);
+    // D-217：薄服务族开关落进程（scan/watch 两条路径统一读；缺省 off=零扰动）。
+    set_service_units(cfg.service_units);
     // P2/D-185（服务装配单元）：发现挂载——扫描 wasm_base 下 plugin.json
     // world:"remote" 的包（每装配单元一载体 + `/plugins/<name>/**` 静态面，D-175）。
     // 缺构建物 → 尝试构建一次；仍缺 → 跳过 + 诚实提示（不炸 serve）；构件存在但
@@ -1296,14 +1301,29 @@ pub fn host_remote_component_bytes() -> Vec<u8> {
 /// `host-remote` 是宿主桥，不是装配单元，按名排除）。序 = 目录名升序（稳定挂载序）。
 /// 坏 plugin.json / 缺构建物 → `eprintln` 跳过（**不炸 serve**，也不上死卡）。
 pub fn scan_remote_units(wasm_base: &std::path::Path) -> Vec<crate::plugin_pkg::PluginPackage> {
-    scan_remote_units_opts(wasm_base, true)
+    scan_remote_units_opts(wasm_base, true, service_units_on())
+}
+
+/// D-217 薄服务族开关（进程级；serve 启动按 `WebConfig.service_units` 落定，
+/// 缺省 **off** = 生产零扰动）。scan/watch 读之；测试直接给 `scan_remote_units_opts`
+/// 传参不受静态影响（无竞态）。
+static SERVICE_UNITS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_service_units(on: bool) {
+    SERVICE_UNITS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn service_units_on() -> bool {
+    SERVICE_UNITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// D-186：`build_missing` = 缺构建物时是否尝试 `cargo component build`（**启动装配 =
 /// true 的开发体验；运行时 watch = false**——构建会阻塞 accept 循环分钟级，绝不允许）。
+/// `service_units` = D-217：`classification:"service"` 单元是否允许挂载（关=跳过）。
 pub fn scan_remote_units_opts(
     wasm_base: &std::path::Path,
     build_missing: bool,
+    service_units: bool,
 ) -> Vec<crate::plugin_pkg::PluginPackage> {
     let mut units = Vec::new();
     let Ok(rd) = std::fs::read_dir(wasm_base) else {
@@ -1336,6 +1356,11 @@ pub fn scan_remote_units_opts(
                 continue;
             }
         };
+        // D-217 薄服务族关：classification:"service" 单元仅在开关开启时挂载（缺省关）。
+        if j.get("classification").and_then(|c| c.as_str()) == Some("service") && !service_units {
+            eprintln!("dsh web: skip service unit {name} (--service-units off)");
+            continue;
+        }
         // D-216 P2 协商关：有声明（participant/requires/supports 任一键）→ 实例化前
         // 纯函数协商；不兼容 → 不挂载（理由进报告面，经 RPC/inventory 可见）。
         if let Some(rep) = crate::contract_gate::negotiate_unit(&name, &j) {
@@ -5157,6 +5182,41 @@ mod tests {
         let units = scan_remote_units(&base);
         let names: Vec<&str> = units.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["unit-good"], "只挂载合格的 remote 装配单元，得 {names:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// D-217 薄服务族关：`classification:"service"` 单元——关=跳过、开=挂载；
+    /// 普通单元两侧都不受开关影响（生产零扰动）。显式传参不走进程静态（无竞态）。
+    #[test]
+    fn service_units_gate_skips_then_mounts() {
+        let base = std::env::temp_dir().join(format!("dsh-svc-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let mk = |name: &str, extra: &str| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("plugin.json"),
+                format!(r#"{{"name":"{name}","world":"remote"{extra}}}"#),
+            )
+            .unwrap();
+            let wasm = dir.join("target/wasm32-wasip1/debug").join(format!("{}_plugin.wasm", name.replace('-', "_")));
+            std::fs::create_dir_all(wasm.parent().unwrap()).unwrap();
+            std::fs::write(&wasm, b"wasm").unwrap();
+        };
+        mk("plain-svc", "");
+        mk("thin-svc", r#","classification":"service""#);
+        let off: Vec<String> = scan_remote_units_opts(&base, false, false)
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        assert!(off.iter().any(|n| n == "plain-svc"), "普通单元关侧必在: {off:?}");
+        assert!(!off.iter().any(|n| n == "thin-svc"), "service 单元关侧必跳: {off:?}");
+        let on: Vec<String> = scan_remote_units_opts(&base, false, true)
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        assert!(on.iter().any(|n| n == "plain-svc") && on.iter().any(|n| n == "thin-svc"), "开侧全挂: {on:?}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

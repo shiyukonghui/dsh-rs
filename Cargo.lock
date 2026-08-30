@@ -953,6 +953,8 @@ dependencies = [
  "dsh-core",
  "dsh-eval",
  "dsh-loader",
+ "dsh-plan",
+ "dsh-session",
  "serde_json",
  "tokio",
  "wasmtime",

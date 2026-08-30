@@ -267,6 +267,8 @@ fn web_main(args: &[String]) {
     let mut env_file: Option<PathBuf> = None;
     // D-115-Web（阶段 C）：动态插件目录（`<dir>/<pluginId>/package.json + plugin.wasm`）。
     let mut dynamic_plugins_dir: Option<PathBuf> = None;
+    // D-217：薄服务族挂载开关（`classification:"service"` 单元；缺省关）。
+    let mut service_units = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -320,6 +322,9 @@ fn web_main(args: &[String]) {
             "--dynamic-plugins-dir" => {
                 i += 1;
                 dynamic_plugins_dir = Some(PathBuf::from(&args[i]));
+            }
+            "--service-units" => {
+                service_units = true;
             }
             other if other.starts_with("--") => {
                 eprintln!("dsh web: unknown arg {other}");
@@ -375,6 +380,7 @@ fn web_main(args: &[String]) {
         dynamic_plugins_dir,
         config_path,
         wasm_base: wasm_base.clone(),
+        service_units,
     };
     match dsh_cli::web::serve(&mut boot, cfg) {
         Ok(server) => {

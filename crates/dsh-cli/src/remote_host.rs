@@ -268,6 +268,24 @@ impl RemoteServiceProjector for RemoteHost {
             .unwrap_or_default(),
             // D-216 P2：协商报告面（inventory 单元据此把不兼容单元并进清单行）。
             "contract" => serde_json::to_vec(&crate::contract_gate::report_value()).unwrap_or_default(),
+            // D-217 薄服务族 #1：plan 单元折叠数据源——三类相关事件原样透传
+            // （plan/mode + command/run[name=plan] + command/done；语义在单元内）。
+            "planEvents" => {
+                let sid = payload.get("sessionId").and_then(|s| s.as_str()).unwrap_or("");
+                let events: Vec<serde_json::Value> = self
+                    .session_events(sid)
+                    .into_iter()
+                    .map(|(_, e)| e)
+                    .filter(|e| {
+                        e.kind == dsh_session::types::EventKind::PlanMode
+                            || e.kind == dsh_session::types::EventKind::CommandDone
+                            || (e.kind == dsh_session::types::EventKind::CommandRun
+                                && e.data.get("name").and_then(|v| v.as_str()) == Some("plan"))
+                    })
+                    .filter_map(|e| serde_json::to_value(&e).ok())
+                    .collect();
+                serde_json::to_vec(&serde_json::json!({"ok": true, "events": events})).unwrap_or_default()
+            }
             // dynamicCordisRunner/inventory 数据源（阶段 C 真实语义）：dynamic 注册表的
             // 包定义（packages = 该插件已定义的全部不可变版本，对齐 TS define order）+
             // 装配状态（entry 是否 active → latestRun）。无包在跑 → 诚实无 latestRun/activeRun。

@@ -5,12 +5,12 @@
 b/c 授权按阐明方案细化。
 
 ## 0. 全局分期与关卡（每相一个可提交工件，过关才下一相）
-| 相 | 工件 | 回滚点 |
-|---|---|---|
-| P0 契约文法硬切 | 「dsh/plugin-ui/v2」→「dsh.panel-ui/v2」全量硬替换 | 单提交 revert |
-| P1 dsh-contract crate | 三原语纯函数（TDD） | 新 crate，删除即回滚 |
-| P2 协商关+报告面 | mount-sync 协商 + RPC 臂 + inventory 展示 + T16 | 单提交 revert |
-| P3 薄服务族试点 | service world + 首单元 plan（带 requires） | 单元删除+挂载回退原生 |
+| 相 | 工件 | 回滚点 | 状态 |
+|---|---|---|---|
+| P0 契约文法硬切 | 「dsh/plugin-ui/v2」→「dsh.panel-ui/v2」全量硬替换 | 单提交 revert | ✅ a69d1e9 |
+| P1 dsh-contract crate | 三原语纯函数（TDD） | 新 crate，删除即回滚 | ✅ bf0a444 |
+| P2 协商关+报告面 | mount-sync 协商 + RPC 臂 + inventory 展示 + T16 | 单提交 revert | ✅ 9eb6ca8 |
+| P3 薄服务族试点 | **修正**：不立新 world（复用 host-remote，目录=ns）；首单元 plan 读+判定面（写面=v2，见 D-217）+ `--service-units` + m42 对拍 + T17 | 单元删除+挂载回退原生 | ✅ D-217 |
 
 ## 1. P0 文法硬切（6a 落地，无兼容）
 - **canonical id**：`dsh.panel-ui/v2`（文法合规：group=`dsh.panel-ui`，major=2，stable）。

@@ -8610,3 +8610,37 @@ host-remote 桥 WIT imports 恒同形，对账基准改「声明 ⊇ RPC 消费�
 
 
 
+
+
+## D-217 · 薄服务族首刀 = plan 单元（P3 落地 + 开关语义 + v1 边界）
+
+**日期**：2026-09-05
+**触发问题**：P3 要求「一个能力族可以单元化」的最薄证明；plan 语义深接宿主
+（会话事件/命令/工具前置），一刀切全迁移会把「接缝证明」拖成「大重构」。
+**考虑的选项**：
+- 新立 `dsh:service` WIT world（设计稿字面方案）——**否决**：与既有
+  `dsh:host-remote` world 的 handle(ns,method,body) 完全同形，另立世界=纯重复，
+  违反自写的「对齐 host-remote 惯例零新机制」原则；目录=RPC ns 直接复用
+  载体分流（`remote_carriers.find(ns)`），新机制=0。
+- 单元内**重写**折叠/判定逻辑——**否决**：双权威漂移；正解=纯语义 crate
+  （dsh-plan/dsh-session 全 serde 零 OS API，实测 wasm32-wasip1 直编）原样进
+  wasm 执行：**单元化=执行位置迁移，非重写**。
+- v1 含写面（enter/exit 落事件）——**暂缓**：写需要「事件追加」host 接缝=
+  真正的新原语，另立决策；先例=面板改写 #6「只读卡先行、写面另立契约决策」。
+**最终选择**：`wasm-plugins/plan`（目录名=RPC ns=惯例）承载读+判定面
+（plan/projection、plan/exitCheck）；plugin.json 新增 `classification:"service"` +
+requires SessionLog 声明（P2 关真校验首次落地）；`--service-units` 旗标
+（WebConfig.service_units + 进程静态 SERVICE_UNITS，缺省 **off**=生产零扰动，
+watch/启动两路统一读；scan_remote_units_opts 显式传参面无竞态）；
+RemoteHost 投影新增 `planEvents`（三相关 kind 透传，语义零上移）。
+**验证**：m42 对拍 3 测（7 组事件序列 wasm/native 逐字节一致+exitCheck 四分支
++失败透传/未知端点）；scan 门测试（关跳开挂/普通单元零扰动）；宿主 lib 270/270；
+workspace 全绿；实测 plan/projection+exitCheck+报告 declared:true；审计 T17 四项
+全 true（含零卡扰动=13）+T0~T16 全回归零 console。
+**预期影响与回滚点**：plan 能力获得第二承载面（原生路径原样保留）；写面/消费
+面迁移=v2 决策（需事件追加接缝）；回滚=revert 本提交（单元目录+旗标+投影臂
+互相独立，原生路径从未依赖）。
+**附带发现**：P2 审计时序暴露 sse-reload-starvation 旧缺陷（长会话/种子 reload
+后页面事件通道饥饿；宿主面铁证正确、新鲜页 700ms 全绿）——档案
+`.spec/service-assembly-ui-panels/sse-reload-starvation.md`，修复候选=unload 显式
+es.close() + CDP 连接数实证，另轮 spike。

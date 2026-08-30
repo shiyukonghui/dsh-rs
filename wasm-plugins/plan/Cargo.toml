@@ -1,0 +1,28 @@
+[package]
+name = "plan-plugin"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[dependencies]
+serde_json = "1"
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+# D-217 薄服务族首刀（P3）：语义 crate 原样进 wasm 执行（单元化=执行位置迁移，非重写）。
+dsh-plan = { path = "../../crates/dsh-plan" }
+dsh-session = { path = "../../crates/dsh-session" }
+
+[lib]
+crate-type = ["cdylib"]
+
+# 薄服务族 #1（D-217）：计划模式声明单元（复用 dsh:host-remote 接口身份；目录名=RPC ns）。
+[package.metadata.component]
+package = "dsh:plan"
+
+[package.metadata.component.target]
+path = "wit"
+
+[package.metadata.component.target.dependencies]
+"dsh:host-remote" = { path = "../../crates/dsh-wasmrt/wit-host-remote" }
+
+[workspace]

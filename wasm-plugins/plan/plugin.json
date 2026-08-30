@@ -1,0 +1,9 @@
+{
+  "name": "plan",
+  "world": "remote",
+  "classification": "service",
+  "participant": "plan",
+  "requires": [
+    { "apiVersion": "dsh.session-log/v1", "kind": "SessionLog" }
+  ]
+}

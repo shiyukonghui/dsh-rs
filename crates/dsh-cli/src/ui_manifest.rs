@@ -258,7 +258,7 @@ pub fn ui_manifest_watch_tick(
         return None;
     }
     st.last_check_ms = now_ms;
-    let desired = crate::web::scan_remote_units_opts(wasm_base, false);
+    let desired = crate::web::scan_remote_units_opts(wasm_base, false, crate::web::service_units_on());
     let desired_names: Vec<&str> = desired.iter().map(|p| p.name.as_str()).collect();
 
     // 装：新出现的合格单元（启动 scan 已挂载的只登记，不重复）。

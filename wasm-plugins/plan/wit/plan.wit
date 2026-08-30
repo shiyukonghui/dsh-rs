@@ -1,0 +1,10 @@
+// plan 薄服务单元（D-217 / P3 首刀）：计划模式能力族经 wasm 接缝承载。
+package dsh:plan;
+
+use dsh:host-remote/remote;
+use dsh:host-remote/host-services;
+
+world plan {
+  export remote;
+  import host-services;
+}

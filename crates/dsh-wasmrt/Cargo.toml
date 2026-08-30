@@ -17,4 +17,7 @@ wasmtime-wasi = { version = "34", features = ["preview1"] }
 [dev-dependencies]
 dsh-agent-presets = { path = "../dsh-agent-presets" }
 dsh-loader = { path = "../dsh-loader" }
+# D-217 m42：薄服务单元对拍（native 语义面 = 同一 crate 的宿主侧执行）。
+dsh-plan = { path = "../dsh-plan" }
+dsh-session = { path = "../dsh-session" }
 tokio = { version = "1", features = ["rt", "macros"] }
