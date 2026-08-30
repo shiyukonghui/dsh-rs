@@ -205,14 +205,8 @@ pub fn serve(boot: &mut Boot, cfg: WebConfig) -> Result<WebServer, CordisError> 
         .unwrap_or(cfg.port);
     let addr = format!("http://{}:{port}", cfg.host);
 
-    // 校验 web_root 存在且含 index.html（否则前端加载不了，早失败）
-    let index = cfg.web_root.join("index.html");
-    if !index.exists() {
-        return Err(CordisError::Internal(format!(
-            "web: no index.html in web root {} (built DeepSeek Harness frontend dist expected)",
-            cfg.web_root.display()
-        )));
-    }
+    // D-212 下线（第 64 轮拍板）：前端=canvas 壳（编译期内嵌，自带入口），
+    // index.html 不再是启动前置——旧 harness SPA 停止服务，web_root 仅观察期保留。
 
     // 阶段1：组装 `__DSH_BOOT__` entry graph（扫描多 plugin_root 下声明 dsh.client
     // 的 web 插件；每个是 `/plugins/<id>/client.js?rev=<hash>` 一行）。D-115-Web：
@@ -915,10 +909,10 @@ fn commands_execute(boot: &crate::Boot, agent_id: Option<&str>, line: &str, imag
     finish(&session, &command_id, outcome)
 }
 
-/// 派发一个请求：`/plugins/*` bundle、`/api/*` RPC/SSE，否则静态文件（SPA fallback）。
+/// 派发一个请求：`/plugins/*` bundle、`/api/*` RPC/SSE，否则 canvas 壳直服（D-212 根下线）。
 fn dispatch_request(
     mut request: tiny_http::Request,
-    web_root: &Path,
+    _web_root: &Path,
     manifest: &BootManifest,
     hmr: &Arc<crate::hmr_events::HmrChannel>,
     boot: &Boot,
@@ -1144,27 +1138,27 @@ fn dispatch_request(
         return;
     }
 
-    // 静态文件：`/` 注入 `__DSH_BOOT__`，其余 SPA fallback。
-    if path == "/" || path.is_empty() {
-        if let Some(html) = render_index_with_boot(web_root, manifest) {
-            let resp = Response::from_data(html)
-                .with_status_code(200)
-                .with_header(
-                    Header::from_bytes(&b"Content-Type"[..], b"text/html; charset=utf-8").unwrap(),
-                );
+    // D-212 根下线（第 64 轮拍板：旧 deepseek 前端停止服务）：`/` 与一切未匹配
+    // 导航面（无扩展名）直服 canvas 壳——旧 SPA 深链直接落桌布（需求稿选项 B）；
+    // 资产型 miss → 404，**绝不回落第二前端**（D-184 铁律反向延伸）。
+    if !path.contains('.') {
+        if let Some((status, ct, body)) = crate::canvas::canvas_shell_entry() {
+            let resp = Response::from_data(body.to_vec())
+                .with_status_code(status)
+                .with_header(Header::from_bytes(&b"Content-Type"[..], ct.as_bytes()).unwrap());
             let _ = request.respond(resp);
             return;
         }
     }
-    let (status, ct, body) = static_response(web_root, &path);
-    let resp = Response::from_data(body)
-        .with_status_code(status)
-        .with_header(Header::from_bytes(&b"Content-Type"[..], ct.as_bytes()).unwrap());
-    let _ = request.respond(resp);
+    let _ = request.respond(Response::empty(404));
 }
 
 /// 静态响应（纯函数；可测）：命中文件 → 内容；目录/miss → index.html（SPA）。
 /// 返回 (status, content_type, body)。
+///
+/// D-212 下线注：路由已不再调用（SPA 停服）；函数与测试保留作选项 C（构建链退役）
+/// 前的观察期参照。
+#[allow(dead_code)]
 fn static_response(web_root: &Path, path: &str) -> (u16, &'static str, Vec<u8>) {
     if path.ends_with('/') {
         if let Ok(body) = std::fs::read(web_root.join("index.html")) {
@@ -1535,6 +1529,8 @@ fn serve_package_asset(
 /// deferred，注册必达）；最后注入 `window.__DSH_BOOT__` graph global。缺
 /// modules/runtime entry（如老前端）→ 跳过对应 preload；`__DSH_BOOT__` 照旧注入
 /// （`<` 转义防逃逸，对齐 `injectBootManifest`）。
+/// D-212 下线注：SPA 已停服，本函数不再被路由调用；保留观察期参照（选项 C 随构建链退役）。
+#[allow(dead_code)]
 fn render_index_with_boot(web_root: &Path, manifest: &BootManifest) -> Option<Vec<u8>> {
     const MODULES_ID: &str = "@deepseek-ai/dsh-client-modules";
     const PRELOAD_IDS: [&str; 2] = [MODULES_ID, "@deepseek-ai/dsh-client-runtime"];

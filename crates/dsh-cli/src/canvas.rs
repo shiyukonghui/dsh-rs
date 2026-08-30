@@ -1,17 +1,12 @@
 //! D-184：桌布 C2/C3 的宿主入口——`/canvas` 独立视图（不依赖 harness dist、不碰 SPA）。
 //!
-//! 壳资产编译进二进制（`include_str!`）：`/canvas` 是唯一入口，`/canvas/assets/*` 是
-//! 闭环集；未识别的 `/canvas/*` **必须 404**（绝不回落 SPA——防「桌布失踪变前端」）。
-//! 核心逻辑可测性在 JS 侧（`assets/canvas/tests/`，node --test）；此处只证路由分发。
+//! 壳资产编译进二进制（`include_str!`）；未识别的 `/canvas/*` **必须 404**（绝不回落
+//! 任何前端）。S6d 后 `/canvas` 默认 = Rust 壳；D-212 后根 `/` 亦由本壳直服（旧
+//! deepseek 前端下线）。JS 渲染器已按拍板退役：`index/core/app/tests` 存档于
+//! `.spec/archive/canvas-js/`，仅 canvas.css 幸存（Rust 壳在用）。
 
-/// 壳页面（模块引用齐；`type="module"` 是渲染器在浏览器且零 eval 的形态锚）。
-pub const CANVAS_HTML: &str = include_str!("../assets/canvas/index.html");
-/// 样式 + 网格几何 CSS 变量（格距 10px 契约值）。
+/// 样式 + 网格几何 CSS 变量（格距 10px 契约值；JS 壳退役后唯一幸存资产）。
 pub const CANVAS_CSS: &str = include_str!("../assets/canvas/canvas.css");
-/// 纯逻辑核心（零 DOM/零 fetch/零 eval）。
-pub const CANVAS_CORE_JS: &str = include_str!("../assets/canvas/core.js");
-/// DOM/fetch/定时器粘合层（薄）。
-pub const CANVAS_APP_JS: &str = include_str!("../assets/canvas/app.js");
 
 // D-210 S5：Rust 壳发布产物内嵌表（build.rs 扫描 assets/canvas-shell/ 生成）。
 include!(concat!(env!("OUT_DIR"), "/shell_assets.rs"));
@@ -28,28 +23,30 @@ fn shell_mime(rel: &str) -> &'static str {
     }
 }
 
+/// Rust 壳入口 html（内嵌件）——`/canvas`、`/canvas/rust` 与根下线后的 `/` 共用。
+pub fn canvas_shell_entry() -> Option<(u16, &'static str, &'static [u8])> {
+    let body = SHELL_ASSETS
+        .iter()
+        .find(|(p, _, _)| *p == "rust.html")
+        .map(|(_, b, _)| *b)?;
+    Some((200, "text/html; charset=utf-8", body))
+}
+
 /// `/canvas` 路由纯函数：命中 → `(status, content_type, body)`；miss → `None`（调用方
-/// 必须回 404，不得落到 SPA fallback）。
+/// 必须回 404，不得落到任何前端 fallback）。
 pub fn canvas_response(path: &str) -> Option<(u16, &'static str, &'static [u8])> {
-    // D-210 S5→S6d：`/canvas` 默认 = Rust 壳（本切换独立成提交=revert 即回滚）；
-    // `/canvas/rust` 同页保留；旧 JS 壳降居 `/canvas/legacy`（资产面原位共享）。
+    // D-210 S5→S6d：`/canvas` 与 `/canvas/rust` 同归 Rust 壳。
     if path == "/canvas" || path == "/canvas/" || path == "/canvas/rust" || path == "/canvas/rust/" {
-        let body = SHELL_ASSETS
-            .iter()
-            .find(|(p, _, _)| *p == "rust.html")
-            .map(|(_, b, _)| *b)?;
-        return Some((200, "text/html; charset=utf-8", body));
+        return canvas_shell_entry();
     }
     if let Some(rel) = path.strip_prefix("/canvas/rust/assets/") {
         let rel = rel.trim_start_matches('/');
         let (_, body, _) = SHELL_ASSETS.iter().find(|(p, _, _)| *p == rel)?;
         return Some((200, shell_mime(rel), body));
     }
+    // D-212：JS 渲染器退役——legacy/core/app 路由已删（revert 本提交 + 存档回迁即回滚）。
     let (ct, body) = match path {
-        "/canvas/legacy" | "/canvas/legacy/" => ("text/html; charset=utf-8", CANVAS_HTML.as_bytes()),
         "/canvas/assets/canvas.css" => ("text/css; charset=utf-8", CANVAS_CSS.as_bytes()),
-        "/canvas/assets/core.js" => ("text/javascript; charset=utf-8", CANVAS_CORE_JS.as_bytes()),
-        "/canvas/assets/app.js" => ("text/javascript; charset=utf-8", CANVAS_APP_JS.as_bytes()),
         _ => return None,
     };
     Some((200, ct, body))
@@ -76,25 +73,7 @@ pub fn canvas_response_enc(path: &str, gz_ok: bool) -> Option<(u16, &'static str
 mod tests {
     use super::*;
 
-    /// 壳入口（S6d 后）：`/canvas`=Rust 壳、`/canvas/legacy`=JS 壳；各自资产引用齐。
-    #[test]
-    fn canvas_shell_served_with_asset_refs() {
-        let (status, ct, body) = canvas_response("/canvas/legacy").expect("/canvas/legacy served");
-        assert_eq!(status, 200);
-        assert_eq!(ct, "text/html; charset=utf-8");
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("/canvas/assets/canvas.css"), "css 引用");
-        assert!(
-            html.contains("type=\"module\" src=\"/canvas/assets/app.js\""),
-            "module 脚本引用"
-        );
-        // 独立视图：不引用 harness bundle
-        assert!(!html.contains("__DSH_BOOT__"), "桌布零依赖 harness boot 注入");
-        assert!(canvas_response("/canvas/legacy/").is_some(), "尾斜杠同页");
-    }
-
-    /// D-210 S6d：默认切 Rust 壳——`/canvas` 返回内嵌 rust 壳（旧 JS 壳经 legacy 可达，
-    /// revert 本提交即回滚）。
+    /// D-210 S6d：默认 = Rust 壳（四入口齐）+ 共享 css 路由不破。
     #[test]
     fn s6d_canvas_default_serves_rust_shell() {
         for p in ["/canvas", "/canvas/", "/canvas/rust", "/canvas/rust/"] {
@@ -111,47 +90,30 @@ mod tests {
         assert_eq!(ct, "text/css; charset=utf-8");
     }
 
-    /// 资产闭环集：mime 正确（模块脚本必须 text/javascript，浏览器才吃 ESM）。
+    /// D-212 根下线：canvas_shell_entry 提供与 /canvas 同源的入口件（web.rs 根路由用）。
     #[test]
-    fn canvas_assets_served_with_mimes() {
-        for (path, ct) in [
-            ("/canvas/assets/canvas.css", "text/css; charset=utf-8"),
-            ("/canvas/assets/core.js", "text/javascript; charset=utf-8"),
-            ("/canvas/assets/app.js", "text/javascript; charset=utf-8"),
+    fn root_entry_serves_canvas_shell() {
+        let (status, ct, body) = canvas_shell_entry().expect("shell entry");
+        assert_eq!((status, ct), (200, "text/html; charset=utf-8"));
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("import init from '/canvas/rust/assets/canvas-shell.js'"));
+        assert!(!html.contains("__DSH_BOOT__"), "零 harness boot 注入");
+    }
+
+    /// D-212 JS 渲染器退役：legacy 与 core/app 路由已灭（miss→404 铁律接管）。
+    #[test]
+    fn js_shell_routes_are_retired() {
+        for p in [
+            "/canvas/legacy",
+            "/canvas/legacy/",
+            "/canvas/assets/core.js",
+            "/canvas/assets/app.js",
         ] {
-            let (status, got, body) = canvas_response(path).unwrap_or_else(|| panic!("{path} served"));
-            assert_eq!((status, got), (200, ct), "{path}");
-            assert!(!body.is_empty(), "{path} 非空");
-        }
-        // 核心零 eval 护栏（不变式 D-179 的资产面哨兵——壳自己也不得引入执行面）
-        assert!(!CANVAS_CORE_JS.contains("eval("), "core.js 零 eval");
-        assert!(!CANVAS_APP_JS.contains("eval("), "app.js 零 eval");
-        // core 必须真导出契约函数（app 引用的名字一个不能少）
-        for name in [
-            "buildModel",
-            "layoutGrid",
-            "validateDeclaration",
-            "columnsForWidth",
-            "collectValues",
-            "rpcEnvelope",
-            "pollDecision",
-            "focusKey",
-            "extractPath",
-            "listRows",
-            "statusItems",
-            "rowActionBody",
-            "needsConfirm",
-            "chatFoldFrame",
-            "chatOptions",
-            "schemaFields",
-            "nsSelectModel",
-            "layoutMeasured",
-        ] {
-            assert!(CANVAS_CORE_JS.contains(&format!("export function {name}")), "core 导出 {name}");
+            assert!(canvas_response(p).is_none(), "{p} 必须 miss（已退役）");
         }
     }
 
-    /// miss → None（调用方 404；**绝不回落 SPA**——D-184）。
+    /// miss → None（调用方 404；**绝不回落任何前端**——D-184）。
     #[test]
     fn canvas_unknown_paths_are_none() {
         for p in [
@@ -202,8 +164,8 @@ mod tests {
         assert!(raw.starts_with(b"\0asm"), "raw 仍是 wasm");
         assert!(raw.len() > body.len(), "gzip 必须真瘦身");
         assert!(canvas_response_enc("/canvas/rust/nope.js", true).is_none());
-        // 非 Rust 壳面（旧 JS 资产）不经 gzip 表，恒原样。
-        let (_s3, _ct3, _b3, enc3) = canvas_response_enc("/canvas/assets/app.js", true).expect("js served");
+        // css 不在 gzip 表面，恒原样。
+        let (_s3, _ct3, _b3, enc3) = canvas_response_enc("/canvas/assets/canvas.css", true).expect("css served");
         assert_eq!(enc3, None);
     }
 }

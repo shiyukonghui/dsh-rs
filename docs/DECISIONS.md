@@ -8501,7 +8501,25 @@ UI 契约 sendRpc join 恰是斜杠形）；②载荷只认旧前端 `content` �
 audit T6.bubbles=6（历史折叠泡+pending 并存）、T11.assistant=true（折叠管线
 首次吃真事件出泡）、consoleErrs=0。
 **影响与回滚**：仅 web.rs 一个 match 臂 + 一个新测；revert `e8c7c8d` 即回。
-serve 配方固化 `--agent-loop`（HANDOFF §3）。E2E 清单已同步（13 卡基线 + §1 行）。
+serve 配方固化 `--agent-loop`（HANDOFF §3）。
+
+## D-212 终态执行：切默认 Dioxus + 根 `/` 下线 + JS 渲染器退役（2026-09-05，第 64 轮，用户拍板）
+
+**触发**：用户醒后一句三项拍板：「切换为默认 Dioxus，旧 deepseek 前端（根 /）下线，
+JS 渲染器直接退役」（跳过观察期，需求稿 §6 四问按推荐默认执行：深链=canvas 直服
+落地、A→C 节奏压缩为 B 直服 + 存档退役）。
+**执行**：①merge 预制分支 `s6d-switch-default`（71822b3）；②根下线=路由尾段替换
+——`/` 与一切未匹配导航面（无扩展名）直服内嵌 canvas 壳（深链落桌布不 404），
+资产 miss→404 绝不回落第二前端；`index.html` 不再是启动前置（硬校验删除）；
+③JS 渲染器退役=`index/core/app/tests` git mv 存档 `.spec/archive/canvas-js/`
+（canvas.css 唯一幸存——Rust 壳在用），legacy/core/app 路由灭（miss→404 测钉）。
+**选项**：SPA 文件保留照服（否决——不是下线）；深链 404（否决——书签断链）；
+观察期缓退役（用户明令跳过）。
+**验证**：dsh-cli lib 263/263 零警告；node 35/35（存档新路径）；真路由矩阵
+`/`+深链=canvas 且 `__DSH_BOOT__` 绝迹、`/canvas/legacy`+`core.js`=404、
+资产 miss=404；**全量交互审计（T0–T11）在根地址全绿零 console**。
+**回滚**：revert 本轮提交 + 存档 git mv 回迁 + merge 提交 revert = 全量复原；
+决策日志三层（D-210 双壳→D-212 切/下线/退役）逐层可退。E2E 清单已同步（13 卡基线 + §1 行）。
 
 
 
