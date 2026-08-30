@@ -8470,7 +8470,12 @@ Rust；S0–S6 切分，每片 TDD；node 35 测断言逐条移植 cargo 测，�
   内调 `dioxus::spawn` → 空作用域栈 unwrap panic（dioxus-core runtime.rs:223）。
   四处收口 `spawn_local`；真路由复验全项过 + 热插拔完整闭环（JS 壳同项三次复现
   DOM 冻结）+ 零 panic。**教训固化：wasm 宿主里 JS 回调只准 spawn_local，
-  dioxus::spawn 仅限组件体/事件处理器/效应内。**E2E 清单已同步（13 卡基线 + §1 行）。
+  dioxus::spawn 仅限组件体/事件处理器/效应内。**
+- **体积优化（第 54 轮）**：binaryen wasm-opt 132 `-Oz --shrink-level=2` 全特性面，
+  内嵌件 **1,384,902 → 937,426 字节（-32.3%）**；真路由 e2e-audit 全量复跑**全绿
+  零 console 错误**（行为零变化）。配方入 build.ps1（WAO 可缺省自动跳过）。
+  环境注记：binaryen windows 现行只发 tar.gz（无 zip），GitHub assets 以
+  API latest 为准（盲猜 tag 404 两次后改查 API 一次命中）。E2E 清单已同步（13 卡基线 + §1 行）。
 
 
 
