@@ -64,3 +64,46 @@
    保留 `dsh/plugin-ui/v2` 方言+映射表（零迁移）？
 3. 协商关是否纳入薄服务族首刀设计稿（推荐：纳入，试点即首个消费者）？
 4. 不兼容报告的 UI 落点：panel-plugin-inventory 加区块（推荐）还是新单元卡？
+
+> **第 69 轮用户答复**：路线=采概念不采依赖（定案）；其余三问要求展开做法 → 见 §6。
+
+## 6. 三案详解（用户令「进一步分析并说明打算如何做」）
+
+### 6a. 版本语法：为什么「标准文法 + 方言映射」而不是全面换文法
+**事实盘点**：现存契约标识有三层——① ui.json 契约字符串 `dsh/plugin-ui/v2`
+（wire 不变式+校验器+13 张卡+审计全在引用）；② WIT world 名（编译期）；
+③ cargo 包命名空间 `dsh:xxx`。注意 `dsh/plugin-ui/v2` 含两个 `/`，**本身不合法**
+于 dsh-std 文法（`group/vN[stabN]`，group 无斜杠）。
+**方案**：新元数据（requires/supports/accepts/协商报告）一律用**纯标准文法**
+canonical id（如 `dsh.panel-ui/v2`、`dsh.service/v1alpha1`）；旧字符串作为**方言
+字面量保留**，由 `contract-registry` 静态映射表关联（一张表+一组测试）；未来契约
+换 major 时**出生即用标准文法**，旧方言永久兼容不回填。
+**为什么不全面换**：换文法=动 13 张单元卡的 ui.json（曾拍板单元层零改动）+
+canvas-shell 校验器 + wire 不变式 + 审计断言，纯迁移税换不到任何新能力；映射表
+方案里协商器只见 canonical id，方言在门口翻译一次——生态兼容门与零迁移兼得。
+
+### 6b. 首刀合流：协商层怎么长进薄服务族试点（四步）
+1. **契约定义先行**：`dsh-contract` 新小 crate（地基新成员，自洽于 §4a 范畴层）：
+   apiVersion 文法解析器 + ProtocolDeclaration 校验器 + Catalog/协商器，
+   纯函数零依赖 ~300 LOC，纯 TDD 田；
+2. **单元侧声明生成**：service world 单元的 plugin.json 增 `"requires":
+   [{apiVersion,kind,optional?}]`——**由构建期生成/校验**（单元 crate 内声明表
+   + CI 校验「WIT imports ⊆ 声明 requires」，杜绝手写漂移；即 §3-2 双账本规矩）；
+3. **宿主协商关**：mount-sync 在 kind 检测之后、实例化之前跑一次纯函数协商——
+   compatible→挂；不兼容→**不挂**并把 issues 记入 `pending_incompatible`
+   （新 RPC 臂 `contract/negotiationReport` 可查）；
+4. **验收即测标准**：同一单元对 v1/v2 两种 host catalog 构建，协商判定进单测；
+   故意不兼容件挂载 → 审计断言「未挂载 + reason codes 可见」。
+**成本对账**：现在加=元数据字段+一次纯函数调用；以后补=给已发布单元重开契约形状
++ manifest 迁移——首刀合流是便宜的时候把地基打好，不是加戏。
+
+### 6c. 报告 UI：为什么落 inventory 而不是新卡
+**展示链**：mount-sync `pending_incompatible` → 新 RPC `contract/negotiationReport`
+→ **panel-plugin-inventory 单元**把自己的 dataRpc 结果与报告合并渲染：不兼容行
+`state="incompatible"`、issue codes 进消息列。
+**为什么零壳改动**：inventory 是声明卡，list 视图天然支持行+列——「不兼容」只是
+行的一种状态（与现有 bad/ok 同型）；canvas-shell/桌布**一行不改**，改动全落在
+单元层（ui.json+数据映射）+一个 RPC 臂。新专卡=多一张卡+新视图语义，收益相同
+成本高一级；只进 RPC=违背全项目「诚实可见」philosophy，排障要靠人开 curl。
+**验收**：审计 T16——放一个 manifest 版本号不存在的假单元 → 断言桌面卡数不变
++ inventory 行含 reason code + 移除后报告清空。
