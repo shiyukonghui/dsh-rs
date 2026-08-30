@@ -8482,7 +8482,26 @@ Rust；S0–S6 切分，每片 TDD；node 35 测断言逐条移植 cargo 测，�
   第四值 Content-Encoding；协商纯函数有测钉：magic/原样/瘦身/miss/旧面不动）。
   实测：**938,129 → 367,512 字节（-61%）**，identity 客户端原样无头，
   浏览器全量 e2e-audit 穿 gzip 全绿（透明解码）。依赖评估：flate2 纯 Rust
-  miniz_oxide 后端零 C 工具链，成熟通用直接引入（build-dependencies 位）。E2E 清单已同步（13 卡基线 + §1 行）。
+  miniz_oxide 后端零 C 工具链，成熟通用直接引入（build-dependencies 位）。
+
+### D-211 聊天发送三层断点 + loop 旗标真相（2026-09-05，第 58 轮）
+
+**触发**：审计 T6 气泡历来只是乐观 pending——「chat 真实回路」从未有活体证据。
+逐层实测剥出三层主机侧断点（旧 JS 壳同样从未发通过）：
+①`dispatch_long_rpc` 只匹点形 `session.prompt`，白名单却放进斜杠形（半修状态，
+UI 契约 sendRpc join 恰是斜杠形）；②载荷只认旧前端 `content` 块，canvas 声明契约
+`text` 被空块吞掉；③只认平铺 payload，而 D-207 规范是 `payload:{args:{…}}`
+信封（args 整体被吞，text 恒空——live 复现时 `user/message` 落空串才现形）。
+**loop 装配真相**：web serve 的 loop 开关是 `--agent-loop` 旗标（cordis 的
+`loop` 条目对 web 路径惰性）；使能后 turn 生命周期真实驱动
+（turn/start→step→request→AUTH 诚实失败缺 key→turn/end），10 事件全落带真文本。
+**选项**：改壳迁就平铺形（否决——违反 D-207 单一信封契约）vs 主机侧双形兼容
+（采纳——args 在位以 args 为准，平铺保留给旧前端直调）。
+**验证**：TDD 红（not-a-long-rpc 钉住）→绿；全量 262/262；活体铁证
+audit T6.bubbles=6（历史折叠泡+pending 并存）、T11.assistant=true（折叠管线
+首次吃真事件出泡）、consoleErrs=0。
+**影响与回滚**：仅 web.rs 一个 match 臂 + 一个新测；revert `e8c7c8d` 即回。
+serve 配方固化 `--agent-loop`（HANDOFF §3）。E2E 清单已同步（13 卡基线 + §1 行）。
 
 
 
