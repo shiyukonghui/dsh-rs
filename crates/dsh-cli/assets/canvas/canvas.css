@@ -40,6 +40,8 @@
   --ok: rgba(var(--semi-green-5), 1);                  /* success */
   --warn: rgba(var(--semi-orange-5), 1);               /* warning */
   --err: rgba(var(--semi-red-5), 1);                   /* danger */
+  --shadow-stroke: rgba(0, 0, 0, 0.04);                /* Semi --semi-color-shadow */
+  --shadow-elevated: 0 0 1px rgba(0, 0, 0, .3), 0 4px 14px rgba(0, 0, 0, .1);
   --r-md: 6px;                                         /* radius-medium */
   --r-sm: 3px;                                         /* radius-small */
 }
@@ -64,6 +66,8 @@ body[theme-mode="dark"] {
   --ok: rgb(93, 194, 100);
   --warn: rgb(255, 174, 67);
   --err: rgb(252, 114, 90);
+  --shadow-stroke: rgba(0, 0, 0, 0.2);
+  --shadow-elevated: inset 0 0 0 1px rgba(255, 255, 255, .1), 0 4px 14px rgba(0, 0, 0, .25);
 }
 
 * { box-sizing: border-box; }
@@ -100,10 +104,10 @@ header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   border-right: 2px solid var(--accent); }
 
 #workbench { flex: 1; overflow-y: auto; padding: 14px; position: relative; }
-#workbench .empty { color: var(--dim); padding: 40px 8px; }
+#workbench .empty { color: var(--dim3); padding: 40px 8px; }
 .card { position: absolute; background: var(--panel);
   border: 1px solid var(--line); border-radius: var(--r-md); padding: 10px 12px;
-  overflow-y: auto; }
+  overflow-y: auto; box-shadow: 0 1px 2px var(--shadow-stroke); }
 .card.focus-hl { border-color: var(--accent);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent); }
 .card .cap { font-weight: 600; display: flex; justify-content: space-between;
@@ -140,16 +144,17 @@ header h1 { font-size: 16px; margin: 0; font-weight: 600; }
 .card .cstat.err { color: var(--err); }
 .card.fail .fail-msg { color: var(--err); }
 .card.fail .code { color: var(--dim3); font-size: 11px; }
-.ltable { border-collapse: collapse; width: 100%; font-size: 12px; }
-.ltable th, .ltable td { text-align: left; padding: 5px 8px;
+/* 表格与行钮：选择器对实际 DOM（Dioxus 表无 class——旧 .ltable 选择器系 JS
+   时代遗留，Rust 壳下从未命中=D-224 收口揪出的静默断链）。 */
+.card table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.card th, .card td { text-align: left; padding: 5px 8px;
   border-bottom: 1px solid var(--line); }
-.ltable th { color: var(--dim); font-weight: 600;
-  background: var(--fill-0); }
-.ltable tbody tr:hover { background: var(--fill-0); }
-.ltable .row-action { background: var(--fill-0); color: var(--text-1); border: 0;
+.card th { color: var(--dim); font-weight: 600; background: var(--fill-0); }
+.card tbody tr:hover { background: var(--fill-0); }
+.card .row-action { background: var(--fill-0); color: var(--text-1); border: 0;
   border-radius: var(--r-sm); padding: 2px 8px; margin-right: 4px; cursor: pointer;
   font: inherit; transition: background .15s; }
-.ltable .row-action:hover { background: var(--fill-1); color: var(--text); }
+.card .row-action:hover { background: var(--fill-1); color: var(--text); }
 .srow { display: flex; justify-content: space-between; padding: 3px 0; font-size: 12px; }
 .srow .slabel { color: var(--dim); }
 .srow .svalue.tone-ok { color: var(--ok); }
@@ -171,6 +176,17 @@ header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   font: inherit; padding: 4px 8px; outline: none; }
 .chat-send input:focus { border-color: var(--accent);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent); }
+
+/* 聊天动作钮（发送/停止）补 Semi 质感（此前漏网=浏览器原生钮）；
+   精确类命中，不动既有分层（.actions/.row-action 各自保留语义色）。 */
+.chat-send button { background: var(--fill-0); color: var(--text-1);
+  border: 1px solid transparent; border-radius: var(--r-md); padding: 4px 12px;
+  cursor: pointer; font: inherit; transition: background .15s; }
+.chat-send button:hover { background: var(--fill-1); color: var(--text); }
+/* 下拉统一自绘 chevron（Semi 形态；data-uri 灰箭两主题通用）。 */
+.card select { appearance: none; -webkit-appearance: none; padding-right: 26px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23898e93' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 9px center; }
 
 /* D-214 拖拽摆位：标题栏即把手（✕ 除外由 JS 侧排除）；重置入口。 */
 .cap { cursor: grab; user-select: none; }

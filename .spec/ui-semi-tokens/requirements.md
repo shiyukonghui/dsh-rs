@@ -71,3 +71,21 @@
   观察项），console 零错——零回归确认。
 - 待办（下轮）：逐卡（13 卡 × 五视图）浅色/深色截图逐一检查 + 收尾。
 
+## 10. 第二轮（逐卡收口）发现与修复
+- **揪出静默断链（重要）**：Dioxus 壳渲染的 `<table>` **无 class**——`.ltable` 系列
+  选择器是 JS 渲染器时代遗留，Rust 壳下**从未命中**：表格样式全丢、
+  `.ltable .row-action` 不生效 → 所有行钮（删除/启用/停止/卸载）渲染为**浏览器
+  原生按钮**（浅色原生钮在深色下刺眼）。修复=选择器改实际 DOM 形态
+  `.card table/.card th/.card td/.card .row-action`（零 DOM 改动）。
+  DOM 取证留档 dom-probe.mjs（`tbls=["","","","",""]` 铁证）。
+- 原生控件补网：聊天发送/停止钮（`.chat-send button` 此前漏网=原生钮）补
+  fill 质感；select 统一自绘 chevron（appearance:none + data-uri 箭）。
+- 卡加 Semi 描边阴影（`--semi-color-shadow` 令牌）与浮层阴影令牌就位。
+- 原版对话视图参考已截（orig-chat.png）：文档流布局/描边圆角钮/inline 灰底
+  code chip/大圆角输入卡——画布卡聊天保持泡式（画布时代形态），取其令牌语言。
+- 深色列表卡修复后目检合格：表头 fill 带/发丝行线/行钮深色 fill 芯片/navy 徽章。
+- 功能回归：e2e-audit T0-T17 再确认与基线逐项一致（console 零错）。
+- 逐卡截图覆盖：form（DeepSeek Provider）/空态（待审批）/list 带行（调度 L+D）/
+  聊泡（L+D）/状态（运行时状态）/会话清单/插件清单/整板三板×双主题。
+
+
