@@ -36,7 +36,7 @@ fn describe_ui_returns_valid_list_declaration() {
         .unwrap();
     assert_eq!(r["ok"], true, "{r}");
     let decl = &r["value"];
-    assert_eq!(decl["$schema"], "dsh/plugin-ui/v2");
+    assert_eq!(decl["$schema"], "dsh.panel-ui/v2");
     assert_eq!(decl["kind"], "card");
     assert_eq!(decl["cardId"], "panel-schedule.list");
     assert_eq!(decl["type"], "runtime", "调度归 runtime 分类");

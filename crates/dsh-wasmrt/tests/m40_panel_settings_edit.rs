@@ -37,7 +37,7 @@ fn describe_ui_returns_valid_dynamic_form_declaration() {
         .unwrap();
     assert_eq!(r["ok"], true, "{r}");
     let decl = &r["value"];
-    assert_eq!(decl["$schema"], "dsh/plugin-ui/v2");
+    assert_eq!(decl["$schema"], "dsh.panel-ui/v2");
     assert_eq!(decl["kind"], "card");
     assert_eq!(decl["cardId"], "panel-settings-edit.edit");
     assert_eq!(decl["type"], "config");

@@ -81,7 +81,7 @@ fn describe_ui_returns_valid_list_declaration() {
         .unwrap();
     assert_eq!(result["ok"], true, "envelope ok: {result}");
     let decl = &result["value"];
-    assert_eq!(decl["$schema"], "dsh/plugin-ui/v2");
+    assert_eq!(decl["$schema"], "dsh.panel-ui/v2");
     assert_eq!(decl["kind"], "card");
     assert_eq!(decl["cardId"], "panel-plugin-inventory.list");
     let type_enum = [

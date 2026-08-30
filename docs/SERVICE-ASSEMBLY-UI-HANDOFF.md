@@ -48,7 +48,7 @@ git 起点：`44f9618 D-180+D-181+D-182 服务装配单元试点落地 → 桌�
 1. **双正交枚举强制分离**：`type` = 侧边栏**分类**轴（面向用户，加值近乎免费）；
    `view.kind` = **渲染契约**轴（加值必须写真渲染器）。**合并成一条枚举已被明确否决**——
    会让侧栏显示 `form/list` 这种用户看不懂的值，且「加一个分类就得配一个渲染器」两条轴互锁。
-2. **v2 顶层唯一容器 `kind:"card"`**：`{ $schema:"dsh/plugin-ui/v2", kind:"card", cardId, type,
+2. **v2 顶层唯一容器 `kind:"card"`**：`{ $schema:"dsh.panel-ui/v2", kind:"card", cardId, type,
    title, description, size{w,h}, view:{ kind, ... } }`。D-180 的顶层 `kind:"form"` **已废止**，
    不是并存；`$schema` 非 v2 → 显式 `schema-version-unsupported`，**不做静默兼容**。
 3. **v1 三视图档位**：`form`/`status`/`list` = 契约「实现档」；`chat`/`chart`/`table` =

@@ -120,13 +120,13 @@ fn card_entry(plugin_name: &str, decl_path: &str, decl: &Value) -> Value {
         );
     }
     let schema = decl.get("$schema").and_then(Value::as_str);
-    if schema != Some("dsh/plugin-ui/v2") {
+    if schema != Some("dsh.panel-ui/v2") {
         return error_entry(
             plugin_name,
             decl_path,
             "schema-version-unsupported",
             &format!(
-                "$schema must be \"dsh/plugin-ui/v2\", got {}",
+                "$schema must be \"dsh.panel-ui/v2\", got {}",
                 match schema {
                     Some(s) => format!("{s:?}"),
                     None => "missing".to_string(),
@@ -346,7 +346,7 @@ mod tests {
     /// 一张合契约的 v2 卡片声明（字段可覆写）。
     fn v2_card(card_id: &str, title: &str) -> Value {
         json!({
-            "$schema": "dsh/plugin-ui/v2",
+            "$schema": "dsh.panel-ui/v2",
             "kind": "card",
             "cardId": card_id,
             "type": "model",
@@ -380,7 +380,7 @@ mod tests {
         write_ui(
             &b,
             &json!({
-                "$schema": "dsh/plugin-ui/v2", "kind": "card",
+                "$schema": "dsh.panel-ui/v2", "kind": "card",
                 "cardId": "pkg-b.status", "type": "runtime", "title": "B Status",
                 "size": { "w": 3, "h": 2 },
                 "view": { "kind": "status", "items": [] }
@@ -435,25 +435,31 @@ mod tests {
         let (_, v1) = tmp_pkg("bad", "pkg-v1");
         let (_, kindbad) = tmp_pkg("bad", "pkg-kindbad");
         let (_, nocard) = tmp_pkg("bad", "pkg-nocard");
+        let (_, old) = tmp_pkg("bad", "pkg-olddialect");
         let (_, good) = tmp_pkg("bad", "pkg-good");
         write_ui(&unparse, "not json{");
         write_ui(
             &v1,
             &json!({"$schema": "dsh/plugin-ui/v1", "kind": "form", "fields": []}).to_string(),
         );
+        // D-216 P0：旧方言 v2 串同 v1 同罪（纯标准文法，零兼容）。
+        write_ui(
+            &old,
+            &json!({"$schema": "dsh/plugin-ui/v2", "kind": "card", "cardId": "x", "type": "misc", "view": {"kind": "status"}}).to_string(),
+        );
         write_ui(
             &kindbad,
-            &json!({"$schema": "dsh/plugin-ui/v2", "kind": "form", "cardId": "x"}).to_string(),
+            &json!({"$schema": "dsh.panel-ui/v2", "kind": "form", "cardId": "x"}).to_string(),
         );
         write_ui(
             &nocard,
-            &json!({"$schema": "dsh/plugin-ui/v2", "kind": "card", "type": "misc"})
+            &json!({"$schema": "dsh.panel-ui/v2", "kind": "card", "type": "misc"})
                 .to_string(),
         );
         write_ui(&good, &v2_card("good.card", "Good").to_string());
 
-        let m = build_manifest(&[unparse, v1, kindbad, nocard, good], &[]);
-        assert_eq!(m.cards.len(), 5, "坏包不静默丢，得 {:?}", m.cards);
+        let m = build_manifest(&[unparse, v1, kindbad, nocard, old, good], &[]);
+        assert_eq!(m.cards.len(), 6, "坏包不静默丢，得 {:?}", m.cards);
         let code_of = |name: &str| -> String {
             let e = m
                 .cards
@@ -464,6 +470,7 @@ mod tests {
         };
         assert_eq!(code_of("pkg-unparse"), "declaration-unparseable");
         assert_eq!(code_of("pkg-v1"), "schema-version-unsupported");
+        assert_eq!(code_of("pkg-olddialect"), "schema-version-unsupported");
         assert_eq!(code_of("pkg-kindbad"), "card-kind-unknown");
         assert_eq!(code_of("pkg-nocard"), "card-id-missing");
         // 好包照常

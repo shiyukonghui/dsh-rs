@@ -4,7 +4,7 @@
 use serde_json::{json, Value};
 
 pub const TYPE_ORDER: [&str; 7] = ["model", "config", "capability", "runtime", "resource", "session", "misc"];
-const SCHEMA: &str = "dsh/plugin-ui/v2";
+const SCHEMA: &str = "dsh.panel-ui/v2";
 const REJECTED: [&str; 1] = ["board"];
 const RESERVED: [&str; 2] = ["chart", "table"];
 const IMPLEMENTED: [&str; 4] = ["form", "status", "list", "chat"];
@@ -184,6 +184,8 @@ mod tests {
         assert!(validate_declaration(&json!([])).is_some());
         assert_eq!(validate_declaration(&json!([])).unwrap().0, "declaration-unparseable");
         assert_eq!(validate_declaration(&json!({"$schema":"dsh/plugin-ui/v1","kind":"card","view":{"kind":"status"}})).unwrap().0, "schema-version-unsupported");
+        // D-216 P0：旧方言串此后同 v1 同罪（纯标准文法，零兼容）。
+        assert_eq!(validate_declaration(&json!({"$schema":"dsh/plugin-ui/v2","kind":"card","view":{"kind":"status"}})).unwrap().0, "schema-version-unsupported");
         assert_eq!(validate_declaration(&json!({"$schema":SCHEMA,"kind":"panel","view":{"kind":"status"}})).unwrap().0, "card-kind-unknown");
         assert_eq!(validate_declaration(&json!({"$schema":SCHEMA,"kind":"card"})).unwrap().0, "view-malformed");
         assert_eq!(validate_declaration(&json!({"$schema":SCHEMA,"kind":"card","view":{"kind":"board"}})).unwrap().0, "view-kind-rejected");

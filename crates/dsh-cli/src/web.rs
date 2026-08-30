@@ -5160,7 +5160,7 @@ mod tests {
         std::fs::write(
             dir.join("web/ui.json"),
             format!(
-                r#"{{"$schema":"dsh/plugin-ui/v2","kind":"card","cardId":"{name}.c","type":"misc","title":"{title}","size":{{"w":2,"h":2}},"view":{{"kind":"form","fields":[],"actions":[]}}}}"#
+                r#"{{"$schema":"dsh.panel-ui/v2","kind":"card","cardId":"{name}.c","type":"misc","title":"{title}","size":{{"w":2,"h":2}},"view":{{"kind":"form","fields":[],"actions":[]}}}}"#
             ),
         )
         .unwrap();
@@ -6456,7 +6456,7 @@ mod tests {
 
     fn ui_manifest_v2(card_id: &str, title: &str) -> String {
         serde_json::json!({
-            "$schema": "dsh/plugin-ui/v2", "kind": "card",
+            "$schema": "dsh.panel-ui/v2", "kind": "card",
             "cardId": card_id, "type": "model", "title": title,
             "size": { "w": 2, "h": 3 },
             "view": { "kind": "form", "fields": [], "actions": [] }

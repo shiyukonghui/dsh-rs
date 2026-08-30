@@ -132,7 +132,7 @@ fn declaration_satisfies_v2_card_contract() {
         .clone();
 
     // 版本显式：渲染器遇非 v2 必须 fail-loud，不做静默兼容（双模型崩塌的入口）。
-    assert_eq!(decl["$schema"], "dsh/plugin-ui/v2");
+    assert_eq!(decl["$schema"], "dsh.panel-ui/v2");
     // 卡身份 = (插件名, cardId)。
     assert!(!decl["cardId"].as_str().unwrap_or("").is_empty(), "cardId 必须非空");
     // type = 分类轴（与渲染轴 view.kind 正交），必须是 v1 闭集成员。
@@ -188,7 +188,7 @@ fn no_legacy_v1_top_level_declaration_anywhere() {
             continue;
         }
         checked += 1;
-        if decl["$schema"] != json!("dsh/plugin-ui/v2") || decl["kind"] != json!("card") {
+        if decl["$schema"] != json!("dsh.panel-ui/v2") || decl["kind"] != json!("card") {
             offenders.push(format!(
                 "{}: $schema={} kind={}",
                 ui.display(),

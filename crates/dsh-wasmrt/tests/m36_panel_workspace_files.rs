@@ -74,7 +74,7 @@ fn describe_ui_returns_valid_list_declaration() {
         .unwrap();
     assert_eq!(r["ok"], true, "{r}");
     let decl = &r["value"];
-    assert_eq!(decl["$schema"], "dsh/plugin-ui/v2");
+    assert_eq!(decl["$schema"], "dsh.panel-ui/v2");
     assert_eq!(decl["kind"], "card");
     assert_eq!(decl["cardId"], "panel-workspace-files.list");
     assert_eq!(decl["type"], "resource", "fs/工作区归 resource 分类（D-181 语义表）");

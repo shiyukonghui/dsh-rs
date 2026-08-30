@@ -73,7 +73,7 @@ fn describe_ui_returns_valid_list_declaration() {
         .unwrap();
     assert_eq!(r["ok"], true, "{r}");
     let decl = &r["value"];
-    assert_eq!(decl["$schema"], "dsh/plugin-ui/v2");
+    assert_eq!(decl["$schema"], "dsh.panel-ui/v2");
     assert_eq!(decl["kind"], "card");
     assert_eq!(decl["cardId"], "panel-sessions.list");
     assert_eq!(decl["type"], "session", "会话相关归 session 分类（D-181 语义表）");

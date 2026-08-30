@@ -73,7 +73,7 @@ fn describe_ui_returns_valid_list_declaration() {
         .unwrap();
     assert_eq!(r["ok"], true, "{r}");
     let decl = &r["value"];
-    assert_eq!(decl["$schema"], "dsh/plugin-ui/v2");
+    assert_eq!(decl["$schema"], "dsh.panel-ui/v2");
     assert_eq!(decl["cardId"], "panel-settings.list");
     assert_eq!(decl["type"], "config", "设置归 config 分类（D-181 语义表）");
     let size = decl["size"].as_object().expect("size 对象");

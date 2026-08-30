@@ -40,7 +40,7 @@ fn default_models() -> Value {
 /// 声明生产（P2：Rust 只生声明，不渲染）。
 fn ui_declaration() -> Value {
     json!({
-        "$schema": "dsh/plugin-ui/v2",
+        "$schema": "dsh.panel-ui/v2",
         "kind": "card",
         "cardId": "llm-deepseek.settings",
         "type": "model",

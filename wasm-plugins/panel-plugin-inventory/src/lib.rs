@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 /// UI 声明（数据，非代码）。静态 web/ui.json 与其保持逐字段一致（m33 断言）。
 fn ui_declaration() -> Value {
     json!({
-        "$schema": "dsh/plugin-ui/v2",
+        "$schema": "dsh.panel-ui/v2",
         "kind": "card",
         "cardId": "panel-plugin-inventory.list",
         "type": "runtime",
