@@ -1,106 +1,181 @@
-/* 桌布壳样式（C3）。网格几何 CSS 变量：格距 10px 是契约值（D-181 §5）；
-   列宽/行高单元可覆写。坐标全部由 core.js 算好，这里只消费 px。 */
+/* 桌布壳样式（C3 · D-224 Semi 令牌化）。
+   网格几何 CSS 变量：格距 10px 是契约值（D-181 §5）；列宽/行高单元可覆写。
+   坐标全部由 JS 算好，这里只消费 px。
+   颜色/圆角/字体移植 Semi Design 设计令牌（semi-theme-default 源码语义），
+   默认浅色对齐 DeepSeek Harness 原版；body[theme-mode="dark"] 切 Semi 深色。 */
 :root {
+  /* ---- 几何契约（勿动） ---- */
   --col: 260px;   /* 列宽（卡宽单元） */
   --row: 100px;   /* 行高单元 */
   --gap: 10px;    /* 格距（契约锁定，勿改） */
-  --bg: #10141a;
-  --panel: #171d26;
-  --line: #2a3441;
-  --text: #d7dee8;
-  --dim: #8a97a8;
-  --ok: #57ab5a;
-  --err: #e5534b;
-  --accent: #4b7bcc;
+
+  /* ---- Semi 调色板原始档（semi-theme-default/_palette.scss · light） ---- */
+  --semi-white: 255, 255, 255;
+  --semi-grey-0: 249, 249, 249;
+  --semi-grey-1: 230, 232, 234;
+  --semi-grey-8: 46, 50, 56;
+  --semi-grey-9: 28, 31, 35;
+  --semi-blue-0: 234, 245, 255;
+  --semi-blue-5: 0, 100, 250;
+  --semi-blue-6: 0, 98, 214;
+  --semi-green-5: 59, 179, 70;
+  --semi-orange-5: 252, 136, 0;
+  --semi-red-5: 249, 57, 32;
+
+  /* ---- 语义层（Semi 语义色的桌布映射） ---- */
+  --bg: rgba(var(--semi-white), 1);                    /* bg-0 */
+  --side: rgba(var(--semi-grey-0), 1);                 /* 侧栏面（原版左栏浅灰） */
+  --panel: rgba(var(--semi-white), 1);                 /* bg-1 卡面 */
+  --line: rgba(var(--semi-grey-8), 0.09);              /* color-border（发丝线） */
+  --line-strong: rgba(var(--semi-grey-8), 0.16);       /* 控件描边 */
+  --text: rgba(var(--semi-grey-9), 1);                 /* text-0 */
+  --text-1: rgba(var(--semi-grey-9), 0.8);             /* text-1 */
+  --dim: rgba(var(--semi-grey-9), 0.62);               /* text-2 */
+  --dim3: rgba(var(--semi-grey-9), 0.35);              /* text-3 */
+  --fill-0: rgba(var(--semi-grey-8), 0.05);            /* fill-0 */
+  --fill-1: rgba(var(--semi-grey-8), 0.09);            /* fill-1 */
+  --accent: rgba(var(--semi-blue-5), 1);               /* primary */
+  --accent-h: rgba(var(--semi-blue-6), 1);             /* primary-hover */
+  --accent-bg: rgba(var(--semi-blue-0), 1);            /* primary-light-default */
+  --ok: rgba(var(--semi-green-5), 1);                  /* success */
+  --warn: rgba(var(--semi-orange-5), 1);               /* warning */
+  --err: rgba(var(--semi-red-5), 1);                   /* danger */
+  --r-md: 6px;                                         /* radius-medium */
+  --r-sm: 3px;                                         /* radius-small */
 }
+body[theme-mode="dark"] {
+  /* Semi 深色语义（global.scss [theme-mode="dark"] 块 + 深色蓝谱）。
+     注意：派生语义变量必须在此**显式重声明**为字面量——:root 上以 var()
+     定义的派生值在 :root 解析完成后被继承固化，三元组的后覆盖不追溯。 */
+  --bg: rgb(22, 22, 26);                              /* dark bg-0 */
+  --side: rgb(30, 31, 36);
+  --panel: rgb(35, 36, 41);                           /* dark bg-1 */
+  --line: rgba(255, 255, 255, 0.08);                  /* dark color-border */
+  --line-strong: rgba(255, 255, 255, 0.2);
+  --text: rgb(249, 249, 249);
+  --text-1: rgba(249, 249, 249, 0.8);
+  --dim: rgba(249, 249, 249, 0.62);
+  --dim3: rgba(249, 249, 249, 0.35);
+  --fill-0: rgba(255, 255, 255, 0.12);
+  --fill-1: rgba(255, 255, 255, 0.16);
+  --accent: rgb(84, 169, 255);                        /* dark blue-5 */
+  --accent-h: rgb(127, 193, 255);                     /* dark blue-6 */
+  --accent-bg: rgb(5, 49, 112);                       /* dark blue-0 */
+  --ok: rgb(93, 194, 100);
+  --warn: rgb(255, 174, 67);
+  --err: rgb(252, 114, 90);
+}
+
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text);
-  font: 14px/1.5 "Segoe UI", "Microsoft YaHei", sans-serif; }
+  font: 14px/1.5 Inter, -apple-system, "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--fill-1); border-radius: var(--r-md); }
+::-webkit-scrollbar-thumb:hover { background: var(--line-strong); }
+::-webkit-scrollbar-track { background: transparent; }
+
 header { display: flex; align-items: baseline; gap: 14px;
-  padding: 10px 16px; border-bottom: 1px solid var(--line); }
-header h1 { font-size: 16px; margin: 0; }
-.rev { color: var(--dim); font-size: 12px; }
+  padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--bg); }
+header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+.rev { color: var(--dim3); font-size: 12px; }
 .status { margin-left: auto; font-size: 12px; color: var(--dim); }
 .status.ok { color: var(--ok); }
 .status.err { color: var(--err); }
 
 .layout { display: flex; height: calc(100vh - 47px); }
 #sidebar { width: 220px; flex: 0 0 220px; overflow-y: auto;
-  border-right: 1px solid var(--line); padding: 8px 0; }
+  border-right: 1px solid var(--line); padding: 8px 0; background: var(--side); }
 #sidebar .all { display: block; width: 100%; text-align: left; }
 #sidebar .group-title { display: flex; justify-content: space-between;
   width: 100%; text-align: left; font-weight: 600; }
-#sidebar .group-title .count { color: var(--dim); font-weight: 400; }
+#sidebar .group-title .count { color: var(--dim3); font-weight: 400; }
 #sidebar .name { display: block; width: 100%; text-align: left;
-  padding-left: 26px; color: var(--dim); }
+  padding-left: 26px; color: var(--text-1); }
 #sidebar button { background: none; border: 0; color: inherit;
-  padding: 5px 12px; cursor: pointer; font: inherit; }
-#sidebar button:hover { background: var(--panel); color: var(--text); }
-#sidebar button.active { color: var(--accent); background: var(--panel);
+  padding: 5px 12px; cursor: pointer; font: inherit; border-radius: 0; }
+#sidebar button:hover { background: var(--fill-0); color: var(--text); }
+#sidebar button.active { color: var(--accent); background: var(--accent-bg);
   border-right: 2px solid var(--accent); }
 
 #workbench { flex: 1; overflow-y: auto; padding: 14px; position: relative; }
 #workbench .empty { color: var(--dim); padding: 40px 8px; }
 .card { position: absolute; background: var(--panel);
-  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: var(--r-md); padding: 10px 12px;
   overflow-y: auto; }
 .card.focus-hl { border-color: var(--accent);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent); }
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent); }
 .card .cap { font-weight: 600; display: flex; justify-content: space-between;
   align-items: baseline; gap: 8px; }
-.card-close { background: none; border: 0; color: var(--dim); cursor: pointer;
-  font-size: 13px; line-height: 1; padding: 0 2px; }
-.card-close:hover { color: var(--err); }
+.card-close { background: none; border: 0; color: var(--dim3); cursor: pointer;
+  font-size: 13px; line-height: 1; padding: 0 2px; border-radius: var(--r-sm); }
+.card-close:hover { color: var(--err); background: var(--fill-0); }
 #sidebar .name.shut { opacity: .45; text-decoration: line-through; }
 .card .badges { display: flex; gap: 6px; align-items: center;
   font-size: 11px; color: var(--dim); margin: 2px 0 8px; }
-.card .badges .type { border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; }
+.card .badges .type { background: var(--accent-bg); color: var(--accent);
+  border-radius: var(--r-sm); padding: 0 6px; line-height: 18px; }
 .card .note { font-size: 11px; color: var(--dim); margin-bottom: 6px; }
 .card label { display: block; margin: 6px 0; }
 .card label > span { display: block; font-size: 12px; color: var(--dim); }
 .card input[type="text"], .card input[type="number"], .card select, .card textarea {
   width: 100%; background: var(--bg); color: var(--text);
-  border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; font: inherit; }
+  border: 1px solid var(--line-strong); border-radius: var(--r-md);
+  padding: 4px 8px; font: inherit; outline: none;
+  transition: border-color .15s, box-shadow .15s; }
+.card input:focus, .card select:focus, .card textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent); }
 .card textarea { min-height: 64px; }
 .card .actions { margin-top: 8px; display: flex; gap: 8px; }
-.card .actions button { background: var(--accent); color: #fff; border: 0;
-  border-radius: 4px; padding: 4px 12px; cursor: pointer; font: inherit; }
-.card .actions button:not(.primary) { background: var(--line); color: var(--text); }
+.card .actions button { background: var(--accent); color: var(--semi-white); border: 0;
+  border-radius: var(--r-md); padding: 5px 14px; cursor: pointer; font: inherit;
+  transition: background .15s; }
+.card .actions button:hover { background: var(--accent-h); }
+.card .actions button:not(.primary) { background: var(--fill-0); color: var(--text-1); }
+.card .actions button:not(.primary):hover { background: var(--fill-1); color: var(--text); }
 .card .cstat { font-size: 12px; margin-top: 6px; color: var(--dim); }
 .card .cstat.ok { color: var(--ok); }
 .card .cstat.err { color: var(--err); }
 .card.fail .fail-msg { color: var(--err); }
-.card.fail .code { color: var(--dim); font-size: 11px; }
+.card.fail .code { color: var(--dim3); font-size: 11px; }
 .ltable { border-collapse: collapse; width: 100%; font-size: 12px; }
-.ltable th, .ltable td { text-align: left; padding: 3px 6px;
+.ltable th, .ltable td { text-align: left; padding: 5px 8px;
   border-bottom: 1px solid var(--line); }
-.ltable th { color: var(--dim); font-weight: 600; }
-.ltable .row-action { background: var(--line); color: var(--text); border: 0;
-  border-radius: 3px; padding: 2px 8px; margin-right: 4px; cursor: pointer; font: inherit; }
-.ltable .row-action:hover { background: var(--err); color: #fff; }
-.srow { display: flex; justify-content: space-between; padding: 2px 0; font-size: 12px; }
+.ltable th { color: var(--dim); font-weight: 600;
+  background: var(--fill-0); }
+.ltable tbody tr:hover { background: var(--fill-0); }
+.ltable .row-action { background: var(--fill-0); color: var(--text-1); border: 0;
+  border-radius: var(--r-sm); padding: 2px 8px; margin-right: 4px; cursor: pointer;
+  font: inherit; transition: background .15s; }
+.ltable .row-action:hover { background: var(--fill-1); color: var(--text); }
+.srow { display: flex; justify-content: space-between; padding: 3px 0; font-size: 12px; }
 .srow .slabel { color: var(--dim); }
 .srow .svalue.tone-ok { color: var(--ok); }
-.srow .svalue.tone-warn { color: #d9a94b; }
+.srow .svalue.tone-warn { color: var(--warn); }
 .srow .svalue.tone-err { color: var(--err); }
 .chat-bar { display: flex; gap: 6px; margin-bottom: 6px; }
 .chat-bar select { flex: 1; background: var(--bg); color: var(--text);
-  border: 1px solid var(--line); border-radius: 3px; font: inherit; }
+  border: 1px solid var(--line-strong); border-radius: var(--r-md); font: inherit; }
 .chat-msgs { overflow-y: auto; max-height: 260px; display: flex;
   flex-direction: column; gap: 4px; }
-.chat-bubble { padding: 3px 8px; border-radius: 6px; font-size: 12px;
+.chat-bubble { padding: 4px 10px; border-radius: var(--r-md); font-size: 12px;
   white-space: pre-wrap; word-break: break-word; }
-.chat-bubble.user { background: var(--line); align-self: flex-end; }
-.chat-bubble.assistant { background: #23303f; align-self: flex-start; }
-.chat-bubble.system { color: var(--dim); font-size: 11px; align-self: center; }
+.chat-bubble.user { background: var(--accent-bg); color: var(--text); align-self: flex-end; }
+.chat-bubble.assistant { background: var(--fill-0); color: var(--text); align-self: flex-start; }
+.chat-bubble.system { color: var(--dim3); font-size: 11px; align-self: center; }
 .chat-send { display: flex; gap: 6px; margin-top: 6px; }
 .chat-send input { flex: 1; background: var(--bg); color: var(--text);
-  border: 1px solid var(--line); border-radius: 3px; font: inherit; padding: 3px 6px; }
+  border: 1px solid var(--line-strong); border-radius: var(--r-md);
+  font: inherit; padding: 4px 8px; outline: none; }
+.chat-send input:focus { border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent); }
 
 /* D-214 拖拽摆位：标题栏即把手（✕ 除外由 JS 侧排除）；重置入口。 */
 .cap { cursor: grab; user-select: none; }
 .cap:active { cursor: grabbing; }
-.reset-pos { margin-left: 12px; background: var(--bg); color: var(--text);
-  border: 1px solid var(--line); border-radius: 4px; font: inherit; font-size: 12px;
-  padding: 2px 10px; cursor: pointer; }
-.reset-pos:hover { border-color: var(--accent, #4a9eff); }
+.reset-pos { margin-left: 12px; background: var(--bg); color: var(--text-1);
+  border: 1px solid var(--line-strong); border-radius: var(--r-md); font: inherit;
+  font-size: 12px; padding: 2px 10px; cursor: pointer; }
+.reset-pos:hover { border-color: var(--accent); color: var(--accent); }
