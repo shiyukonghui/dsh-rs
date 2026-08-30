@@ -1,0 +1,11 @@
+[package]
+name = "dsh-contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "D-216：dsh-std 元协议三原语的 Rust 移植（文法/声明/目录协商，纯函数零业务）"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

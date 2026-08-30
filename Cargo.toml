@@ -22,6 +22,8 @@ members = [
   "crates/dsh-shell", "crates/dsh-terminal", "crates/dsh-code-runtime",
   # presets（B+C）：per-session agent preset 组合（发现/挂载/服务桥，路径 B）
   "crates/dsh-agent-presets",
+  # D-216：dsh-std 三原语 Rust 移植（契约文法/声明/目录协商，地基新成员）
+  "crates/dsh-contract",
 ]
 
 [workspace.package]
