@@ -23,7 +23,7 @@
 | 设置概览（list） | ns/字段/值与 settings.describe 一致；secret 仅存在性 | 设置面板（只读子集） |
 | **聊天（chat）** | 选会话→历史气泡与旧前端一致；发送→乐观气泡→SSE 真回复；切会话不串线；**停止**→turn 中止（aborted 事件）不删历史 | **聊天主视图（关键路径）** |
 | 设置编辑（form+fieldsFrom+**nsSelect**） | 下拉列出全部 ns；切换重投影；保存成功；改并发→SETTINGS_CONFLICT 显式；Restart 类 ns 保存后显示「需重启生效」；**秘密字段**=password 框（设→存在性转「已设」；留空保存不改写） | 设置面板（写端**全 ns**，D-201/204） |
-| ↳ 自主 E2E 进度（CDP） | ✅ 13 卡渲染+37 行真数据（D-207）；✅ nsSelect 重投影/表单诚实错误/侧栏过滤（D-208）；✅ **保存成功+「需重启生效」/SETTINGS_CONFLICT 显式/password 首次设置+空值不清洗**（e2e-write）；⚠️ 热插拔：manifest 与 SSE rev 帧均达（页面实测收帧），**DOM 未即时重渲染——渲染器链路待查**；⚠️ report() 成功态把 namespace_view 整坨 JSON 上 stat 行（观感缺陷）；⚠️ ns 切换后旧 stat 文案残留 | — |
+| ↳ 自主 E2E 进度（CDP） | **双壳并存（D-210+S6a）**：`/canvas/rust`（Rust 壳）交互审计**全绿**——13 卡/关闭重开+localStorage 互通/nsSelect 重投影/表单诚实错误/chat 乐观气泡/**热插拔完整闭环（12→13）**/零 panic（s6-audit.md 第 51–52 轮）。`/canvas`（JS 旧壳）：保存三态/password 闸等仍绿（e2e-write），但热插拔 DOM 冻结**三次复现坐实**+report() 整坨 JSON+ns 切换 stat 残留——三件**不在旧壳修**，切默认整体了结（HANDOFF §4）。待你：chat 真实回路+审批闭环（需 agent loop/LLM key 的正式 cordis）目检 | — |
 | 设置编辑 · locale（form，固定 ns） | 同契约换 ns=locale（D-201 后与上卡重叠，可合并裁撤） | 设置面板（冗余保留，待拍板） |
 | 调度任务（list+删） | after/at/every 行与实况一致；**删除弹确认**；删后行消失（fold 回读） | 调度面板（读+删） |
 | 创建调度（form） | kind/prompt/afterSeconds 保存 → 调度任务卡出现该行 | 调度面板（建端） |

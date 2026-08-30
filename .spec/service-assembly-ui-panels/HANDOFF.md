@@ -1,52 +1,49 @@
-# 服务装配前端：交接总览（2026-09-05，D-206 后基线）
+# 服务装配前端：交接总览（2026-09-05 · 第 53 轮同步，覆盖 D-207 … D-210 + S6a）
 
-一页入口：晨间验证与下线判定所需的一切。细节各有专档，此处只做路由。
+一页入口：验证、切默认（S6d）与旧前端下线拍板所需的一切。细节各有专档，此处只做路由。
 
 ## 1. 终态一句话
-harness 全部核心前端能力已由 **13 张服务单元卡**在 `/canvas` 上承载（声明=数据、
-渲染器在浏览器、Rust 零渲染），旧前端路由原样保留，等待**你的浏览器 E2E + 下线拍板**。
+13 张服务单元卡承载全部前端能力，且渲染器自身完成 **Rust 化双壳并存**：
+`/canvas`（JS 旧壳，零改动保留）与 **`/canvas/rust`（Dioxus 壳，审计全绿且热插拔反超）**
+同源于同一声明契约（声明=数据、单元=wasip1 组件、渲染器只是壳）。
+剩两步 = **你的目检 + S6d/下线拍板**（材料已备齐，见 §3/§5）。
 
-## 2. 生态账本
+## 2. 生态账本（末次认证 = 第 52 轮）
 | 维度 | 数字 | 权威出处 |
 |---|---|---|
-| 装配单元 / 桌面卡 | **13 / 13**（11 面板单元 + 2 表单/编辑补充） | `wasm-plugins/` 目录 + `ui_manifest.rs` scan 测试逐卡断言 |
-| 决策日志 | D-180 … **D-206** 每片一条（选项/否决/实测/回滚点） | `docs/DECISIONS.md` |
-| 面板台账 | 逐卡状态表 | `.spec/service-assembly-ui-panels/progress.md` |
-| 测试基线 | node **34/34**、verify-diff **ALL PASS**、dsh-cli **259/0**、wasmrt m32–m44、clippy **0** | 2026-09-05 交接认证 |
-| 活体冒烟（D-206） | serve 真实 HTTP：13 卡全挂载、数据面 ok、诚实态×2、**抓出并修复信封闸 bug** | `docs/DECISIONS.md` D-206 |
+| 装配单元 / 桌面卡 | **13 / 13**（契约未动，双壳共用） | `wasm-plugins/` + `ui_manifest.rs` 逐卡断言 |
+| 决策日志 | D-180 … **D-210**（含 S1–S6a 进度补记、S6a 教训） | `docs/DECISIONS.md` |
+| Rust 壳（canvas-shell） | lib 纯函数 **22/22**（宿主可测）+ 活体审计全绿 | `canvas-shell/`，`.spec/…-shell-dioxus/s6-audit.md` |
+| JS 壳测试 | node **35/35**（D-209 后） | `assets/canvas/tests/core.test.mjs` |
+| 宿主 | dsh-cli lib **260/0**（含 Rust 壳内嵌路由测） | cargo test 第 52 轮 |
+| wasmrt / verify-diff | m32–m44、ALL PASS（D-208 期认证；此后单元层零改动） | DECISIONS D-19x–D-208 |
+| 内嵌面 | `/canvas/rust` + assets 由 **build.rs include_bytes!** 表驱动 | `crates/dsh-cli/build.rs`、D-210 S5 |
 
-## 3. 晨间三步（预计 30–60 分钟）
-1. **起服**（D-206 实证配方）：`target\debug\dsh.exe web scenarios\web-smoke.cordis.yml --port <端口>`
-   （或 `cargo run -p dsh-cli --bin dsh -- web <同>`；**子命令是 `web`，cordis.yml 必填**，
-   `dsh serve` 不存在。生产换你的正式 cordis.yml）。agent loop 关时 调度/审批 显示诚实
-   「未装配」错误态——设计行为非 bug（RPC 层已活体实证）。
-2. **照单打勾**：`.spec/service-assembly-ui-panels/e2e-offline-checklist.md`
-   §0 基线（13 卡/五分类/无红卡 + 热插拔抽查）→ §1 逐卡 13 行（聊天与审批=关键路径）。
-3. **判定**：§3 规则——§1 全绿 + §2 缺口你接受（或点名补齐）→ 批准下线旧前端路由
-   （独立小提交，撤之即回滚）；任一 ❌ 把现象记在对应行，回对应切片修。
+## 3. 晨间三步（更新版）
+1. **起服**（配方不变）：`target\debug\dsh.exe web scenarios\web-smoke.cordis.yml --port <端口>`。
+   两壳同服：`http://<host>/canvas`（JS）与 `http://<host>/canvas/rust`（Rust）。
+   agent loop 关时 调度/审批 显诚实「未装配」态——设计行为非 bug。
+2. **照单打勾**：`e2e-offline-checklist.md` §1；交互面已由 `e2e-audit.mjs` 自动对打
+   （关闭/重开/nsSelect/表单诚实错误/chat 气泡/热插拔 SSE）——**Rust 壳全绿**，
+   JS 壳热插拔项已知缺陷（DOM 冻结，将由切默认一并了结）。
+3. **拍板两件**：① S6d 切默认（照 `.spec/service-assembly-ui-shell-dioxus/s6-runbook.md`，
+   单提交可回滚）；② 旧 deepseek 前端（根 `/`）下线（`e2e-offline-checklist.md` §3 规则）。
 
-## 4. §2 缺口速览（判定材料）
-- **已落地（D-202）**：动态插件**启用**（= dynamicActivate 同后端，行动作非破坏无确认）。
-- **已落地（D-203）**：聊天**停止**（cancelRpc 声明键 + session.cancel 真取消，turn 中可送达）。
-- **已落地（D-204）**：secrets **write-only 编辑**（password 框；留空=不改的防误清闸；
-  顺带封掉旧渲染保存即清密的既有隐患）。
-- **非目标（D-205 终审，TS 全表面取证）**：动态插件 define（旧前端本无此浏览器能力，
-  代码定义=宿主/文件语义）；聊天附件（新协议域非改写）。
-- **里程碑（D-205 判级）**：旧前端全部浏览器能力已有服务单元等价物——「不可机械化」
-  清单清空，技术侧收口；剩余 = §1 逐卡 E2E + 下线拍板（均你侧）。
-- **已终结（D-201）**：其余 ns 设置编辑——设置编辑卡自带 **nsSelect 命名空间下拉**，
-  一卡通用编辑全部 ns（含 llm[Restart]/shell/agent-loop/…），**不再需要点单复制**；
-  panel-locale-edit 固定卡自此冗余，E2E 后可裁撤（你拍板）。
-- 审批策略编辑（approval/policy）属设置域，同上。
+## 4. 缺口速览（判定材料，更新）
+- **JS 旧壳三件观感缺陷**（report 成功态 JSON 整坨 / ns 切换旧 stat 残留 / 热插拔 DOM 冻结）：
+  **不在旧壳修**——Rust 壳对应实现全部正确且有审计证据；切默认即整体了结（省工且避免双维护）。
+- **待你环境验证**：chat 真实回复回路（需 LLM key/agent loop 开启的正式 cordis）；
+  审批动作闭环（需 agent loop 开）。冒烟环境下两者均为诚实错误态（已实证）。
+- 既有条目（D-201 裁撤 locale 固定卡、D-202/203/204/205 系列）状态不变，见 DECISIONS。
 
-## 5. 诚实账（不代宣的三件事）
-1. ~~DOM 渲染层从未被真实执行~~ → **已解除（D-207）**：自主 CDP 浏览器 E2E 首跑抓出并
-   修复白屏级信封 bug，13 卡渲染+37 行真数据+14 端点全活体绿。你的浏览器逐卡目检
-   降级为**推荐**（交互手感类），不再是判定必需。
-2. 目标「不再使用 deepseek 前端」的**最后一公里 = 你的拍板**，技术上无阻塞项。
-3. 新单元包自 m38 后未跑独立「包不存在红」（红型已九次实证，逐条注记在 D-19x/D-200）。
+## 5. 诚实账
+1. **审计是拦截器不是橡皮图章**：S6 首轮审计拦下了 Rust 壳 panic=abort 级崩溃
+   （dioxus-core runtime 223/280；根因=JS 回调内 `dioxus::spawn`），修复后复验全绿。
+   教训固化：JS 回调只准 `spawn_local`（D-210 补记）。
+2. rows 38 vs 46 = 观感差（status 行 markup），非契约违背，已记审计档。
+3. 目标「不再使用 deepseek 前端」的最后一公里 = **你的两项拍板**（§3 第 3 步）；
+   技术侧无阻塞项，回滚路径全部预置（双壳并存即回滚态）。
 
-## 6. 若要继续自主开发（优先级建议）
-~~点单 ns 编辑卡~~（D-201 nsSelect 终结）；~~激活面原生臂~~（D-202 启用落地；define 经
-D-205 终审 = 非目标）。技术队列已空——下一步 = **你跑 §3 三步**，产出 E2E 反馈后回对应
-切片修复（瀑布关卡：需求文档 → 设计 → TDD → 验收 → D-207+）。可选裁撤：locale 固定卡。
+## 6. 若要继续自主开发
+技术队列近空。可做的小尾巴：rows 观感对齐、locale 固定卡裁撤（等你批）、
+release 面 wasm-opt 体积优化（1.37MB→预计 ~0.9MB）。大动作（S6d/退役）= 等你拍板。
